@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -20,35 +21,38 @@ import (
 )
 
 // ============================================================
-// websocket.io wrappers
+// WebSocket io.ReadWriteCloser wrapper
 // ============================================================
 
-type wsReadWriteCloser struct {
+type wsConn struct {
 	conn *websocket.Conn
 }
 
-func (w *wsReadWriteCloser) Read(p []byte) (int, error) {
-	_, msg, err := w.conn.ReadMessage()
-	if err != nil {
-		return 0, err
+func (w *wsConn) Read(p []byte) (int, error) {
+	for {
+		_, msg, err := w.conn.ReadMessage()
+		if err != nil {
+			return 0, err
+		}
+		n := copy(p, msg)
+		if n < len(msg) {
+			return n, nil // truncated
+		}
+		if n > 0 {
+			return n, nil
+		}
+		// empty message, skip
 	}
-	n := len(msg)
-	if n > len(p) {
-		n = len(p)
-	}
-	copy(p, msg[:n])
-	return n, nil
 }
 
-func (w *wsReadWriteCloser) Write(p []byte) (int, error) {
-	err := w.conn.WriteMessage(websocket.BinaryMessage, p)
-	if err != nil {
+func (w *wsConn) Write(p []byte) (int, error) {
+	if err := w.conn.WriteMessage(websocket.BinaryMessage, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-func (w *wsReadWriteCloser) Close() error { return w.conn.Close() }
+func (w *wsConn) Close() error { return w.conn.Close() }
 
 // ============================================================
 // Config & Metrics
@@ -90,9 +94,8 @@ type Splitter struct {
 	logger      *log.Logger
 	secret      []byte
 	mu          sync.RWMutex
-	metricsAddr string
-	upSession   *yamux.Session // WS up-carrier (to Germany)
-	downSession *yamux.Session // TCP down-carrier (to Germany)
+	upSession   *yamux.Session // WS server (CDN → upload streams)
+	downSession *yamux.Session // TCP server (Germany → download streams)
 }
 
 func main() {
@@ -125,7 +128,6 @@ func main() {
 	}
 
 	derived := mux.DeriveSecret(cfg.Secret)
-
 	s := &Splitter{
 		config:  cfg,
 		store:   session.NewSessionStore(),
@@ -144,39 +146,19 @@ func main() {
 		go func() { defer wg.Done(); s.runMetrics(fmt.Sprintf("127.0.0.1:%d", cfg.MetricsPort)) }()
 	}
 
-	// --- Up-carrier: WS server from CDN ---
+	// --- Up-Carrier: WS server (behind CDN /upload) ---
 	wg.Add(1)
-	go func() { defer wg.Done(); s.runWsServer(&wg) }()
+	go func() { defer wg.Done(); s.runUpCarrier(&wg) }()
 
-	// --- SOCKS5 server for user connections ---
+	// --- SOCKS5 server (user connections from Xray) ---
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runSocksServer() }()
 
-	// --- Down-carrier: dial local Xray (VLESS tunnel to Germany) ---
-	dcConn, err := net.DialTimeout("tcp", cfg.DownCarrierAddr, 10*time.Second)
-	if err != nil {
-		s.logger.Fatalf("Down-carrier dial failed: %v", err)
-	}
-	s.logger.Printf("Down-carrier connected to %s", cfg.DownCarrierAddr)
-
-	// Auth: send secret, read ACK
-	_, err = dcConn.Write(append([]byte{0x00, 0x00, 0x00, 32}, derived...))
-	if err != nil {
-		s.logger.Printf("Down-carrier auth send: %v", err)
-	} else {
-		buf := make([]byte, 1)
-		dcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.ReadFull(dcConn, buf); err != nil || buf[0] != 0 {
-			s.logger.Printf("Down-carrier auth ACK: got type byte %v", buf)
-		} else {
-			s.logger.Printf("Down-carrier authenticated")
-		}
-	}
-
+	// --- Down-Carrier: TCP client → Germany ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		s.runDownCarrierSession(dcConn)
+		s.runDownCarrier(&wg)
 	}()
 
 	s.logger.Printf("SOCKS5: %s | WS: %s | Down → %s", cfg.SocksListen, cfg.WsListen, cfg.DownCarrierAddr)
@@ -185,33 +167,38 @@ func main() {
 	<-sigCh
 	s.logger.Println("Shutting down...")
 	s.store.CloseAll()
+	s.mu.RLock()
 	if s.upSession != nil {
 		s.upSession.Close()
 	}
 	if s.downSession != nil {
 		s.downSession.Close()
 	}
+	s.mu.RUnlock()
 	wg.Wait()
 	s.logger.Println("iran-splitter stopped")
 }
 
-// ---- Up-carrier: WS server (CDN/Nginx sends upload data) ----
+// ============================================================
+// Up-Carrier: WebSocket server (CDN connects to us on SPLIT_WS_LISTEN)
+// ============================================================
 
-func (s *Splitter) runWsServer(wg *sync.WaitGroup) {
+func (s *Splitter) runUpCarrier(wg *sync.WaitGroup) {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
-	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+	muxHTTP := http.NewServeMux()
+	muxHTTP.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			s.logger.Printf("WS upgrade: %v", err)
+			s.logger.Printf("WS upgrade failed from %s: %v", r.RemoteAddr, err)
 			return
 		}
 		s.logger.Printf("Up-carrier WS connected from %s", r.RemoteAddr)
-		s.handleUpCarrierConn(conn)
+		s.handleUpWsConn(wsConn)
 		s.logger.Printf("Up-carrier WS disconnected from %s", r.RemoteAddr)
 	})
 
@@ -220,51 +207,61 @@ func (s *Splitter) runWsServer(wg *sync.WaitGroup) {
 		s.logger.Fatalf("WS listener: %v", err)
 	}
 	defer ln.Close()
-
 	s.logger.Printf("WS server listening on %s", s.config.WsListen)
-	if err := http.Serve(ln, nil); err != nil && err != http.ErrServerClosed {
-		s.logger.Printf("WS server: %v", err)
+
+	if err := http.Serve(ln, muxHTTP); err != nil && err != http.ErrServerClosed {
+		s.logger.Printf("WS server error: %v", err)
 	}
 }
 
-func (s *Splitter) handleUpCarrierConn(wsConn *websocket.Conn) {
-	wsc := &wsReadWriteCloser{conn: wsConn}
+func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
+	wsc := &wsConn{conn: ws}
 
-	// Auth: read secret, validate
-	hdr := make([]byte, 4)
-	if _, err := io.ReadFull(wsc, hdr); err != nil {
+	// Auth: read 32-byte secret with 4-byte big-endian length prefix
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(wsc, lenBuf[:]); err != nil {
+		s.logger.Printf("Up-carrier auth read length: %v", err)
+		wsc.Close()
 		return
 	}
-	sl := int(hdr[2])<<8 | int(hdr[3])
-	secretPayload := make([]byte, sl)
+	secretLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+	if secretLen != 32 {
+		s.logger.Printf("Up-carrier auth bad length %d", secretLen)
+		wsc.Close()
+		return
+	}
+	secretPayload := make([]byte, 32)
 	if _, err := io.ReadFull(wsc, secretPayload); err != nil {
+		s.logger.Printf("Up-carrier auth read secret: %v", err)
+		wsc.Close()
 		return
 	}
 	if !mux.ValidateSecret(secretPayload, s.secret) {
-		s.logger.Printf("Up-carrier auth rejected for %s", wsConn.RemoteAddr())
+		s.logger.Printf("Up-carrier auth rejected from %s", ws.RemoteAddr())
 		wsc.Close()
 		return
 	}
 	// Auth ACK
-	wsc.Write([]byte{0x00, 0x00, 0x00, 1, 0x00})
+	wsc.Write([]byte{0x00})
+	s.logger.Printf("Up-carrier authenticated from %s", ws.RemoteAddr())
 
-	// Create yamux session (we are server; CDN is client)
+	// Wrap in yamux.Server (we are server, CDN is client)
 	yamuxCfg := yamux.DefaultConfig()
 	yamuxCfg.EnableKeepAlive = true
 	yamuxCfg.KeepAliveInterval = s.config.KeepAliveInterval
 	yamuxSession, err := yamux.Server(wsc, yamuxCfg)
 	if err != nil {
 		s.logger.Printf("Up-carrier yamux server: %v", err)
+		wsc.Close()
 		return
 	}
-
-	s.logger.Printf("Up-carrier yamux session established")
 
 	s.mu.Lock()
 	s.upSession = yamuxSession
 	s.mu.Unlock()
+	s.logger.Printf("Up-carrier yamux session established")
 
-	// Accept streams
+	// Accept upload streams from CDN (each stream = one user session)
 	go func() {
 		for {
 			stream, err := yamuxSession.AcceptStream()
@@ -277,18 +274,6 @@ func (s *Splitter) handleUpCarrierConn(wsConn *websocket.Conn) {
 		}
 	}()
 
-	// Keepalive
-	go func() {
-		ticker := time.NewTicker(s.config.KeepAliveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				yamuxSession.Ping()
-			}
-		}
-	}()
-
 	<-yamuxSession.CloseChan()
 	s.logger.Printf("Up-carrier yamux session closed")
 	s.mu.Lock()
@@ -298,101 +283,139 @@ func (s *Splitter) handleUpCarrierConn(wsConn *websocket.Conn) {
 	s.mu.Unlock()
 }
 
+// handleUpStream: passthrough — download data comes via down-carrier instead
 func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	defer stream.Close()
+	buf := make([]byte, 1460)
+	for {
+		_, err := stream.Read(buf)
+		if err != nil {
+			return
+		}
+	}
+}
 
-	// Read sessionID (16 bytes) first
+// ============================================================
+// Down-Carrier: TCP client → Germany (persistent tunnel)
+// ============================================================
+
+func (s *Splitter) runDownCarrier(wg *sync.WaitGroup) {
+	for {
+		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, 10*time.Second)
+		if err != nil {
+			s.logger.Printf("Down-carrier dial to %s: %v (retrying in 5s)", s.config.DownCarrierAddr, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		s.logger.Printf("Down-carrier connected to %s", s.config.DownCarrierAddr)
+
+		// Auth: send 32-byte secret with 4-byte length prefix
+		prefix := make([]byte, 4)
+		binary.BigEndian.PutUint32(prefix, 32)
+		if _, err := conn.Write(append(prefix, s.secret...)); err != nil {
+			s.logger.Printf("Down-carrier auth send: %v", err)
+			conn.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		ack := make([]byte, 1)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(conn, ack); err != nil || ack[0] != 0x00 {
+			s.logger.Printf("Down-carrier auth ACK failed: byte=%v err=%v", ack, err)
+			conn.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		s.logger.Printf("Down-carrier authenticated")
+
+		// Wrap in yamux.Server (we are server, Germany is client)
+		yamuxCfg := yamux.DefaultConfig()
+		yamuxCfg.EnableKeepAlive = true
+		yamuxCfg.KeepAliveInterval = s.config.KeepAliveInterval
+		yamuxSession, err := yamux.Server(conn, yamuxCfg)
+		if err != nil {
+			s.logger.Printf("Down-carrier yamux server: %v", err)
+			conn.Close()
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		s.mu.Lock()
+		if s.downSession != nil {
+			s.downSession.Close()
+		}
+		s.downSession = yamuxSession
+		s.mu.Unlock()
+		s.logger.Printf("Down-carrier yamux session established")
+
+		// Accept download streams from Germany
+		go func() {
+			for {
+				stream, err := yamuxSession.AcceptStream()
+				if err != nil {
+					s.logger.Printf("Down-carrier accept stream: %v", err)
+					yamuxSession.Close()
+					return
+				}
+				go s.handleDownStream(stream)
+			}
+		}()
+
+		<-yamuxSession.CloseChan()
+		s.logger.Printf("Down-carrier yamux session closed")
+		s.mu.Lock()
+		if s.downSession == yamuxSession {
+			s.downSession = nil
+		}
+		s.mu.Unlock()
+
+		// Reconnect delay
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// handleDownStream: download stream from Germany — contains sessionID + download data
+func (s *Splitter) handleDownStream(stream *yamux.Stream) {
+	defer stream.Close()
+
+	// Read sessionID (16 bytes)
 	sidBuf := make([]byte, session.SessionIDLen)
 	if _, err := io.ReadFull(stream, sidBuf); err != nil {
+		s.logger.Printf("DownStream read sessionID: %v", err)
 		return
 	}
 	var sid session.SessionID
 	copy(sid[:], sidBuf)
 
-	// Read dest header (addr_type + addr + port)
-	hdr := make([]byte, session.MaxHeaderSize)
-	if _, err := io.ReadFull(stream, hdr); err != nil {
-		return
-	}
-	dest := session.ParseDestinationFromBuf(hdr)
-	if dest == nil {
-		s.metrics.incErr()
+	// Look up session
+	sess, ok := s.store.GetSession(sid)
+	if !ok {
+		s.logger.Printf("DownStream session %s not found", sid.String())
 		return
 	}
 
-	s.logger.Printf("Up-stream: session %s → %s:%d", sid.String(), dest.Addr, dest.Port)
+	s.logger.Printf("DownStream session %s: relaying to client", sid.String())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session.Session{ID: sid, Dest: dest, Ctx: ctx, Cancel: cancel}
-	s.store.Add(sid, sess)
-	s.metrics.incSession()
-
-	// Relay: upStream → client (upload data from user → internet)
-	go func() {
-		buf := make([]byte, s.config.RelayBufSize)
-		for {
-			n, err := stream.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					s.logger.Printf("UpStream read: %v", err)
-				}
-				cancel()
-				return
+	// Relay: downStream → client
+	buf := make([]byte, s.config.RelayBufSize)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				s.logger.Printf("DownStream read: %v", err)
 			}
-			if n > 0 {
-				s.metrics.incUp(int64(n))
-				sess.ClientConn.Write(buf[:n])
-			}
+			return
 		}
-	}()
-
-	<-ctx.Done()
-	s.logger.Printf("Session %s ended", sid.String())
-	s.store.Remove(sid)
-	s.metrics.decSession()
+		if n > 0 {
+			s.metrics.incDown(int64(n))
+			sess.ClientConn.Write(buf[:n])
+		}
+	}
 }
 
-// ---- Down-carrier: TCP (Xray tunnel to Germany) ----
-
-func (s *Splitter) runDownCarrierSession(dcConn net.Conn) {
-	defer dcConn.Close()
-
-	yamuxCfg := yamux.DefaultConfig()
-	yamuxCfg.EnableKeepAlive = true
-	yamuxCfg.KeepAliveInterval = s.config.KeepAliveInterval
-	yamuxSession, err := yamux.Client(dcConn, yamuxCfg)
-	if err != nil {
-		s.logger.Printf("Down-carrier yamux client: %v", err)
-		return
-	}
-
-	s.logger.Printf("Down-carrier yamux session established")
-
-	s.mu.Lock()
-	s.downSession = yamuxSession
-	s.mu.Unlock()
-
-	go func() {
-		ticker := time.NewTicker(s.config.KeepAliveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				yamuxSession.Ping()
-			}
-		}
-	}()
-
-	<-yamuxSession.CloseChan()
-	s.logger.Printf("Down-carrier yamux session closed")
-	s.mu.Lock()
-	if s.downSession == yamuxSession {
-		s.downSession = nil
-	}
-	s.mu.Unlock()
-}
-
-// ---- SOCKS5 Server (user connections from Xray) ----
+// ============================================================
+// SOCKS5 Server (user connections from Xray)
+// ============================================================
 
 func (s *Splitter) runSocksServer() {
 	ln, err := net.Listen("tcp", s.config.SocksListen)
@@ -401,46 +424,50 @@ func (s *Splitter) runSocksServer() {
 	}
 	defer ln.Close()
 	s.logger.Printf("SOCKS5 listening on %s", s.config.SocksListen)
+
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			continue
 		}
-		go s.handleSocksConnection(c)
+		go s.handleSocksConn(c)
 	}
 }
 
-func (s *Splitter) handleSocksConnection(clientConn net.Conn) {
+func (s *Splitter) handleSocksConn(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// SOCKS5 negotiation
-	hdr := make([]byte, 3)
+	// --- SOCKS5 negotiation ---
+	// Read [0x05, NMETHODS]
+	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(clientConn, hdr); err != nil {
 		return
 	}
-	nm := int(hdr[1])
-	if nm > 0 {
-		methods := make([]byte, nm)
+	nMethods := int(hdr[1])
+	if nMethods > 0 {
+		methods := make([]byte, nMethods)
 		io.ReadFull(clientConn, methods)
 	}
-	// SOCKS5 success: 10-byte response (version 5, no auth, IPv4 0.0.0.0:0)
-	successReply := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	clientConn.Write(successReply)
+	// Write [0x05, 0x00] (no auth required)
+	clientConn.Write([]byte{0x05, 0x00})
 
-	// SOCKS5 CONNECT request
+	// --- SOCKS5 CONNECT request ---
+	// Read [0x05, 0x01, 0x00, ATYP]
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(clientConn, req); err != nil {
 		return
 	}
-	atype := req[3]
+	atyp := req[3]
 
-	dest, err := session.ReadDestinationEx(clientConn, atype)
+	// Read destination
+	dest, err := session.ReadDestinationEx(clientConn, atyp)
 	if err != nil {
 		s.logger.Printf("SOCKS5 dest: %v", err)
 		return
 	}
-	s.logger.Printf("User CONNECT → %s:%d", dest.Addr, dest.Port)
+	s.logger.Printf("User SOCKS5 CONNECT → %s:%d", dest.Addr, dest.Port)
 
+	// --- Create session ---
 	rawSid, err := session.GenerateSessionID()
 	if err != nil {
 		return
@@ -449,23 +476,30 @@ func (s *Splitter) handleSocksConnection(clientConn net.Conn) {
 	copy(sid[:], rawSid)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session.Session{ID: sid, Dest: dest, ClientConn: clientConn, Ctx: ctx, Cancel: cancel}
+	sess := &session.Session{
+		ID:     sid,
+		Dest:   dest,
+		Ctx:    ctx,
+		Cancel: cancel,
+	}
 	s.store.Add(sid, sess)
 	s.metrics.incSession()
 
+	// Wait for up-carrier session
 	s.mu.RLock()
 	upS := s.upSession
 	downS := s.downSession
 	s.mu.RUnlock()
 
 	if upS == nil || downS == nil {
+		s.logger.Printf("No carrier sessions available")
 		cancel()
 		s.store.Remove(sid)
 		s.metrics.decSession()
 		return
 	}
 
-	// Open up-stream (upload to Germany via CDN)
+	// Open yamux stream on up-carrier (to Germany via CDN)
 	upStream, err := upS.OpenStream()
 	if err != nil {
 		s.logger.Printf("Open up-stream: %v", err)
@@ -475,28 +509,21 @@ func (s *Splitter) handleSocksConnection(clientConn net.Conn) {
 		return
 	}
 
-	// Open down-stream (download from Germany via direct tunnel)
-	downStream, err := downS.OpenStream()
-	if err != nil {
-		s.logger.Printf("Open down-stream: %v", err)
+	// Write sessionID (16 bytes) + destination header
+	headerBuf := make([]byte, session.SessionIDLen+session.MaxHeaderSize)
+	copy(headerBuf[:session.SessionIDLen], sid[:])
+	n := session.WriteDestinationBuffer(headerBuf[session.SessionIDLen:], dest)
+	if n <= 0 {
+		s.logger.Printf("Failed to encode destination")
+		upStream.Close()
 		cancel()
 		s.store.Remove(sid)
 		s.metrics.decSession()
 		return
 	}
+	upStream.Write(headerBuf[:session.SessionIDLen+n])
 
-	sess.UpStream = upStream
-	sess.DownStream = downStream
-
-	// Write session header: sessionID (16) + dest header (variable)
-	headerBuf := make([]byte, session.SessionIDLen+session.MaxHeaderSize)
-	copy(headerBuf[:session.SessionIDLen], sid[:])
-	n := session.WriteDestinationBuffer(headerBuf[session.SessionIDLen:], dest)
-	if n > 0 {
-		upStream.Write(headerBuf[:session.SessionIDLen+n])
-	}
-
-	// Relay: client → up-stream (upload)
+	// Relay: client → up-stream (upload direction)
 	go func() {
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
@@ -515,34 +542,17 @@ func (s *Splitter) handleSocksConnection(clientConn net.Conn) {
 		}
 	}()
 
-	// Relay: down-stream → client (download)
-	go func() {
-		buf := make([]byte, s.config.RelayBufSize)
-		for {
-			n, err := downStream.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					s.logger.Printf("DownStream read: %v", err)
-				}
-				cancel()
-				return
-			}
-			if n > 0 {
-				s.metrics.incDown(int64(n))
-				clientConn.Write(buf[:n])
-			}
-		}
-	}()
-
+	// Wait for session to end
 	<-ctx.Done()
 	s.logger.Printf("Session %s ended", sid.String())
 	upStream.Close()
-	downStream.Close()
 	s.store.Remove(sid)
 	s.metrics.decSession()
 }
 
-// ---- Metrics ----
+// ============================================================
+// Metrics
+// ============================================================
 
 func (s *Splitter) runMetrics(addr string) error {
 	mhttp := http.NewServeMux()
