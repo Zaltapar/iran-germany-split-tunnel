@@ -2,14 +2,18 @@ package mux
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"crypto/sha256"
+	"crypto/subtle"
 )
 
-// Frame types
 const (
 	FrameData  = 0x00
 	FrameAuth  = 0x01
@@ -20,15 +24,12 @@ const (
 
 const MaxPayloadSize = 65535
 
-// FrameHeader is the 7-byte multiplexed frame header:
-// StreamID (4 bytes BE) + Type (1 byte) + Length (2 bytes BE)
 type FrameHeader struct {
 	StreamID uint32
 	Type     byte
 	Length   uint16
 }
 
-// Frame is a complete multiplexed frame
 type Frame struct {
 	Header   *FrameHeader
 	Payload  []byte
@@ -36,7 +37,6 @@ type Frame struct {
 	StreamID uint32
 }
 
-// Stream represents a multiplexed virtual connection
 type Stream struct {
 	ID      uint32
 	mu      sync.Mutex
@@ -44,27 +44,20 @@ type Stream struct {
 	closed  bool
 }
 
-// Carrier manages the persistent multiplexed connection
 type Carrier struct {
 	mu           sync.RWMutex
 	streams      map[uint32]*Stream
 	nextStreamID uint32
 	secret       []byte
 	connected    atomic.Bool
-	writeMu      sync.Mutex
 }
 
-// NewCarrier creates a new carrier
 func NewCarrier(secret []byte) *Carrier {
-	c := &Carrier{
-		streams: make(map[uint32]*Stream),
-		secret:  secret,
-	}
+	c := &Carrier{streams: make(map[uint32]*Stream), secret: secret}
 	c.connected.Store(false)
 	return c
 }
 
-// OpenStream creates a new virtual stream
 func (c *Carrier) OpenStream() *Stream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -75,110 +68,92 @@ func (c *Carrier) OpenStream() *Stream {
 	return s
 }
 
-// GetStream retrieves a stream by ID
 func (c *Carrier) GetStream(id uint32) (*Stream, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	s, ok := c.streams[id]
-	return s, ok
+	return c.streams[id], true
 }
 
-// RemoveStream removes a stream
 func (c *Carrier) RemoveStream(id uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.streams, id)
 }
 
-// StreamCount returns active stream count
 func (c *Carrier) StreamCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.streams)
 }
 
-// IsConnected returns connection state
 func (c *Carrier) IsConnected() bool {
 	return c.connected.Load()
 }
 
-// SetConnected sets connection state
 func (c *Carrier) SetConnected(v bool) {
 	c.connected.Store(v)
 }
 
-// Secret returns the carrier secret
 func (c *Carrier) Secret() []byte {
 	return c.secret
 }
 
-// Frame constructors
+func DeriveSecret(s string) []byte {
+	h := sha256.Sum256([]byte(s))
+	return h[:]
+}
+
+func SecretFromHex(hexStr string) ([]byte, error) {
+	return hex.DecodeString(hexStr)
+}
+
 func NewAuthFrame(secret []byte) *Frame {
 	return &Frame{
-		Header:   &FrameHeader{StreamID: 0, Type: FrameAuth, Length: uint16(len(secret))},
-		Payload:  secret,
-		Type:     FrameAuth,
-		StreamID: 0,
+		Header:  &FrameHeader{StreamID: 0, Type: FrameAuth, Length: uint16(len(secret))},
+		Payload: secret,
+		Type:    FrameAuth,
 	}
 }
 
 func NewPingFrame() *Frame {
-	return &Frame{
-		Header:   &FrameHeader{StreamID: 0, Type: FramePing, Length: 0},
-		Type:     FramePing,
-		StreamID: 0,
-	}
+	return &Frame{Header: &FrameHeader{StreamID: 0, Type: FramePing, Length: 0}, Type: FramePing}
 }
 
 func NewPongFrame() *Frame {
-	return &Frame{
-		Header:   &FrameHeader{StreamID: 0, Type: FramePong, Length: 0},
-		Type:     FramePong,
-		StreamID: 0,
-	}
+	return &Frame{Header: &FrameHeader{StreamID: 0, Type: FramePong, Length: 0}, Type: FramePong}
 }
 
 func NewDataFrame(streamID uint32, data []byte) *Frame {
 	return &Frame{
-		Header:   &FrameHeader{StreamID: streamID, Type: FrameData, Length: uint16(len(data))},
-		Payload:  data,
-		Type:     FrameData,
-		StreamID: streamID,
+		Header:  &FrameHeader{StreamID: streamID, Type: FrameData, Length: uint16(len(data))},
+		Payload: data,
+		Type:    FrameData,
 	}
 }
 
 func NewCloseFrame(streamID uint32) *Frame {
-	return &Frame{
-		Header:   &FrameHeader{StreamID: streamID, Type: FrameClose, Length: 0},
-		Type:     FrameClose,
-		StreamID: streamID,
-	}
+	return &Frame{Header: &FrameHeader{StreamID: streamID, Type: FrameClose, Length: 0}, Type: FrameClose}
 }
 
-// ReadFrame reads a complete frame from reader
 func ReadFrame(r io.Reader) (*Frame, error) {
 	buf4 := make([]byte, 4)
 	if _, err := io.ReadFull(r, buf4); err != nil {
 		return nil, err
 	}
 	streamID := binary.BigEndian.Uint32(buf4)
-
 	buf1 := make([]byte, 1)
 	if _, err := io.ReadFull(r, buf1); err != nil {
 		return nil, err
 	}
 	frameType := buf1[0]
-
 	buf2 := make([]byte, 2)
 	if _, err := io.ReadFull(r, buf2); err != nil {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint16(buf2)
-
 	if length > MaxPayloadSize {
 		return nil, errors.New("payload too large")
 	}
-
 	var payload []byte
 	if length > 0 {
 		payload = make([]byte, length)
@@ -186,7 +161,6 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 			return nil, err
 		}
 	}
-
 	return &Frame{
 		Header:   &FrameHeader{StreamID: streamID, Type: frameType, Length: length},
 		Payload:  payload,
@@ -195,7 +169,6 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}, nil
 }
 
-// WriteFrame writes a complete frame to writer
 func WriteFrame(w io.Writer, f *Frame) error {
 	sidBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(sidBuf, f.StreamID)
@@ -217,23 +190,12 @@ func WriteFrame(w io.Writer, f *Frame) error {
 	return nil
 }
 
-// ValidateSecret verifies shared secret
-func ValidateSecret(provided, expected []byte) bool {
-	if len(provided) != len(expected) {
-		return false
-	}
-	for i := range expected {
-		if provided[i] != expected[i] {
-			return false
-		}
-	}
-	return true
+func ValidateSecret(provided []byte, expected []byte) bool {
+	return subtle.ConstantTimeCompare(provided, expected) == 1
 }
 
-// KeepAliveInterval is the default keepalive period
 const KeepAliveInterval = 30 * time.Second
 
-// Write sends data to a stream
 func (s *Stream) Write(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -248,10 +210,93 @@ func (s *Stream) Write(data []byte) error {
 	}
 }
 
-// Close closes a stream
 func (s *Stream) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
 	return nil
+}
+
+type CarrierConn struct {
+	conn    net.Conn
+	carrier *Carrier
+	writeCh chan *Frame
+	done    chan struct{}
+	closeMu sync.Mutex
+	closed  bool
+}
+
+func NewCarrierConn(conn net.Conn, carrier *Carrier) *CarrierConn {
+	cc := &CarrierConn{conn: conn, carrier: carrier, writeCh: make(chan *Frame, 512), done: make(chan struct{})}
+	go cc.writerLoop()
+	return cc
+}
+
+func (cc *CarrierConn) writerLoop() {
+	defer close(cc.done)
+	for f := range cc.writeCh {
+		if cc.closed {
+			break
+		}
+		WriteFrame(cc.conn, f)
+	}
+}
+
+func (cc *CarrierConn) SendQueue(f *Frame) error {
+	cc.closeMu.Lock()
+	if cc.closed {
+		cc.closeMu.Unlock()
+		return errors.New("carrier closed")
+	}
+	cc.closeMu.Unlock()
+	select {
+	case cc.writeCh <- f:
+		return nil
+	default:
+		return errors.New("write queue full")
+	}
+}
+
+func (cc *CarrierConn) Send(f *Frame) error {
+	cc.closeMu.Lock()
+	if cc.closed {
+		cc.closeMu.Unlock()
+		return errors.New("carrier closed")
+	}
+	cc.closeMu.Unlock()
+	return WriteFrame(cc.conn, f)
+}
+
+func (cc *CarrierConn) Read(b []byte) (n int, err error) {
+	return cc.conn.Read(b)
+}
+
+func (cc *CarrierConn) Close() error {
+	cc.closeMu.Lock()
+	defer cc.closeMu.Unlock()
+	if cc.closed {
+		return nil
+	}
+	cc.closed = true
+	cc.conn.Close()
+	<-cc.done
+	return nil
+}
+
+func (cc *CarrierConn) Conn() net.Conn {
+	return cc.conn
+}
+
+func (cc *CarrierConn) IsClosed() bool {
+	cc.closeMu.Lock()
+	defer cc.closeMu.Unlock()
+	return cc.closed
+}
+
+func (cc *CarrierConn) Write(b []byte) (n int, err error) {
+	return cc.conn.Write(b)
+}
+
+func (cc *CarrierConn) OpenStream() *Stream {
+	return cc.carrier.OpenStream()
 }

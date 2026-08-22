@@ -21,98 +21,30 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "tls",
-        "tcpSettings": {
-          "header": {
-            "type": "none"
-          }
-        }
+        "security": "tls"
       },
       "sniffing": {
         "enabled": true,
         "destOverride": ["http", "tls"]
       }
-    },
-    {
-      "tag": "helper-up-in",
-      "listen": "127.0.0.1",
-      "port": 10801,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1",
-        "port": 80,
-        "network": "tcp"
-      },
-      "sniffing": {
-        "enabled": false
-      }
-    },
-    {
-      "tag": "helper-down-in",
-      "listen": "127.0.0.1",
-      "port": 10802,
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1",
-        "port": 80,
-        "network": "tcp"
-      },
-      "sniffing": {
-        "enabled": false
-      }
     }
   ],
   "outbounds": [
-    {
-      "tag": "up-cdn",
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4"
-      }
-    },
-    {
-      "tag": "down-direct",
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4"
-      }
-    },
+    {"tag": "up-cdn", "protocol": "freedom", "settings": {}},
+    {"tag": "down-direct", "protocol": "freedom", "settings": {}},
     {
       "tag": "to-splitter",
       "protocol": "socks",
       "settings": {
-        "servers": [
-          {
-            "address": "127.0.0.1",
-            "port": 10900
-          }
-        ]
+        "servers": [{"address": "127.0.0.1", "port": 10900}]
       }
     },
-    {
-      "tag": "blackhole",
-      "protocol": "blackhole",
-      "settings": {}
-    }
+    {"tag": "blackhole", "protocol": "blackhole", "settings": {}}
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["helper-up-in"],
-        "outboundTag": "up-cdn"
-      },
-      {
-        "type": "field",
-        "inboundTag": ["helper-down-in"],
-        "outboundTag": "down-direct"
-      },
-      {
-        "type": "field",
-        "inboundTag": ["user-vless-reality"],
-        "outboundTag": "to-splitter"
-      }
+      {"type": "field", "inboundTag": ["user-vless-reality"], "outboundTag": "to-splitter"}
     ]
   },
   "dns": {}

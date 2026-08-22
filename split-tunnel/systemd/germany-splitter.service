@@ -1,5 +1,5 @@
 [Unit]
-Description=Germany Splitter Daemon
+Description=Germany Splitter Daemon (Dual-Carrier Mux Mode)
 After=network.target xray.service
 
 [Service]
@@ -7,7 +7,8 @@ Type=simple
 ExecStart=/usr/local/bin/germany-splitter
 Restart=always
 RestartSec=5
-Environment=SPLIT_LISTEN=:9000
+Environment=SPLIT_LISTEN=:9001
+Environment=SPLIT_LISTEN_DOWN=:9002
 Environment=SPLIT_SECRET=YOUR-SECRET-HERE
 Environment=SPLIT_METRICS_PORT=9101
 LimitNOFILE=65535

@@ -40,8 +40,16 @@ func ReadDestination(r io.Reader) (*Destination, error) {
 	if _, err := io.ReadFull(r, addrType); err != nil {
 		return nil, err
 	}
-	dest := &Destination{AddrType: addrType[0]}
-	switch addrType[0] {
+	return readDestFromReader(r, addrType[0])
+}
+
+func ReadDestinationEx(r io.Reader, atype byte) (*Destination, error) {
+	return readDestFromReader(r, atype)
+}
+
+func readDestFromReader(r io.Reader, atype byte) (*Destination, error) {
+	dest := &Destination{AddrType: atype}
+	switch atype {
 	case AddrTypeIPv4:
 		ip := make([]byte, 4)
 		if _, err := io.ReadFull(r, ip); err != nil {
@@ -116,118 +124,6 @@ func WriteDestination(w io.Writer, dest *Destination) error {
 	return err
 }
 
-type Session struct {
-	ID        SessionID
-	Dest      *Destination
-	UpConn    net.Conn
-	DownConn  net.Conn
-	DeadConn  net.Conn
-	Ctx       context.Context
-	cancel    context.CancelFunc
-	CreatedAt time.Time
-}
-
-func NewSession(id SessionID, dest *Destination) (*Session, context.Context) {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Session{ID: id, Dest: dest, CreatedAt: time.Now(), Ctx: ctx, cancel: cancel}, ctx
-}
-
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[SessionID]*Session
-}
-
-func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[SessionID]*Session)}
-}
-
-func (ss *SessionStore) Add(id SessionID, s *Session) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.sessions[id] = s
-}
-
-func (ss *SessionStore) Get(id SessionID) (*Session, bool) {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	s, ok := ss.sessions[id]
-	return s, ok
-}
-
-func (ss *SessionStore) Remove(id SessionID) {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	delete(ss.sessions, id)
-}
-
-func (ss *SessionStore) CloseAll() {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	for _, s := range ss.sessions {
-		if s.DeadConn != nil {
-			s.DeadConn.Close()
-		}
-	}
-}
-
-func (ss *SessionStore) Count() int {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	return len(ss.sessions)
-}
-
-func (ss *SessionStore) Wait(id SessionID, timeoutMs int) (*Session, bool) {
-	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	for time.Now().Before(deadline) {
-		ss.mu.RLock()
-		s, ok := ss.sessions[id]
-		ss.mu.RUnlock()
-		if ok {
-			return s, true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return nil, false
-}
-
-type ReadyFlag struct {
-	mu    sync.Mutex
-	ready bool
-	cond  *sync.Cond
-}
-
-func NewReadyFlag() *ReadyFlag {
-	rf := &ReadyFlag{}
-	rf.cond = sync.NewCond(&rf.mu)
-	return rf
-}
-
-func (rf *ReadyFlag) SignalReady() {
-	rf.cond.L.Lock()
-	defer rf.cond.L.Unlock()
-	rf.ready = true
-	rf.cond.Broadcast()
-}
-
-func (rf *ReadyFlag) WaitForReady(timeoutMs int) bool {
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(time.Duration(timeoutMs) * time.Millisecond)
-		close(done)
-	}()
-	rf.cond.L.Lock()
-	defer rf.cond.L.Unlock()
-	for !rf.ready {
-		select {
-		case <-done:
-			return false
-		default:
-			rf.cond.Wait()
-		}
-	}
-	return true
-}
-
 func WriteDestinationBuffer(buf []byte, dest *Destination) int {
 	if len(buf) < MaxHeaderSize {
 		return 0
@@ -267,10 +163,100 @@ func WriteDestinationBuffer(buf []byte, dest *Destination) int {
 	return pos
 }
 
-func GenerateSessionID() (SessionID, error) {
-	var sid SessionID
-	if _, err := io.ReadFull(rand.Reader, sid[:]); err != nil {
-		return sid, err
+type Session struct {
+	ID           SessionID
+	Dest         *Destination
+	UpStreamID   uint32
+	DownStreamID uint32
+	ClientConn   net.Conn
+	Ctx          context.Context
+	cancel       context.CancelFunc
+}
+
+func (s *Session) Cancel() {
+	if s.cancel != nil {
+		s.cancel()
 	}
-	return sid, nil
+}
+
+type SessionStore struct {
+	mu       sync.RWMutex
+	sessions map[SessionID]*Session
+}
+
+func NewSessionStore() *SessionStore {
+	return &SessionStore{sessions: make(map[SessionID]*Session)}
+}
+
+func (ss *SessionStore) Add(id SessionID, s *Session) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.sessions[id] = s
+}
+
+func (ss *SessionStore) Get(id SessionID) (*Session, bool) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return ss.sessions[id], true
+}
+
+func (ss *SessionStore) Remove(id SessionID) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	s, ok := ss.sessions[id]
+	if ok {
+		if s.ClientConn != nil {
+			s.ClientConn.Close()
+		}
+		if s.cancel != nil {
+			s.cancel()
+		}
+		delete(ss.sessions, id)
+	}
+}
+
+func (ss *SessionStore) CloseAll() {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, s := range ss.sessions {
+		if s.ClientConn != nil {
+			s.ClientConn.Close()
+		}
+	}
+}
+
+func (ss *SessionStore) Count() int {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return len(ss.sessions)
+}
+
+func (ss *SessionStore) ForEachSession(fn func(id SessionID, s *Session)) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for id, s := range ss.sessions {
+		fn(id, s)
+	}
+}
+
+func (ss *SessionStore) Wait(id SessionID, timeoutMs int) (*Session, bool) {
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ss.mu.RLock()
+		s, ok := ss.sessions[id]
+		ss.mu.RUnlock()
+		if ok {
+			return s, true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, false
+}
+
+func GenerateSessionID() ([]byte, error) {
+	buf := make([]byte, SessionIDLen)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
