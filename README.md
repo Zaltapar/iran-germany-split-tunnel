@@ -1,97 +1,99 @@
 # Iran-Germany Asymmetric Split-Tunnel
 
-Dual-carrier frame-multiplexed relay for Xray/3x-ui with WebSocket CDN transport for upload and raw TCP for download.
+Dual-carrier frame-multiplexed relay for Xray/3x-ui. Upload goes through CDN (good upload), download goes through direct tunnel (good download).
+
+## Quick Install (Automatic)
+
+```bash
+# Iran server:
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s -- iran
+
+# Germany server:
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s -- germany
+
+# With flags (non-interactive):
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s -- iran --secret YOUR_SECRET --metrics-port 9100
+```
 
 ## Architecture
 
 ```
-Client → Iran Xray → iran-splitter (SOCKS5:10900)
-                            ├── up-carrier (WS listener :9001, from CDN)
-                            └── down-carrier (TCP dialer → 127.0.0.1:10802)
-                                                      ↓ via Xray tunnel to Germany
-                                              germany-splitter
-                            ├── up-carrier (WS dialer → wss://cdn/upload)
-                            └── down-carrier (TCP listener :9002)
+Client → Iran Xray → iran-splitter
+                       ├── SOCKS5 :10900 (from Xray)
+                       ├── WS :9001 (from Nginx/CDN)
+                       └── TCP → 127.0.0.1:10802 (Xray download tunnel → Germany)
                                                       ↓
-                                              Real destination (internet)
-```
-
-- **Up-carrier (upload: client → internet)**: WebSocket through ArvanCloud CDN
-- **Down-carrier (download: internet → client)**: Raw TCP via Xray VLESS+Reality tunnel
-- **Frame protocol**: 7-byte header (StreamID 4B + Type 1B + Length 2B)
-- **Auth**: Shared secret with SHA256 derivation + constant-time comparison
-
-## Quick Start
-
-### Build
-
-```bash
-cd split-tunnel
-go build -o iran-splitter ./cmd/iran-splitter
-go build -o germany-splitter ./cmd/germany-splitter
-```
-
-### Deploy Iran Server
-
-```bash
-sudo cp iran-splitter /usr/local/bin/
-sudo cp systemd/iran-splitter.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now iran-splitter
-```
-
-### Deploy Germany Server
-
-```bash
-sudo cp germany-splitter /usr/local/bin/
-sudo cp systemd/germany-splitter.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now germany-splitter
+                                              germany-splitter
+                       ├── WS dialer → wss://cdn/upload (upload)
+                       └── TCP :9002 (receives from Iran)
+                                                      ↓
+                                              Real destination
 ```
 
 ## Configuration
 
-| Variable | Iran Default | Germany Default | Description |
-|----------|-------------|-----------------|-------------|
-| `SPLIT_SOCKS_LISTEN` | `127.0.0.1:10900` | — | SOCKS5 listen (Iran only) |
-| `SPLIT_WS_LISTEN` | `127.0.0.1:9001` | — | WS listen for CDN (Iran) |
-| `SPLIT_DOWN_CARRIER_ADDR` | `127.0.0.1:10802` | — | Xray outbound dial (Iran) |
-| `SPLIT_DOWN_LISTEN` | — | `:9002` | TCP listen for down-carrier (Germany) |
-| `SPLIT_UP_WS_URL` | — | `wss://cdn.example.com/upload` | CDN WebSocket URL (Germany) |
-| `SPLIT_SECRET` | — | — | **Must match on both servers** |
+| Variable | Iran | Germany | Description |
+|----------|------|---------|-------------|
+| `SPLIT_SOCKS_LISTEN` | `127.0.0.1:10900` | — | SOCKS5 for Xray |
+| `SPLIT_WS_LISTEN` | `127.0.0.1:9001` | — | WS from CDN/Nginx |
+| `SPLIT_DOWN_CARRIER_ADDR` | `127.0.0.1:10802` | — | Xray download tunnel |
+| `SPLIT_DOWN_LISTEN` | — | `:9002` | TCP listen for Iran |
+| `SPLIT_UP_WS_URL` | — | `wss://cdn.example.com/upload` | CDN WebSocket |
+| `SPLIT_SECRET` | **must match** | **must match** | Shared auth secret |
 | `SPLIT_METRICS_PORT` | `0` | `0` | HTTP metrics port (0=off) |
+
+## Manual Build
+
+```bash
+cd split-tunnel
+curl -fsSL -o iran-splitter https://github.com/Zaltapar/iran-germany-split-tunnel/releases/latest/download/iran-splitter
+curl -fsSL -o germany-splitter https://github.com/Zaltapar/iran-germany-split-tunnel/releases/latest/download/germany-splitter
+sudo cp iran-splitter germany-splitter /usr/local/bin/
+```
+
+Or build from source:
+```bash
+cd split-tunnel
+GOOS=linux GOARCH=amd64 go build -o iran-splitter ./cmd/iran-splitter
+GOOS=linux GOARCH=amd64 go build -o germany-splitter ./cmd/germany-splitter
+```
 
 ## Xray Config (Iran)
 
 ```json
 {
   "outbounds": [
-    {"tag": "to-splitter",
-     "protocol": "socks",
-     "settings": {"servers":[{"address":"127.0.0.1","port":10900}]}
-    },
-    {"tag": "down-tunnel",
-     "protocol": "socks",
-     "settings": {"servers":[{"address":"127.0.0.1","port":10802}]}
+    {"tag": "up-cdn", "protocol": "freedom", "settings": {}},
+    {"tag": "down-direct", "protocol": "freedom", "settings": {}},
+    {
+      "tag": "to-splitter",
+      "protocol": "socks",
+      "settings": {"servers": [{"address": "127.0.0.1", "port": 10900}]}
     }
   ],
   "routing": {
     "rules": [
-      {"type":"field","inboundTag":["user-inbound"],"outboundTag":"to-splitter"}
+      {"type":"field","inboundTag":["your-user-inbound"],"outboundTag":"to-splitter"}
     ]
   }
 }
 ```
 
-## Frame Protocol
+## Nginx Config (Iran)
 
-| Type | Value | Description |
-|------|-------|-------------|
-| Data | 0x00 | User data payload |
-| Auth | 0x01 | Shared secret authentication |
-| Ping | 0x02 | Keepalive ping |
-| Pong | 0x03 | Keepalive pong |
-| Close | 0x04 | Stream close |
+```nginx
+server {
+    listen 9001;  # or your WS port
+    location /upload {
+        proxy_pass http://127.0.0.1:9001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+    }
+}
+```
 
 ## Metrics
 
