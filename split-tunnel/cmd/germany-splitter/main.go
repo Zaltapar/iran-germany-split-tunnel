@@ -212,7 +212,7 @@ func (s *Splitter) runUpCarrier(wg *sync.WaitGroup) {
 	}
 }
 
-// handleUpStream: received from Iran via CDN — contains sessionID + dest header
+// handleUpStream: received from Iran via CDN - contains sessionID + dest header
 func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	defer stream.Close()
 
@@ -238,7 +238,7 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	}
 
 	addr := fmt.Sprintf("%s:%d", dest.Addr, dest.Port)
-	s.logger.Printf("New session %s → %s", sid.String(), addr)
+	s.logger.Printf("New session %s -> %s", sid.String(), addr)
 
 	// Dial target destination
 	destConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -249,23 +249,14 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	}
 	s.logger.Printf("Session %s destination connected", sid.String())
 
-	done := make(chan struct{})
-	entry := &SessionEntry{DestConn: destConn, Dest: dest, Done: done}
-
+	// Create entry with defer cleanup
+	entry := &SessionEntry{DestConn: destConn, Dest: dest}
 	s.mu.Lock()
 	s.store[sid] = entry
 	s.mu.Unlock()
-
 	s.metrics.incSession()
-	go func() {
-		<-done
-		s.metrics.decSession()
-		s.mu.Lock()
-		delete(s.store, sid)
-		s.mu.Unlock()
-	}()
 
-	// Relay: stream (upload from Iran) → destConn
+	// Relay: stream (upload from Iran) -> destConn
 	go func() {
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
@@ -284,12 +275,13 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 		}
 	}()
 
-	// Relay: destConn (download from internet) → down-carrier yamux stream
+	// Relay: destConn (download from internet) -> down-carrier yamux stream
 	// Wait for down-carrier session to be ready
+	var downStream *yamux.Stream
 	for s.downSession == nil {
 		time.Sleep(100 * time.Millisecond)
 	}
-	downStream, err := s.downSession.OpenStream()
+	downStream, err = s.downSession.OpenStream()
 	if err != nil {
 		s.logger.Printf("Open down-stream: %v", err)
 		destConn.Close()
@@ -300,7 +292,7 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	// Write sessionID (16 bytes) first
 	downStream.Write(sid[:])
 
-	// Relay: destConn → down-stream
+	// Relay: destConn -> down-stream
 	go func() {
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
@@ -317,6 +309,15 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 				downStream.Write(buf[:n])
 			}
 		}
+	}()
+
+	// Defer cleanup: remove session and close destination when stream ends
+	defer func() {
+		s.mu.Lock()
+		delete(s.store, sid)
+		s.mu.Unlock()
+		s.metrics.decSession()
+		destConn.Close()
 	}()
 }
 
@@ -410,23 +411,32 @@ func (s *Splitter) cleanupAll() {
 }
 
 // ============================================================
-// WebSocket io.ReadWriteCloser wrapper
+// WebSocket io.ReadWriteCloser wrapper (streaming NextReader)
 // ============================================================
 
 type wsReadWriteCloser struct {
-	conn *websocket.Conn
+	conn   *websocket.Conn
+	reader io.Reader
 }
 
 func (w *wsReadWriteCloser) Read(p []byte) (int, error) {
 	for {
-		_, msg, err := w.conn.ReadMessage()
-		if err != nil {
-			return 0, err
+		if w.reader == nil {
+			_, r, err := w.conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			w.reader = r
 		}
-		n := copy(p, msg)
-		if n > 0 {
-			return n, nil
+		n, err := w.reader.Read(p)
+		if err == io.EOF {
+			w.reader = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
 		}
+		return n, err
 	}
 }
 

@@ -21,27 +21,32 @@ import (
 )
 
 // ============================================================
-// WebSocket io.ReadWriteCloser wrapper
+// WebSocket io.ReadWriteCloser wrapper (streaming NextReader)
 // ============================================================
 
 type wsConn struct {
-	conn *websocket.Conn
+	conn   *websocket.Conn
+	reader io.Reader
 }
 
 func (w *wsConn) Read(p []byte) (int, error) {
 	for {
-		_, msg, err := w.conn.ReadMessage()
-		if err != nil {
-			return 0, err
+		if w.reader == nil {
+			_, r, err := w.conn.NextReader()
+			if err != nil {
+				return 0, err
+			}
+			w.reader = r
 		}
-		n := copy(p, msg)
-		if n < len(msg) {
-			return n, nil // truncated
+		n, err := w.reader.Read(p)
+		if err == io.EOF {
+			w.reader = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
 		}
-		if n > 0 {
-			return n, nil
-		}
-		// empty message, skip
+		return n, err
 	}
 }
 
@@ -465,6 +470,12 @@ func (s *Splitter) handleSocksConn(clientConn net.Conn) {
 		s.logger.Printf("SOCKS5 dest: %v", err)
 		return
 	}
+
+	// Send SOCKS5 success reply immediately after reading destination
+	if _, err := clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		s.logger.Printf("SOCKS5 reply: %v", err)
+		return
+	}
 	s.logger.Printf("User SOCKS5 CONNECT → %s:%d", dest.Addr, dest.Port)
 
 	// --- Create session ---
@@ -477,10 +488,11 @@ func (s *Splitter) handleSocksConn(clientConn net.Conn) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &session.Session{
-		ID:     sid,
-		Dest:   dest,
-		Ctx:    ctx,
-		Cancel: cancel,
+		ID:         sid,
+		Dest:       dest,
+		ClientConn: clientConn,
+		Ctx:        ctx,
+		Cancel:     cancel,
 	}
 	s.store.Add(sid, sess)
 	s.metrics.incSession()
