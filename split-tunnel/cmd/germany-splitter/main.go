@@ -213,12 +213,13 @@ func (s *Splitter) runUpCarrier(wg *sync.WaitGroup) {
 }
 
 // handleUpStream: received from Iran via CDN - contains sessionID + dest header
+// Uses sync.WaitGroup to block until both relay loops terminate, ensuring
+// stream, destConn, and downStream stay open for the full session lifetime.
 func (s *Splitter) handleUpStream(stream *yamux.Stream) {
-	defer stream.Close()
-
 	// Read 16-byte SessionID
 	sidBuf := make([]byte, session.SessionIDLen)
 	if _, err := io.ReadFull(stream, sidBuf); err != nil {
+		stream.Close()
 		s.logger.Printf("UpStream read sessionID: %v", err)
 		return
 	}
@@ -228,11 +229,13 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	// Read destination header
 	hdr := make([]byte, session.MaxHeaderSize)
 	if _, err := io.ReadFull(stream, hdr); err != nil {
+		stream.Close()
 		s.logger.Printf("UpStream read dest: %v", err)
 		return
 	}
 	dest := session.ParseDestinationFromBuf(hdr)
 	if dest == nil {
+		stream.Close()
 		s.logger.Printf("UpStream invalid dest")
 		return
 	}
@@ -243,21 +246,27 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	// Dial target destination
 	destConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
+		stream.Close()
 		s.logger.Printf("Dial %s: %v", addr, err)
 		s.metrics.incErr()
 		return
 	}
 	s.logger.Printf("Session %s destination connected", sid.String())
 
-	// Create entry with defer cleanup
+	// Register session
 	entry := &SessionEntry{DestConn: destConn, Dest: dest}
 	s.mu.Lock()
 	s.store[sid] = entry
 	s.mu.Unlock()
 	s.metrics.incSession()
 
-	// Relay: stream (upload from Iran) -> destConn
+	// WaitGroup to block until both relay loops finish
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Relay 1: stream (upload from Iran) -> destConn
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
 			n, err := stream.Read(buf)
@@ -275,7 +284,6 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 		}
 	}()
 
-	// Relay: destConn (download from internet) -> down-carrier yamux stream
 	// Wait for down-carrier session to be ready
 	var downStream *yamux.Stream
 	for s.downSession == nil {
@@ -285,15 +293,21 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	if err != nil {
 		s.logger.Printf("Open down-stream: %v", err)
 		destConn.Close()
+		stream.Close()
+		wg.Wait()
+		s.mu.Lock()
+		delete(s.store, sid)
+		s.mu.Unlock()
+		s.metrics.decSession()
 		return
 	}
-	defer downStream.Close()
 
 	// Write sessionID (16 bytes) first
 	downStream.Write(sid[:])
 
-	// Relay: destConn -> down-stream
+	// Relay 2: destConn (download from internet) -> down-stream
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
 			n, err := destConn.Read(buf)
@@ -311,14 +325,18 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 		}
 	}()
 
-	// Defer cleanup: remove session and close destination when stream ends
-	defer func() {
-		s.mu.Lock()
-		delete(s.store, sid)
-		s.mu.Unlock()
-		s.metrics.decSession()
-		destConn.Close()
-	}()
+	// Block until both relay loops finish
+	wg.Wait()
+
+	// Cleanup: close all resources after both relays are done
+	stream.Close()
+	downStream.Close()
+	destConn.Close()
+	s.mu.Lock()
+	delete(s.store, sid)
+	s.mu.Unlock()
+	s.metrics.decSession()
+	s.logger.Printf("Session %s cleaned up", sid.String())
 }
 
 // ============================================================
