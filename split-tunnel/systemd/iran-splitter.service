@@ -1,5 +1,5 @@
 [Unit]
-Description=Iran Splitter Daemon (Dual-Carrier Mux Mode)
+Description=Iran Splitter Daemon (WS Up-Carrier + TCP Down-Carrier)
 After=network.target xray.service
 
 [Service]
@@ -7,9 +7,9 @@ Type=simple
 ExecStart=/usr/local/bin/iran-splitter
 Restart=always
 RestartSec=5
-Environment=SPLIT_LISTEN=127.0.0.1:10900
-Environment=SPLIT_CARRIER_UP=germany-server:9001
-Environment=SPLIT_CARRIER_DOWN=germany-server:9002
+Environment=SPLIT_SOCKS_LISTEN=127.0.0.1:10900
+Environment=SPLIT_WS_LISTEN=127.0.0.1:9001
+Environment=SPLIT_DOWN_CARRIER_ADDR=127.0.0.1:10802
 Environment=SPLIT_SECRET=YOUR-SECRET-HERE
 Environment=SPLIT_METRICS_PORT=9100
 LimitNOFILE=65535

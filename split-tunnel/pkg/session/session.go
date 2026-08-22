@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -10,31 +11,44 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Zaltapar/iran-germany-split-tunnel/split-tunnel/pkg/mux"
 )
 
+// Transport is an alias to mux.Transport for session references
+type Transport = mux.Transport
+
+// Address types (compatible with SOCKS5 and Trojan headers)
 const (
 	AddrTypeIPv4   = 1
 	AddrTypeDomain = 3
 	AddrTypeIPv6   = 4
 )
 
-const SessionIDLen = 16
-const MaxHeaderSize = 1 + 255 + 2
+// Constants
+const (
+	SessionIDLen  = 16
+	MaxHeaderSize = 1 + 255 + 2
+)
 
+// SessionID is a unique 16-byte identifier for each split-tunnel session
 type SessionID [SessionIDLen]byte
 
+// String returns the session ID as a hex string
 func (s SessionID) String() string {
 	h := make([]byte, SessionIDLen*2)
 	hex.Encode(h, s[:])
 	return string(h)
 }
 
+// Destination represents the destination address parsed from the header
 type Destination struct {
 	AddrType byte
 	Addr     string
 	Port     uint16
 }
 
+// ReadDestination reads a destination address from the reader
 func ReadDestination(r io.Reader) (*Destination, error) {
 	addrType := make([]byte, 1)
 	if _, err := io.ReadFull(r, addrType); err != nil {
@@ -43,6 +57,7 @@ func ReadDestination(r io.Reader) (*Destination, error) {
 	return readDestFromReader(r, addrType[0])
 }
 
+// ReadDestinationEx reads a destination from a raw SOCKS5 address type byte
 func ReadDestinationEx(r io.Reader, atype byte) (*Destination, error) {
 	return readDestFromReader(r, atype)
 }
@@ -87,6 +102,7 @@ func readDestFromReader(r io.Reader, atype byte) (*Destination, error) {
 	return dest, nil
 }
 
+// WriteDestination writes a destination address to the writer
 func WriteDestination(w io.Writer, dest *Destination) error {
 	if _, err := w.Write([]byte{dest.AddrType}); err != nil {
 		return err
@@ -124,6 +140,8 @@ func WriteDestination(w io.Writer, dest *Destination) error {
 	return err
 }
 
+// WriteDestinationBuffer writes a destination address into a pre-allocated buffer
+// and returns the number of bytes written. Returns 0 on error.
 func WriteDestinationBuffer(buf []byte, dest *Destination) int {
 	if len(buf) < MaxHeaderSize {
 		return 0
@@ -163,43 +181,103 @@ func WriteDestinationBuffer(buf []byte, dest *Destination) int {
 	return pos
 }
 
-type Session struct {
-	ID           SessionID
-	Dest         *Destination
-	UpStreamID   uint32
-	DownStreamID uint32
-	ClientConn   net.Conn
-	Ctx          context.Context
-	cancel       context.CancelFunc
+// ParseDestinationFromBuf manually parses a destination from a byte buffer
+func ParseDestinationFromBuf(buf []byte) *Destination {
+	if len(buf) < 4 {
+		return nil
+	}
+	dest := &Destination{AddrType: buf[0]}
+	pos := 1
+	switch dest.AddrType {
+	case AddrTypeIPv4:
+		if len(buf) < pos+4+2 {
+			return nil
+		}
+		dest.Addr = net.IP(buf[pos : pos+4]).String()
+		pos += 4
+	case AddrTypeDomain:
+		if len(buf) < pos+1+2 {
+			return nil
+		}
+		domainLen := int(buf[pos])
+		pos++
+		if len(buf) < pos+domainLen+2 {
+			return nil
+		}
+		dest.Addr = string(buf[pos : pos+domainLen])
+		pos += domainLen
+	case AddrTypeIPv6:
+		if len(buf) < pos+16+2 {
+			return nil
+		}
+		dest.Addr = net.IP(buf[pos : pos+16]).String()
+		pos += 16
+	default:
+		return nil
+	}
+	if len(buf) < pos+2 {
+		return nil
+	}
+	dest.Port = uint16(buf[pos])<<8 | uint16(buf[pos+1])
+	return dest
 }
 
+// Session represents an active split-tunnel session.
+// The 16-byte SessionID is the primary router key - both splitters
+// match sessions by this ID, not by stream IDs.
+type Session struct {
+	// Identity
+	ID   SessionID
+	Dest *Destination
+
+	// Transport
+	ClientConn net.Conn // Xray → iran-splitter connection
+
+	// Per-carrier transport references (for relay goroutines)
+	UpTransport   *Transport // pointer to up-carrier transport
+	DownTransport *Transport // pointer to down-carrier transport
+
+	// Context
+	Ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// Cancel cancels the session
 func (s *Session) Cancel() {
 	if s.cancel != nil {
 		s.cancel()
 	}
 }
 
+// SessionStore is a thread-safe map of active sessions keyed by 16-byte SessionID
 type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[SessionID]*Session
 }
 
+// NewSessionStore creates a new session store
 func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[SessionID]*Session)}
+	return &SessionStore{
+		sessions: make(map[SessionID]*Session),
+	}
 }
 
+// Add adds a session to the store
 func (ss *SessionStore) Add(id SessionID, s *Session) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	ss.sessions[id] = s
 }
 
+// Get retrieves a session by ID
 func (ss *SessionStore) Get(id SessionID) (*Session, bool) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
-	return ss.sessions[id], true
+	s, ok := ss.sessions[id]
+	return s, ok
 }
 
+// Remove removes a session from the store
 func (ss *SessionStore) Remove(id SessionID) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -215,6 +293,7 @@ func (ss *SessionStore) Remove(id SessionID) {
 	}
 }
 
+// CloseAll closes all client connections
 func (ss *SessionStore) CloseAll() {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
@@ -225,12 +304,14 @@ func (ss *SessionStore) CloseAll() {
 	}
 }
 
+// Count returns the number of active sessions
 func (ss *SessionStore) Count() int {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
 	return len(ss.sessions)
 }
 
+// ForEachSession calls fn for each session. Safe for concurrent use.
 func (ss *SessionStore) ForEachSession(fn func(id SessionID, s *Session)) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
@@ -239,6 +320,25 @@ func (ss *SessionStore) ForEachSession(fn func(id SessionID, s *Session)) {
 	}
 }
 
+// GetSession retrieves a session by ID (thread-safe).
+func (ss *SessionStore) GetSession(id SessionID) (*Session, bool) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	s, ok := ss.sessions[id]
+	return s, ok
+}
+
+// SetTransport stores up/down transport references for a session.
+func (ss *SessionStore) SetTransport(id SessionID, up *Transport, down *Transport) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if s, ok := ss.sessions[id]; ok {
+		s.UpTransport = up
+		s.DownTransport = down
+	}
+}
+
+// Wait waits for a session to become available with timeout
 func (ss *SessionStore) Wait(id SessionID, timeoutMs int) (*Session, bool) {
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -253,6 +353,7 @@ func (ss *SessionStore) Wait(id SessionID, timeoutMs int) (*Session, bool) {
 	return nil, false
 }
 
+// GenerateSessionID creates a new random 16-byte session ID
 func GenerateSessionID() ([]byte, error) {
 	buf := make([]byte, SessionIDLen)
 	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
@@ -260,3 +361,6 @@ func GenerateSessionID() ([]byte, error) {
 	}
 	return buf, nil
 }
+
+// Ensure bytes package is imported
+var _ = bytes.NewReader

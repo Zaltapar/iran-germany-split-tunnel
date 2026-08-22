@@ -39,6 +39,12 @@
         "servers": [{"address": "127.0.0.1", "port": 10900}]
       }
     },
+    {"tag": "down-tunnel",
+      "protocol": "socks",
+      "settings": {
+        "servers": [{"address": "127.0.0.1", "port": 10802}]
+      }
+    },
     {"tag": "blackhole", "protocol": "blackhole", "settings": {}}
   ],
   "routing": {

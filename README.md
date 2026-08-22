@@ -1,15 +1,23 @@
 # Iran-Germany Asymmetric Split-Tunnel
 
-Dual-carrier frame-multiplexed relay for Xray/3x-ui with shared secret authentication.
+Dual-carrier frame-multiplexed relay for Xray/3x-ui with WebSocket CDN transport for upload and raw TCP for download.
 
 ## Architecture
 
 ```
-Client → Iran Xray → iran-splitter ===[Up-Carrier:9001]===[CDN Path]=== germany-splitter ===[Down-Carrier:9002]===[Direct Path]=== Internet
+Client → Iran Xray → iran-splitter (SOCKS5:10900)
+                            ├── up-carrier (WS listener :9001, from CDN)
+                            └── down-carrier (TCP dialer → 127.0.0.1:10802)
+                                                      ↓ via Xray tunnel to Germany
+                                              germany-splitter
+                            ├── up-carrier (WS dialer → wss://cdn/upload)
+                            └── down-carrier (TCP listener :9002)
+                                                      ↓
+                                              Real destination (internet)
 ```
 
-- **Up-carrier** (port 9001): Goes through CDN path for better upload
-- **Down-carrier** (port 9002): Direct path for better download
+- **Up-carrier (upload: client → internet)**: WebSocket through ArvanCloud CDN
+- **Down-carrier (download: internet → client)**: Raw TCP via Xray VLESS+Reality tunnel
 - **Frame protocol**: 7-byte header (StreamID 4B + Type 1B + Length 2B)
 - **Auth**: Shared secret with SHA256 derivation + constant-time comparison
 
@@ -45,10 +53,11 @@ sudo systemctl enable --now germany-splitter
 
 | Variable | Iran Default | Germany Default | Description |
 |----------|-------------|-----------------|-------------|
-| `SPLIT_LISTEN` | `127.0.0.1:10900` | — | SOCKS5 listen (Iran only) |
-| `SPLIT_CARRIER_UP` | `germany:9001` | — | Up-carrier address (Iran) |
-| `SPLIT_CARRIER_DOWN` | `germany:9002` | — | Down-carrier address (Iran) |
-| `SPLIT_LISTEN_DOWN` | — | `:9002` | Down-carrier listen (Germany) |
+| `SPLIT_SOCKS_LISTEN` | `127.0.0.1:10900` | — | SOCKS5 listen (Iran only) |
+| `SPLIT_WS_LISTEN` | `127.0.0.1:9001` | — | WS listen for CDN (Iran) |
+| `SPLIT_DOWN_CARRIER_ADDR` | `127.0.0.1:10802` | — | Xray outbound dial (Iran) |
+| `SPLIT_DOWN_LISTEN` | — | `:9002` | TCP listen for down-carrier (Germany) |
+| `SPLIT_UP_WS_URL` | — | `wss://cdn.example.com/upload` | CDN WebSocket URL (Germany) |
 | `SPLIT_SECRET` | — | — | **Must match on both servers** |
 | `SPLIT_METRICS_PORT` | `0` | `0` | HTTP metrics port (0=off) |
 
@@ -57,17 +66,18 @@ sudo systemctl enable --now germany-splitter
 ```json
 {
   "outbounds": [
-    {"tag": "up-cdn"},
-    {"tag": "down-direct"},
-    {
-      "tag": "to-splitter",
-      "protocol": "socks",
-      "settings": {"servers": [{"address": "127.0.0.1", "port": 10900}]}
+    {"tag": "to-splitter",
+     "protocol": "socks",
+     "settings": {"servers":[{"address":"127.0.0.1","port":10900}]}
+    },
+    {"tag": "down-tunnel",
+     "protocol": "socks",
+     "settings": {"servers":[{"address":"127.0.0.1","port":10802}]}
     }
   ],
   "routing": {
     "rules": [
-      {"type": "field", "inboundTag": ["your-inbound-tag"], "outboundTag": "to-splitter"}
+      {"type":"field","inboundTag":["user-inbound"],"outboundTag":"to-splitter"}
     ]
   }
 }
