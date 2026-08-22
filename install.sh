@@ -14,7 +14,6 @@ SYSTEMD_DIR="/etc/systemd/system"
 XRAY_CONFIGS=(
   "/usr/local/etc/xray/config.json"
   "/etc/xray/config.json"
-  "/etc/xray/config.json"
 )
 
 RED='\033[0;31m'
@@ -62,9 +61,39 @@ parse_args() {
       --xray-config)
         XRAY_CONFIG_PATH="$2"
         shift 2 ;;
+      --socks-listen)
+        SOCKS_LISTEN="$2"
+        shift 2 ;;
+      --socks-listen=*)
+        SOCKS_LISTEN="${1#*=}"
+        shift ;;
+      --ws-listen)
+        WS_LISTEN="$2"
+        shift 2 ;;
+      --ws-listen=*)
+        WS_LISTEN="${1#*=}"
+        shift ;;
+      --down-carrier-addr)
+        DOWN_CARRIER_ADDR="$2"
+        shift 2 ;;
+      --down-carrier-addr=*)
+        DOWN_CARRIER_ADDR="${1#*=}"
+        shift ;;
+      --down-listen)
+        DOWN_LISTEN="$2"
+        shift 2 ;;
+      --down-listen=*)
+        DOWN_LISTEN="${1#*=}"
+        shift ;;
+      --up-ws-url)
+        UP_WS_URL="$2"
+        shift 2 ;;
+      --up-ws-url=*)
+        UP_WS_URL="${1#*=}"
+        shift ;;
       *)
         error "Unknown flag: $1"
-        echo "Usage: $0 [iran|germany] [--secret SECRET] [--metrics-port PORT] [--relay-buf SIZE] [--xray-config PATH]"
+        echo "Usage: $0 [iran|germany] [--secret SECRET] [--metrics-port PORT] [--relay-buf SIZE] [--xray-config PATH] [--socks-listen ADDR] [--ws-listen ADDR] [--down-carrier-addr ADDR] [--down-listen PORT] [--up-ws-url URL]"
         exit 1 ;;
     esac
   done
@@ -129,10 +158,13 @@ check_root() {
   fi
 }
 
+# ============================================================
+# Check & install Go - NON-INTERACTIVE (no read prompt)
+# ============================================================
 check_go() {
   if ! command -v go &>/dev/null; then
     warn "Go is not installed. Installing golang..."
-    read -r -p "Press Enter to continue, or Ctrl+C to abort."
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq golang-go 2>/dev/null
     if ! command -v go &>/dev/null; then
@@ -144,7 +176,7 @@ check_go() {
 }
 
 # ============================================================
-# Download and build
+# Download and build with dynamic go.mod discovery
 # ============================================================
 download_and_build() {
   info "Downloading source from $TARBALL_URL ..."
@@ -276,14 +308,12 @@ merge_xray_config() {
 
   case "$ROLE" in
     iran)
-      # Add SOCKS5 outbound to-splitter
       python3 -c "
 import json, sys
 
 with open('$xray_conf', 'r') as f:
   cfg = json.load(f)
 
-# Add to-splitter outbound if not exists
 outs = cfg.get('outbounds', [])
 if not any(o.get('tag') == 'to-splitter' for o in outs):
     outs.append({
@@ -293,10 +323,8 @@ if not any(o.get('tag') == 'to-splitter' for o in outs):
     })
     cfg['outbounds'] = outs
 
-# Add routing rule for user inbound to to-splitter
 routing = cfg.get('routing', {})
 rules = routing.get('rules', [])
-# Remove old rule for this inbound if exists
 user_inbound = input('Enter your user inbound tag (e.g. user-vless-reality): ')
 rules = [r for r in rules if not (r.get('type') == 'field' and r.get('inboundTag') and user_inbound in r.get('inboundTag', []))]
 rules.append({
@@ -345,22 +373,13 @@ SNIPPET
 # Nginx config (Iran only)
 # ============================================================
 configure_nginx() {
-  if [ "$NGINX_CONFIG" != "y" ] && [ "$NGINX_CONFIG" != "Y" ]; then
-    info "Skipping Nginx configuration."
-    return
-  fi
-
-  if ! command -v nginx &>/dev/null; then
-    warn "Nginx not found. Install it manually or run: apt-get install -y nginx"
-    return
-  fi
-
+  [ "$NGINX_CONFIG" != "y" ] && [ "$NGINX_CONFIG" != "Y" ] && return
+  command -v nginx &>/dev/null || { warn "Nginx not found."; return; }
   info "Configuring Nginx for CDN WebSocket..."
   cat > /etc/nginx/conf.d/split-tunnel.conf <<EOF
 server {
     listen ${WS_LISTEN%%:*} default_server;
     server_name _;
-
     location /upload {
         proxy_pass http://${WS_LISTEN%%:*}:9001;
         proxy_http_version 1.1;
@@ -374,13 +393,7 @@ server {
     }
 }
 EOF
-
-  nginx -t 2>&1 && {
-    systemctl reload nginx
-    info "Nginx configured and reloaded."
-  } || {
-    error "Nginx config test failed. Check /etc/nginx/conf.d/split-tunnel.conf"
-  }
+  nginx -t 2>&1 && systemctl reload nginx || error "Nginx config failed."
 }
 
 # ============================================================
@@ -408,8 +421,31 @@ main() {
     gather_params_interactive
   fi
 
+  # Assign defaults for non-interactive mode (CLI flags or hardcoded defaults)
+  case "$ROLE" in
+    iran)
+      SOCKS_LISTEN="${SOCKS_LISTEN:-127.0.0.1:10900}"
+      WS_LISTEN="${WS_LISTEN:-127.0.0.1:9001}"
+      DOWN_CARRIER_ADDR="${DOWN_CARRIER_ADDR:-127.0.0.1:10802}"
+      ;;
+    germany)
+      DOWN_LISTEN="${DOWN_LISTEN:-:9002}"
+      UP_WS_URL="${UP_WS_URL:-wss://cdn.example.com/upload}"
+      ;;
+  esac
+
+  # Generate secret if not provided
+  if [ -z "$SECRET" ]; then
+    SECRET=$(openssl rand -hex 24 2>/dev/null || head -c 48 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c 48)
+    echo ""
+    echo -e "${YELLOW}============================================${NC}"
+    echo -e "${YELLOW}SECRET: ${SECRET}${NC}"
+    echo -e "${YELLOW}============================================${NC}"
+    echo ""
+  fi
+
   info "Role: $ROLE"
-  info "Secret: ${SECRET:0:4}****"
+  info "Secret: ${SECRET:0:4}**** (${#SECRET} chars)"
 
   case "$ROLE" in
     iran)
