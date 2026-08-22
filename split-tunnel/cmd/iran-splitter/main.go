@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log"
@@ -12,20 +14,19 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/split-tunnel/pkg/session"
 )
 
-// Config holds the iran-splitter configuration
 type Config struct {
-	ListenAddr   string // Address Xray connects to (127.0.0.1:10900)
-	UpSockAddr   string // helper-up SOCKS address (127.0.0.1:10801)
-	DownSockAddr string // helper-down SOCKS address (127.0.0.1:10802)
-	MetricsPort  int    // Port for metrics endpoint (0 = disabled)
-	RelayBufSize int    // Relay buffer size in bytes
-	LogFile      string // Log file path (empty = stderr)
+	ListenAddr   string
+	CarrierAddr  string
+	MetricsPort  int
+	RelayBufSize int
+	Secret       string
+	WaitTimeout  int
 }
 
-// Metrics tracks statistics for the splitter
 type Metrics struct {
 	mu             sync.Mutex
 	activeSessions int64
@@ -33,33 +34,90 @@ type Metrics struct {
 	totalBytesUp   int64
 	totalBytesDown int64
 	errors         int64
+	activeStreams  int64
 }
 
-// Splitter is the iran-splitter daemon
 type Splitter struct {
 	config  *Config
-	store   *session.SessionStore
+	store   *SessionStore
 	metrics *Metrics
 	logger  *log.Logger
+}
+
+type SessionStore struct {
+	mu       sync.RWMutex
+	sessions map[session.SessionID]*UserSession
+}
+
+type UserSession struct {
+	Stream   *mux.Stream
+	StreamID uint32
+	Dest     *session.Destination
+	Ctx      context.Context
+	Cancel   context.CancelFunc
+}
+
+func NewSessionStore() *SessionStore {
+	return &SessionStore{sessions: make(map[session.SessionID]*UserSession)}
+}
+
+func (ss *SessionStore) Add(id session.SessionID, s *UserSession) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.sessions[id] = s
+}
+
+func (ss *SessionStore) Remove(id session.SessionID) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	s, ok := ss.sessions[id]
+	if ok {
+		if s.Stream != nil {
+			s.Stream.Close()
+		}
+		if s.Cancel != nil {
+			s.Cancel()
+		}
+		delete(ss.sessions, id)
+	}
+}
+
+func (ss *SessionStore) CloseAll() {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, s := range ss.sessions {
+		if s.Stream != nil {
+			s.Stream.Close()
+		}
+		if s.Cancel != nil {
+			s.Cancel()
+		}
+	}
+}
+
+func (ss *SessionStore) Count() int {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	return len(ss.sessions)
 }
 
 func main() {
 	cfg := &Config{
 		ListenAddr:   "127.0.0.1:10900",
-		UpSockAddr:   "127.0.0.1:10801",
-		DownSockAddr: "127.0.0.1:10802",
+		CarrierAddr:  "germany-server:9000",
+		Secret:       "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING",
 		RelayBufSize: 32768,
+		WaitTimeout:  5000,
 	}
 
-	// Environment variable overrides
 	if v := os.Getenv("SPLIT_LISTEN"); v != "" {
 		cfg.ListenAddr = v
 	}
-	if v := os.Getenv("SPLIT_UP_SOCKS"); v != "" {
-		cfg.UpSockAddr = v
+	if v := os.Getenv("SPLIT_CARRIER"); v != "" {
+		cfg.CarrierAddr = v
 	}
-	if v := os.Getenv("SPLIT_DOWN_SOCKS"); v != "" {
-		cfg.DownSockAddr = v
+	if v := os.Getenv("SPLIT_SECRET"); v != "" {
+		cfg.Secret = v
 	}
 	if v := os.Getenv("SPLIT_METRICS_PORT"); v != "" {
 		cfg.MetricsPort = parseInt(v)
@@ -68,20 +126,18 @@ func main() {
 		cfg.RelayBufSize = parseInt(v)
 	}
 
+	secret := sha256.Sum256([]byte(cfg.Secret))
 	s := &Splitter{
 		config:  cfg,
-		store:   session.NewSessionStore(),
+		store:   NewSessionStore(),
 		metrics: &Metrics{},
 		logger:  log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags),
 	}
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	var wg sync.WaitGroup
 
-	// Metrics server
 	if cfg.MetricsPort > 0 {
 		wg.Add(1)
 		go func() {
@@ -90,7 +146,28 @@ func main() {
 		}()
 	}
 
-	// Main listener
+	carrier := mux.NewCarrier(secret[:])
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			s.logger.Printf("Connecting to carrier %s...", cfg.CarrierAddr)
+			conn, err := net.DialTimeout("tcp", cfg.CarrierAddr, 10*time.Second)
+			if err != nil {
+				s.logger.Printf("Carrier connect failed: %v (retrying in 5s)", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			s.logger.Printf("Connected to carrier %s", cfg.CarrierAddr)
+			carrier.SetConnected(true)
+			s.handleCarrier(conn, carrier)
+			carrier.SetConnected(false)
+			s.logger.Printf("Carrier disconnected, reconnecting in 2s...")
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		s.logger.Fatalf("Failed to listen on %s: %v", cfg.ListenAddr, err)
@@ -98,8 +175,7 @@ func main() {
 	defer ln.Close()
 
 	s.logger.Printf("Listening on %s", cfg.ListenAddr)
-	s.logger.Printf("Up SOCKS: %s", cfg.UpSockAddr)
-	s.logger.Printf("Down SOCKS: %s", cfg.DownSockAddr)
+	s.logger.Printf("Carrier target: %s", cfg.CarrierAddr)
 
 	wg.Add(1)
 	go func() {
@@ -110,30 +186,128 @@ func main() {
 				s.logger.Printf("Accept error: %v", err)
 				continue
 			}
-			go s.handleConnection(conn)
+			go s.handleConnection(conn, carrier)
 		}
 	}()
 
-	s.logger.Println("iran-splitter started")
-
+	s.logger.Println("iran-splitter started (mux mode)")
 	<-sigCh
 	s.logger.Println("Shutting down...")
-
 	s.store.CloseAll()
 	wg.Wait()
 	s.logger.Println("iran-splitter stopped")
 }
 
-// handleConnection processes a connection from Xray
-func (s *Splitter) handleConnection(clientConn net.Conn) {
+func (s *Splitter) handleCarrier(conn net.Conn, carrier *mux.Carrier) {
+	authFrame := mux.NewAuthFrame(carrier.Secret())
+	if err := mux.WriteFrame(conn, authFrame); err != nil {
+		s.logger.Printf("Failed to send auth: %v", err)
+		conn.Close()
+		return
+	}
+
+	respFrame, err := mux.ReadFrame(conn)
+	if err != nil {
+		s.logger.Printf("Failed to read auth response: %v", err)
+		conn.Close()
+		return
+	}
+	if respFrame.Type != mux.FrameAuth || len(respFrame.Payload) < 1 {
+		s.logger.Printf("Invalid auth response type: %d", respFrame.Type)
+		conn.Close()
+		return
+	}
+	if respFrame.Payload[0] != 0 {
+		s.logger.Printf("Auth rejected")
+		conn.Close()
+		return
+	}
+	s.logger.Printf("Carrier authenticated")
+
+	var readerDone chan struct{}
+	var readerWg sync.WaitGroup
+	readerDone = make(chan struct{})
+	readerWg.Add(1)
+	go func() {
+		defer readerWg.Done()
+		s.readFrames(conn, readerDone)
+	}()
+
+	var keepaliveDone chan struct{}
+	keepaliveDone = make(chan struct{})
+	readerWg.Add(1)
+	go func() {
+		defer readerWg.Done()
+		s.keepaliveWriter(conn, keepaliveDone)
+	}()
+
+	<-readerDone
+	close(keepaliveDone)
+	readerWg.Wait()
+}
+
+func (s *Splitter) readFrames(conn net.Conn, done chan struct{}) {
+	defer close(done)
+	for {
+		frame, err := mux.ReadFrame(conn)
+		if err != nil {
+			if err != io.EOF {
+				s.logger.Printf("Read frame error: %v", err)
+			}
+			return
+		}
+		switch frame.Type {
+		case mux.FrameData:
+			s.handleDataFrame(frame)
+		case mux.FramePing:
+			pong := mux.NewPongFrame()
+			mux.WriteFrame(conn, pong)
+		}
+	}
+}
+
+func (s *Splitter) handleDataFrame(frame *mux.Frame) {
+	s.store.mu.RLock()
+	for _, sess := range s.store.sessions {
+		if sess.StreamID == frame.StreamID {
+			s.metrics.incDown(len(frame.Payload))
+			if sess.Stream != nil {
+				sess.Stream.Write(frame.Payload)
+			}
+			s.store.mu.RUnlock()
+			return
+		}
+	}
+	s.store.mu.RUnlock()
+	s.metrics.incErr()
+}
+
+func (s *Splitter) keepaliveWriter(conn net.Conn, done chan struct{}) {
+	ticker := time.NewTicker(mux.KeepAliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			ping := mux.NewPingFrame()
+			mux.WriteFrame(conn, ping)
+		}
+	}
+}
+
+func (s *Splitter) handleConnection(clientConn net.Conn, carrier *mux.Carrier) {
 	defer clientConn.Close()
 
-	s.logger.Printf("Connection from %s", clientConn.RemoteAddr())
+	if !carrier.IsConnected() {
+		s.logger.Printf("Carrier not connected, rejecting")
+		s.metrics.incErr()
+		return
+	}
 
-	// Read header: session_id (16 bytes)
 	rawSid := make([]byte, session.SessionIDLen)
 	if _, err := io.ReadFull(clientConn, rawSid); err != nil {
-		s.logger.Printf("Read session ID from %s: %v", clientConn.RemoteAddr(), err)
+		s.logger.Printf("Read session ID: %v", err)
 		s.metrics.incErr()
 		return
 	}
@@ -141,169 +315,92 @@ func (s *Splitter) handleConnection(clientConn net.Conn) {
 	var sid session.SessionID
 	copy(sid[:], rawSid)
 
-	// Connect to helper-up SOCKS
-	upLeg, err := s.connectWithSID(s.config.UpSockAddr, sid)
+	dest, err := session.ReadDestination(clientConn)
 	if err != nil {
-		s.logger.Printf("Up-leg connect: %v", err)
+		s.logger.Printf("Read destination: %v", err)
 		s.metrics.incErr()
 		return
 	}
 
-	// Connect to helper-down SOCKS
-	downLeg, err := s.connectWithSID(s.config.DownSockAddr, sid)
-	if err != nil {
-		s.logger.Printf("Down-leg connect: %v", err)
-		s.metrics.incErr()
-		upLeg.Close()
-		return
-	}
+	s.logger.Printf("Session %s -> %s:%d", sid.String(), dest.Addr, dest.Port)
 
-	// Register session
-	s.store.Add(sid, &session.Session{ID: sid})
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := &UserSession{Dest: dest, Ctx: ctx, Cancel: cancel}
+	s.store.Add(sid, sess)
 	s.metrics.incSession()
 	defer func() {
 		s.metrics.decSession()
 		s.store.Remove(sid)
+		cancel()
 	}()
 
-	// Relay: client <-> upLeg (upload direction)
-	// Relay: client <-> downLeg (download direction)
-	var wg sync.WaitGroup
-	wg.Add(2)
+	stream := carrier.OpenStream()
+	sess.Stream = stream
+	sess.StreamID = stream.ID
+	s.metrics.incStream()
+	defer func() {
+		s.metrics.decStream()
+	}()
+
+	destBuf := make([]byte, session.MaxHeaderSize)
+	n := session.WriteDestinationBuffer(destBuf, dest)
+	if n > 0 {
+		stream.Write(destBuf[:n])
+	}
 
 	go func() {
-		defer wg.Done()
-		s.copyLoop(clientConn, upLeg, true)
+		buf := make([]byte, s.config.RelayBufSize)
+		for {
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					s.logger.Printf("Client read error: %v", err)
+				}
+				return
+			}
+			if n > 0 {
+				s.metrics.incUp(n)
+				stream.Write(buf[:n])
+			}
+		}
 	}()
 
-	go func() {
-		defer wg.Done()
-		s.copyLoop(downLeg, clientConn, false)
-	}()
-
-	wg.Wait()
+	<-ctx.Done()
 	s.logger.Printf("Session %s ended", sid.String())
 }
 
-// connectWithSID connects to a SOCKS server and sends the session ID
-func (s *Splitter) connectWithSID(addr string, sid session.SessionID) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-
-	// Send session ID
-	if _, err := conn.Write(sid[:]); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	// Wait for ACK
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	if buf[0] != 0 {
-		conn.Close()
-		return nil, fmt.Errorf("NACK received: code %d", buf[0])
-	}
-
-	return conn, nil
-}
-
-// copyLoop copies data from src to dst, tracking bytes
-func (s *Splitter) copyLoop(dst, src net.Conn, isUp bool) {
-	defer src.Close()
-	defer dst.Close()
-
-	buf := make([]byte, s.config.RelayBufSize)
-	for {
-		n, err := src.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				s.logger.Printf("Copy error: %v", err)
-			}
-			return
-		}
-		if n > 0 {
-			if isUp {
-				s.metrics.incUp(n)
-			} else {
-				s.metrics.incDown(n)
-			}
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				s.logger.Printf("Copy write error: %v", werr)
-				return
-			}
-		}
-	}
-}
-
-// runMetrics serves basic metrics on HTTP
 func (s *Splitter) runMetrics(addr string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mhttp := http.NewServeMux()
+	mhttp.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		s.metrics.mu.Lock()
 		fmt.Fprintf(w, `active_sessions %d
 total_sessions %d
 total_bytes_up %d
 total_bytes_down %d
+active_streams %d
 errors %d
 `,
 			s.metrics.activeSessions,
 			s.metrics.totalSessions,
 			s.metrics.totalBytesUp,
 			s.metrics.totalBytesDown,
+			s.metrics.activeStreams,
 			s.metrics.errors,
 		)
 		fmt.Fprintf(w, "session_count %d\n", s.store.Count())
 		s.metrics.mu.Unlock()
 	})
-
 	s.logger.Printf("Metrics on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, mhttp); err != nil {
 		s.logger.Printf("Metrics server error: %v", err)
 	}
 }
 
-// Metrics methods
-func (m *Metrics) incSession() {
-	m.mu.Lock()
-	m.activeSessions++
-	m.totalSessions++
-	m.mu.Unlock()
-}
-
-func (m *Metrics) decSession() {
-	m.mu.Lock()
-	m.activeSessions--
-	m.mu.Unlock()
-}
-
-func (m *Metrics) incUp(n int) {
-	m.mu.Lock()
-	m.totalBytesUp += int64(n)
-	m.mu.Unlock()
-}
-
-func (m *Metrics) incDown(n int) {
-	m.mu.Lock()
-	m.totalBytesDown += int64(n)
-	m.mu.Unlock()
-}
-
-func (m *Metrics) incErr() {
-	m.mu.Lock()
-	m.errors++
-	m.mu.Unlock()
-}
-
-func parseInt(s string) int {
-	var n int
-	fmt.Sscanf(s, "%d", &n)
-	return n
-}
+func (m *Metrics) incSession()       { m.mu.Lock(); m.activeSessions++; m.totalSessions++; m.mu.Unlock() }
+func (m *Metrics) decSession()       { m.mu.Lock(); m.activeSessions--; m.mu.Unlock() }
+func (m *Metrics) incUp(n int)       { m.mu.Lock(); m.totalBytesUp += int64(n); m.mu.Unlock() }
+func (m *Metrics) incDown(n int)     { m.mu.Lock(); m.totalBytesDown += int64(n); m.mu.Unlock() }
+func (m *Metrics) incErr()           { m.mu.Lock(); m.errors++; m.mu.Unlock() }
+func (m *Metrics) incStream()        { m.mu.Lock(); m.activeStreams++; m.mu.Unlock() }
+func (m *Metrics) decStream()        { m.mu.Lock(); m.activeStreams--; m.mu.Unlock() }
+func parseInt(s string) int          { var n int; fmt.Sscanf(s, "%d", &n); return n }
