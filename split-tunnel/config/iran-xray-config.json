@@ -1,57 +1,44 @@
 {
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
   "inbounds": [
     {
       "tag": "user-vless-reality",
-      "listen": "0.0.0.0",
       "port": 443,
       "protocol": "vless",
       "settings": {
-        "clients": [
-          {
-            "id": "YOUR-USER-UUID-HERE",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
+        "clients": [{ "id": "YOUR-UUID" }]
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "tls"
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/etc/letsencrypt/live/example.com/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/example.com/privkey.pem"
+            }
+          ]
+        }
       }
     }
   ],
   "outbounds": [
-    {"tag": "up-cdn", "protocol": "freedom", "settings": {}},
-    {"tag": "down-direct", "protocol": "freedom", "settings": {}},
+    { "tag": "up-cdn", "protocol": "freedom" },
+    { "tag": "down-direct", "protocol": "freedom" },
     {
       "tag": "to-splitter",
       "protocol": "socks",
       "settings": {
-        "servers": [{"address": "127.0.0.1", "port": 10900}]
+        "servers": [{ "address": "127.0.0.1", "port": 10900 }]
       }
-    },
-    {"tag": "down-tunnel",
-      "protocol": "socks",
-      "settings": {
-        "servers": [{"address": "127.0.0.1", "port": 10802}]
-      }
-    },
-    {"tag": "blackhole", "protocol": "blackhole", "settings": {}}
+    }
   ],
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {"type": "field", "inboundTag": ["user-vless-reality"], "outboundTag": "to-splitter"}
+      {
+        "type": "field",
+        "inboundTag": ["user-vless-reality"],
+        "outboundTag": "to-splitter"
+      }
     ]
-  },
-  "dns": {}
+  }
 }
