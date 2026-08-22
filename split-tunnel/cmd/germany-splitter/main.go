@@ -156,8 +156,25 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 	s.store[sid] = entry
 	s.mu.Unlock()
 	s.metrics.incSession()
+
+	var downStream *yamux.Stream
+	for s.downSession == nil { time.Sleep(100 * time.Millisecond) }
+	downStream, err = s.downSession.OpenStream()
+	if err != nil {
+		s.logger.Printf("Open down-stream: %v", err)
+		destConn.Close()
+		stream.Close()
+		s.mu.Lock()
+		delete(s.store, sid)
+		s.mu.Unlock()
+		s.metrics.decSession()
+		return
+	}
+	downStream.Write(sid[:])
+
 	var wg sync.WaitGroup
 	wg.Add(2)
+
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, s.config.RelayBufSize)
@@ -167,11 +184,7 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 			if n > 0 { s.metrics.incUp(int64(n)); destConn.Write(buf[:n]) }
 		}
 	}()
-	var downStream *yamux.Stream
-	for s.downSession == nil { time.Sleep(100 * time.Millisecond) }
-	downStream, err = s.downSession.OpenStream()
-	if err != nil { destConn.Close(); stream.Close(); wg.Wait(); s.mu.Lock(); delete(s.store, sid); s.mu.Unlock(); s.metrics.decSession(); return }
-	downStream.Write(sid[:])
+
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, s.config.RelayBufSize)
@@ -181,6 +194,7 @@ func (s *Splitter) handleUpStream(stream *yamux.Stream) {
 			if n > 0 { s.metrics.incDown(int64(n)); downStream.Write(buf[:n]) }
 		}
 	}()
+
 	wg.Wait()
 	stream.Close()
 	downStream.Close()
