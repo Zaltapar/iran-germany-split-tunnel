@@ -1,0 +1,21 @@
+[Unit]
+Description=Germany Splitter Daemon
+After=network.target xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/germany-splitter
+Restart=always
+RestartSec=5
+Environment=SPLIT_UP_LISTEN=127.0.0.1:10901
+Environment=SPLIT_DOWN_LISTEN=127.0.0.1:10902
+Environment=SPLIT_METRICS_PORT=9101
+Environment=SPLIT_RELAY_BUF=32768
+Environment=SPLIT_WAIT_TIMEOUT=3000
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=germany-splitter
+
+[Install]
+WantedBy=multi-user.target
