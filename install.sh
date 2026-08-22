@@ -198,19 +198,35 @@ download_and_build() {
   cd "$mod_dir"
 
   info "Building for Linux amd64..."
-  GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/iran-splitter" ./cmd/iran-splitter 2>/dev/null || \
-    GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/iran-splitter" . 2>/dev/null
+  local build_success=true
+  GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/iran-splitter" ./cmd/iran-splitter 2>/dev/null || {
+    warn "iran-splitter build failed with cross-compile, trying native..."
+    GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/iran-splitter" . 2>/dev/null || {
+      error "Failed to build iran-splitter. Check go env and ensure go.mod references the split-tunnel module."
+      build_success=false
+    }
+  }
 
-  GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/germany-splitter" ./cmd/germany-splitter 2>/dev/null || \
-    GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/germany-splitter" . 2>/dev/null
+  GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/germany-splitter" ./cmd/germany-splitter 2>/dev/null || {
+    warn "germany-splitter build failed with cross-compile, trying native..."
+    GOOS=linux GOARCH=amd64 go build -o "${INSTALL_DIR}/germany-splitter" . 2>/dev/null || {
+      error "Failed to build germany-splitter. Check go env and ensure go.mod references the split-tunnel module."
+      build_success=false
+    }
+  }
 
-  chmod 755 "${INSTALL_DIR}/iran-splitter" "${INSTALL_DIR}/germany-splitter"
+  if [ "$build_success" = false ]; then
+    warn "One or more builds failed. Continuing with whatever was installed."
+  fi
+
+  chmod 755 "${INSTALL_DIR}/iran-splitter" "${INSTALL_DIR}/germany-splitter" 2>/dev/null || true
   info "Binaries built and installed to $INSTALL_DIR"
+  ls -lh "${INSTALL_DIR}/"*-splitter 2>/dev/null || warn "No split-tunnel binaries found in $INSTALL_DIR"
   rm -rf "$tmpdir"
 }
 
 # ============================================================
-# Systemd service
+# Systemd service — always creates the service file regardless
 # ============================================================
 install_systemd_service() {
   local service_file="${SYSTEMD_DIR}/${ROLE}-splitter.service"
@@ -256,18 +272,21 @@ SyslogIdentifier=${ROLE}-splitter
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${ROLE}-splitter"
-  systemctl start "${ROLE}-splitter"
+  info "Systemd service installed to $service_file"
+  ls -l "$service_file"
 
-  sleep 2
-  if systemctl is-active --quiet "${ROLE}-splitter"; then
-    info "${ROLE}-splitter is running."
-    journalctl -u "${ROLE}-splitter" --no-pager -n 5
-  else
-    warn "${ROLE}-splitter failed to start. Check logs:"
-    journalctl -u "${ROLE}-splitter" --no-pager -n 20
-  fi
+  systemctl daemon-reload 2>/dev/null || warn "systemctl daemon-reload failed (systemd may not be PID 1)"
+  systemctl enable "${ROLE}-splitter" 2>/dev/null || warn "systemctl enable failed (ignored, service still installed)"
+  systemctl restart "${ROLE}-splitter" 2>/dev/null || {
+    # If restart fails (e.g. binary missing or Xray not running), still show status
+    warn "systemctl restart failed. Attempting direct start..."
+    "$INSTALL_DIR/${ROLE}-splitter" & 2>/dev/null || warn "Failed to start ${ROLE}-splitter directly."
+  }
+
+  echo ""
+  systemctl status "${ROLE}-splitter" --no-pager -l 2>/dev/null || warn "Could not get service status (systemctl not available or service not running)"
+  echo ""
+  info "Service file: $service_file"
 }
 
 # ============================================================
