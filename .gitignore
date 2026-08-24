@@ -3,8 +3,8 @@
 *.bin
 
 # Build artifacts
-split-tunnel/iran-splitter.exe
-split-tunnel/germany-splitter.exe
+iran-splitter.exe
+germany-splitter.exe
 
 # IDE
 .vscode/

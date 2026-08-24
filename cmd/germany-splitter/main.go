@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Zaltapar/iran-germany-split-tunnel/split-tunnel/pkg/mux"
-	"github.com/Zaltapar/iran-germany-split-tunnel/split-tunnel/pkg/session"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
 )
 
