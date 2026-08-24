@@ -1,12 +1,16 @@
+# Binaries
 *.exe
 *.bin
-split-tunnel/*.exe
-split-tunnel/*.bin
+
+# Build artifacts
+split-tunnel/iran-splitter.exe
+split-tunnel/germany-splitter.exe
 
 # IDE
 .vscode/
 .idea/
 *.swp
+*.swo
 
 # OS
 .DS_Store
@@ -16,6 +20,10 @@ Thumbs.db
 *.log
 log/
 
-# Secrets
-.env
+# Config with secrets
 *.secret
+.env
+# Local temp/scratch
+tmp-*
+$null
+*.exe~

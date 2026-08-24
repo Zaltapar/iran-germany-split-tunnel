@@ -275,12 +275,14 @@ merge_xray_config() {
 
   case "$ROLE" in
     iran)
+      # Add SOCKS5 outbound to-splitter
       python3 -c "
 import json, sys
 
 with open('$xray_conf', 'r') as f:
   cfg = json.load(f)
 
+# Add to-splitter outbound if not exists
 outs = cfg.get('outbounds', [])
 if not any(o.get('tag') == 'to-splitter' for o in outs):
     outs.append({
@@ -290,8 +292,10 @@ if not any(o.get('tag') == 'to-splitter' for o in outs):
     })
     cfg['outbounds'] = outs
 
+# Add routing rule for user inbound to to-splitter
 routing = cfg.get('routing', {})
 rules = routing.get('rules', [])
+# Remove old rule for this inbound if exists
 user_inbound = input('Enter your user inbound tag (e.g. user-vless-reality): ')
 rules = [r for r in rules if not (r.get('type') == 'field' and r.get('inboundTag') and user_inbound in r.get('inboundTag', []))]
 rules.append({
@@ -442,6 +446,7 @@ main() {
   esac
 }
 
+# Handle uninstall flag
 if [ "${1:-}" = "uninstall" ]; then
   ROLE="${2:-germany}"
   uninstall

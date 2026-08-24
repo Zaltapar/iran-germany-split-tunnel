@@ -1,363 +1,368 @@
 package mux
 
 import (
+	"bufio"
+	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"crypto/sha256"
-	"crypto/subtle"
 )
 
-// Frame types
-const (
-	FrameData  = 0x00
-	FrameAuth  = 0x01
-	FramePing  = 0x02
-	FramePong  = 0x03
-	FrameClose = 0x04
-)
-
-const MaxPayloadSize = 65535
-
-// FrameHeader is the 7-byte multiplexed frame header:
-// StreamID (4 bytes BE) + Type (1 byte) + Length (2 bytes BE)
-type FrameHeader struct {
-	StreamID uint32
-	Type     byte
-	Length   uint16
+// writeReq is one serialized write request.
+type writeReq struct {
+	data []byte
+	done chan error
 }
 
-// Frame is a complete multiplexed frame
-type Frame struct {
-	Header   *FrameHeader
-	Payload  []byte
-	Type     byte   // alias for convenience
-	StreamID uint32 // alias for convenience
-}
+// CarrierConn is the frame engine for one carrier (up-carrier WS or
+// down-carrier TCP). It wraps any io.ReadWriteCloser — a raw net.Conn or a
+// *websocket.Conn behind a ReadWriteCloser adapter.
+//
+// Concurrency model:
+//   - one read-loop goroutine decodes frames and pushes them on frames;
+//   - one dispatcher goroutine (Dispatch) owns the stream-channel map and
+//     routes per-stream payloads to handler goroutines;
+//   - ALL writes (auth, keepalive, data, close) are serialized through
+//     writeCh by a single writer goroutine, so frames can never interleave.
+type CarrierConn struct {
+	rwc io.ReadWriteCloser
 
-// Stream represents a multiplexed virtual connection
-type Stream struct {
-	ID      uint32
+	bufMu sync.Mutex
+	buf   *bufio.Reader
+
+	frames    chan Frame
+	writeCh   chan writeReq
+	readErr   error
+	readDone  chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+
 	mu      sync.Mutex
-	writeCh chan []byte
-	closed  bool
+	streams map[uint32]chan []byte
+	closing bool
+
+	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
+	// goroutine) when the first frame for a previously unknown stream
+	// arrives. The dispatcher creates and registers the stream channel and
+	// passes it to the callback; the callback must return quickly (spawn a
+	// goroutine for slow work such as a target dial).
+	OnNewStream func(streamID uint32, ch chan []byte)
 }
 
-// Transport is the abstract transport layer for carriers.
-// It wraps any io.ReadWriteCloser (websocket.Conn, net.Conn, etc.)
-// and provides a serialized frame writer.
-type Transport struct {
-	reader  io.Reader
-	writer  io.Writer
-	closer  io.Closer
-	writeCh chan *Frame
-	done    chan struct{}
-	closeMu sync.Mutex
-	closed  bool
-}
-
-// NewTransport wraps an io.ReadWriteCloser and starts the serialized writer goroutine.
-func NewTransport(rw io.ReadWriteCloser) *Transport {
-	t := &Transport{
-		reader:  rw,
-		writer:  rw,
-		closer:  rw,
-		writeCh: make(chan *Frame, 512),
-		done:    make(chan struct{}),
+// NewCarrierConn starts the read loop, writer and keepalive ping loop.
+// The read loop consumes the stream exclusively from this point on; use
+// CarrierAuth BEFORE calling NewCarrierConn to run the auth handshake,
+// then install the auth bufio.Reader with SetReadBuffer so already
+// buffered bytes are not lost.
+func NewCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration) *CarrierConn {
+	c := &CarrierConn{
+		rwc:      rwc,
+		frames:   make(chan Frame, 256),
+		writeCh:  make(chan writeReq, 256),
+		readDone: make(chan struct{}),
+		closed:   make(chan struct{}),
+		streams:  make(map[uint32]chan []byte),
 	}
-	go t.writerLoop()
-	return t
-}
-
-// NewTransportFromReaderWriterCloser creates a transport from separate io interfaces
-func NewTransportFromReaderWriterCloser(r io.Reader, w io.Writer, c io.Closer) *Transport {
-	t := &Transport{
-		reader:  r,
-		writer:  w,
-		closer:  c,
-		writeCh: make(chan *Frame, 512),
-		done:    make(chan struct{}),
+	go c.writeLoop()
+	go c.readLoop()
+	if pingInterval > 0 {
+		go c.keepalive(pingInterval)
 	}
-	go t.writerLoop()
-	return t
-}
-
-// writerLoop reads from writeCh and serializes all writes to the underlying writer.
-func (t *Transport) writerLoop() {
-	defer close(t.done)
-	for f := range t.writeCh {
-		if t.closed {
-			break
-		}
-		WriteFrame(t.writer, f)
-	}
-}
-
-// SendQueue pushes a frame onto the write queue (non-blocking).
-func (t *Transport) SendQueue(f *Frame) error {
-	t.closeMu.Lock()
-	if t.closed {
-		t.closeMu.Unlock()
-		return errors.New("transport closed")
-	}
-	t.closeMu.Unlock()
-	select {
-	case t.writeCh <- f:
-		return nil
-	default:
-		return errors.New("write queue full")
-	}
-}
-
-// Send sends a frame synchronously (blocks until written).
-func (t *Transport) Send(f *Frame) error {
-	t.closeMu.Lock()
-	if t.closed {
-		t.closeMu.Unlock()
-		return errors.New("transport closed")
-	}
-	t.closeMu.Unlock()
-	return WriteFrame(t.writer, f)
-}
-
-// Read delegates to the underlying reader.
-func (t *Transport) Read(b []byte) (n int, err error) {
-	return t.reader.Read(b)
-}
-
-// Close shuts down the transport and stops the writer goroutine.
-func (t *Transport) Close() error {
-	t.closeMu.Lock()
-	defer t.closeMu.Unlock()
-	if t.closed {
-		return nil
-	}
-	t.closed = true
-	if t.closer != nil {
-		return t.closer.Close()
-	}
-	return nil
-}
-
-// IsClosed returns whether the transport is closed.
-func (t *Transport) IsClosed() bool {
-	t.closeMu.Lock()
-	defer t.closeMu.Unlock()
-	return t.closed
-}
-
-// Writer returns the io.Writer for direct writes.
-func (t *Transport) Writer() io.Writer {
-	return t.writer
-}
-
-// Carrier manages the persistent multiplexed connection
-type Carrier struct {
-	mu           sync.RWMutex
-	streams      map[uint32]*Stream
-	nextStreamID uint32
-	secret       []byte
-	connected    atomic.Bool
-}
-
-// NewCarrier creates a new multiplexed carrier
-func NewCarrier(secret []byte) *Carrier {
-	c := &Carrier{
-		streams: make(map[uint32]*Stream),
-		secret:  secret,
-	}
-	c.connected.Store(false)
 	return c
 }
 
-// OpenStream creates a new stream and registers it, returns a unique stream ID.
-// Uses a prefix from carrierRole (0=up, 1=down) to prevent collisions.
-func (c *Carrier) OpenStream(role byte) *Stream {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	id := c.nextStreamID
-	c.nextStreamID++
-	// Encode role in upper 8 bits to prevent collisions
-	encodedID := (uint32(role) << 24) | (id & 0x00FFFFFF)
-	s := &Stream{
-		ID:      encodedID,
-		writeCh: make(chan []byte, 1024),
+func (c *CarrierConn) readLoop() {
+	defer close(c.readDone)
+	defer close(c.frames)
+	br := c.readBuffer()
+	for {
+		f, err := ReadFrame(br)
+		if err != nil {
+			c.mu.Lock()
+			c.readErr = err
+			c.mu.Unlock()
+			return
+		}
+		select {
+		case c.frames <- f:
+		case <-c.closed:
+			return
+		}
 	}
-	c.streams[encodedID] = s
-	return s
 }
 
-// GetStream retrieves a stream by ID
-func (c *Carrier) GetStream(id uint32) (*Stream, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	s, ok := c.streams[id]
-	return s, ok
+// writeLoop serializes every write through a single goroutine.
+func (c *CarrierConn) writeLoop() {
+	for req := range c.writeCh {
+		_, err := c.rwc.Write(req.data)
+		req.done <- err
+	}
 }
 
-// RemoveStream removes a stream
-func (c *Carrier) RemoveStream(id uint32) {
+// write is the serialized write primitive: it enqueues the raw encoded
+// frame and waits for the writer goroutine to complete it.
+func (c *CarrierConn) write(data []byte) error {
+	req := writeReq{data: data, done: make(chan error, 1)}
+	select {
+	case c.writeCh <- req:
+	case <-c.closed:
+		return errors.New("mux: carrier closed")
+	}
+	return <-req.done
+}
+
+// WriteFrame encodes and sends one frame. Serialized via writeCh.
+func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) error {
+	if len(payload) > MaxPayload {
+		return errors.New("mux: frame payload too large")
+	}
+	buf := make([]byte, HeaderSize+len(payload))
+	binary.BigEndian.PutUint32(buf[0:4], streamID)
+	buf[4] = typ
+	binary.BigEndian.PutUint16(buf[5:7], uint16(len(payload)))
+	copy(buf[HeaderSize:], payload)
+	return c.write(buf)
+}
+
+func (c *CarrierConn) keepalive(interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	ping := make([]byte, HeaderSize) // StreamID 0, FramePing, Length 0
+	for {
+		select {
+		case <-t.C:
+			_ = c.write(ping)
+		case <-c.closed:
+			return
+		}
+	}
+}
+
+// Conn returns the underlying io.ReadWriteCloser.
+func (c *CarrierConn) Conn() io.ReadWriteCloser { return c.rwc }
+
+// SetReadBuffer installs the bufio.Reader the read loop should consume
+// (e.g. the one used during the pre-protocol auth handshake). Call it
+// before starting Dispatch.
+func (c *CarrierConn) SetReadBuffer(br *bufio.Reader) {
+	c.bufMu.Lock()
+	c.buf = br
+	c.bufMu.Unlock()
+}
+
+// readBuffer returns the active read buffer, creating one if needed.
+func (c *CarrierConn) readBuffer() *bufio.Reader {
+	c.bufMu.Lock()
+	if c.buf == nil {
+		c.buf = bufio.NewReaderSize(c.rwc, 65536)
+	}
+	br := c.buf
+	c.bufMu.Unlock()
+	return br
+}
+
+// ReadErr returns the error that terminated the read loop (nil while the
+// read loop is still running).
+func (c *CarrierConn) ReadErr() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.streams, id)
+	return c.readErr
 }
 
-// StreamCount returns active stream count
-func (c *Carrier) StreamCount() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+// Ready reports whether the carrier read loop is still alive.
+func (c *CarrierConn) Ready() bool {
+	select {
+	case <-c.readDone:
+		return false
+	default:
+	}
+	c.mu.Lock()
+	dead := c.closing
+	c.mu.Unlock()
+	return !dead
+}
+
+// WaitCarrier polls Ready() at 50ms intervals until the context expires.
+func WaitCarrier(ctx context.Context, c *CarrierConn) (*CarrierConn, error) {
+	if c == nil {
+		return nil, errors.New("mux: no carrier")
+	}
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if c.Ready() {
+			return c, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// Register adds a stream channel and returns it. Mutex-protected and safe
+// to call from any goroutine (typically the session handler). Returns nil
+// if the carrier is already closing.
+func (c *CarrierConn) Register(streamID uint32) chan []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return nil
+	}
+	ch := make(chan []byte, 64)
+	c.streams[streamID] = ch
+	return ch
+}
+
+// Deregister removes a stream channel. Safe to call from any goroutine.
+func (c *CarrierConn) Deregister(streamID uint32) {
+	c.mu.Lock()
+	delete(c.streams, streamID)
+	c.mu.Unlock()
+}
+
+// StreamCount returns the number of registered streams.
+func (c *CarrierConn) StreamCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return len(c.streams)
 }
 
-// IsConnected returns connection state
-func (c *Carrier) IsConnected() bool {
-	return c.connected.Load()
-}
-
-// SetConnected sets connection state
-func (c *Carrier) SetConnected(v bool) {
-	c.connected.Store(v)
-}
-
-// Secret returns the carrier secret
-func (c *Carrier) Secret() []byte {
-	return c.secret
-}
-
-// DeriveSecret derives a 32-byte binary secret from a string using SHA256
-func DeriveSecret(s string) []byte {
-	h := sha256.Sum256([]byte(s))
-	return h[:]
-}
-
-// SecretFromHex derives a 32-byte binary secret from a hex-encoded string
-func SecretFromHex(hexStr string) ([]byte, error) {
-	return hex.DecodeString(hexStr)
-}
-
-// Frame constructors
-func NewAuthFrame(secret []byte) *Frame {
-	return &Frame{
-		Header:  &FrameHeader{StreamID: 0, Type: FrameAuth, Length: uint16(len(secret))},
-		Payload: secret,
-		Type:    FrameAuth,
+// Dispatch is the single consumer of the frames channel. Stream channels
+// are pre-registered by session handlers via Register (safe from any
+// goroutine); Dispatch only routes: FrameHeader/FrameData payloads go to
+// the stream's channel, FrameClose is delivered as a nil payload, and
+// frames for unknown or already-removed streams are dropped — unless
+// OnNewStream is set, in which case the first frame of a new stream
+// creates the channel and triggers the callback. FramePing gets a
+// FramePong[0] reply. Dispatch returns when the read loop terminates.
+func (c *CarrierConn) Dispatch() {
+	for f := range c.frames {
+		switch f.Type {
+		case FrameData, FrameHeader, FrameClose:
+			c.mu.Lock()
+			ch := c.streams[f.StreamID]
+			newStream := false
+			if ch == nil && c.OnNewStream != nil {
+				ch = make(chan []byte, 64)
+				c.streams[f.StreamID] = ch
+				newStream = true
+			}
+			c.mu.Unlock()
+			if ch == nil {
+				continue
+			}
+			if newStream {
+				c.OnNewStream(f.StreamID, ch)
+			}
+			var payload []byte
+			if f.Type == FrameData || f.Type == FrameHeader {
+				payload = f.Payload
+			}
+			select {
+			case ch <- payload:
+			case <-c.closed:
+				return
+			}
+		case FramePing:
+			pong := make([]byte, HeaderSize+1)
+			pong[4] = FramePong
+			binary.BigEndian.PutUint16(pong[5:7], 1)
+			pong[7] = 0
+			_ = c.write(pong)
+		case FramePong:
+			// keepalive ack, nothing to do
+		default:
+			// unknown frame type: drop
+		}
 	}
 }
 
-func NewPingFrame() *Frame {
-	return &Frame{Header: &FrameHeader{StreamID: 0, Type: FramePing, Length: 0}, Type: FramePing}
+// Close shuts the carrier down: it closes the underlying connection and
+// every registered stream channel so blocked handlers unblock and clean up.
+// Idempotent. Call it AFTER the dispatcher goroutine has returned, so the
+// read loop has already stopped consuming the connection.
+func (c *CarrierConn) Close() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		c.mu.Lock()
+		c.closing = true
+		for id, ch := range c.streams {
+			close(ch)
+			delete(c.streams, id)
+		}
+		c.mu.Unlock()
+		_ = c.rwc.Close()
+	})
 }
 
-func NewPongFrame() *Frame {
-	return &Frame{Header: &FrameHeader{StreamID: 0, Type: FramePong, Length: 0}, Type: FramePong}
-}
-
-func NewDataFrame(streamID uint32, data []byte) *Frame {
-	return &Frame{
-		Header:  &FrameHeader{StreamID: streamID, Type: FrameData, Length: uint16(len(data))},
-		Payload: data,
-		Type:    FrameData,
-	}
-}
-
-func NewCloseFrame(streamID uint32) *Frame {
-	return &Frame{Header: &FrameHeader{StreamID: streamID, Type: FrameClose, Length: 0}, Type: FrameClose}
-}
-
-// ReadFrame reads a complete frame from reader
-func ReadFrame(r io.Reader) (*Frame, error) {
-	buf4 := make([]byte, 4)
-	if _, err := io.ReadFull(r, buf4); err != nil {
+// CarrierAuth performs the symmetric FrameAuth handshake on rwc:
+// the initiator (carrier client) sends FrameAuth(SHA-256 secret) and waits
+// for FramePong [0]; the responder (carrier server) validates the secret in
+// constant time and replies FrameAuth (echo) + FramePong [0].
+// The returned bufio.Reader holds any bytes already buffered from rwc —
+// pass it to the new CarrierConn via SetReadBuffer.
+func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, secret []byte) (*bufio.Reader, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	streamID := binary.BigEndian.Uint32(buf4)
-
-	buf1 := make([]byte, 1)
-	if _, err := io.ReadFull(r, buf1); err != nil {
-		return nil, err
+	ds, hasDeadline := rwc.(interface {
+		SetDeadline(time.Time) error
+	})
+	resetDeadline := func() {
+		if hasDeadline {
+			_ = ds.SetDeadline(time.Time{})
+		}
 	}
-	frameType := buf1[0]
-
-	buf2 := make([]byte, 2)
-	if _, err := io.ReadFull(r, buf2); err != nil {
-		return nil, err
-	}
-	length := binary.BigEndian.Uint16(buf2)
-
-	if length > MaxPayloadSize {
-		return nil, errors.New("payload too large")
-	}
-
-	var payload []byte
-	if length > 0 {
-		payload = make([]byte, length)
-		if _, err := io.ReadFull(r, payload); err != nil {
+	if isClient {
+		if err := WriteFrame(rwc, 0, FrameAuth, secret); err != nil {
 			return nil, err
 		}
 	}
-
-	return &Frame{
-		Header:   &FrameHeader{StreamID: streamID, Type: frameType, Length: length},
-		Payload:  payload,
-		Type:     frameType,
-		StreamID: streamID,
-	}, nil
-}
-
-// WriteFrame writes a complete frame to writer (serialized by caller)
-func WriteFrame(w io.Writer, f *Frame) error {
-	sidBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(sidBuf, f.StreamID)
-	if _, err := w.Write(sidBuf); err != nil {
-		return err
+	if hasDeadline {
+		if d, ok := ctx.Deadline(); ok {
+			_ = ds.SetDeadline(d)
+		}
 	}
-	if _, err := w.Write([]byte{f.Type}); err != nil {
-		return err
+	br := bufio.NewReader(rwc)
+	for {
+		f, err := ReadFrame(br)
+		if err != nil {
+			resetDeadline()
+			return nil, err
+		}
+		switch f.Type {
+		case FrameAuth:
+			if !isClient {
+				if len(f.Payload) != 32 || !ValidateSecret(f.Payload, secret) {
+					resetDeadline()
+					return nil, errors.New("mux: auth secret mismatch")
+				}
+				if err := WriteFrame(rwc, 0, FrameAuth, secret); err != nil {
+					resetDeadline()
+					return nil, err
+				}
+				if err := WriteFrame(rwc, 0, FramePong, []byte{0}); err != nil {
+					resetDeadline()
+					return nil, err
+				}
+				resetDeadline()
+				return br, nil
+			}
+			// client: server echo, keep waiting for FramePong
+		case FramePong:
+			if len(f.Payload) == 1 && f.Payload[0] == 0 {
+				resetDeadline()
+				return br, nil
+			}
+			resetDeadline()
+			return nil, errors.New("mux: bad auth pong")
+		default:
+			resetDeadline()
+			return nil, errors.New("mux: unexpected frame during auth")
+		}
 	}
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, f.Header.Length)
-	if _, err := w.Write(lenBuf); err != nil {
-		return err
-	}
-	if f.Payload != nil {
-		_, err := w.Write(f.Payload)
-		return err
-	}
-	return nil
-}
-
-// ValidateSecret verifies shared secret using constant-time comparison
-func ValidateSecret(provided []byte, expected []byte) bool {
-	return subtle.ConstantTimeCompare(provided, expected) == 1
-}
-
-// KeepAliveInterval is the default keepalive period
-const KeepAliveInterval = 30 * time.Second
-
-// Write sends data to a stream (enqueues payload for writer goroutine)
-func (s *Stream) Write(data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return errors.New("stream closed")
-	}
-	select {
-	case s.writeCh <- data:
-		return nil
-	default:
-		return errors.New("write queue full")
-	}
-}
-
-// Close closes a stream
-func (s *Stream) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
-	return nil
 }

@@ -1,19 +1,26 @@
 [Unit]
-Description=Iran Splitter Daemon (Asymmetric Split-Tunnel)
-After=network.target
-Wants=xray.service
+Description=iran-splitter - SOCKS5 entry, up-carrier WS server, down-carrier dialer
+After=network-online.target xray.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/iran-splitter
 Restart=always
 RestartSec=5
+
+# SOCKS5 listener - the local Xray routes client traffic here
 Environment=SPLIT_SOCKS_LISTEN=127.0.0.1:10900
-Environment=SPLIT_WS_LISTEN=127.0.0.1:9001
+# Up-carrier WebSocket server - front it with nginx -> CDN (path /upload)
+Environment=SPLIT_WS_LISTEN=0.0.0.0:9001
+# Down-carrier dial target - local Xray VLESS+Reality outbound port
 Environment=SPLIT_DOWN_CARRIER_ADDR=127.0.0.1:10802
-Environment=SPLIT_SECRET=CHANGE-ME-SECRET
-Environment=SPLIT_METRICS_PORT=9100
-Environment=SPLIT_RELAY_BUF=32768
+# Must match SPLIT_SECRET on the Germany node
+Environment=SPLIT_SECRET=YOUR-SECRET-HERE
+# Optional:
+#Environment=SPLIT_METRICS_PORT=9100
+#Environment=SPLIT_RELAY_BUF=32768
+
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal

@@ -1,26 +1,53 @@
 {
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
   "inbounds": [
     {
-      "tag": "up-cdn-inbound",
-      "port": 9001,
+      "tag": "up-cdn-in",
+      "listen": "0.0.0.0",
+      "port": 443,
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "YOUR-UUID" }]
+        "clients": [
+          {
+            "id": "YOUR-GERMANY-USER-UUID-HERE",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "/upload" }
+        "network": "tcp",
+        "security": "tls"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
       }
     },
     {
-      "tag": "down-direct-inbound",
-      "port": 9002,
-      "protocol": "vless",
+      "tag": "down-direct-in",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vmess",
       "settings": {
-        "clients": [{ "id": "YOUR-UUID" }]
+        "clients": [
+          {
+            "id": "YOUR-GERMANY-DOWN-UUID-HERE",
+            "alterId": 0
+          }
+        ]
       },
       "streamSettings": {
-        "network": "tcp"
+        "network": "tcp",
+        "security": "tls"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
       }
     }
   ],
@@ -28,26 +55,54 @@
     {
       "tag": "to-up-listener",
       "protocol": "socks",
-      "settings": { "servers": [{ "address": "127.0.0.1", "port": 10901 }] }
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 10901
+          }
+        ]
+      }
     },
     {
       "tag": "to-down-listener",
       "protocol": "socks",
-      "settings": { "servers": [{ "address": "127.0.0.1", "port": 10902 }] }
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 10902
+          }
+        ]
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
+    {
+      "tag": "blackhole",
+      "protocol": "blackhole",
+      "settings": {}
     }
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["up-cdn-inbound"],
+        "inboundTag": ["up-cdn-in"],
         "outboundTag": "to-up-listener"
       },
       {
         "type": "field",
-        "inboundTag": ["down-direct-inbound"],
+        "inboundTag": ["down-direct-in"],
         "outboundTag": "to-down-listener"
       }
     ]
-  }
+  },
+  "dns": {}
 }
