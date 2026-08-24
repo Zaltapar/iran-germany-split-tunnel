@@ -32,7 +32,30 @@ tunneled over VLESS+Reality. One direction per carrier — no cross-traffic.
 
 ## Quick Start
 
-### Build
+### Install (interactive installer)
+
+The installer asks for every setting (role, shared secret, ports, CDN domain,
+Xray inbound tag, nginx, metrics) with sensible defaults — just press Enter to
+accept. It then installs the Go toolchain if needed, builds the binary for the
+role, sets up the systemd service, merges the Xray config (Iran) and
+configures nginx (Iran), and prints the exact next steps for the other node.
+
+```bash
+# Iran node
+sudo bash install.sh
+# or remotely:
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s
+
+# Germany node (must use the same shared secret)
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s -- germany --yes \
+  --secret <SECRET-FROM-IRAN> --up-ws-url wss://<cdn-domain>/upload
+```
+
+Every question also has a flag (see `install.sh --help`), so the installer can
+run fully non-interactive with `--yes`. To remove everything the installer
+added: `sudo bash install.sh uninstall [iran|germany]`.
+
+### Manual build & deploy (without the installer)
 
 ```bash
 go build -o iran-splitter ./cmd/iran-splitter
