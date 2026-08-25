@@ -21,8 +21,11 @@ const (
 
 // Constants
 const (
-	SessionIDLen  = 16
-	MaxHeaderSize = 1 + 255 + 2
+	SessionIDLen = 16
+	// MaxHeaderSize is the largest possible destination header:
+	// [1 atype][1 domain length][255 domain][2 port] = 259 bytes.
+	// (IPv4 headers are 7 bytes, IPv6 headers are 19 bytes.)
+	MaxHeaderSize = 1 + 1 + 255 + 2
 )
 
 // SessionID is a unique 16-byte identifier

@@ -116,7 +116,7 @@ func (c *CarrierConn) write(data []byte) error {
 // WriteFrame encodes and sends one frame. Serialized via writeCh.
 func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) error {
 	if len(payload) > MaxPayload {
-		return errors.New("mux: frame payload too large")
+		return ErrPayloadTooLarge
 	}
 	buf := make([]byte, HeaderSize+len(payload))
 	binary.BigEndian.PutUint32(buf[0:4], streamID)
@@ -130,6 +130,7 @@ func (c *CarrierConn) keepalive(interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	ping := make([]byte, HeaderSize) // StreamID 0, FramePing, Length 0
+	ping[4] = FramePing
 	for {
 		select {
 		case <-t.C:

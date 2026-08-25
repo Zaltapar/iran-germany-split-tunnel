@@ -406,50 +406,17 @@ func (s *Splitter) runSocksServer() {
 }
 
 // socksReply sends a SOCKS5 reply (bind addr 0.0.0.0:0, atyp IPv4).
-func socksReply(clientConn net.Conn, status byte) {
-	_, _ = clientConn.Write([]byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+func socksReply(w io.Writer, status byte) {
+	_, _ = w.Write([]byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
 
 func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	defer clientConn.Close()
 	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	// --- SOCKS5 greeting: [0x05, NMETHODS, methods...] ---
-	greet := make([]byte, 2)
-	if _, err := io.ReadFull(clientConn, greet); err != nil || greet[0] != 0x05 {
-		return
-	}
-	methods := make([]byte, int(greet[1]))
-	if _, err := io.ReadFull(clientConn, methods); err != nil {
-		return
-	}
-	methodOK := false
-	for _, m := range methods {
-		if m == 0x00 {
-			methodOK = true
-			break
-		}
-	}
-	if !methodOK {
-		_, _ = clientConn.Write([]byte{0x05, 0xFF})
-		return
-	}
-	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	// --- SOCKS5 request: [0x05, CMD, 0x00, ATYP, ...] ---
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(clientConn, req); err != nil {
-		return
-	}
-	if req[0] != 0x05 || req[1] != 0x01 {
-		socksReply(clientConn, 0x07) // command not supported
-		return
-	}
-	dest, err := session.ReadDestinationEx(clientConn, req[3])
+	dest, err := socksNegotiate(clientConn)
 	if err != nil {
-		s.logger.Printf("SOCKS5 destination parse: %v", err)
+		s.logger.Printf("SOCKS5 negotiation: %v (from %s)", err, clientConn.RemoteAddr())
 		return
 	}
 	_ = clientConn.SetDeadline(time.Time{})

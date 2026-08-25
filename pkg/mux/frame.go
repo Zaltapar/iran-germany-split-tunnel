@@ -21,6 +21,10 @@ const (
 	MaxPayload = 65535
 )
 
+// ErrPayloadTooLarge is returned by the frame encoders when the payload
+// exceeds the 16-bit Length field.
+var ErrPayloadTooLarge = errors.New("mux: frame payload too large")
+
 // Frame types
 const (
 	FrameData   uint8 = 0x00 // user data payload
@@ -42,7 +46,7 @@ type Frame struct {
 // WriteFrame encodes one frame (header + payload) into w in a single write.
 func WriteFrame(w io.Writer, streamID uint32, typ uint8, payload []byte) error {
 	if len(payload) > MaxPayload {
-		return errors.New("mux: frame payload too large")
+		return ErrPayloadTooLarge
 	}
 	hdr := make([]byte, HeaderSize)
 	binary.BigEndian.PutUint32(hdr[0:4], streamID)
