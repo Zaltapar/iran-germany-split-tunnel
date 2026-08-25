@@ -72,6 +72,25 @@ type Config struct {
 	MetricsPort       int
 	RelayBufSize      int
 	KeepAliveInterval time.Duration
+
+	// Stream queue (backpressure) settings, SPLIT_STREAM_QUEUE_* /
+	// SPLIT_STREAM_OVERFLOW_MS. Zero falls back to the library defaults
+	// (mux.SanitizeLimits); a slow stream is terminated, never the carrier.
+	QueueBytesPerStream  int
+	QueueFramesPerStream int
+	QueueBytesTotal      int
+	OverflowWaitMs       int
+}
+
+// streamLimits builds the per-stream mailbox limits from config. Zero
+// values fall back to mux.DefaultStreamLimits via SanitizeLimits.
+func (s *Splitter) streamLimits() mux.StreamLimits {
+	return mux.StreamLimits{
+		MaxBytesPerStream:  s.config.QueueBytesPerStream,
+		MaxFramesPerStream: s.config.QueueFramesPerStream,
+		MaxBytesTotal:      s.config.QueueBytesTotal,
+		OverflowWait:       time.Duration(s.config.OverflowWaitMs) * time.Millisecond,
+	}
 }
 
 type Metrics struct {
@@ -195,6 +214,18 @@ func main() {
 	if v := os.Getenv("SPLIT_RELAY_BUF"); v != "" {
 		cfg.RelayBufSize = parseInt(v)
 	}
+	if v := os.Getenv("SPLIT_STREAM_QUEUE_BYTES"); v != "" {
+		cfg.QueueBytesPerStream = parseInt(v)
+	}
+	if v := os.Getenv("SPLIT_STREAM_QUEUE_FRAMES"); v != "" {
+		cfg.QueueFramesPerStream = parseInt(v)
+	}
+	if v := os.Getenv("SPLIT_STREAM_QUEUE_TOTAL_BYTES"); v != "" {
+		cfg.QueueBytesTotal = parseInt(v)
+	}
+	if v := os.Getenv("SPLIT_STREAM_OVERFLOW_MS"); v != "" {
+		cfg.OverflowWaitMs = parseInt(v)
+	}
 
 	derived := mux.DeriveSecret(cfg.Secret)
 	s := &Splitter{
@@ -307,6 +338,7 @@ func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 
 	carrier := mux.NewCarrierConn(wsc, s.config.KeepAliveInterval)
 	carrier.SetReadBuffer(br)
+	carrier.SetStreamLimits(s.streamLimits())
 	h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
 	go func() {
 		defer close(h.done)
@@ -355,6 +387,7 @@ func (s *Splitter) runDownCarrier() {
 
 		carrier := mux.NewCarrierConn(conn, s.config.KeepAliveInterval)
 		carrier.SetReadBuffer(br)
+		carrier.SetStreamLimits(s.streamLimits())
 		h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
 		go func() {
 			defer close(h.done)

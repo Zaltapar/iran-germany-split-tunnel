@@ -92,6 +92,10 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_SECRET` | ✓ | ✓ | placeholder | **Must match on both nodes** |
 | `SPLIT_METRICS_PORT` | ✓ | ✓ | `0` (off) | Local HTTP metrics port |
 | `SPLIT_RELAY_BUF` | ✓ | ✓ | `32768` | Relay buffer size in bytes |
+| `SPLIT_STREAM_QUEUE_BYTES` | ✓ | ✓ | `1048576` (1 MiB) | Max payload bytes buffered per stream before that stream (not the carrier) is terminated |
+| `SPLIT_STREAM_QUEUE_FRAMES` | ✓ | ✓ | `16` | Max frames buffered per stream |
+| `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `33554432` (32 MiB) | Aggregate queued bytes across all streams per carrier |
+| `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `100` | How long a stalled stream may hold its buffer (ms) before termination |
 
 ## Xray Config (Iran)
 

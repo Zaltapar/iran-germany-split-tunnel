@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 2 (carrier lifecycle) — COMPLETE
+## Current phase: Phase 3 (stream backpressure) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -64,7 +64,7 @@ Environment: go1.27.0 windows/amd64 (Go cross-build for linux/amd64 verified).
      pong was ever generated and liveness detection was dead. Now sets
      `ping[4] = FramePing` as the comment always claimed.
 
-## Phase 2 — carrier lifecycle (this commit)
+## Phase 2 — carrier lifecycle (previous commit `67e291d`)
 
 Made `CarrierConn` shutdown deterministic, race-safe, idempotent and
 leak-free. No backpressure or reconnect work mixed in.
@@ -112,15 +112,79 @@ leak-free. No backpressure or reconnect work mixed in.
 - All Phase 1 baseline tests still pass unchanged; `e2e-pipe-test` still
   passes; no call-site changes needed (main.go/e2e unchanged).
 
+## Phase 3 — stream backpressure (this commit)
+
+Fixed Issue B: one stalled stream can no longer stall the whole carrier
+dispatcher. The dispatcher only does non-blocking mailbox pushes now, and
+the overflow policy terminates the offending STREAM, never the carrier.
+
+- **Bounded per-stream mailbox** (`pkg/mux/queue.go`, new): `StreamQueue`
+  with dual limits — at most `MaxFramesPerStream` items AND at most
+  `MaxBytesPerStream` payload bytes. Dispatcher side: non-blocking
+  `TryPush` (never blocks). Consumer side: single-consumer `Pop` (one
+  worker per stream). `Close()` returns the discarded payload bytes so
+  the carrier can return them to its aggregate budget.
+- **`StreamLimits` / `SanitizeLimits` / `SetStreamLimits`**
+  (`pkg/mux/carrier.go`):
+  - defaults (`DefaultStreamLimits`): 16 frames / 1 MiB per stream,
+    32 MiB aggregate per carrier, 100 ms overflow wait;
+  - sanitize: zero/negative → default, frame bound clamped to 16,
+    aggregate below per-stream → default aggregate;
+  - applied at all four carrier-creation sites in both mains (up + down
+    carrier) before `Dispatch`/`Register`.
+- **Aggregate budget**: the carrier tracks `queuedBytes` (payload bytes
+  across all mailboxes); a push that would exceed `MaxBytesTotal` is
+  refused and the pressure policy applies to THAT stream, so many slow
+  streams cannot multiply per-stream memory into unbounded RAM.
+- **Overflow policy** (`deliver` / `applyPressure` / `terminateStream`):
+  - dispatcher never blocks: full mailbox → frame dropped, pressure
+    timestamp recorded, every other stream keeps being served;
+  - pressure re-evaluates on each later push for the stream; once it has
+    persisted for `OverflowWait`, that stream alone is terminated;
+  - the consumer receives `nil` (same signal as `FrameClose`) when the
+    channel can accept it; the mailbox is closed and its discarded bytes
+    are returned to the aggregate budget;
+  - a best-effort `FrameClose` goes back to the peer for terminations
+    caused by local overflow, so the remote side tears its end down;
+  - a terminated stream STAYS registered (`terminated` flag) so later
+    frames for its ID are dropped instead of starting a new stream —
+    which would re-fire `OnNewStream` and re-dial a dead destination;
+  - the per-stream workers count toward Phase 2's `live` set and exit
+    via the existing shutdown machinery (`ShutdownDone` unchanged).
+- **Config** (both mains): `SPLIT_STREAM_QUEUE_BYTES`,
+  `SPLIT_STREAM_QUEUE_FRAMES`, `SPLIT_STREAM_QUEUE_TOTAL_BYTES`,
+  `SPLIT_STREAM_OVERFLOW_MS` (milliseconds). Parsed with the existing
+  `parseInt`; non-numeric values become 0 and `SanitizeLimits` falls
+  back to defaults (documented; the `parseInt` error-swallowing itself
+  stays known-failure #4 for Phase 7).
+- **Tests**:
+  - `pkg/mux/queue_test.go` (new, 6): frame bound, byte bound,
+    FIFO + parked-Pop wake, Close byte accounting (discarded bytes
+    returned exactly once), Close waking a parked Pop, SanitizeLimits
+    contract (defaults, clamp, aggregate-vs-per-stream, pass-through).
+  - `pkg/mux/backpressure_test.go` (new, 7): slow stream does not stall
+    the dispatcher (stream 2 served while stream 1 is under pressure,
+    carrier stays Ready, stream 1 terminated), aggregate budget
+    enforcement across streams (fits-mailbox frame refused at the budget,
+    boundary-inclusive acceptance), FrameClose under pressure (channel
+    goes quiet, no discarded-frame resurfacing, other stream + carrier
+    unaffected), terminated stream stays registered (late frames
+    dropped, `OnNewStream` does NOT re-fire), per-stream ordering
+    preserved under interleaving, Close with data queued (channels
+    closed, budget fully reclaimed, `ShutdownDone` closes), terminated
+    stream's worker exits (no goroutine leak).
+- All Phase 1/2 tests pass unchanged; `e2e-pipe-test` passes; no
+  wire-protocol changes (same frame layout, same semantics).
+
 ## Known failures / pre-existing defects (NOT fixed here — planned phases)
 
 Documented so later phases can verify each one is addressed:
 
 1. **Issue A — sessions bound to a CarrierConn**: a carrier disconnect
    kills its streams; no rebind/resume. → Phase 5 (reconnect/rebind).
-2. **Issue B — dispatcher head-of-line blocking**: `Dispatch()` does a
-   blocking send into per-stream channels (cap 64); one slow stream stalls
-   the whole carrier dispatcher. → Phase 3 (backpressure).
+2. **Issue B — dispatcher head-of-line blocking**: FIXED in Phase 3
+   (bounded per-stream mailbox + timed pressure + per-stream termination;
+   see Phase 3 notes).
 3. **Issue E — no handshake freshness**: symmetric secret echo allows
    replay/reflection; no role/nonces. → Phase 6 (security).
 4. **Issue F — `parseInt` swallows errors** (both mains): `fmt.Sscanf(s,
@@ -148,11 +212,12 @@ Documented so later phases can verify each one is addressed:
 
 ## Tests passed
 
-- `go test ./... -count=3 -timeout 300s` — PASS (all packages, 3× to shake
-  out timing-sensitive shutdown races)
+- `go test ./... -count=1` — PASS (all packages)
+- `go test ./pkg/mux/ -count=5` (backpressure subset) — PASS (5× to shake
+  out timing-sensitive pressure/termination races)
 - `go vet ./...` — PASS
-- `go build ./cmd/...` — PASS (windows/amd64)
-- `GOOS=linux GOARCH=amd64 go build ./cmd/...` — PASS
+- `go build ./...` — PASS (windows/amd64)
+- `GOOS=linux GOARCH=amd64 go build ./...` — PASS
 - `go run ./e2e-pipe-test` — PASS
 - `gofmt -l .` — clean
 
@@ -163,18 +228,25 @@ shutdown logic is channel/lock-ordered by construction (see Phase 2 notes);
 
 ## Next phase
 
-Phase 3 — backpressure (`phase-3-backpressure`):
-dispatcher head-of-line blocking (Issue B) — per-stream non-blocking/drop
-policy or backpressure to the writer, without touching the lifecycle
-behavior pinned by Phase 2 tests.
+Phase 4 is not yet scoped on the roadmap (Phases 5–8 are assigned under
+"Known failures"); the next defined item is Phase 5 — reconnect/rebind
+(Issue A: sessions bound to a CarrierConn). Scope Phase 4 first
+(candidate: soak/load testing of the new mailbox + termination paths).
 
 ## Files modified (this commit)
 
-- `pkg/mux/carrier.go` (lifecycle: ErrCarrierClosed, writeWG reservation,
-  writeLoop exit on closed, Close shutdown sequence, drainWrites,
-  goroutine tracking + ShutdownDone)
-- `pkg/mux/carrier_shutdown_test.go` (new — 8 lifecycle tests)
-- `IMPLEMENTATION_STATUS.md` (phase 2 update)
+- `pkg/mux/queue.go` (new — bounded StreamQueue mailbox)
+- `pkg/mux/carrier.go` (streamRec, StreamLimits/SanitizeLimits/
+  SetStreamLimits, aggregate queuedBytes, non-blocking Dispatch/deliver,
+  applyPressure, terminateStream, streamWorker, Close reclaims discarded
+  bytes from the budget)
+- `pkg/mux/queue_test.go` (new — 6 mailbox + SanitizeLimits tests)
+- `pkg/mux/backpressure_test.go` (new — 7 backpressure tests)
+- `cmd/iran-splitter/main.go`, `cmd/germany-splitter/main.go`
+  (SPLIT_STREAM_QUEUE_* / SPLIT_STREAM_OVERFLOW_MS parsing +
+  SetStreamLimits on all four carrier-creation sites)
+- `IMPLEMENTATION_STATUS.md` (phase 3 update)
+- `README.md` (new env vars documented)
 
 ## Commit
 
@@ -183,11 +255,11 @@ behavior pinned by Phase 2 tests.
 ## Rollback
 
 ```
-git revert <phase-2-carrier-lifecycle-commit>
+git revert <phase-3-stream-backpressure-commit>
 ```
 
-Phase 2 touches only `pkg/mux/carrier.go` plus one new test file, so the
-revert is self-contained (no call-site changes were required).
+Phase 3 touches `pkg/mux` plus both mains (config wiring only); no
+wire-protocol changes, so the revert is self-contained.
 
 or to abandon the whole effort:
 
