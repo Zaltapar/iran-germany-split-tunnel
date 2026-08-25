@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 3 (stream backpressure) — COMPLETE
+## Current phase: Phase 4 (session lifecycle) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -112,7 +112,7 @@ leak-free. No backpressure or reconnect work mixed in.
 - All Phase 1 baseline tests still pass unchanged; `e2e-pipe-test` still
   passes; no call-site changes needed (main.go/e2e unchanged).
 
-## Phase 3 — stream backpressure (this commit)
+## Phase 3 — stream backpressure (previous commit `0be3952`)
 
 Fixed Issue B: one stalled stream can no longer stall the whole carrier
 dispatcher. The dispatcher only does non-blocking mailbox pushes now, and
@@ -176,6 +176,78 @@ the overflow policy terminates the offending STREAM, never the carrier.
 - All Phase 1/2 tests pass unchanged; `e2e-pipe-test` passes; no
   wire-protocol changes (same frame layout, same semantics).
 
+## Phase 4 — session lifecycle (this commit)
+
+Goal: a single, explicit, idempotent session lifecycle — no ambiguous
+ownership between client conn, target conn, the two carrier streams, the
+session store, contexts, carrier registrations, relay goroutines and
+metrics. Scope: make the existing lifecycle correct and deterministic.
+NO reconnect/rebind (Phase 5), NO wire-protocol changes.
+
+### State machine
+
+```
+Pending → Active → Closing → Closed
+            ├── DirUp half-closed   (client EOF / FrameClose)
+            └── DirDown half-closed (target EOF / FrameClose)
+```
+
+- `NewSession(...)` → Pending. The session EXCLUSIVELY owns its
+  `ClientConn`/`TargetConn` (whichever are non-nil) and its context
+  (the cancel func is now private); `Close` is the only closer.
+- `Activate()` only from Pending; a session that reached Closed can
+  never become active again.
+- `MarkDirClosed(dir, reason)` half-closes ONE direction; the other
+  keeps flowing. When both directions are closed the session transitions
+  itself into Closing.
+- `Close(reason)` is the single authoritative teardown, callable from
+  any goroutine any number of times: ctx cancel → conn closes →
+  `OnClose` hooks, exactly once (first reason wins). `Done()` signals
+  completion; `Reason()` records why.
+- Invalid transitions (activate/half-close after close, half-close from
+  Pending, re-marking a direction) are documented no-ops.
+
+### Termination semantics (kept distinct)
+
+- client EOF → best-effort `FrameClose` up + up half-close; the download
+  KEEPS FLOWING. (Pre-Phase 4: a client EOF hard-closed the whole session
+  on the Iran side and discarded the target's in-flight response — fixed.)
+- target EOF → `FrameClose` down (Germany) / `CloseWrite` on the client
+  (Iran) + down half-close; already-buffered data is not discarded.
+- upload/download carrier failure, carrier replacement, local socket
+  read/write failure, peer `FrameClose` on the up stream (dial failure /
+  no down-carrier) and explicit cancellation/timeout are hard
+  `Close(reason)` calls with distinct reasons; every relay selects on
+  `Ctx.Done()` so a close always unblocks the other relays.
+
+### Ownership
+
+- The binaries install carrier deregistration + store unindex +
+  `decSession` once via `OnClose` → each runs exactly once (no double
+  metric decrements, no double stream removal, no double socket close,
+  no use-after-close, no leaked goroutines).
+- `SessionStore.Remove` is a pure unindex now (it used to close the
+  client conn and cancel the ctx — that moved to `Session.Close`);
+  `Add`/`AddStream` refuse already-closing sessions (checked under the
+  store lock, atomic with `Remove`) so late registrations cannot leak
+  indices; `CloseAll` closes via `Session.Close` outside the lock
+  (resolves known failure #8).
+
+### Tests (pkg/session/lifecycle_test.go, new — 18 tests)
+
+normal lifecycle; client-first / target-first / upload / download
+half-closes; both directions simultaneously; carrier close while active;
+timeout while a relay is blocked; double Close; 12 concurrent Close;
+no goroutine leak; Closed-never-reactivates; half-close-from-Pending
+no-op; late `OnClose` runs immediately; combined 6-direction termination
+(cleanup exactly once); client-FIN keeps the download flowing with
+buffered data intact; store cleanup while registering; store cleanup
+while deregistering; metrics net-zero after 60 racing close attempts.
+`session_test.go` store tests updated to the new ownership.
+
+Both mains (`handleSOCKS5Conn`, `bootstrapUpStream`) rewritten on this
+lifecycle; `e2e-pipe-test` is unchanged and passing (protocol untouched).
+
 ## Known failures / pre-existing defects (NOT fixed here — planned phases)
 
 Documented so later phases can verify each one is addressed:
@@ -197,8 +269,9 @@ Documented so later phases can verify each one is addressed:
    bytes up/down, errors). → Phase 8 (observability).
 7. `SessionStore.Wait` polls at 10 ms with `time.Sleep` (fine at current
    scale; noted for later).
-8. `SessionStore.CloseAll` holds only a `RLock` while calling `Close()` on
-   conns (works today because Close does not take the store lock; noted).
+8. FIXED in Phase 4: `SessionStore.CloseAll` snapshots under the read
+   lock and closes each session via `Session.Close` with no store lock
+   held.
 9. `WriteDestinationBuffer` silently truncates >255-char domains while
    `WriteDestination` rejects them — inconsistent; pinned by a test.
    (Behavior preserved; revisit in Phase 7.)
@@ -212,54 +285,55 @@ Documented so later phases can verify each one is addressed:
 
 ## Tests passed
 
-- `go test ./... -count=1` — PASS (all packages)
-- `go test ./pkg/mux/ -count=5` (backpressure subset) — PASS (5× to shake
-  out timing-sensitive pressure/termination races)
+- `gofmt -l .` — clean
 - `go vet ./...` — PASS
 - `go build ./...` — PASS (windows/amd64)
 - `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- `go test ./... -count=3` — PASS (all packages; 3× to shake out
+  timing-sensitive termination races)
 - `go run ./e2e-pipe-test` — PASS
-- `gofmt -l .` — clean
 
-`go test -race ./...` — still cannot execute on this Windows host (toolchain
-crash at startup, verified in Phase 0 with an unrelated module). The new
-shutdown logic is channel/lock-ordered by construction (see Phase 2 notes);
+`go test -race ./...` — still cannot execute on this Windows host (same
+`0xc0000139` toolchain crash as Phases 1–3). The lifecycle is lock-ordered
+by construction: all state under `s.mu`, teardown under `sync.Once`;
 `-race` should be run in any Linux CI as a final confirmation.
 
 ## Next phase
 
-Phase 4 is not yet scoped on the roadmap (Phases 5–8 are assigned under
-"Known failures"); the next defined item is Phase 5 — reconnect/rebind
-(Issue A: sessions bound to a CarrierConn). Scope Phase 4 first
-(candidate: soak/load testing of the new mailbox + termination paths).
+Phase 5 — reconnect/rebind (Issue A: sessions bound to a CarrierConn):
+make sessions survive carrier replacement by rebinding them to a new
+`CarrierConn` (reconnect grace, stream re-registration, in-flight stream
+policy). Build on the Phase 4 lifecycle: rebind = re-register the streams
+of an Active session on the new carrier; the `OnClose` hooks already make
+deregistration idempotent, and carrier replacement is today a plain
+`Close("carrier replaced")`.
 
 ## Files modified (this commit)
 
-- `pkg/mux/queue.go` (new — bounded StreamQueue mailbox)
-- `pkg/mux/carrier.go` (streamRec, StreamLimits/SanitizeLimits/
-  SetStreamLimits, aggregate queuedBytes, non-blocking Dispatch/deliver,
-  applyPressure, terminateStream, streamWorker, Close reclaims discarded
-  bytes from the budget)
-- `pkg/mux/queue_test.go` (new — 6 mailbox + SanitizeLimits tests)
-- `pkg/mux/backpressure_test.go` (new — 7 backpressure tests)
+- `pkg/session/session.go` (State/Direction state machine, NewSession,
+  Activate, MarkDirClosed, Close/teardown, OnClose, Done/Reason/DirClosed;
+  store: Add/AddStream closing-guard, pure Remove, CloseAll via
+  Session.Close)
+- `pkg/session/lifecycle_test.go` (new — 18 lifecycle/termination tests)
+- `pkg/session/session_test.go` (store tests updated to the new ownership)
 - `cmd/iran-splitter/main.go`, `cmd/germany-splitter/main.go`
-  (SPLIT_STREAM_QUEUE_* / SPLIT_STREAM_OVERFLOW_MS parsing +
-  SetStreamLimits on all four carrier-creation sites)
-- `IMPLEMENTATION_STATUS.md` (phase 3 update)
-- `README.md` (new env vars documented)
+  (handleSOCKS5Conn / bootstrapUpStream rewritten on the lifecycle)
+- `IMPLEMENTATION_STATUS.md` (phase 4 update)
+- `README.md` (session lifecycle section updated)
 
 ## Commit
 
-(see `git log --oneline -1` on branch hardening/production-reliability)
+Subject `phase-4-session-lifecycle` on branch
+`hardening/production-reliability` (see `git log --oneline -1`).
 
 ## Rollback
 
 ```
-git revert <phase-3-stream-backpressure-commit>
+git revert <phase-4-session-lifecycle-commit>
 ```
 
-Phase 3 touches `pkg/mux` plus both mains (config wiring only); no
-wire-protocol changes, so the revert is self-contained.
+Phase 4 touches `pkg/session` plus both mains (lifecycle wiring only);
+no wire-protocol changes, so the revert is self-contained.
 
 or to abandon the whole effort:
 

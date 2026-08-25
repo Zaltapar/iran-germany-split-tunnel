@@ -444,12 +444,12 @@ func socksReply(w io.Writer, status byte) {
 }
 
 func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
-	defer clientConn.Close()
 	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
 
 	dest, err := socksNegotiate(clientConn)
 	if err != nil {
 		s.logger.Printf("SOCKS5 negotiation: %v (from %s)", err, clientConn.RemoteAddr())
+		clientConn.Close()
 		return
 	}
 	_ = clientConn.SetDeadline(time.Time{})
@@ -460,47 +460,42 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	if err != nil {
 		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
 		socksReply(clientConn, 0x06) // general SOCKS server failure
+		clientConn.Close()
 		return
 	}
 
-	// --- Create session ---
+	// --- Create the session (Phase 4: the session owns the client conn) ---
 	rawSid, _ := session.GenerateSessionID()
 	var sid session.SessionID
 	copy(sid[:], rawSid)
 
 	streamID := atomic.AddUint32(&s.streamID, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session.Session{
-		ID:           sid,
-		Dest:         dest,
-		ClientConn:   clientConn,
-		StreamIDUp:   streamID,
-		StreamIDDown: streamID,
-		Ctx:          ctx,
-		Cancel:       cancel,
-	}
+	sess := session.NewSession(sid, dest, clientConn, nil, context.Background())
+	sess.StreamIDUp = streamID
+	sess.StreamIDDown = streamID
+	// Binary-owned teardown, run exactly once by Session.Close: carrier
+	// deregistration, store unindex, metric decrement.
+	sess.OnClose(func() {
+		upC.Deregister(streamID)
+		downC.Deregister(streamID)
+		s.store.Remove(sid)
+		s.metrics.decSession()
+		s.logger.Printf("Session %s cleaned up (%s)", sid.String(), sess.Reason())
+	})
 	s.store.Add(sid, sess)
 	s.store.AddStream(sess)
 	s.metrics.incSession()
 	s.logger.Printf("Session %s → %s:%d (stream %d)", sid.String(), dest.Addr, dest.Port, streamID)
 
-	var once sync.Once
-	cleanup := func() {
-		once.Do(func() {
-			cancel()
-			s.store.RemoveStream(sess)
-			s.store.Remove(sid)
-			s.metrics.decSession()
-			s.logger.Printf("Session %s cleaned up", sid.String())
-		})
-	}
-
 	// Register this session's streams in both carrier demuxers
 	upCh := upC.Register(streamID)
 	downCh := downC.Register(streamID)
 	if upCh == nil || downCh == nil {
-		cleanup()
+		sess.Close("carrier stream registration failed")
+		return
+	}
+	if !sess.Activate() {
+		sess.Close("session activate failed")
 		return
 	}
 
@@ -511,80 +506,125 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	hdrBuf := make([]byte, session.MaxHeaderSize)
 	n := session.WriteDestinationBuffer(hdrBuf, dest)
 	if n <= 0 {
-		cleanup()
+		sess.Close("destination encode failed")
 		return
 	}
 	if err := upC.WriteFrame(streamID, mux.FrameHeader, hdrBuf[:n]); err != nil {
 		s.logger.Printf("Session %s up-carrier header: %v", sid.String(), err)
-		cleanup()
+		sess.Close("up-carrier header write failed")
 		return
 	}
 
-	// Up-carrier stream watcher: a FrameClose from Germany tears the
-	// session down (unexpected data frames are ignored).
+	upWatchDone := make(chan struct{})
+	downDone := make(chan struct{})
+	upRelayDone := make(chan struct{})
+
+	// Up-carrier stream watcher: a FrameClose from Germany (dial failure,
+	// down-carrier not ready) tears the session down. Unexpected data
+	// frames in this direction are ignored.
 	go func() {
-		defer upC.Deregister(streamID)
-		for frame := range upCh {
-			if frame == nil {
-				s.logger.Printf("Session %s: up-carrier closed by Germany", sid.String())
-				cleanup()
+		defer close(upWatchDone)
+		for {
+			select {
+			case <-sess.Ctx.Done():
 				return
+			case frame, ok := <-upCh:
+				if !ok {
+					sess.Close("up carrier closed")
+					return
+				}
+				if frame == nil {
+					s.logger.Printf("Session %s: up-carrier closed by Germany", sid.String())
+					sess.Close("up stream closed by peer")
+					return
+				}
 			}
 		}
-		cleanup()
 	}()
 
-	// Down-carrier relay: Germany → client (download direction)
+	// Down relay: down-carrier → client (download direction)
 	go func() {
-		defer downC.Deregister(streamID)
-		for frame := range downCh {
-			if frame == nil {
-				// target finished: half-close the client side
-				if tc, ok := clientConn.(*net.TCPConn); ok {
-					_ = tc.CloseWrite()
-				}
-				cleanup()
-				return
-			}
+		defer close(downDone)
+		for {
 			select {
-			case <-ctx.Done():
+			case <-sess.Ctx.Done():
+				return
+			case frame, ok := <-downCh:
+				if !ok {
+					sess.Close("down carrier closed")
+					return
+				}
+				if frame == nil {
+					// Target finished (FrameClose from Germany):
+					// half-close the client write side. Every frame has
+					// already been written, so the data the client has
+					// not read yet stays deliverable.
+					if tc, ok := clientConn.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+					sess.MarkDirClosed(session.DirDown, "target EOF")
+					return
+				}
+				s.metrics.incDown(int64(len(frame)))
+				if _, werr := clientConn.Write(frame); werr != nil {
+					s.logger.Printf("Session %s client write: %v", sid.String(), werr)
+					sess.Close("client write failed")
+					return
+				}
+			}
+		}
+	}()
+
+	// Up relay: client → up-carrier (upload direction)
+	go func() {
+		defer close(upRelayDone)
+		buf := make([]byte, s.config.RelayBufSize)
+		for {
+			select {
+			case <-sess.Ctx.Done():
 				return
 			default:
 			}
-			s.metrics.incDown(int64(len(frame)))
-			if _, werr := clientConn.Write(frame); werr != nil {
-				cleanup()
+			n, rerr := clientConn.Read(buf)
+			if n > 0 {
+				s.metrics.incUp(int64(n))
+				if werr := upC.WriteFrame(streamID, mux.FrameData, buf[:n]); werr != nil {
+					s.logger.Printf("Session %s up-carrier write: %v", sid.String(), werr)
+					sess.Close("up-carrier write failed")
+					return
+				}
+				// Carrier replaced underneath us → tear down (the old
+				// carrier is torn down by its own run loop).
+				if s.getUp() != upC {
+					sess.Close("up carrier replaced")
+					return
+				}
+			}
+			if rerr != nil {
+				// Tell Germany the client side is finished (best effort).
+				_ = upC.WriteFrame(streamID, mux.FrameClose, nil)
+				if errors.Is(rerr, io.EOF) {
+					// Client FIN: half-close ONLY. Germany closes its
+					// target write side; the target may still send
+					// response data, which the down relay keeps
+					// delivering until the target EOF.
+					sess.MarkDirClosed(session.DirUp, "client EOF")
+				} else {
+					s.logger.Printf("Session %s client read: %v", sid.String(), rerr)
+					sess.Close("client read error")
+				}
 				return
 			}
 		}
-		cleanup()
 	}()
 
-	// Relay: client → up-carrier (upload direction)
-	buf := make([]byte, s.config.RelayBufSize)
-	for {
-		n, rerr := clientConn.Read(buf)
-		if n > 0 {
-			s.metrics.incUp(int64(n))
-			if werr := upC.WriteFrame(streamID, mux.FrameData, buf[:n]); werr != nil {
-				s.logger.Printf("Session %s up-carrier write: %v", sid.String(), werr)
-				break
-			}
-			// carrier replaced underneath us → tear down
-			if s.getUp() != upC {
-				break
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				s.logger.Printf("Session %s client read: %v", sid.String(), rerr)
-			}
-			break
-		}
-	}
-	// Half-close: tell Germany the client side is finished
-	_ = upC.WriteFrame(streamID, mux.FrameClose, nil)
-	cleanup()
+	// Wait for both directions (and the watcher) to finish, then
+	// finalize. If a direction already closed the session, this is an
+	// idempotent no-op.
+	<-upRelayDone
+	<-downDone
+	<-upWatchDone
+	sess.Close("session ended")
 }
 
 // ============================================================

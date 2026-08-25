@@ -225,7 +225,7 @@ func TestSessionStoreAddGetRemove(t *testing.T) {
 	var sid SessionID
 	sid[0] = 0x11
 	fc := &fakeConn{}
-	s := &Session{ID: sid, ClientConn: fc}
+	s := NewSession(sid, nil, fc, nil, context.Background())
 	ss.Add(sid, s)
 	if n := ss.Count(); n != 1 {
 		t.Fatalf("Count = %d, want 1", n)
@@ -248,8 +248,10 @@ func TestSessionStoreAddGetRemove(t *testing.T) {
 	if n := ss.Count(); n != 0 {
 		t.Fatalf("Count after Remove = %d, want 0", n)
 	}
-	if !fc.closed {
-		t.Error("Remove did not close the client connection")
+	// Phase 4 ownership: Remove is a pure unindex — closing the client
+	// connection belongs to Session.Close, not to the store.
+	if fc.closed {
+		t.Error("Remove closed the client connection (must be pure unindex)")
 	}
 	// Remove must be idempotent: a second Remove must not panic or change state.
 	ss.Remove(sid)
@@ -258,17 +260,25 @@ func TestSessionStoreAddGetRemove(t *testing.T) {
 	}
 }
 
-func TestSessionStoreRemoveCancelsContext(t *testing.T) {
+func TestSessionStoreRemoveDoesNotCancel(t *testing.T) {
+	// Phase 4: context cancellation belongs to Session.Close. The store
+	// only unindexes.
 	ss := NewSessionStore()
 	var sid SessionID
-	s := &Session{ID: sid}
-	s.Ctx, s.Cancel = context.WithCancel(context.Background())
+	s := NewSession(sid, nil, nil, nil, context.Background())
 	ss.Add(sid, s)
 	ss.Remove(sid)
 	select {
 	case <-s.Ctx.Done():
+		t.Fatal("Remove cancelled the session context (must be pure unindex)")
 	default:
-		t.Fatal("Remove did not cancel the session context")
+	}
+	// ...and Close cancels it.
+	s.Close("test")
+	select {
+	case <-s.Ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel the session context")
 	}
 }
 

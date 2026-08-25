@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -336,17 +337,22 @@ func nextBackoff(b time.Duration) time.Duration {
 //	up-carrier stream → target socket        (upload)
 //	target socket → down-carrier             (download, strictly)
 func (s *Splitter) bootstrapUpStream(upC *mux.CarrierConn, streamID uint32, ch chan []byte) {
-	defer upC.Deregister(streamID)
-
 	// First frame: the Header payload (encoded destination)
-	hdr := <-ch
+	hdr, ok := <-ch
+	if !ok {
+		// carrier died before the header arrived: nothing to bootstrap
+		upC.Deregister(streamID)
+		return
+	}
 	if hdr == nil {
-		// Late FrameClose for an already-torn-down stream — nothing to do
+		// Late FrameClose for an already-torn-down stream: nothing to do
+		upC.Deregister(streamID)
 		return
 	}
 	dest := session.ParseDestinationFromBuf(hdr)
 	if dest == nil {
 		s.logger.Printf("Up-carrier stream %d: invalid destination header", streamID)
+		upC.Deregister(streamID)
 		return
 	}
 	addr := net.JoinHostPort(dest.Addr, strconv.Itoa(int(dest.Port)))
@@ -358,6 +364,7 @@ func (s *Splitter) bootstrapUpStream(upC *mux.CarrierConn, streamID uint32, ch c
 		s.logger.Printf("Stream %d: dial %s: %v", streamID, addr, err)
 		s.metrics.incErr()
 		_ = upC.WriteFrame(streamID, mux.FrameClose, nil) // session dead
+		upC.Deregister(streamID)
 		return
 	}
 	s.logger.Printf("Stream %d: target connected", streamID)
@@ -365,94 +372,106 @@ func (s *Splitter) bootstrapUpStream(upC *mux.CarrierConn, streamID uint32, ch c
 	downC := s.getDown()
 	if downC == nil || !downC.Ready() {
 		s.logger.Printf("Stream %d: down-carrier not ready, dropping", streamID)
-		destConn.Close()
+		destConn.Close() // no session yet: the bootstrap owns the conn
 		_ = upC.WriteFrame(streamID, mux.FrameClose, nil)
+		upC.Deregister(streamID)
 		return
 	}
 
-	// Register the active session
+	// Register the active session (Phase 4: the session owns destConn)
 	sidBytes, _ := session.GenerateSessionID()
 	var sid session.SessionID
 	copy(sid[:], sidBytes)
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session.Session{
-		ID:           sid,
-		Dest:         dest,
-		StreamIDUp:   streamID,
-		StreamIDDown: streamID,
-		Ctx:          ctx,
-		Cancel:       cancel,
-	}
+	sess := session.NewSession(sid, dest, nil, destConn, context.Background())
+	sess.StreamIDUp = streamID
+	sess.StreamIDDown = streamID
+	// Binary-owned teardown, run exactly once by Session.Close: carrier
+	// deregistration, store unindex, metric decrement.
+	sess.OnClose(func() {
+		upC.Deregister(streamID)
+		downC.Deregister(streamID)
+		s.store.Remove(sid)
+		s.metrics.decSession()
+		s.logger.Printf("Stream %d cleaned up (%s)", streamID, sess.Reason())
+	})
 	s.store.Add(sid, sess)
 	s.store.AddStream(sess)
 	s.metrics.incSession()
 	s.logger.Printf("Stream %d: session %s registered", streamID, sid.String())
-
-	var once sync.Once
-	cleanup := func() {
-		once.Do(func() {
-			cancel()
-			destConn.Close()
-			s.store.RemoveStream(sess)
-			s.store.Remove(sid)
-			s.metrics.decSession()
-			s.logger.Printf("Stream %d cleaned up", streamID)
-		})
+	if !sess.Activate() {
+		sess.Close("session activate failed")
+		return
 	}
 
-	// Both relays report completion; cleanup runs after they are done.
+	// Both relays report completion; the session is finalized after they
+	// are done.
 	upDone := make(chan struct{})
 	downDone := make(chan struct{})
 
-	// Up-relay: up-carrier stream → target
+	// Up relay: up-carrier stream → target (upload direction)
 	go func() {
 		defer close(upDone)
 		for {
 			select {
-			case <-ctx.Done():
+			case <-sess.Ctx.Done():
 				return
 			case frame, ok := <-ch:
 				if !ok {
-					return // carrier died
+					sess.Close("up carrier closed")
+					return
 				}
 				if frame == nil {
-					// FrameClose from Iran: client finished → half-close target
+					// FrameClose from Iran: client finished. Half-close
+					// the target write side; the target may still send
+					// response data (the download keeps flowing).
 					if tc, ok := destConn.(*net.TCPConn); ok {
 						_ = tc.CloseWrite()
 					}
+					sess.MarkDirClosed(session.DirUp, "client EOF (FrameClose)")
 					return
 				}
 				s.metrics.incUp(int64(len(frame)))
 				if _, werr := destConn.Write(frame); werr != nil {
 					s.logger.Printf("Stream %d target write: %v", streamID, werr)
+					sess.Close("target write failed")
 					return
 				}
 			}
 		}
 	}()
 
-	// Down-relay: target → down-carrier (strictly)
+	// Down relay: target → down-carrier (download direction, strictly)
 	go func() {
 		defer close(downDone)
 		buf := make([]byte, s.config.RelayBufSize)
 		for {
+			select {
+			case <-sess.Ctx.Done():
+				return
+			default:
+			}
 			n, rerr := destConn.Read(buf)
 			if n > 0 {
 				s.metrics.incDown(int64(n))
 				if werr := downC.WriteFrame(streamID, mux.FrameData, buf[:n]); werr != nil {
 					s.logger.Printf("Stream %d down-carrier write: %v", streamID, werr)
-					break
+					sess.Close("down carrier write failed")
+					return
 				}
 			}
 			if rerr != nil {
-				if rerr != io.EOF {
+				if errors.Is(rerr, io.EOF) {
+					// Target finished: propagate FrameClose over the
+					// down-carrier, then half-close this direction.
+					_ = downC.WriteFrame(streamID, mux.FrameClose, nil)
+					sess.MarkDirClosed(session.DirDown, "target EOF")
+				} else {
 					s.logger.Printf("Stream %d target read: %v", streamID, rerr)
+					sess.Close("target read error")
 				}
-				break
+				return
 			}
 		}
-		// target finished: propagate FrameClose over the down-carrier
-		_ = downC.WriteFrame(streamID, mux.FrameClose, nil)
 	}()
 
 	// Wait for the up direction to end, then give the down relay a grace
@@ -462,8 +481,10 @@ func (s *Splitter) bootstrapUpStream(upC *mux.CarrierConn, streamID uint32, ch c
 	select {
 	case <-downDone:
 	case <-time.After(10 * time.Second):
+		sess.Close("target did not finish after client EOF")
 	}
-	cleanup()
+	<-downDone                  // if the timeout closed the session, wait for the relay
+	sess.Close("session ended") // idempotent finalizer
 }
 
 // ============================================================

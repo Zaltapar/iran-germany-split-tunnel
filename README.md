@@ -144,9 +144,16 @@ Header (7 bytes): `StreamID uint32 BE | Type uint8 | Length uint16 BE` — paylo
    target (`net.DialTimeout` 10 s), registers the session, and starts:
    - up relay: up-carrier `FrameData` → target socket
    - down relay: target socket → down-carrier `FrameData` (download only)
-3. Teardown: client EOF → Iran `FrameClose` (up); target EOF → Germany `FrameClose` (down);
-   both sides deregister streams and close sockets. `FrameClose` for an unknown/late stream is a
-   no-op.
+3. Teardown: each session runs an explicit state machine
+   (`Pending → Active → Closing → Closed` with per-direction half-close).
+   Client EOF → Iran `FrameClose` (up) + up half-close: the target's
+   in-flight response keeps flowing. Target EOF → Germany `FrameClose`
+   (down) + down half-close. Any hard failure (carrier loss, socket
+   error, cancellation) tears the session down through one authoritative
+   `Session.Close(reason)`: socket close, stream deregistration, store
+   unindex and metric decrement each run exactly once, no matter how
+   many directions request termination at once. `FrameClose` for an
+   unknown/late stream is a no-op.
 
 ## Local end-to-end test
 
