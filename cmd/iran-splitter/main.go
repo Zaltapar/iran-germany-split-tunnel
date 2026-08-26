@@ -141,6 +141,11 @@ type Splitter struct {
 	socksLn net.Listener
 	upLn    net.Listener
 	mLn     net.Listener
+
+	// Up-carrier auth-failure backoff state (Phase 6).
+	authFailMu sync.Mutex
+	authFails  int
+	authFailAt time.Time
 }
 
 func (s *Splitter) getUp() *mux.CarrierConn {
@@ -227,6 +232,12 @@ func main() {
 		cfg.OverflowWaitMs = parseInt(v)
 	}
 
+	// Fail fast on insecure secret material (Phase 6). The blocklist is
+	// always enforced; the length policy has a dev/test bypass.
+	if err := mux.ValidateSecretMaterial(cfg.Secret, os.Getenv("SPLIT_ALLOW_WEAK_SECRET") == "1"); err != nil {
+		log.Fatalf("invalid SPLIT_SECRET: %v (generate one with: openssl rand -hex 32)", err)
+	}
+
 	derived := mux.DeriveSecret(cfg.Secret)
 	s := &Splitter{
 		config:  cfg,
@@ -281,15 +292,81 @@ func main() {
 // Germany dials wss://<cdn-domain>/upload → CDN → nginx → here
 // ============================================================
 
+// Up-carrier handshake resource limits (Phase 6): bound concurrent
+// in-flight handshakes, and back off new handshakes after a burst of
+// repeated authentication failures (a per-process counter, no
+// distributed state).
+const (
+	maxConcurrentHandshakes = 16
+	authFailBackoffLimit    = 10
+	authFailBackoffWindow   = 60 * time.Second
+)
+
 func (s *Splitter) runUpCarrier() {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
-		CheckOrigin:     func(r *http.Request) bool { return true },
+		// Machine-to-machine carrier: the Origin header is NOT a security
+		// boundary here (carrier dialers send no Origin; browsers are not
+		// legitimate clients of this endpoint). The real security boundary
+		// is the v1 challenge/response carrier authentication (plus
+		// TLS/Reality in the transport), so the permissive origin policy is
+		// deliberate and documented — do not "tighten" it without
+		// breaking CDN dial patterns.
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
 	muxHTTP := http.NewServeMux()
-	muxHTTP.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+	muxHTTP.HandleFunc("/upload", s.uploadHandler(upgrader))
+	// Every other path gets the mux's default 404; the carrier is only
+	// ever established on /upload.
+
+	ln, err := net.Listen("tcp", s.config.WsListen)
+	if err != nil {
+		s.logger.Fatalf("Up-carrier WS listener: %v", err)
+	}
+	s.lnMu.Lock()
+	s.upLn = ln
+	s.lnMu.Unlock()
+	defer ln.Close()
+	s.logger.Printf("Up-carrier WS server listening on %s (path /upload)", s.config.WsListen)
+
+	// ReadHeaderTimeout bounds the UNAUTHENTICATED request phase;
+	// IdleTimeout reclaims idle keep-alive sockets. Read/Write timeouts
+	// must stay ZERO: after the upgrade the connection is a long-lived
+	// authenticated carrier and must never be killed by a write timeout.
+	srv := &http.Server{
+		Handler:           muxHTTP,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		s.logger.Printf("Up-carrier WS server error: %v", err)
+	}
+}
+
+// uploadHandler is the /upload HTTP handler: method check, auth-failure
+// backoff, bounded handshake concurrency, single-carrier enforcement,
+// then the WebSocket upgrade.
+func (s *Splitter) uploadHandler(upgrader websocket.Upgrader) http.HandlerFunc {
+	sem := make(chan struct{}, maxConcurrentHandshakes)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.authInBackoff() {
+			s.logger.Printf("Up-carrier: rejected handshake from %s (auth-failure backoff active)", r.RemoteAddr)
+			http.Error(w, "too many failed authentications; retry later", http.StatusTooManyRequests)
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			http.Error(w, "too many concurrent handshakes", http.StatusServiceUnavailable)
+			return
+		}
 		if s.getUp() != nil {
 			s.logger.Printf("Up-carrier: rejected %s (carrier already connected)", r.RemoteAddr)
 			http.Error(w, "up-carrier already connected", http.StatusConflict)
@@ -303,21 +380,35 @@ func (s *Splitter) runUpCarrier() {
 		s.logger.Printf("Up-carrier WS connected from %s", r.RemoteAddr)
 		s.handleUpWsConn(wsConn)
 		s.logger.Printf("Up-carrier WS disconnected from %s", r.RemoteAddr)
-	})
-
-	ln, err := net.Listen("tcp", s.config.WsListen)
-	if err != nil {
-		s.logger.Fatalf("Up-carrier WS listener: %v", err)
 	}
-	s.lnMu.Lock()
-	s.upLn = ln
-	s.lnMu.Unlock()
-	defer ln.Close()
-	s.logger.Printf("Up-carrier WS server listening on %s (path /upload)", s.config.WsListen)
+}
 
-	if err := http.Serve(ln, muxHTTP); err != nil && err != http.ErrServerClosed {
-		s.logger.Printf("Up-carrier WS server error: %v", err)
+// recordAuthFail / clearAuthFails / authInBackoff implement a lightweight
+// per-process backoff: after authFailBackoffLimit failures within
+// authFailBackoffWindow, new handshakes are rejected (HTTP 429) until the
+// window lapses. A successful authentication resets the counter.
+func (s *Splitter) recordAuthFail() {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	if s.authFails > 0 && time.Since(s.authFailAt) > authFailBackoffWindow {
+		s.authFails = 0 // burst window lapsed
 	}
+	s.authFails++
+	if s.authFails == 1 {
+		s.authFailAt = time.Now()
+	}
+}
+
+func (s *Splitter) clearAuthFails() {
+	s.authFailMu.Lock()
+	s.authFails = 0
+	s.authFailMu.Unlock()
+}
+
+func (s *Splitter) authInBackoff() bool {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	return s.authFails >= authFailBackoffLimit && time.Since(s.authFailAt) <= authFailBackoffWindow
 }
 
 func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
@@ -328,12 +419,17 @@ func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	watchdog := time.AfterFunc(15*time.Second, func() { ws.Close() })
 	defer watchdog.Stop()
 
-	br, err := mux.CarrierAuth(context.Background(), wsc, false, s.secret)
+	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret)
 	if err != nil {
+		// The error is for LOCAL logging only; nothing about WHICH check
+		// failed is transmitted to the peer (the connection is simply
+		// closed by the auth implementation).
 		s.logger.Printf("Up-carrier auth failed from %s: %v", ws.RemoteAddr(), err)
+		s.recordAuthFail()
 		ws.Close()
 		return
 	}
+	s.clearAuthFails()
 	s.logger.Printf("Up-carrier authenticated from %s", ws.RemoteAddr())
 
 	carrier := mux.NewCarrierConn(wsc, s.config.KeepAliveInterval)
@@ -375,7 +471,7 @@ func (s *Splitter) runDownCarrier() {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		br, err := mux.CarrierAuth(ctx, conn, true, s.secret)
+		br, err := mux.CarrierAuth(ctx, conn, true, mux.RoleDownload, s.secret)
 		cancel()
 		if err != nil {
 			s.logger.Printf("Down-carrier auth to %s: %v (retrying in 2s)", s.config.DownCarrierAddr, err)

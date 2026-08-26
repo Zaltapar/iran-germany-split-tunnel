@@ -93,7 +93,7 @@ func (tp *topo) installUp() {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		br, err := mux.CarrierAuth(ctx, tp.upDe, true, tp.secret)
+		br, err := mux.CarrierAuth(ctx, tp.upDe, true, mux.RoleUpload, tp.secret)
 		if err != nil {
 			done <- err
 			return
@@ -101,7 +101,7 @@ func (tp *topo) installUp() {
 		tp.de.InstallUp(tp.upDe, br)
 		done <- nil
 	}()
-	br, err := mux.CarrierAuth(ctx, tp.upIr, false, tp.secret)
+	br, err := mux.CarrierAuth(ctx, tp.upIr, false, mux.RoleUpload, tp.secret)
 	if err != nil {
 		tp.t.Fatalf("up auth (iran): %v", err)
 	}
@@ -120,7 +120,7 @@ func (tp *topo) installDown() {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		br, err := mux.CarrierAuth(ctx, tp.downDe, false, tp.secret)
+		br, err := mux.CarrierAuth(ctx, tp.downDe, false, mux.RoleDownload, tp.secret)
 		if err != nil {
 			done <- err
 			return
@@ -128,7 +128,7 @@ func (tp *topo) installDown() {
 		tp.de.InstallDown(tp.downDe, br)
 		done <- nil
 	}()
-	br, err := mux.CarrierAuth(ctx, tp.downIr, true, tp.secret)
+	br, err := mux.CarrierAuth(ctx, tp.downIr, true, mux.RoleDownload, tp.secret)
 	if err != nil {
 		tp.t.Fatalf("down auth (iran): %v", err)
 	}
@@ -162,7 +162,7 @@ func (tp *topo) injectUpCarrier() *testutil.MemConn {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		br, err := mux.CarrierAuth(ctx, de, true, tp.secret)
+		br, err := mux.CarrierAuth(ctx, de, true, mux.RoleUpload, tp.secret)
 		if err != nil {
 			done <- err
 			return
@@ -170,7 +170,7 @@ func (tp *topo) injectUpCarrier() *testutil.MemConn {
 		tp.de.InstallUp(de, br)
 		done <- nil
 	}()
-	if _, err := mux.CarrierAuth(ctx, ir, false, tp.secret); err != nil {
+	if _, err := mux.CarrierAuth(ctx, ir, false, mux.RoleUpload, tp.secret); err != nil {
 		tp.t.Fatalf("injectUpCarrier auth (iran): %v", err)
 	}
 	if err := <-done; err != nil {

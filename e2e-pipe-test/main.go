@@ -70,10 +70,16 @@ func main() {
 	ad := make(chan authRes, 1)
 	gu := make(chan authRes, 1)
 	gd := make(chan authRes, 1)
-	go func() { br, err := mux.CarrierAuth(ctx, upIr, false, secret); au <- authRes{br, err} }()
-	go func() { br, err := mux.CarrierAuth(ctx, downIr, true, secret); ad <- authRes{br, err} }()
-	go func() { br, err := mux.CarrierAuth(ctx, upDe, true, secret); gu <- authRes{br, err} }()
-	go func() { br, err := mux.CarrierAuth(ctx, downDe, false, secret); gd <- authRes{br, err} }()
+	go func() { br, err := mux.CarrierAuth(ctx, upIr, false, mux.RoleUpload, secret); au <- authRes{br, err} }()
+	go func() {
+		br, err := mux.CarrierAuth(ctx, downIr, true, mux.RoleDownload, secret)
+		ad <- authRes{br, err}
+	}()
+	go func() { br, err := mux.CarrierAuth(ctx, upDe, true, mux.RoleUpload, secret); gu <- authRes{br, err} }()
+	go func() {
+		br, err := mux.CarrierAuth(ctx, downDe, false, mux.RoleDownload, secret)
+		gd <- authRes{br, err}
+	}()
 	auths := map[string]chan authRes{"iran-up": au, "iran-down": ad, "germany-up": gu, "germany-down": gd}
 	brs := map[string]*bufio.Reader{}
 	for name, ch := range auths {
@@ -152,9 +158,20 @@ func main() {
 	deDone := make(chan struct{})
 	deUpDone := make(chan struct{})
 	upDeC.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
-		// Frame-type-aware dispatch (Phase 5): this test opens streams
-		// only via FrameHeader; any other opener is a protocol violation.
+		// Frame-type-aware dispatch (Phase 5): streams are opened only via
+		// FrameHeader. A non-header opener is a protocol violation EXCEPT
+		// a late FrameClose for an already-deregistered stream: after
+		// Deregister, any frame for the ID starts a NEW stream (documented
+		// carrier behavior), and production drops such non-header openers
+		// rather than treating them as new sessions.
 		if firstType != mux.FrameHeader {
+			if firstType == mux.FrameClose {
+				go func() {
+					for range ch { /* discard the late close */
+					}
+				}()
+				return
+			}
 			fail("germany: stream %d opened by frame type 0x%02x, want FrameHeader (0x%02x)", id, firstType, mux.FrameHeader)
 		}
 		go func() {

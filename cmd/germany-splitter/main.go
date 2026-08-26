@@ -206,6 +206,12 @@ func main() {
 		cfg.OverflowWaitMs = parseInt(v)
 	}
 
+	// Fail fast on insecure secret material (Phase 6). The blocklist is
+	// always enforced; the length policy has a dev/test bypass.
+	if err := mux.ValidateSecretMaterial(cfg.Secret, os.Getenv("SPLIT_ALLOW_WEAK_SECRET") == "1"); err != nil {
+		log.Fatalf("invalid SPLIT_SECRET: %v (generate one with: openssl rand -hex 32)", err)
+	}
+
 	derived := mux.DeriveSecret(cfg.Secret)
 	s := &Splitter{
 		config:  cfg,
@@ -271,7 +277,7 @@ func (s *Splitter) runUpCarrier() {
 
 		wsc := &wsConn{conn: conn}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		br, err := mux.CarrierAuth(ctx, wsc, true, s.secret)
+		br, err := mux.CarrierAuth(ctx, wsc, true, mux.RoleUpload, s.secret)
 		cancel()
 		if err != nil {
 			s.logger.Printf("Up-carrier auth failed: %v (retrying in %s)", err, backoff)
@@ -542,7 +548,7 @@ func (s *Splitter) handleDownConn(conn net.Conn) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	br, err := mux.CarrierAuth(ctx, conn, false, s.secret)
+	br, err := mux.CarrierAuth(ctx, conn, false, mux.RoleDownload, s.secret)
 	cancel()
 	if err != nil {
 		s.logger.Printf("Down-carrier auth failed from %s: %v", conn.RemoteAddr(), err)

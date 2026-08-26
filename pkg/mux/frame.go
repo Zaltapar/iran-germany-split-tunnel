@@ -25,6 +25,16 @@ const (
 // exceeds the 16-bit Length field.
 var ErrPayloadTooLarge = errors.New("mux: frame payload too large")
 
+// ErrProtocolViolation is set as the carrier's ReadErr when a post-auth
+// frame violates the protocol's frame-context rules (see
+// CarrierConn.readLoop): FrameAuth is only valid during the handshake, and
+// application frames (Data/Header/Rebind/Close) are never valid on the
+// reserved control stream 0. Such a violation is a connection-level
+// failure: the carrier is terminated rather than the frame dropped,
+// because a peer producing it is either a v0 peer (incompatible with the
+// v1 auth, both ends must be upgraded together) or actively attacking.
+var ErrProtocolViolation = errors.New("mux: protocol violation")
+
 // Frame types
 const (
 	FrameData   uint8 = 0x00 // user data payload

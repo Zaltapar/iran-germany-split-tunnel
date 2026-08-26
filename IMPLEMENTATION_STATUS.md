@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 5 (reconnect/rebind) — COMPLETE
+## Current phase: Phase 6 (security hardening) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -435,3 +435,173 @@ commit.
 git revert <phase-5-build-fix-commit>
 git revert <phase-5-reconnect-rebind-commit>
 ```
+## Phase 6 — security hardening
+
+### Authentication protocol v1 (replaces v0)
+
+The v0 handshake sent the 32-byte derived secret itself on the wire
+(`FrameAuth` payload), making any captured handshake replayable forever.
+v1 (`pkg/mux/auth.go`, new file) is a three-message **mutual**
+HMAC-SHA256 challenge/response on `FrameAuth`/StreamID 0:
+
+1. **Challenge** (responder → initiator), 22 B:
+   `version(1) | role | ts_s uint32 BE | nonce_s 16B (crypto/rand)`
+2. **Response** (initiator → responder), 74 B:
+   `version | role | ts_c | echo(ts_s) | echo(nonce_s) | nonce_c 16B |
+   mac_c = HMAC-SHA256(secret, challenge ‖ ts_c ‖ nonce_c)`
+3. **Confirmation** (responder → initiator), 50 B:
+   `version | role | nonce_s2 16B |
+   mac_s = HMAC-SHA256(secret, challenge ‖ response ‖ nonce_s2)`
+
+- **Raw secret never on the wire** — only HMAC tags over fresh data
+  (stdlib `crypto/hmac`, `crypto/sha256`, `crypto/rand`,
+  `crypto/subtle`; constant-time MAC and echo comparisons).
+- **Replay resistance without any nonce store**: every handshake starts
+  with a fresh 128-bit server nonce covered by both MACs; the response
+  must echo the current challenge (ts_s + nonce_s), so a captured
+  response/confirmation from an earlier handshake fails the echo check
+  against any new challenge. Nothing to remember → nothing unbounded.
+- **Role binding**: `RoleUpload` ('U') / `RoleDownload` ('D') are inside
+  both MAC transcripts — a valid secret cannot authenticate the wrong
+  carrier direction; a replayed upload handshake cannot become a
+  download handshake.
+- **Versioning**: `AuthVersion = 1`; unknown versions rejected before MAC
+  verification. **Compatibility: v0 ⇄ v1 is NOT interoperable — both
+  nodes must be upgraded together** (documented in README).
+- **Freshness**: both ends check the peer timestamp within ±60 s
+  (`AuthMaxClockSkew`); defense in depth on top of the nonces.
+- **Hard timeout**: `AuthTimeout` (15 s, variable for tests) bounds the
+  whole handshake and is applied as a socket deadline (`SetDeadline`
+  where supported), even with a deadline-less context — a silent/stalling
+  attacker cannot hold a connection.
+- **Failure handling**: every failure is a connection-level close with NO
+  protocol error transmitted (no "correct role but wrong HMAC" leakage);
+  the returned error is for local logging only.
+- **Auth state machine**: `Unauthenticated → challenge/response →
+  Authenticated`. During the handshake only `FrameAuth`/stream 0 in the
+  expected phase is accepted; ANY other frame (data/header/rebind/close/
+  ping, or a non-zero stream) terminates the connection — no usable
+  stream can exist before auth completes.
+
+The old v0 `CarrierAuth` (and its raw-secret wire format) was removed
+from `pkg/mux/carrier.go`. `DeriveSecret` remains the shared-secret
+derivation (SHA-256 of the operator string); `ValidateSecret`
+(constant-time compare) is retained.
+
+### Secret policy (startup)
+
+`pkg/mux/secret.go` + both mains: `ValidateSecretMaterial` fails the
+process at startup on empty secrets, the always-enforced blocklist of
+known insecure values (password/test/secret/… and the `change-me*`,
+`your-secret*` placeholder prefixes — the shipped default
+`CHANGE-ME-SECRET-…` no longer boots), and values < 32 chars unless
+`SPLIT_ALLOW_WEAK_SECRET=1` (dev/test bypass; blocklist still enforced).
+Secrets are never logged.
+
+### Frame-context enforcement (carrier)
+
+`pkg/mux/carrier.go` `readLoop` + `Register`/`createStreamLocked`:
+
+- `FrameAuth` after the handshake → **carrier terminated**
+  (`ErrProtocolViolation`, new sentinel in `frame.go`).
+- Application frames (`Data`/`Header`/`Rebind`/`Close`) on reserved
+  StreamID 0 → **carrier terminated** (previously such frames could
+  create a phantom stream 0 via `OnNewStream`).
+- `Register(0)` / `createStreamLocked(0)` refuse: StreamID 0 can never
+  be a stream.
+- `FramePing`/`FramePong` on stream 0 remain valid (keepalive).
+- Unknown frame types are dropped (unchanged); oversized/truncated
+  frames were already rejected by `WriteFrame`/`ReadFrame` (Phase 1
+  tests). Malformed wire data can never panic the process.
+### WebSocket / HTTP hardening (Iran `/upload`)
+
+`cmd/iran-splitter/main.go`:
+
+- `http.Server` with `ReadHeaderTimeout=10s` (bounds the
+  UNAUTHENTICATED request phase) and `IdleTimeout=60s`; Read/Write
+  timeouts stay 0 on purpose (long-lived post-upgrade carrier).
+- `/upload` only (other paths → 404), non-GET → 405, non-WebSocket
+  requests → 400 (gorilla handshake rejection), upgrade concurrency
+  capped at 16 (HTTP 503 when saturated), single-carrier rule → 409
+  (unchanged).
+- **Auth-failure backoff**: per-process counter — after 10 failures
+  within 60 s the endpoint returns HTTP 429 until the window lapses; a
+  successful authentication resets it.
+- `CheckOrigin` remains permissive **by documented decision**
+  (machine-to-machine endpoint; the security boundary is v1 auth +
+  TLS/Reality in the transport).
+
+### Rebind security (verification, no change)
+
+Phase 5's `handleRebind` conditions were re-audited and already satisfy
+the Phase 6 requirements: v1-authenticated carrier, direction-bound
+closure, payload version check, session must exist AND be Active,
+direction not half-closed, attachment in rebindable state, sender
+generation STRICTLY greater than the last accepted (stale/replay/dup
+rebind refused), attach-before-consumer ordering, strict
+`AttAttached`-AND-current-generation consumer guard (late/stale
+carrier frames can never reach the socket or be read as a half-close).
+Covered by Phase 5 tests (TestRebindUnknownSession,
+TestStaleRebindRefused, TestRebindAfterSessionClosed,
+TestRebindScopedToStreamOwner, TestLateFramesNeverCorruptReboundSession).
+A rebind on the wrong-direction carrier is refused structurally
+(per-direction `handleRebind` + attachment-state check).
+
+### Metrics / listeners
+
+Metrics already bound `127.0.0.1` on both binaries (verified, no
+change); they expose only counters/byte totals — no secrets, tokens or
+destination details. No logging of secrets/auth payloads anywhere
+(audited: auth-failure logs carry only the local generic error).
+
+### Tests added (Phase 6)
+
+- `pkg/mux/auth_test.go` — REWRITTEN for v1 (13 tests / 16 subtests):
+  success (both roles), wrong secret (ErrAuthMAC), wrong role (both
+  ends), wrong version (both ends), corrupted response MAC, corrupted
+  confirm MAC, truncated challenge, truncated response, freshness
+  (stale/future challenge, stale response), replay of a captured
+  response against a fresh challenge (echo mismatch), data/rebind
+  before auth (stream 0 and stream 5), hard-timeout against a silent
+  peer, invalid role.
+- `pkg/mux/security_test.go` (new): carrier terminated on stream-0 data
+  and on post-auth FrameAuth (ReadErr = ErrProtocolViolation, all
+  goroutines shut down), ping-on-0 + data-on-1 still accepted,
+  `Register(0)` = nil.
+- `pkg/mux/secret_test.go`: `ValidateSecretMaterial` policy matrix
+  (9 cases).
+- `cmd/iran-splitter/ws_test.go` (new): 404 unknown path, 405 non-GET,
+  400 non-WebSocket, 429 during auth-failure backoff, reset on success,
+  backoff-window reset logic.
+- `e2e-pipe-test/main.go`: the strict "first frame must be FrameHeader"
+  assertion now drops a **late FrameClose** opener (documented carrier
+  behavior: after Deregister, any frame for the ID starts a new stream;
+  production drops non-header openers). This is a harness fix, not a
+  protocol change.
+
+### Verification (Phase 6)
+
+- `gofmt -l .` clean
+- `go vet ./...` PASS
+- `go build ./...` PASS (windows/amd64)
+- `GOOS=linux GOARCH=amd64 go build ./...` PASS
+- `go test ./... -count=1` PASS (all packages)
+- `go run ./e2e-pipe-test` PASS
+- `go test -race ./...` — still NOT runnable on this Windows host
+  (toolchain startup crash `0xc0000139`, pre-existing, unrelated to
+  code). Run on Linux/CI.
+
+### Known limitations / notes
+
+- v0 ⇄ v1 not interoperable — coordinated upgrade of both nodes (by
+  design, documented).
+- The freshness check trusts host clocks (NTP); the nonce mechanism
+  defeats replay independently of clock quality.
+- `SPLIT_ALLOW_WEAK_SECRET` is a documented dev/test bypass only; the
+  blocklist is still enforced with it set.
+- Origin policy intentionally permissive (documented in code + README).
+
+### Rollback
+
+Revert the Phase 6 commit (see git log on this branch). Phase 5 and
+earlier remain independently revertible as before.

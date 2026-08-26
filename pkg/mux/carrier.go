@@ -141,6 +141,22 @@ func (c *CarrierConn) readLoop() {
 			c.mu.Unlock()
 			return
 		}
+		// Post-auth frame-context rules (Phase 6):
+		//  1. FrameAuth is ONLY valid during the handshake (which ran
+		//     before this carrier existed) — any FrameAuth seen now is a
+		//     protocol violation (v0 peer or attacker).
+		//  2. Stream 0 is reserved for control frames (Ping/Pong).
+		//     Application frames on stream 0 would otherwise create a
+		//     phantom stream via OnNewStream or hit Deregister(0); they
+		//     are rejected.
+		// Both are connection-level failures: the carrier is terminated.
+		if f.Type == FrameAuth ||
+			(f.StreamID == 0 && f.Type != FramePing && f.Type != FramePong) {
+			c.mu.Lock()
+			c.readErr = ErrProtocolViolation
+			c.mu.Unlock()
+			return
+		}
 		select {
 		case c.frames <- f:
 		case <-c.closed:
@@ -329,6 +345,9 @@ type streamRec struct {
 // callback marks whether OnNewStream must fire for this stream (only for
 // streams the dispatcher discovers; pre-registered streams never fire it).
 func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
+	if id == 0 {
+		return nil // stream 0 is reserved for control frames
+	}
 	if s, ok := c.streams[id]; ok {
 		return s
 	}
@@ -351,8 +370,8 @@ func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
 func (c *CarrierConn) Register(id uint32) chan []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closing {
-		return nil
+	if c.closing || id == 0 {
+		return nil // stream 0 is reserved for control frames
 	}
 	s, ok := c.streams[id]
 	if !ok {
@@ -716,70 +735,4 @@ func (c *CarrierConn) Close() {
 	})
 }
 
-// CarrierAuth performs the symmetric FrameAuth handshake on rwc:
-// the initiator (carrier client) sends FrameAuth(SHA-256 secret) and waits
-// for FramePong [0]; the responder (carrier server) validates the secret in
-// constant time and replies FrameAuth (echo) + FramePong [0].
-// The returned bufio.Reader holds any bytes already buffered from rwc —
-// pass it to the new CarrierConn via SetReadBuffer.
-func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, secret []byte) (*bufio.Reader, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	ds, hasDeadline := rwc.(interface {
-		SetDeadline(time.Time) error
-	})
-	resetDeadline := func() {
-		if hasDeadline {
-			_ = ds.SetDeadline(time.Time{})
-		}
-	}
-	if isClient {
-		if err := WriteFrame(rwc, 0, FrameAuth, secret); err != nil {
-			return nil, err
-		}
-	}
-	if hasDeadline {
-		if d, ok := ctx.Deadline(); ok {
-			_ = ds.SetDeadline(d)
-		}
-	}
-	br := bufio.NewReader(rwc)
-	for {
-		f, err := ReadFrame(br)
-		if err != nil {
-			resetDeadline()
-			return nil, err
-		}
-		switch f.Type {
-		case FrameAuth:
-			if !isClient {
-				if len(f.Payload) != 32 || !ValidateSecret(f.Payload, secret) {
-					resetDeadline()
-					return nil, errors.New("mux: auth secret mismatch")
-				}
-				if err := WriteFrame(rwc, 0, FrameAuth, secret); err != nil {
-					resetDeadline()
-					return nil, err
-				}
-				if err := WriteFrame(rwc, 0, FramePong, []byte{0}); err != nil {
-					resetDeadline()
-					return nil, err
-				}
-				resetDeadline()
-				return br, nil
-			}
-			// client: server echo, keep waiting for FramePong
-		case FramePong:
-			if len(f.Payload) == 1 && f.Payload[0] == 0 {
-				resetDeadline()
-				return br, nil
-			}
-			resetDeadline()
-			return nil, errors.New("mux: bad auth pong")
-		default:
-			resetDeadline()
-			return nil, errors.New("mux: unexpected frame during auth")
-		}
-	}
-}
+// CarrierAuth lives in auth.go (v1 challenge/response protocol, Phase 6).
