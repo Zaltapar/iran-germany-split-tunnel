@@ -287,7 +287,17 @@ func (s *Splitter) runUpCarrier() {
 		carrier.SetReadBuffer(br)
 		carrier.SetStreamLimits(s.streamLimits())
 		c := carrier // closure must capture this carrier, not the loop var
-		carrier.OnNewStream = func(streamID uint32, ch chan []byte) {
+		carrier.OnNewStream = func(streamID uint32, firstType uint8, ch chan []byte) {
+			// Frame-type-aware dispatch (Phase 5): a stream opens on
+			// FrameHeader (bootstrap a new session) or FrameRebind (an
+			// existing session re-attaching after a carrier loss). This
+			// standalone binary predates rebind support and keeps no
+			// cross-carrier session state, so it can only bootstrap; any
+			// other opener is dropped, never misread as a destination.
+			if firstType != mux.FrameHeader {
+				go s.dropUnsupportedStream(c, streamID, firstType, ch)
+				return
+			}
 			go s.bootstrapUpStream(c, streamID, ch)
 		}
 		h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
@@ -328,6 +338,17 @@ func nextBackoff(b time.Duration) time.Duration {
 // ============================================================
 // Stream bootstrap & internet relaying
 // ============================================================
+
+// dropUnsupportedStream ends a stream that was not opened by a
+// FrameHeader (e.g. a Phase 5 FrameRebind from a newer Iran node). The
+// dispatcher still delivers the triggering frame's payload, so drain it
+// first, then deregister. No target is dialed and NO FrameClose is sent:
+// a refused open must not be mistaken for a peer half-close.
+func (s *Splitter) dropUnsupportedStream(upC *mux.CarrierConn, streamID uint32, firstType uint8, ch chan []byte) {
+	_, _ = <-ch // drain the triggering frame's payload
+	s.logger.Printf("Stream %d: unsupported opening frame type 0x%02x (this build only bootstraps FrameHeader streams); dropping", streamID, firstType)
+	upC.Deregister(streamID)
+}
 
 // bootstrapUpStream handles a new up-carrier stream. The first frame the
 // dispatcher delivers on the stream channel is the FrameHeader payload

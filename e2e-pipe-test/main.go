@@ -151,7 +151,12 @@ func main() {
 	// ================= Germany side (mirror of bootstrapUpStream) ========
 	deDone := make(chan struct{})
 	deUpDone := make(chan struct{})
-	upDeC.OnNewStream = func(id uint32, ch chan []byte) {
+	upDeC.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
+		// Frame-type-aware dispatch (Phase 5): this test opens streams
+		// only via FrameHeader; any other opener is a protocol violation.
+		if firstType != mux.FrameHeader {
+			fail("germany: stream %d opened by frame type 0x%02x, want FrameHeader (0x%02x)", id, firstType, mux.FrameHeader)
+		}
 		go func() {
 			defer upDeC.Deregister(id)
 			hdr := <-ch

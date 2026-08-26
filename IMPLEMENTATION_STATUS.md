@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 4 (session lifecycle) — COMPLETE
+## Current phase: Phase 5 (reconnect/rebind) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -339,4 +339,99 @@ or to abandon the whole effort:
 
 ```
 git checkout main && git branch -D hardening/production-reliability
+```
+
+## Phase 5 — reconnect/rebind (Issue A) — COMPLETE
+
+Carrier loss no longer kills sessions. Sessions bind to carriers through
+`pkg/session.Attachment` (per-direction state + generation):
+
+- `pkg/session/attachment.go` — attachment state machine
+  (Unavailable → Attach(gen) → Detach(gen) → Rebinding → Attached),
+  exactly-once grace timer, ready signaling, epoch join, and the
+  versioned `EncodeRebind`/`ParseRebind` payload.
+- `pkg/mux` — new `FrameRebind` frame type (0x06); dispatch is
+  frame-type-aware and `OnNewStream` now receives the triggering frame
+  type: `func(streamID uint32, firstType uint8, ch chan []byte)`.
+  `FrameRebind` opens a stream exactly like `FrameHeader` (its payload
+  is the first channel item).
+- `pkg/node` (new) — the production node for both roles, with a
+  two-node in-memory harness (`internal/testutil.MemPipe`):
+  - strict carrier-generation guard: a consumer delivers frames only
+    while its attachment is `Attached` AND bound to the consumer's
+    exact generation; frames from old/dead/superseded/mid-rebind
+    carriers are dropped and never interpreted as a legitimate close;
+  - attach ordering: `Attach(newGen)` always runs BEFORE the new
+    consumer can observe frames (rebind sweep and peer rebind
+    handler alike), so a fresh consumer never drops legitimate data;
+  - rebind protocol: the stream-originating node sends `FrameRebind`
+    as the FIRST frame of each stream on the replacement carrier; the
+    peer resolves the session by the shared `StreamID`
+    (`store.GetByStream`) and refuses unknown/stale/post-close
+    rebinds without a spurious `FrameClose`;
+  - reconnect grace: a session not re-attached within the grace
+    window is closed with an explicit reason and is never revived by
+    a late carrier;
+  - carrier-replacement race: a replacement install waits (bounded)
+    for the old carrier's loss sweep to settle before running the
+    rebind sweep; reconnect metrics are counted loss-driven (an
+    install-snapshot `wasLost` alone misses the
+    install-before-sweep interleaving) and the stale lost flag is
+    settled after the sweep completes.
+- `cmd/germany-splitter` + `e2e-pipe-test` — updated to the
+  frame-type-aware `OnNewStream`. `e2e-pipe-test` asserts the opener
+  is `FrameHeader`; `cmd/germany-splitter` (pre-Phase-5 standalone
+  binary) keeps its bootstrap-only semantics and cleanly refuses
+  non-header openers (drain, log, deregister, no `FrameClose`)
+  instead of misreading a `FrameRebind` as a destination. Neither
+  command was deleted; both compile and work.
+- `pkg/node/node_test.go` — 18 scenario tests: single/10-session
+  survival, grace timeout + no late revival, fast reconnect, flapping,
+  late-frame protection, replacement while the old carrier is shutting
+  down, up-only / down-only / both-carrier failure, half-close across
+  loss, shutdown during loss, rebind scoping, unknown / stale /
+  post-close rebind refusal, bounded-buffer backpressure, and a
+  120-session stress test cycling up- and down-carriers.
+
+Test calibration (test-only, NOT production behavior): `readN`
+deadline 10 s and stress grace 20 s — under 120 concurrent sessions a
+down-direction rebind can exceed 3 s on a loaded host; the assertions
+test correctness (no loss, no lost sessions, metric balance, no
+goroutine growth), not rebind latency.
+
+## Phase 5 verification (final state)
+
+- Phase 5: complete
+- Full repository build: PASS (`go build ./...` and
+  `GOOS=linux GOARCH=amd64 go build ./...` from the repo root)
+- `go vet ./...` — PASS
+- `gofmt -l .` — clean
+- `go test ./...` — PASS; `go test ./... -count=3` — PASS
+- e2e-pipe-test: PASS (`go run ./e2e-pipe-test`)
+- Node stress: PASS (`TestHundredSessionStress` -count=10; full
+  `pkg/node` suite -count=5)
+- Known environment limitation: `go test -race` still cannot execute
+  on this Windows host (race-instrumented binaries abort at startup
+  with `0xc0000139`, same toolchain failure as Phases 1–4). Run
+  `-race` in any Linux CI as the final confirmation.
+
+## Build-fix follow-up (this commit)
+
+`e2e-pipe-test/main.go` and `cmd/germany-splitter/main.go` were the
+only stale `OnNewStream` call sites left from the pre-Phase-5 API;
+both were updated to the frame-type-aware signature (see above). No
+production semantics in `pkg/node` / `pkg/mux` were altered by this
+commit.
+
+## Commits (this phase)
+
+- `phase-5-reconnect-rebind` — Phase 5 design, `pkg/node`, tests
+- `phase-5-build-fix` — stale call-site compatibility + this status
+  update
+
+## Rollback (this phase)
+
+```
+git revert <phase-5-build-fix-commit>
+git revert <phase-5-reconnect-rebind-commit>
 ```
