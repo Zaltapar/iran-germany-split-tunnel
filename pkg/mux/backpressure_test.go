@@ -275,7 +275,7 @@ func TestTerminatedStreamStaysRegistered(t *testing.T) {
 	}
 
 	var fired atomic.Int32
-	c.OnNewStream = func(id uint32, ch chan []byte) { fired.Add(1) }
+	c.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) { fired.Add(1) }
 	if err := WriteFrame(b, 1, FrameData, []byte("late")); err != nil {
 		t.Fatalf("WriteFrame: %v", err)
 	}

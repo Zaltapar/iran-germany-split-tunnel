@@ -8,6 +8,7 @@ package testutil
 import (
 	"errors"
 	"io"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -116,3 +117,14 @@ func (m *MemConn) SetWriteDeadline(t time.Time) error {
 	m.out.setWriteDeadline(t)
 	return nil
 }
+
+type memAddr struct{}
+
+func (memAddr) Network() string { return "mem" }
+func (memAddr) String() string  { return "mem" }
+
+// LocalAddr is part of net.Conn (the in-memory pipe has no real address).
+func (m *MemConn) LocalAddr() net.Addr { return memAddr{} }
+
+// RemoteAddr is part of net.Conn (the in-memory pipe has no real address).
+func (m *MemConn) RemoteAddr() net.Addr { return memAddr{} }

@@ -307,6 +307,14 @@ type Session struct {
 	// the carriers happens in the binary's OnClose hooks.
 	StreamIDUp   uint32
 	StreamIDDown uint32
+	// UpAtt / DownAtt (Phase 5) track the carrier binding per direction:
+	// which carrier generation currently carries this direction and the
+	// bounded grace window after a carrier loss. Owned and driven by the
+	// binary (see pkg/node); the session only guarantees they are closed
+	// during teardown and when a direction is half-closed. Nil for
+	// sessions/tests without carrier management.
+	UpAtt   *Attachment
+	DownAtt *Attachment
 	// Ctx is cancelled by Close; relays select on it to unblock.
 	Ctx context.Context
 
@@ -384,6 +392,15 @@ func (s *Session) DirClosed(dir Direction) bool {
 	return s.downClosed
 }
 
+// Att returns the carrier attachment for one direction (nil if the
+// session has no attachment for it — tests and legacy wiring).
+func (s *Session) Att(dir Direction) *Attachment {
+	if dir == DirUp {
+		return s.UpAtt
+	}
+	return s.DownAtt
+}
+
 // OnClose registers a teardown hook (carrier deregistration, store
 // unindex, metric decrement, ...). Hooks run exactly once, in
 // registration order, after the owned connections are closed. A hook
@@ -444,6 +461,13 @@ func (s *Session) MarkDirClosed(dir Direction, reason string) bool {
 		s.state = StateClosing
 	}
 	s.mu.Unlock()
+	// Phase 5: a half-closed direction is permanently done — close its
+	// attachment so a carrier reconnect can never re-bind it (this is
+	// what keeps a client FIN a half-close, not a full close, across a
+	// carrier loss).
+	if att := s.Att(dir); att != nil {
+		att.Close()
+	}
 	if complete {
 		s.teardown()
 	}
@@ -483,6 +507,14 @@ func (s *Session) teardown() {
 		}
 		if s.TargetConn != nil {
 			s.TargetConn.Close()
+		}
+		// Phase 5: cancel any running carrier-loss grace timers BEFORE the
+		// hooks run, so a pending timer cannot race the deregistration.
+		if s.UpAtt != nil {
+			s.UpAtt.Close()
+		}
+		if s.DownAtt != nil {
+			s.DownAtt.Close()
 		}
 		for _, fn := range s.onClose {
 			fn()
@@ -610,6 +642,21 @@ func (ss *SessionStore) CloseAll() {
 	for _, s := range sessions {
 		s.Close("store: close all")
 	}
+}
+
+// Snapshot returns a point-in-time list of all sessions in the store.
+// Used by the carrier-loss/rebind sweep (Phase 5): iterating a snapshot
+// keeps the store lock out of the (potentially slow) rebind path, and
+// entries may close between snapshot and use — every consumer re-validates
+// session state before acting.
+func (ss *SessionStore) Snapshot() []*Session {
+	ss.mu.RLock()
+	sessions := make([]*Session, 0, len(ss.sessions))
+	for _, s := range ss.sessions {
+		sessions = append(sessions, s)
+	}
+	ss.mu.RUnlock()
+	return sessions
 }
 
 func (ss *SessionStore) Count() int {

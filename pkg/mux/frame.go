@@ -33,6 +33,25 @@ const (
 	FramePong   uint8 = 0x03 // keepalive pong
 	FrameClose  uint8 = 0x04 // stream close / half-close
 	FrameHeader uint8 = 0x05 // stream header: encoded target destination
+	// FrameRebind (Phase 5): "this StreamID continues an EXISTING logical
+	// session — do not bootstrap a new one". Sent by the stream-originating
+	// node on a freshly (re)established carrier as the FIRST frame of the
+	// stream, before any user data. Payload (versioned, see
+	// session.EncodeRebind/ParseRebind):
+	//
+	//	[0]     protocol version (1)
+	//	[1:17]  SessionID (16 bytes) of the session to re-attach
+	//	[17:25] sender's carrier generation for this direction (uint64 BE)
+	//
+	// The generation is monotonically increasing per sender+direction, so a
+	// replayed/stale rebind (old carrier generation) is rejected. Rebinding
+	// never creates a session: the receiver resolves the existing session
+	// by the frame's StreamID (the identity shared by both nodes — each
+	// node keeps its own local SessionID, carried in the payload only as
+	// the sender's diagnostic identifier), and re-attaches it; anything
+	// it cannot validate is dropped (never a FrameClose — a refused
+	// rebind must not be mistaken for a peer half-close).
+	FrameRebind uint8 = 0x06
 )
 
 // Frame is a single decoded frame.

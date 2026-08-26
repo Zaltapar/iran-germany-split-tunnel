@@ -130,7 +130,10 @@ func TestDispatchOnNewStream(t *testing.T) {
 
 	var newCh chan []byte
 	fired := make(chan uint32, 1)
-	c.OnNewStream = func(id uint32, ch chan []byte) {
+	c.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
+		if firstType != FrameHeader {
+			t.Errorf("OnNewStream firstType = %d, want FrameHeader", firstType)
+		}
 		newCh = ch
 		fired <- id
 	}
@@ -158,6 +161,50 @@ func TestDispatchOnNewStream(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("header payload never delivered")
+	}
+}
+
+// TestDispatchOnNewStreamRebind verifies FrameRebind opens a stream exactly
+// like FrameHeader: OnNewStream fires with firstType == FrameRebind and the
+// rebind payload is the first item on the new channel (Phase 5 — the
+// receiver must be able to distinguish rebind from bootstrap).
+func TestDispatchOnNewStreamRebind(t *testing.T) {
+	a, b := testutil.NewMemPipe()
+	defer a.Close()
+	defer b.Close()
+	c := NewCarrierConn(a, 0)
+	defer c.Close()
+
+	var newCh chan []byte
+	fired := make(chan struct{}, 1)
+	c.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
+		if firstType != FrameRebind {
+			t.Errorf("OnNewStream firstType = %d, want FrameRebind", firstType)
+		}
+		if id != 42 {
+			t.Errorf("OnNewStream id = %d, want 42", id)
+		}
+		newCh = ch
+		fired <- struct{}{}
+	}
+	go c.Dispatch()
+
+	payload := []byte{0x01, 0xAA, 0xBB, 0xCC, 0x01, 0x02}
+	if err := WriteFrame(b, 42, FrameRebind, payload); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnNewStream never fired for FrameRebind")
+	}
+	select {
+	case f := <-newCh:
+		if string(f) != string(payload) {
+			t.Fatalf("rebind payload = %v, want %v", f, payload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebind payload never delivered")
 	}
 }
 

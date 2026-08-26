@@ -89,9 +89,13 @@ type CarrierConn struct {
 	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
 	// goroutine) when the first frame for a previously unknown stream
 	// arrives. The dispatcher creates and registers the stream channel and
-	// passes it to the callback; the callback must return quickly (spawn a
-	// goroutine for slow work such as a target dial).
-	OnNewStream func(streamID uint32, ch chan []byte)
+	// passes it to the callback together with the TYPE of the triggering
+	// frame (Phase 5: a stream may be opened by FrameHeader — bootstrap a
+	// new session — or by FrameRebind — re-attach an existing one; the
+	// callback must branch on it). The triggering frame's payload is the
+	// first item delivered on ch. The callback must return quickly (spawn
+	// a goroutine for slow work such as a target dial).
+	OnNewStream func(streamID uint32, firstType uint8, ch chan []byte)
 }
 
 // NewCarrierConn starts the read loop, writer and keepalive ping loop.
@@ -471,10 +475,11 @@ func (c *CarrierConn) StreamCount() int {
 }
 
 // Dispatch is the single consumer of the frames channel. It routes
-// FrameHeader/FrameData/FrameClose into the stream's bounded mailbox and
-// replies FramePong[0] to FramePing. Frames for unknown or already
-// removed streams are dropped — unless OnNewStream is set, in which case
-// the first frame of a new stream creates it and triggers the callback.
+// FrameHeader/FrameData/FrameRebind/FrameClose into the stream's bounded
+// mailbox and replies FramePong[0] to FramePing. Frames for unknown or
+// already removed streams are dropped — unless OnNewStream is set, in
+// which case the first frame of a new stream creates it and triggers the
+// callback (with the triggering frame's type).
 //
 // Dispatch NEVER blocks on a slow consumer (Phase 3, Issue B): every
 // delivery is a non-blocking TryPush into the stream mailbox. When a
@@ -487,7 +492,7 @@ func (c *CarrierConn) StreamCount() int {
 func (c *CarrierConn) Dispatch() {
 	for f := range c.frames {
 		switch f.Type {
-		case FrameData, FrameHeader, FrameClose:
+		case FrameData, FrameHeader, FrameRebind, FrameClose:
 			c.mu.Lock()
 			s, ok := c.streams[f.StreamID]
 			if !ok && c.OnNewStream != nil && !c.closing {
@@ -500,7 +505,7 @@ func (c *CarrierConn) Dispatch() {
 			}
 			if s.callback {
 				s.callback = false
-				c.OnNewStream(f.StreamID, s.ch)
+				c.OnNewStream(f.StreamID, f.Type, s.ch)
 			}
 			var it queueItem
 			if f.Type == FrameClose {
