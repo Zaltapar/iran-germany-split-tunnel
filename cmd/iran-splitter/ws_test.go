@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
@@ -17,7 +18,7 @@ import (
 // handler tests (no listeners, no carriers).
 func newTestSplitter() *Splitter {
 	return &Splitter{
-		config:  &Config{},
+		config:  config.Defaults(),
 		store:   session.NewSessionStore(),
 		metrics: &Metrics{},
 		logger:  log.New(io.Discard, "", 0),

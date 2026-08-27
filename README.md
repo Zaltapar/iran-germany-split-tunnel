@@ -85,7 +85,7 @@ sudo systemctl enable --now germany-splitter
 | Variable | Iran | Germany | Default | Description |
 |----------|:----:|:-------:|---------|-------------|
 | `SPLIT_SOCKS_LISTEN` | ✓ | | `127.0.0.1:10900` | SOCKS5 listener (local Xray connects here) |
-| `SPLIT_WS_LISTEN` | ✓ | | `0.0.0.0:9001` | Up-carrier WebSocket server (path `/upload`, front with nginx → CDN) |
+| `SPLIT_WS_LISTEN` | ✓ | | `127.0.0.1:9001` | Up-carrier WebSocket server (path `/upload`, front with nginx → CDN) |
 | `SPLIT_DOWN_CARRIER_ADDR` | ✓ | | `127.0.0.1:10802` | Down-carrier dial target (local Xray VLESS+Reality outbound) |
 | `SPLIT_UP_WS_URL` | | ✓ | `wss://cdn.example.com/upload` | Up-carrier WebSocket URL (CDN domain) |
 | `SPLIT_DOWN_LISTEN` | | ✓ | `:9002` | Down-carrier TCP listener |
@@ -97,6 +97,37 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_STREAM_QUEUE_FRAMES` | ✓ | ✓ | `16` | Max frames buffered per stream |
 | `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `33554432` (32 MiB) | Aggregate queued bytes across all streams per carrier |
 | `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `100` | How long a stalled stream may hold its buffer (ms) before termination |
+
+### Configuration validation
+
+Both binaries share one centralized configuration layer
+(`internal/config`): **load (env → defaults) → parse → validate →
+construct**. A node never opens a listener or starts a goroutine until
+`config.Load` succeeds, and a startup failure reports **every** problem
+at once (aggregated list) instead of one-at-a-time:
+
+* empty / unset variable = "use the default";
+* integers are strictly parsed (`abc`, negatives and out-of-range values
+  are config errors, never silent zeros); `SPLIT_ALLOW_WEAK_SECRET`
+  must be a real boolean (`1/0/true/false`);
+* addresses must be `host:port` (bare `:port` allowed for listeners,
+  bracketed IPv6 like `[::1]:9001`, explicit host required for dial
+  targets);
+* `SPLIT_UP_WS_URL` must be `ws(s)://host/upload` — the placeholder
+  `wss://cdn.example.com/upload` is rejected, as are wrong paths;
+* port collisions between the app's own listeners (and the metrics
+  port) are detected at config time;
+* `SPLIT_STREAM_QUEUE_*` / `SPLIT_STREAM_OVERFLOW_MS` values of `0`
+  keep the library defaults; the aggregate budget must cover at least
+  one stream's share;
+* the Phase 6 secret policy applies (blocklist always, length minimum
+  unless `SPLIT_ALLOW_WEAK_SECRET=1`); error messages never contain the
+  secret value.
+
+`SPLIT_STREAM_QUEUE_*` and `SPLIT_STREAM_OVERFLOW_MS` ship the value `0`
+by default, which the runtime resolves to `mux.DefaultStreamLimits`
+(16 frames / 1 MiB per stream, 32 MiB per carrier, 100 ms) via
+`mux.SanitizeLimits`.
 
 ## Xray Config (Iran)
 
@@ -229,7 +260,7 @@ counts and byte totals — no secrets, tokens or destination details.
 **Firewall.** Only these inbound ports should be reachable, and only from
 their expected source:
 
-* Iran: `SPLIT_WS_LISTEN` (default `:9001`) — via CDN/nginx only, never
+* Iran: `SPLIT_WS_LISTEN` (default `127.0.0.1:9001`) — via CDN/nginx only, never
   direct;
 * Germany: `SPLIT_DOWN_LISTEN` (default `:9002`) — from the download
   carrier transport (Xray inbound) only;

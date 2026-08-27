@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 6 (security hardening) — COMPLETE
+## Current phase: Phase 7 (centralized configuration validation) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -605,3 +605,90 @@ destination details. No logging of secrets/auth payloads anywhere
 
 Revert the Phase 6 commit (see git log on this branch). Phase 5 and
 earlier remain independently revertible as before.
+
+## Phase 7 — centralized configuration validation
+
+Goal: both binaries load, parse and validate their ENTIRE configuration
+through one shared layer before anything runs, and report every problem
+at once instead of failing one-at-a-time.
+
+### What changed
+
+- **`internal/config` (new package)** — the single
+  load → parse → validate → construct path:
+  - `Config`, `Defaults()`, `Load(role)`, `(c *Config) Validate(role)`.
+    `Validate` is exported so directly-constructed configs validate
+    without environment access (used by tests and future non-env
+    callers).
+  - `ConfigError` aggregates ALL problems (formatted as a bulleted
+    list); a startup failure prints the whole list at once.
+  - Env parsing rules: unset OR empty = "use the default"; integers
+    parsed with `strconv` and explicit min/max bounds (the legacy
+    `fmt.Sscanf` parseInt that silently zeroed bad values is gone);
+    `SPLIT_ALLOW_WEAK_SECRET` parsed with `strconv.ParseBool` (any other
+    value is a config error).
+  - Address validation: `host:port` (bare `:port` for listeners,
+    bracketed IPv6, explicit host for dial targets), ports 1..65535,
+    no whitespace in hosts.
+  - `SPLIT_UP_WS_URL` validation: `ws(s)://` scheme, non-empty host,
+    path must be `/upload`; the placeholder
+    `wss://cdn.example.com/upload` is explicitly rejected so a fresh
+    install fails fast instead of dialing a dead domain forever.
+  - Cross-field checks: the app's own listeners may not share an
+    endpoint, and the metrics port may not collide with any of them
+    (wildcard-aware); the aggregate stream-queue budget must cover at
+    least one stream's share.
+  - Numeric bounds: relay buffer 1 KiB..8 MiB; queue bytes/frames/
+    overflow-wait bounded (64 MiB / 256 MiB / `mux.MaxFrames` / 30 s);
+    `0` keeps the documented "library default" sentinel resolved by
+    `mux.SanitizeLimits` at runtime.
+  - Secret policy delegated to Phase 6's
+    `mux.ValidateSecretMaterial` (not re-implemented); errors never
+    contain the secret value.
+- **`cmd/iran-splitter/main.go`** — local `Config` struct, all
+  `os.Getenv`/`parseInt` parsing and the inline secret check are
+  removed; `main` now starts with `config.Load(config.RoleIran)` and
+  dies before opening any listener when validation fails.
+- **`cmd/germany-splitter/main.go`** — same treatment with
+  `config.Load(config.RoleGermany)`.
+- **`cmd/iran-splitter/ws_test.go`** — test fixture uses
+  `config.Defaults()` (no duplicate config type).
+- **`internal/config/config_test.go` (new)** — ~30 tests / 50+
+  subtests: both valid roles via env and via direct construction;
+  unknown role; invalid host:port forms (8 cases); invalid WS URLs
+  (5 cases); placeholder URL rejection; placeholder + blocklisted
+  secret rejection; weak-secret bypass (`1`/`true`, off); invalid bool;
+  8 integer error cases (non-numeric, below min, above max, negative,
+  overflow); port collision detection (4 directions); queue
+  cross-field + out-of-range; aggregated multi-error output; helper
+  units (`envInt`, `envString`, `conflict`); secret-never-leaks check.
+- **README** — new "Configuration validation" section under
+  Configuration; fixed the stale `SPLIT_WS_LISTEN` default
+  (`0.0.0.0:9001` → `127.0.0.1:9001`, matching the code).
+
+### Verification
+
+- `gofmt -l .` clean
+- `go vet ./...` PASS
+- `go build ./...` PASS (windows/amd64)
+- `GOOS=linux GOARCH=amd64 go build ./...` PASS
+- `go test ./... -count=1` PASS (all packages, incl. the new config
+  suite)
+- `go run ./e2e-pipe-test` PASS
+- Manual negative-process runs (all exit 1 immediately, before any
+  listener): weak secret; three simultaneous bad values reported in
+  one aggregated message; placeholder `SPLIT_UP_WS_URL` with the
+  weak-secret bypass honored.
+- `go test -race ./...` — still NOT runnable on this Windows host
+  (toolchain startup crash `0xc0000139`, pre-existing). Run on
+  Linux/CI.
+
+### Known limitations / notes
+
+- `KeepAliveInterval` is a fixed default (`30s`) with no env variable
+  on purpose; it is validated only via `Defaults()`.
+- Validation is lexical/structural; it does not probe the network
+  (e.g. whether the CDN domain actually resolves).
+- `SPLIT_WS_LISTEN` default is `127.0.0.1:9001`: production deploys
+  front it via nginx/CDN and are expected to set an explicit listen
+  address.

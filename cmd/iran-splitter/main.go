@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
@@ -63,24 +64,10 @@ func (w *wsConn) Close() error { return w.conn.Close() }
 // ============================================================
 // Config & Metrics
 // ============================================================
-
-type Config struct {
-	SocksListen       string
-	WsListen          string
-	DownCarrierAddr   string
-	Secret            string
-	MetricsPort       int
-	RelayBufSize      int
-	KeepAliveInterval time.Duration
-
-	// Stream queue (backpressure) settings, SPLIT_STREAM_QUEUE_* /
-	// SPLIT_STREAM_OVERFLOW_MS. Zero falls back to the library defaults
-	// (mux.SanitizeLimits); a slow stream is terminated, never the carrier.
-	QueueBytesPerStream  int
-	QueueFramesPerStream int
-	QueueBytesTotal      int
-	OverflowWaitMs       int
-}
+//
+// The Config type lives in internal/config (Phase 7): one shared
+// load→parse→validate→construct path for both binaries. This file only
+// builds runtime limits from the validated config.
 
 // streamLimits builds the per-stream mailbox limits from config. Zero
 // values fall back to mux.DefaultStreamLimits via SanitizeLimits.
@@ -125,7 +112,7 @@ func (h *carrierHandle) close() {
 }
 
 type Splitter struct {
-	config  *Config
+	config  *config.Config
 	store   *session.SessionStore
 	metrics *Metrics
 	logger  *log.Logger
@@ -192,50 +179,12 @@ func (s *Splitter) waitCarriers() (*mux.CarrierConn, *mux.CarrierConn, error) {
 }
 
 func main() {
-	cfg := &Config{
-		SocksListen:       "127.0.0.1:10900",
-		WsListen:          "127.0.0.1:9001",
-		DownCarrierAddr:   "127.0.0.1:10802",
-		Secret:            "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING",
-		RelayBufSize:      32768,
-		KeepAliveInterval: 30 * time.Second,
-	}
-
-	if v := os.Getenv("SPLIT_SOCKS_LISTEN"); v != "" {
-		cfg.SocksListen = v
-	}
-	if v := os.Getenv("SPLIT_WS_LISTEN"); v != "" {
-		cfg.WsListen = v
-	}
-	if v := os.Getenv("SPLIT_DOWN_CARRIER_ADDR"); v != "" {
-		cfg.DownCarrierAddr = v
-	}
-	if v := os.Getenv("SPLIT_SECRET"); v != "" {
-		cfg.Secret = v
-	}
-	if v := os.Getenv("SPLIT_METRICS_PORT"); v != "" {
-		cfg.MetricsPort = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_RELAY_BUF"); v != "" {
-		cfg.RelayBufSize = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_STREAM_QUEUE_BYTES"); v != "" {
-		cfg.QueueBytesPerStream = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_STREAM_QUEUE_FRAMES"); v != "" {
-		cfg.QueueFramesPerStream = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_STREAM_QUEUE_TOTAL_BYTES"); v != "" {
-		cfg.QueueBytesTotal = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_STREAM_OVERFLOW_MS"); v != "" {
-		cfg.OverflowWaitMs = parseInt(v)
-	}
-
-	// Fail fast on insecure secret material (Phase 6). The blocklist is
-	// always enforced; the length policy has a dev/test bypass.
-	if err := mux.ValidateSecretMaterial(cfg.Secret, os.Getenv("SPLIT_ALLOW_WEAK_SECRET") == "1"); err != nil {
-		log.Fatalf("invalid SPLIT_SECRET: %v (generate one with: openssl rand -hex 32)", err)
+	// Phase 7: load → parse → validate the ENTIRE configuration before
+	// any listener opens or goroutine starts. Load reports every problem
+	// at once (aggregated) and enforces the Phase 6 secret policy.
+	cfg, err := config.Load(config.RoleIran)
+	if err != nil {
+		log.Fatalf("iran-splitter: %v", err)
 	}
 
 	derived := mux.DeriveSecret(cfg.Secret)
@@ -746,10 +695,4 @@ func (s *Splitter) runMetrics(addr string) error {
 	s.lnMu.Unlock()
 	defer ln.Close()
 	return http.Serve(ln, mhttp)
-}
-
-func parseInt(s string) int {
-	var n int
-	fmt.Sscanf(s, "%d", &n)
-	return n
 }
