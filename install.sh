@@ -6,11 +6,29 @@
 # Xray inbound tag, nginx, ...) with sensible defaults, then:
 #   1. installs the Go toolchain if missing/too old (official tarball)
 #   2. builds the requested role binary (local checkout or GitHub tarball)
-#   3. installs + starts the systemd service
-#   4. merges the Xray config (Iran role, JSON config, python3)
-#   5. configures nginx for the CDN up-carrier (Iran role)
-#   6. offers ufw firewall rules
-#   7. prints a summary + exact next steps for the other node
+#   3. runs the binary's OWN pre-install configuration gate
+#      (<binary> --validate-config — the same internal/config
+#      validation the production binary uses at startup)
+#   4. backs up any existing installation (unit + binary) and
+#      installs + restarts the systemd service
+#   5. merges the Xray config (Iran role, JSON config, python3)
+#   6. configures nginx for the CDN up-carrier (Iran role)
+#   7. offers ufw firewall rules
+#   8. prints a summary + exact next steps for the other node
+#
+# Secret handling:
+#   - auto-generated with `openssl rand -hex 32` (256 bits) when
+#     you do not provide one;
+#   - stored at /root/.split-tunnel-secret (mode 600) so the other
+#     node can be configured with --secret-file — the secret never
+#     has to ride on a command line or into shell history;
+#   - MASKED in the summary by default (--show-secret to reveal).
+#
+# Upgrades: re-running the installer on an existing installation
+# pre-fills the current unit's values as prompt defaults, backs up
+# the old unit file (<unit>.bak.<ts>) and binary (<bin>.bak), and
+# KEEPS the existing shared secret unless you explicitly provide
+# (or generate) a new one.
 #
 # Usage:
 #   Interactive (recommended):
@@ -19,7 +37,8 @@
 #
 #   Non-interactive (values via flags):
 #     sudo bash install.sh iran --yes --secret <SECRET>
-#     sudo bash install.sh germany --yes --secret <SECRET> --up-ws-url wss://cdn.example.com/upload
+#     sudo bash install.sh germany --yes --up-ws-url wss://<cdn>/upload \
+#       --secret-file /root/.split-tunnel-secret
 #
 #   Uninstall:
 #     sudo bash install.sh uninstall [iran|germany]     # no role = both
@@ -28,7 +47,7 @@
 # ============================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 REPO_OWNER="Zaltapar"
 REPO_NAME="iran-germany-split-tunnel"
 TARBALL_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/main.tar.gz"
@@ -37,6 +56,10 @@ INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
 MIN_GO_MINOR=21
 GO_FALLBACK_VERSION="go1.23.4"
+
+# Local copy of the installed shared secret (mode 600), used for the
+# cross-node hand-off via --secret-file.
+SECRET_STORE="/root/.split-tunnel-secret"
 
 XRAY_CONFIG_CANDIDATES=(
   "/usr/local/etc/xray/config.json"
@@ -54,10 +77,11 @@ error() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 step()  { printf "\n${CYAN}==> %s${NC}\n" "$*"; }
 
 # ------------------------------------------------------------
-# State (flags -> defaults -> interactive answers)
+# State (flags -> existing install -> defaults -> interactive)
 # ------------------------------------------------------------
 ROLE=""
 SECRET=""
+SECRET_FROM_STORE=0     # 1 = --secret-file was used (do not echo back)
 SOCKS_LISTEN=""
 WS_LISTEN=""
 DOWN_CARRIER_ADDR=""
@@ -71,6 +95,7 @@ DOWN_LISTEN=""
 UP_WS_URL=""
 METRICS_PORT=""
 RELAY_BUF=""
+SHOW_SECRET=0
 ASSUME_YES=0
 UNINSTALL=0
 INTERACTIVE=1
@@ -97,36 +122,82 @@ Role options:
   (iran)    --nginx-port PORT        public port nginx listens on (default 80)
   (iran)    --xray-config PATH       Xray config JSON to merge (default: auto-detect, 'skip' = skip)
   (iran)    --xray-inbound TAG       Xray user inbound tag (default user-vless-reality)
-  (germany) --up-ws-url URL          up-carrier WS URL (default wss://cdn.example.com/upload)
+  (germany) --up-ws-url URL          up-carrier WS URL, wss://<cdn>/upload (no default — required)
   (germany) --down-listen ADDR       down-carrier TCP listener (default 0.0.0.0:9002)
 
 Common options:
   --secret SECRET        shared secret, must match on both nodes (empty = generate)
+  --secret-file PATH     read the shared secret from a file (mode 600, no command-line leak)
+  --show-secret          show the full secret in the summary (default: masked)
   --metrics-port PORT    local metrics HTTP port, 0 = off (default 0)
   --relay-buf BYTES      relay buffer size in bytes (default 32768)
   --xray-service NAME    xray/3x-ui systemd service for ordering (default: auto-detect)
   --yes, -y              non-interactive: never prompt, use flags/defaults
   --help                 show this help
+
+Secrets are generated with 'openssl rand -hex 32' and stored at
+${SECRET_STORE} (mode 600) for the cross-node hand-off.
 EOF
 }
 
 # ------------------------------------------------------------
-# Validators
+# Validators — mirror internal/config (Phase 7) rules for FAST
+# early feedback. The authoritative gate is the binary's own
+# --validate-config run (validate_config_gate); these must never
+# be stricter than internal/config, only cheaper.
 # ------------------------------------------------------------
 is_port() {
   [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 <= 65535 ))
 }
+
+# host:port — bare ":port" allowed for listeners, bracketed IPv6
+# allowed, port 1..65535, no whitespace in the host.
 is_hostport() {
-  [[ "$1" =~ ^[0-9A-Za-z.]*:[0-9]{1,5}$ ]] && (( 10#${1##*:} <= 65535 ))
+  local a="$1" host port
+  [[ "$a" == *" "* ]] && return 1
+  [[ "$a" == *:* ]] || return 1
+  host="${a%:*}"
+  port="${a##*:}"
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+  # bracketed IPv6 host: "[::1]:9001"
+  if [[ "$host" == *"["*"]"* ]]; then
+    [[ "$host" =~ ^\[[^]]+\]$ ]] || return 1
+    return 0
+  fi
+  # plain host: letters, digits, dot, dash (no extra colons)
+  [[ "$host" =~ ^[A-Za-z0-9.-]*$ ]]
 }
+
+# ws(s)://host[:port]/upload — the exact URL shape internal/config
+# accepts; the placeholder CDN URL is rejected explicitly.
 is_wss_url() {
-  [[ "$1" =~ ^wss://[0-9A-Za-z.-]+(:[0-9]{1,5})?(/[0-9A-Za-z._~%/&=?-]+)?$ ]]
+  local a="$1" rest hostport
+  [[ "$a" == wss://* || "$a" == ws://* ]] || return 1
+  rest="${a#*://}"
+  hostport="${rest%%/*}"
+  local path="/${rest#*/}"
+  [[ "$hostport" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+  [[ "$path" == "/upload" ]] || return 1
+  [[ "$a" != "wss://cdn.example.com/upload" ]]
 }
+
+# 1024..8 MiB — internal/config's SPLIT_RELAY_BUF bounds.
 is_uint() {
-  [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= 1024 ))
+  [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= 1024 && 10#$1 <= 8388608 ))
 }
+
+# Secret: matches the Phase 6 policy (internal/config delegates to
+# mux.ValidateSecretMaterial): not a known placeholder, and >= 32
+# chars. The full policy is re-checked by the binary's gate.
 is_secret() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$ ]]
+  local low
+  low="${1,,}"
+  case "$low" in
+    ""|password|passw0rd|admin|test|secret|changeme|change-me|split-secret|default|qwerty|letmein|123456|12345678|1234567890|iloveyou) return 1 ;;
+    change-me*|your-secret*) return 1 ;;
+  esac
+  (( ${#1} >= 32 ))
 }
 
 # ------------------------------------------------------------
@@ -209,10 +280,31 @@ ask_yesno() {
 # Small helpers
 # ------------------------------------------------------------
 generate_secret() {
+  # 256 bits of randomness, hex-encoded (64 chars) — the documented
+  # recommendation, matches `openssl rand -hex 32`.
   if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 24
+    openssl rand -hex 32
   else
-    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
+# secret_display: masked by default, full with --show-secret.
+# Never use this for the Germany hand-off command; that uses the file.
+secret_display() {
+  if [ "$SHOW_SECRET" -eq 1 ]; then
+    printf '%s' "$SECRET"
+  else
+    printf '**** (hidden — use --show-secret to reveal)'
+  fi
+}
+
+store_secret() {
+  # Persist the secret for the cross-node hand-off, root-only.
+  if [ "$(id -u)" -eq 0 ]; then
+    umask 077
+    printf '%s' "$SECRET" > "$SECRET_STORE"
+    chmod 600 "$SECRET_STORE"
   fi
 }
 
@@ -235,6 +327,43 @@ detect_xray_config() {
       return 0
     fi
   done
+  return 0
+}
+
+# unit_env: extract one SPLIT_* value from an installed unit file
+# (first match wins; values are never quoted by this installer).
+unit_env() {
+  local unit="$1" key="$2"
+  [ -f "$unit" ] || return 1
+  grep -E "^Environment=${key}=" "$unit" 2>/dev/null | head -n1 | sed "s/^Environment=${key}=//" || true
+}
+
+# Detect an existing installation for the given role and pre-fill the
+# matching state variables with the values currently installed (so an
+# upgrade keeps working configuration unless the operator changes it).
+load_existing_config() {
+  local unit="${SYSTEMD_DIR}/${ROLE}-splitter.service"
+  local v
+  [ -f "$unit" ] || return 0
+  info "Existing installation detected: ${unit}"
+  v="$(unit_env "$unit" SPLIT_SECRET)"
+  if [ -n "$v" ] && [ -z "$SECRET" ]; then
+    SECRET="$v"
+    info "Keeping the currently installed shared secret (override with --secret)."
+  fi
+  case "$ROLE" in
+    iran)
+      v="$(unit_env "$unit" SPLIT_SOCKS_LISTEN)";       [ -n "$v" ] && [ -z "$SOCKS_LISTEN" ]      && SOCKS_LISTEN="$v"
+      v="$(unit_env "$unit" SPLIT_WS_LISTEN)";           [ -n "$v" ] && [ -z "$WS_LISTEN" ]         && WS_LISTEN="$v"
+      v="$(unit_env "$unit" SPLIT_DOWN_CARRIER_ADDR)";   [ -n "$v" ] && [ -z "$DOWN_CARRIER_ADDR" ] && DOWN_CARRIER_ADDR="$v"
+      ;;
+    germany)
+      v="$(unit_env "$unit" SPLIT_DOWN_LISTEN)";         [ -n "$v" ] && [ -z "$DOWN_LISTEN" ] && DOWN_LISTEN="$v"
+      v="$(unit_env "$unit" SPLIT_UP_WS_URL)";           [ -n "$v" ] && [ -z "$UP_WS_URL" ]   && UP_WS_URL="$v"
+      ;;
+  esac
+  v="$(unit_env "$unit" SPLIT_METRICS_PORT)"; [ -n "$v" ] && [ -z "$METRICS_PORT" ] && METRICS_PORT="$v"
+  v="$(unit_env "$unit" SPLIT_RELAY_BUF)";    [ -n "$v" ] && [ -z "$RELAY_BUF" ]    && RELAY_BUF="$v"
   return 0
 }
 
@@ -297,6 +426,10 @@ parse_args() {
         ASSUME_YES=1
         shift
         ;;
+      --show-secret)
+        SHOW_SECRET=1
+        shift
+        ;;
       iran|germany)
         if [ -n "$ROLE" ] && [ "$ROLE" != "$1" ]; then
           error "Role already set to '$ROLE'."
@@ -307,6 +440,17 @@ parse_args() {
         ;;
       --secret)
         require_arg "$@"; SECRET="$2"; shift 2 ;;
+      --secret-file)
+        require_arg "$@"
+        local sf="$2"
+        if [ ! -f "$sf" ]; then
+          error "--secret-file: no such file: ${sf}"
+          exit 1
+        fi
+        SECRET="$(tr -d '[:space:]' < "$sf")"
+        SECRET_FROM_STORE=1
+        shift 2
+        ;;
       --socks-listen)
         require_arg "$@"; SOCKS_LISTEN="$2"; shift 2 ;;
       --ws-listen)
@@ -391,18 +535,33 @@ gather_params() {
   fi
   info "Role: ${ROLE}"
 
+  # ---- Existing installation: pre-fill + keep the current secret ----
+  load_existing_config
+
   # ---- Shared secret ----
-  if [ -z "$SECRET" ] && [ "$INTERACTIVE" -eq 1 ]; then
-    ask "Shared secret (must match on both nodes; empty = auto-generate)" ""
-    SECRET="${REPLY_VALUE}"
-  fi
   if [ -z "$SECRET" ]; then
-    SECRET="$(generate_secret)"
-    info "Generated random shared secret: ${SECRET}"
-  elif ! is_secret "$SECRET"; then
-    error "Invalid secret: use 8-128 characters of letters, digits, dot, dash or underscore."
+    if [ "$INTERACTIVE" -eq 1 ]; then
+      ask "Shared secret (must match on both nodes; empty = auto-generate 256-bit random)" ""
+      SECRET="${REPLY_VALUE}"
+    fi
+    if [ -z "$SECRET" ]; then
+      SECRET="$(generate_secret)"
+      info "Generated a random 256-bit shared secret."
+      info "It is stored at ${SECRET_STORE} (mode 600) for the cross-node hand-off."
+      info "Copy it now if you need the raw value; the summary shows it masked."
+    elif ! is_secret "$SECRET"; then
+      error "Invalid secret: minimum 32 characters, not a known placeholder."
+      error "Generate one with: openssl rand -hex 32"
+      exit 1
+    fi
+  elif [ "$SECRET_FROM_STORE" -eq 0 ] && ! is_secret "$SECRET"; then
+    # A flag-supplied secret is checked here too (fast feedback); the
+    # binary's gate re-checks with the full Phase 6 policy.
+    error "Invalid secret: minimum 32 characters, not a known placeholder."
+    error "Generate one with: openssl rand -hex 32"
     exit 1
   fi
+  store_secret
 
   case "${ROLE}" in
     iran)
@@ -454,8 +613,10 @@ gather_params() {
         DOWN_LISTEN="${REPLY_VALUE}"
       fi
       if [ -z "$UP_WS_URL" ]; then
-        ask_valid "Up-carrier WebSocket URL (your CDN domain, path /upload)" \
-          "wss://cdn.example.com/upload" is_wss_url "expected wss://domain[:port]/path"
+        # No default: the placeholder CDN URL is rejected by the binary
+        # (Phase 7), so a fresh Germany install MUST be given a real URL.
+        ask_valid "Up-carrier WebSocket URL (your CDN domain, path /upload — required)" \
+          "" is_wss_url "expected wss://<cdn-domain>/upload (not the placeholder example.com)"
         UP_WS_URL="${REPLY_VALUE}"
       fi
       ;;
@@ -479,7 +640,7 @@ gather_params() {
     METRICS_PORT="${REPLY_VALUE}"
   fi
   if [ -z "$RELAY_BUF" ]; then
-    ask_valid "Relay buffer size in bytes" "32768" is_uint "expected a positive integer >= 1024"
+    ask_valid "Relay buffer size in bytes" "32768" is_uint "expected an integer between 1024 and 8388608"
     RELAY_BUF="${REPLY_VALUE}"
   fi
 
@@ -494,11 +655,11 @@ gather_params() {
       ;;
     germany)
       if ! is_hostport "$DOWN_LISTEN"; then error "Down listen '${DOWN_LISTEN}' is invalid (expected host:port)"; bad=1; fi
-      if ! is_wss_url "$UP_WS_URL"; then error "Up WS URL '${UP_WS_URL}' is invalid (expected wss://domain/path)"; bad=1; fi
+      if ! is_wss_url "$UP_WS_URL"; then error "Up WS URL '${UP_WS_URL}' is invalid (expected wss://<domain>/upload, not the placeholder)"; bad=1; fi
       ;;
   esac
   if ! is_port "$METRICS_PORT"; then error "Metrics port '${METRICS_PORT}' is invalid (expected 0-65535)"; bad=1; fi
-  if ! is_uint "$RELAY_BUF"; then error "Relay buffer '${RELAY_BUF}' is invalid (expected integer >= 1024)"; bad=1; fi
+  if ! is_uint "$RELAY_BUF"; then error "Relay buffer '${RELAY_BUF}' is invalid (expected 1024..8388608)"; bad=1; fi
   if [ -n "$XRAY_INBOUND_TAG" ] && [[ "$XRAY_INBOUND_TAG" =~ [[:space:]] ]]; then
     error "Xray inbound tag '${XRAY_INBOUND_TAG}' must not contain spaces"
     bad=1
@@ -594,6 +755,39 @@ build_binary() {
 }
 
 # ------------------------------------------------------------
+# Pre-install configuration gate
+# Runs the freshly built binary's OWN configuration validation
+# (internal/config, Phase 7) with the exact values that are about
+# to be written into the systemd unit. The binary exits before
+# opening any listener. No shell-side re-implementation of the
+# validation rules — the app stays the single source of truth.
+# ------------------------------------------------------------
+validate_config_gate() {
+  local bin="${INSTALL_DIR}/${ROLE}-splitter"
+  step "Configuration gate (binary --validate-config)"
+  local out
+  if out="$(
+    SPLIT_SOCKS_LISTEN="$SOCKS_LISTEN" \
+    SPLIT_WS_LISTEN="$WS_LISTEN" \
+    SPLIT_DOWN_CARRIER_ADDR="$DOWN_CARRIER_ADDR" \
+    SPLIT_UP_WS_URL="$UP_WS_URL" \
+    SPLIT_DOWN_LISTEN="$DOWN_LISTEN" \
+    SPLIT_SECRET="$SECRET" \
+    SPLIT_METRICS_PORT="$METRICS_PORT" \
+    SPLIT_RELAY_BUF="$RELAY_BUF" \
+    "$bin" --validate-config 2>&1
+  )"; then
+    info "$out"
+    info "Configuration accepted by the binary (same validation as production startup)."
+  else
+    error "The binary REJECTED this configuration — nothing was installed:"
+    error "$out"
+    error "Fix the values above and re-run the installer."
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------
 # Systemd service
 # ------------------------------------------------------------
 install_systemd_service() {
@@ -617,6 +811,13 @@ Environment=SPLIT_DOWN_CARRIER_ADDR=${DOWN_CARRIER_ADDR}"
 Environment=SPLIT_UP_WS_URL=${UP_WS_URL}"
       ;;
   esac
+
+  # Back up an existing unit (upgrade path) before overwriting it.
+  if [ -f "$unit" ]; then
+    local unit_bak="${unit}.bak.$(date +%s)"
+    cp "$unit" "$unit_bak"
+    info "Backed up existing unit to: ${unit_bak}"
+  fi
 
   info "Writing systemd unit: ${unit}"
   cat > "$unit" <<EOF
@@ -642,6 +843,9 @@ SyslogIdentifier=${ROLE}-splitter
 [Install]
 WantedBy=multi-user.target
 EOF
+  # The unit carries the shared secret — keep it root-readable-only.
+  chmod 640 "$unit"
+  chown root:root "$unit" 2>/dev/null || true
 
   systemctl daemon-reload
   systemctl enable "$svc" >/dev/null
@@ -929,6 +1133,18 @@ uninstall_role() {
     info "Removed nginx config /etc/nginx/conf.d/split-tunnel.conf"
   fi
   systemctl daemon-reload
+  # Rollback hints (backups are KEPT on purpose — remove them manually once
+  # you are sure the removal is final).
+  info "Rollback: previous unit:  ${SYSTEMD_DIR}/${svc}.service.bak.<ts> (latest = newest timestamp)"
+  info "Rollback: previous binary: ${INSTALL_DIR}/${svc}.bak"
+  info "Remove the backups when no longer needed (rm the .bak* files above)."
+  if [ "$(id -u)" -eq 0 ] && [ -f "$SECRET_STORE" ]; then
+    info "Shared secret store kept at ${SECRET_STORE} (delete it if no longer needed: rm -f ${SECRET_STORE})"
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n1 | grep -qi "status:.*active"; then
+    warn "ufw rules added by the installer were NOT removed (they may be shared)."
+    warn "To remove them: ufw delete allow <port>/tcp   (see: ufw status)"
+  fi
   info "${svc} removed. (Xray config backups in the Xray config directory were kept.)"
   return 0
 }
@@ -985,7 +1201,8 @@ print_summary() {
       info " Up-carrier:    ${UP_WS_URL}"
       ;;
   esac
-  info " Secret:        ${SECRET}"
+  info " Secret:        $(secret_display)"
+  info " Secret file:   ${SECRET_STORE} (mode 600)"
   info " Metrics:       ${metrics_line}"
   info " Status:        systemctl status ${ROLE}-splitter"
   info " Logs:          journalctl -u ${ROLE}-splitter -f"
@@ -1005,10 +1222,13 @@ print_summary() {
    2. In the Iran Xray/3x-ui, make sure the down-carrier path exists: a
       local inbound on ${DOWN_CARRIER_ADDR} that tunnels over VLESS+Reality
       to Germany and targets 127.0.0.1:<Germany down-carrier port>.
-   3. On the Germany node, run:
-      curl -fsSL ${RAW_INSTALL_SH} | sudo bash -s -- germany --yes \
-        --secret ${SECRET} --up-ws-url ${url}
-   4. If the Xray config was merged, restart Xray, then test with a
+   3. Transfer the shared secret to the Germany node WITHOUT using a
+      command line (scp the file, or copy-paste into the installer):
+         scp ${SECRET_STORE} root@<germany>:${SECRET_STORE}
+   4. On the Germany node, run:
+      curl -fsSL ${RAW_INSTALL_SH} | sudo bash -s -- germany --yes \\
+        --up-ws-url ${url} --secret-file ${SECRET_STORE}
+   5. If the Xray config was merged, restart Xray, then test with a
       SOCKS5 client pointed at ${SOCKS_LISTEN}.
 EOF
       ;;
@@ -1016,7 +1236,9 @@ EOF
       cat <<EOF
 
   Next steps:
-   1. On the Iran node, make sure SPLIT_SECRET is exactly: ${SECRET}
+   1. On the Iran node, make sure SPLIT_SECRET matches the value in the
+      systemd unit (this installer kept/reused it — re-run the Iran
+      installer with --secret to rotate it on BOTH nodes together).
    2. In the Germany Xray/3x-ui, route the VLESS+Reality inbound traffic
       destined to 127.0.0.1:${DOWN_LISTEN##*:} directly to the internet
       (freedom/direct outbound) so it reaches this splitter.
@@ -1058,7 +1280,16 @@ main() {
   ensure_go
 
   step "Build & install binary"
+  # Back up the previously installed binary before replacing it, so an
+  # upgrade can be rolled back without a rebuild.
+  if [ -f "${INSTALL_DIR}/${ROLE}-splitter" ]; then
+    cp "${INSTALL_DIR}/${ROLE}-splitter" "${INSTALL_DIR}/${ROLE}-splitter.bak"
+    info "Backed up previous binary to: ${INSTALL_DIR}/${ROLE}-splitter.bak"
+  fi
   build_binary
+
+  step "Configuration gate"
+  validate_config_gate
 
   step "Systemd service"
   install_systemd_service

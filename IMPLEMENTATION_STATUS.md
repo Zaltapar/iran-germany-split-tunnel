@@ -3,7 +3,7 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 7 (centralized configuration validation) — COMPLETE
+## Current phase: Phase 8 (interactive installer) — COMPLETE
 
 ## Baseline (measured before any change)
 
@@ -692,3 +692,145 @@ at once instead of failing one-at-a-time.
 - `SPLIT_WS_LISTEN` default is `127.0.0.1:9001`: production deploys
   front it via nginx/CDN and are expected to set an explicit listen
   address.
+
+## Phase 8 — interactive installer
+
+Goal: a robust interactive install/upgrade/uninstall experience that is
+BUILT ON `internal/config` instead of duplicating it, keeps the Phase 6
+secret policy intact, and never leaks secrets into output or shell
+history.
+
+### Pre-existing defects found during inspection (fixed here)
+
+The installer (commit `c85ed76`, pre-hardening) predated Phase 7 and
+diverged from the app's own validation:
+
+1. **`is_secret` accepted 8–127 chars** — Phase 6/7 policy requires
+   ≥ 32 (`mux.ValidateSecretMaterial`). The old harness (Test 3) even
+   installed an 18-char secret that the binary would refuse to boot.
+2. **Germany's default `SPLIT_UP_WS_URL` was the placeholder
+   `wss://cdn.example.com/upload`**, which `internal/config` explicitly
+   rejects — the default path installed a dead service.
+3. **No pre-install validation**: config errors surfaced only as
+   `service failed` in the journal, after the unit was written.
+4. **Secret printed in plaintext** in the summary AND embedded in the
+   printed Germany curl command (`--secret ${SECRET}`) — into terminals,
+   logs and shell history.
+5. **No upgrade path**: a re-run silently overwrote the unit (no
+   backup) and could not pre-fill; the operator re-typed everything and
+   had to re-supply the old secret.
+6. **Stale checked-in units**: `SPLIT_WS_LISTEN=0.0.0.0:9001`
+   (vs code default `127.0.0.1:9001`) and no note that the
+   placeholder secret/URL is rejected at startup.
+
+### What changed
+
+- **`cmd/iran-splitter/main.go` + `cmd/germany-splitter/main.go`**
+  (the ONLY Go change, minimal & additive): a first-argument
+  `--validate-config` flag. When present, the binary runs
+  `config.Load(role)` and exits with the aggregated `ConfigError` (or
+  success) BEFORE any listener is opened or goroutine started. Normal
+  startup behavior is byte-for-byte unchanged. `install.sh` uses this
+  as its configuration gate; it is also a documented manual dry-run
+  (README). This is the installer-compatibility change the Phase 8
+  scope allowed: the app stays the SINGLE validation authority — the
+  shell never re-implements the full rules.
+- **`install.sh` (v1.1.0)**:
+  - **Configuration gate** (`validate_config_gate`): after the build,
+    the installer runs
+    `<binary> --validate-config` with the EXACT env values it is about
+    to write into the unit. A rejection aborts the install before any
+    unit file is written (asserted by a test).
+  - **Early checks aligned to `internal/config`** (fast UX only, never
+    stricter than the app): secret ≥ 32 chars + Phase 6 blocklist
+    (exact values + `change-me*`/`your-secret*` prefixes);
+    `wss://host[:port]/upload` with `ws://` allowed and the
+    placeholder `wss://cdn.example.com/upload` explicitly rejected;
+    Germany's up-WS-URL prompt has NO default (a real URL is
+    required); `host:port` accepts bare `:port` listeners and bracketed
+    IPv6 (`[::1]:9001`); `SPLIT_RELAY_BUF` bounds 1024..8 MiB.
+  - **Secret hygiene**: generation bumped to `openssl rand -hex 32`
+    (256 bits, 64 hex — was `-hex 24`); the secret is persisted to
+    `/root/.split-tunnel-secret` (mode 600) for the cross-node
+    hand-off; new `--secret-file PATH` flag (whitespace-stripped) so the
+    non-interactive Germany command never carries the secret on a
+    command line; summary shows the secret MASKED by default
+    (`--show-secret` reveals); the printed Iran→Germany next-steps now
+    use `scp /root/.split-tunnel-secret` + `--secret-file` instead of
+    embedding the value; generated-secret notice replaces the old
+    "Generated random shared secret: <value>" line.
+  - **Upgrade path** (`load_existing_config`): an existing
+    `<role>-splitter.service` is detected; its `SPLIT_*` values
+    (including the secret, read via `sed`, never re-printed) pre-fill
+    the prompts/flags; the old unit is backed up to
+    `<unit>.bak.<ts>` and the previous binary to
+    `<role>-splitter.bak` before replacement; the unit is written
+    mode 640.
+  - **Uninstall** (per role or both, as before): removes the unit +
+    binary + managed nginx conf (marker-guarded), and now PRINTS
+    rollback hints (kept `.bak` unit/binary files, secret store, and a
+    `ufw delete` reminder — ufw rules are intentionally not removed
+    automatically).
+  - Version string 1.0.0 → 1.1.0 (unit Description follows).
+- **`systemd/*.service`** (checked-in manual-deploy units): Iran
+  `SPLIT_WS_LISTEN` corrected `0.0.0.0:9001` → `127.0.0.1:9001`
+  (matching the code default); comments now state that the shipped
+  `YOUR-SECRET-HERE` / placeholder URL are REJECTED at startup and show
+  `openssl rand -hex 32`; commented Phase 3 queue variables documented.
+- **`test-install.sh`**: extended (9 → 13 scenarios, 90 assertions):
+  generated secret is now 64 hex; short (18-char) and blocklisted
+  secrets are rejected with a clear message; placeholder and wrong-path
+  up-WS-URLs are rejected; bare `:port` and bracketed IPv6 are
+  accepted; a failing configuration gate (fake binary via
+  `FAKE_GATE_FAIL=1`) aborts BEFORE the unit is written;
+  `--secret-file` populates the unit and the value is masked in the
+  summary; `--show-secret` reveals it; an upgrade run keeps all
+  existing unit values (incl. secret), pre-fills, and backs up the old
+  unit; summary no longer contains the plaintext secret (file-based
+  hand-off asserted); unit mode 640 asserted on Linux (skipped on
+  git-bash where chmod is emulated). Test 1's answer file now uses
+  `printf` — heredocs strip trailing blank lines, which silently
+  shifted the interactive answers.
+- **`README.md`**: installer section rewritten (secret generation,
+  file-based cross-node hand-off, masking, upgrade semantics,
+  uninstall/rollback hints); new "Pre-install dry-run" note
+  documenting `--validate-config`.
+- **Repo hygiene**: removed the stray untracked
+  `ntent IMPLEMENTATION_STATUS.md` (an accidental `git log` dump).
+
+### Verification
+
+- `gofmt -l .` clean; `go vet ./...` PASS
+- `go build ./...` PASS (windows/amd64); `GOOS=linux GOARCH=amd64`
+  cross-builds verified by the installer's build step
+- `go test ./...` PASS (all packages)
+- `go run ./e2e-pipe-test` PASS
+- `--validate-config` negative/positive runs verified by hand
+  (valid env → `configuration OK`, exit 0; short secret → aggregated
+  `ConfigError`, exit 1, no listener opened)
+- `bash test-install.sh` — 90/90 PASS (git-bash on Windows; the 640
+  mode assertion auto-skips there and runs on Linux)
+- `go test -race ./...` — still NOT runnable on this Windows host
+  (same pre-existing toolchain crash `0xc0000139`). Run on Linux/CI.
+
+### Notes
+
+- The shell validators in `install.sh` are a deliberately thin
+  pre-check; `internal/config` (via `--validate-config`) is the
+  authority. They must never be made stricter than the app.
+- `deploy.sh` (legacy manual deploy) was left untouched; it still
+  copies the checked-in units, which are now corrected and documented.
+- The secret file at `/root/.split-tunnel-secret` is created on
+  install and kept on uninstall on purpose (documented in the output);
+  it is never committed.
+
+### Rollback
+
+```
+git revert <phase-8-interactive-installer-commit>
+```
+
+Phase 8 touches `install.sh`, `test-install.sh`, both `systemd/*.service`,
+the README/this file, and only ADDS the `--validate-config` early-exit in
+both mains (reverting the commit removes it cleanly; no protocol,
+lifecycle, or queue code was modified).

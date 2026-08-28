@@ -37,23 +37,43 @@ tunneled over VLESS+Reality. One direction per carrier — no cross-traffic.
 The installer asks for every setting (role, shared secret, ports, CDN domain,
 Xray inbound tag, nginx, metrics) with sensible defaults — just press Enter to
 accept. It then installs the Go toolchain if needed, builds the binary for the
-role, sets up the systemd service, merges the Xray config (Iran) and
-configures nginx (Iran), and prints the exact next steps for the other node.
+role, runs the binary's OWN pre-install configuration gate
+(`<role>-splitter --validate-config`, the same `internal/config` validation
+the production binary uses at startup) and only writes/starts the systemd
+service if that gate passes. On the Iran role it also merges the Xray config
+and configures nginx, then prints the exact next steps for the other node.
 
 ```bash
-# Iran node
+# Iran node (the installer generates the shared secret for you)
 sudo bash install.sh
 # or remotely:
 curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s
+```
 
-# Germany node (must use the same shared secret)
-curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s -- germany --yes \
-  --secret <SECRET-FROM-IRAN> --up-ws-url wss://<cdn-domain>/upload
+**Secret handling.** Without `--secret` the installer generates a 256-bit
+secret (`openssl rand -hex 32`), stores it at `/root/.split-tunnel-secret`
+(mode 600), and shows it MASKED in the summary (use `--show-secret` to
+reveal). Transfer the secret to the other node as a FILE, not a command-line
+argument:
+
+```bash
+# on the Iran node, after the install:
+scp /root/.split-tunnel-secret root@<germany>:~/.split-tunnel-secret
+
+# Germany node (non-interactive; the secret never appears on the command line)
+curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s \
+  -- germany --yes --up-ws-url wss://<cdn-domain>/upload --secret-file ~/.split-tunnel-secret
 ```
 
 Every question also has a flag (see `install.sh --help`), so the installer can
-run fully non-interactive with `--yes`. To remove everything the installer
-added: `sudo bash install.sh uninstall [iran|germany]`.
+run fully non-interactive with `--yes`. Re-running the installer on an
+existing installation is an **upgrade**: it pre-fills the current unit's
+values as prompt defaults, backs up the old unit
+(`<unit>.service.bak.<ts>`) and binary (`<role>-splitter.bak`), and keeps the
+existing shared secret unless you supply a new one. To remove the service,
+binary and managed nginx config: `sudo bash install.sh uninstall
+[iran|germany]` (rollback backups are kept and listed in the output;
+`ufw` rules are NOT removed automatically — see the printed hints).
 
 ### Manual build & deploy (without the installer)
 
@@ -128,6 +148,17 @@ at once (aggregated list) instead of one-at-a-time:
 by default, which the runtime resolves to `mux.DefaultStreamLimits`
 (16 frames / 1 MiB per stream, 32 MiB per carrier, 100 ms) via
 `mux.SanitizeLimits`.
+
+**Pre-install dry-run.** Both binaries accept `--validate-config` as their
+first argument: they run the full load→parse→validate path above, print the
+result, and exit WITHOUT opening any listener. `install.sh` uses this as its
+configuration gate (the exact environment values that go into the systemd
+unit are passed in), and it is also a convenient manual dry-run:
+
+```bash
+SPLIT_SECRET=... SPLIT_UP_WS_URL=wss://cdn.example.org/upload \
+  ./germany-splitter --validate-config
+```
 
 ## Xray Config (Iran)
 

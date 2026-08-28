@@ -179,6 +179,20 @@ func (s *Splitter) waitCarriers() (*mux.CarrierConn, *mux.CarrierConn, error) {
 }
 
 func main() {
+	// Phase 8 (installer): `--validate-config` runs the Phase 7
+	// load→parse→validate→construct path and exits BEFORE any listener
+	// is opened or goroutine started. install.sh uses this as a
+	// pre-install gate so a misconfigured deployment is reported before
+	// the systemd unit is written. No other argument is interpreted;
+	// normal startup is unchanged.
+	if len(os.Args) > 1 && os.Args[1] == "--validate-config" {
+		if _, err := config.Load(config.RoleIran); err != nil {
+			log.Fatalf("iran-splitter: %v", err)
+		}
+		log.Printf("iran-splitter: configuration OK (role: %s)", config.RoleIran)
+		return
+	}
+
 	// Phase 7: load → parse → validate the ENTIRE configuration before
 	// any listener opens or goroutine starts. Load reports every problem
 	// at once (aggregated) and enforces the Phase 6 secret policy.
