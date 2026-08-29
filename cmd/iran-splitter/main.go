@@ -327,11 +327,10 @@ func (s *Splitter) authInBackoff() bool {
 func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	wsc := &wsConn{conn: ws}
 
-	// The WS adapter cannot enforce deadlines, so watchdog any
-	// connection that does not complete the auth handshake in time.
-	watchdog := time.AfterFunc(15*time.Second, func() { ws.Close() })
-	defer watchdog.Stop()
-
+	// The WS adapter cannot enforce deadlines, so CarrierAuth itself
+	// bounds this handshake: it races each read against AuthTimeout
+	// (and the context, where one is given) and closes the connection
+	// on expiry, which interrupts the blocked read.
 	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret())
 	if err != nil {
 		// The error is for LOCAL logging only; nothing about WHICH check

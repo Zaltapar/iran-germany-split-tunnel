@@ -70,9 +70,13 @@ import (
 // server never sends a challenge). Both ends must be upgraded together.
 //
 // Timeout: the whole handshake is bounded by AuthTimeout even when the
-// caller's context has no deadline, and the bound is also applied to
-// the socket (SetDeadline, where supported), so an attacker that opens
-// a connection and stalls or goes silent cannot hold resources.
+// caller's context has no deadline, so an attacker that opens a
+// connection and stalls or goes silent cannot hold resources. Where the
+// transport supports deadlines (SetDeadline, matching net.Conn
+// semantics) the bound is applied to the socket; where it does not (e.g.
+// the WebSocket adapter) each handshake read is raced against the bound
+// and the connection is closed on expiry, which interrupts the blocked
+// read.
 
 // AuthVersion is the current authentication protocol version.
 const AuthVersion = 1
@@ -245,14 +249,20 @@ func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, rol
 		return nil, err
 	}
 
-	// Hard handshake bound: min(ctx deadline, now+AuthTimeout), applied
-	// to the socket too (where supported) so a silent/stalling peer
-	// cannot hold the connection past the bound.
+	// Hard handshake bound: min(ctx deadline, now+AuthTimeout). Where the
+	// transport supports deadlines (SetDeadline, matching net.Conn
+	// semantics) the bound is applied to the socket; where it does not
+	// (e.g. the WebSocket adapter) every handshake read is raced against
+	// the bound — on expiry the connection is closed, which interrupts
+	// the blocked read (the adapter's Close closes the underlying TCP
+	// conn). After this point no deadline is in effect, so normal
+	// long-lived authenticated behavior is unaffected.
 	deadline := time.Now().Add(AuthTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
 	type deadlineer interface{ SetDeadline(time.Time) error }
+	_, hasDeadline := rwc.(deadlineer)
 	if dl, ok := rwc.(deadlineer); ok {
 		_ = dl.SetDeadline(deadline)
 	}
@@ -263,8 +273,45 @@ func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, rol
 
 	// readAuthFrame reads the next frame and enforces the handshake
 	// context: FrameAuth on stream 0 with exactly wantLen payload bytes.
+	// On a deadline-less transport the read is additionally raced
+	// against the handshake bound (see above); the blocked read is
+	// interrupted by closing the connection.
 	readAuthFrame := func(wantLen int) ([]byte, error) {
-		f, err := ReadFrame(br)
+		var (
+			f   Frame
+			err error
+		)
+		if hasDeadline {
+			f, err = ReadFrame(br)
+		} else {
+			// The result is handed back through a buffered channel
+			// (never the captured variables): on timeout/cancellation
+			// this function returns first, and the reader goroutine
+			// must be able to finish without touching caller state.
+			type readResult struct {
+				frame Frame
+				err   error
+			}
+			res := make(chan readResult, 1)
+			go func() {
+				ff, err := ReadFrame(br)
+				res <- readResult{ff, err}
+			}()
+			select {
+			case r := <-res:
+				f, err = r.frame, r.err
+			case <-ctx.Done():
+				// Cancellation (e.g. node shutdown) interrupts the
+				// blocked read: closing the connection makes the
+				// reader goroutine above return promptly.
+				_ = rwc.Close()
+				return nil, ctx.Err()
+			case <-time.After(deadline.Sub(time.Now())):
+				// Handshake bound reached: same interrupt mechanism.
+				_ = rwc.Close()
+				return nil, context.DeadlineExceeded
+			}
+		}
 		if err != nil {
 			return nil, err
 		}

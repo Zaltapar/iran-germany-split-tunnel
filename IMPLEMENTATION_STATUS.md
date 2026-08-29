@@ -3,7 +3,57 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 8 (interactive installer) — COMPLETE
+## Current state
+
+- **All hardening phases (1–8) complete** — see the historical phase
+  records below.
+- **Phase 5 (reconnect/rebind) production wiring is COMPLETE** — commit
+  `881d46d` (phase-5-production-wiring): both production binaries
+  (`cmd/iran-splitter`, `cmd/germany-splitter`) run the `pkg/node`
+  engine (carrier generations, rebind protocol, grace windows); the
+  Phase 5 design/commit records below are historical context for the
+  wiring, not pending work.
+- **Fix A (authenticated bufio.Reader handoff race) fixed** — commit
+  `9d4e2f2`: the reader returned by `CarrierAuth` is bound into the
+  carrier before its read loop starts, so pre-buffered frames are never
+  orphaned.
+- **Follow-up maintenance (this commit)**: the WebSocket carrier auth
+  handshake is now bounded even on transports that cannot enforce socket
+  deadlines (the production `wsConn` adapter exposes only Read/Write/
+  Close); deterministic regression tests; Linux GitHub Actions CI
+  (`.github/workflows/go.yml`): `gofmt`, `go vet`, `go test`,
+  `go test -race`, `go build` (host + linux/amd64 cross-build); the
+  unused historical `hashicorp/yamux` dependency removed via
+  `go mod tidy`. No changes to `install.sh`, the v1 protocol, session
+  lifecycle, reconnect/rebind, or backpressure.
+- Full verification for the follow-up is recorded in the
+  "Follow-up — bounded WebSocket auth handshake" section at the bottom.
+
+### Known limitations (current, honest list)
+
+- `go test -race` cannot run on the Windows development host
+  (race-instrumented binaries abort at startup with `0xc0000139` — a
+  toolchain/environment issue that predates all hardening phases). It is
+  now covered by the Linux CI workflow on pushes to `main` and on PRs.
+- The Iran `/upload` `CheckOrigin` policy is permissive **by documented
+  decision** (machine-to-machine endpoint; the security boundary is the
+  v1 authentication plus TLS/Reality in the transport) — Phase 6 record.
+- `KeepAliveInterval` is a fixed 30 s default with no env variable on
+  purpose — Phase 7 notes.
+- Configuration validation is lexical/structural; it does not probe the
+  network (e.g. CDN DNS) — Phase 7 notes.
+- The up-carrier WebSocket auth handshake bound is 15 s (`mux.AuthTimeout`);
+  a peer that upgrades but never sends the challenge now costs at most
+  that long per attempt before the connection is closed (before this
+  follow-up, the Germany-side dial path could block indefinitely on a
+  silent peer because `wsConn` has no `SetDeadline`).
+
+## Historical phase records
+
+The sections below are the phase-by-phase records, kept as written at
+the time — including their own "next phase" forward pointers, which are
+superseded as the work progressed (each is marked where it has been
+superseded).
 
 ## Baseline (measured before any change)
 
@@ -307,7 +357,11 @@ Documented so later phases can verify each one is addressed:
 by construction: all state under `s.mu`, teardown under `sync.Once`;
 `-race` should be run in any Linux CI as a final confirmation.
 
-## Next phase
+## Next phase (SUPERSEDED — Phase 5 is complete)
+
+The historical Phase 4 record pointed forward to Phase 5, which has
+since been completed (design in the Phase 5 section below; production
+wiring in commit `881d46d`). Kept for the record:
 
 Phase 5 — reconnect/rebind (Issue A: sessions bound to a CarrierConn):
 make sessions survive carrier replacement by rebinding them to a new
@@ -843,3 +897,96 @@ Phase 8 touches `install.sh`, `test-install.sh`, both `systemd/*.service`,
 the README/this file, and only ADDS the `--validate-config` early-exit in
 both mains (reverting the commit removes it cleanly; no protocol,
 lifecycle, or queue code was modified).
+
+## Follow-up — bounded WebSocket auth handshake (this commit)
+
+### The gap (audited and confirmed in source)
+
+`mux.CarrierAuth` bounds the handshake by `AuthTimeout` and applied that
+bound to the socket only when the transport implemented
+`SetDeadline` (a type assertion on the `io.ReadWriteCloser`). The
+production WebSocket adapter (`wsConn` in both mains) exposes only
+`Read`/`Write`/`Close` — no `SetDeadline` — and the Germany up-carrier
+client path (`runUpCarrier`) passed it to `CarrierAuth` with a 15 s
+context, but the context was checked only ONCE at the top of the
+handshake, so a blocked `Read` was never interrupted by it. A peer that
+completed the WebSocket upgrade but never sent the authentication
+challenge could therefore hold the Germany-side dial goroutine
+indefinitely (the Iran-side server path was covered only by an external
+`time.AfterFunc` watchdog in `handleUpWsConn`).
+
+### The fix (minimal, protocol-unchanged)
+
+- `pkg/mux/auth.go` — on a transport WITHOUT `SetDeadline`, each
+  handshake read now runs in a short-lived goroutine and is raced
+  against `ctx.Done()` and the handshake bound (`min(ctx deadline,
+  now+AuthTimeout)`). On expiry/cancellation the connection is closed —
+  which interrupts the blocked read (the adapter's `Close` closes the
+  underlying TCP conn) — and the read result is handed back through a
+  buffered channel so the reader goroutine can always finish (no shared
+  state, no goroutine leak). On transports WITH `SetDeadline` (all TCP
+  paths) the code path is byte-for-byte the old one. The v1 protocol,
+  role binding, replay protection, and post-auth long-lived behavior are
+  unchanged; no deadline survives past the handshake.
+- `cmd/germany-splitter/main.go` — `runUpCarrier` split into the loop
+  plus `runUpCarrierOnce` (behavior-preserving extraction, made the
+  production path directly testable; the 15 s auth context is
+  unchanged).
+- `cmd/iran-splitter/main.go` — the now-redundant `time.AfterFunc`
+  watchdog in `handleUpWsConn` removed; `CarrierAuth` itself bounds the
+  handshake for the deadline-less `wsConn` (same 15 s `AuthTimeout`).
+
+### Regression tests (deterministic, no real 30 s waits)
+
+- `pkg/mux/auth_ws_timeout_test.go` (new): deadline-less transport
+  (mirrors `wsConn`) against a silent peer — (a) `AuthTimeout` bound
+  fires (`context.DeadlineExceeded`, conn closed, no goroutine leak),
+  (b) a shorter caller context deadline is respected, (c) context
+  CANCELLATION interrupts the blocked handshake with
+  `context.Canceled` and closes the connection. All use 100–300 ms
+  test-specific bounds.
+- `cmd/germany-splitter/up_carrier_ws_test.go` (new): the PRODUCTION
+  path — real gorilla server that upgrades then goes silent; the
+  Germany `runUpCarrierOnce` (dial → `wsConn` → `CarrierAuth`) returns
+  in ~0.3 s (test-specific `AuthTimeout`) with the connection closed;
+  plus a live-peer success test proving normal authenticated handshakes
+  over `wsConn` are unaffected.
+
+### CI (new)
+
+- `.github/workflows/go.yml` (new, first workflow in the repo): Linux
+  (`ubuntu-latest`, Go `1.21` per `go.mod`) — `gofmt -l` clean check,
+  `go vet ./...`, `go test ./...`, `go test -race ./...`, `go build
+  ./...` (host) and `GOOS=linux GOARCH=amd64 go build ./...`. No
+  release/build automation. This also gives a permanent home for the
+  `-race` suite that cannot run on the Windows dev host.
+
+### Dependency cleanup
+
+- `hashicorp/yamux` was imported by no Go code (historical dependency);
+  removed via `go mod tidy` — `go.mod`/`go.sum` now carry only
+  `gorilla/websocket`. Full test suite re-run confirms no behavior
+  change.
+
+### Verification
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS (windows/amd64)
+- `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- `go test ./... -count=5` — PASS (all packages)
+- New regression tests re-run repeatedly (5× each) — deterministic
+- `go run ./e2e-pipe-test` — PASS
+- `go test -race ./...` — see Linux CI (Windows-host toolchain crash
+  `0xc0000139` unchanged, pre-existing)
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+The commit is self-contained: `pkg/mux/auth.go`, both mains (refactor
++ watchdog removal), two new test files, the new workflow, `go.mod` /
+`go.sum`, and this documentation update. No `install.sh` changes, no
+wire-protocol changes, no session-lifecycle or backpressure changes.
