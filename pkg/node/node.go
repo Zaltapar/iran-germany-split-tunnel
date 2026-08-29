@@ -181,6 +181,12 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 // Store is the session store.
 func (n *Node) Store() *session.SessionStore { return n.store }
 
+// Secret returns the derived shared secret. The Node does not perform
+// the carrier authentication itself; the transport layer (cmd/*) runs
+// mux.CarrierAuth with this secret BEFORE handing the authenticated
+// connection to InstallUp/InstallDown.
+func (n *Node) Secret() []byte { return n.secret }
+
 // Metrics is the metrics set (used by the /metrics handler).
 func (n *Node) Metrics() *Metrics { return n.metrics }
 

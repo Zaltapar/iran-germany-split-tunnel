@@ -302,6 +302,10 @@ func TestValidateDoesNotReadEnv(t *testing.T) {
 		WsListen:        "127.0.0.1:9001",
 		DownCarrierAddr: "127.0.0.1:10802",
 		Secret:          strongSecret,
+		// Phase 5 carrier-loss recovery bounds (must be in range for
+		// Validate; take the canonical defaults).
+		CarrierGraceMs:  Defaults().CarrierGraceMs,
+		SessionBufBytes: Defaults().SessionBufBytes,
 	}
 	if err := c.Validate(RoleIran); err != nil {
 		t.Fatalf("hand-built config must validate without env: %v", err)

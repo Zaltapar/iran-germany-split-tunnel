@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,13 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/backoff"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
-	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
 	"github.com/gorilla/websocket"
 )
 
@@ -62,95 +61,40 @@ func (w *wsConn) Write(p []byte) (int, error) {
 func (w *wsConn) Close() error { return w.conn.Close() }
 
 // ============================================================
-// Config & Metrics
+// Splitter — thin transport wrapper around pkg/node
 // ============================================================
 //
-// The Config type lives in internal/config (Phase 7): one shared
-// load→parse→validate→construct path for both binaries. This file only
-// builds runtime limits from the validated config.
-
-// streamLimits builds the per-stream mailbox limits from config. Zero
-// values fall back to mux.DefaultStreamLimits via SanitizeLimits.
-func (s *Splitter) streamLimits() mux.StreamLimits {
-	return mux.StreamLimits{
-		MaxBytesPerStream:  s.config.QueueBytesPerStream,
-		MaxFramesPerStream: s.config.QueueFramesPerStream,
-		MaxBytesTotal:      s.config.QueueBytesTotal,
-		OverflowWait:       time.Duration(s.config.OverflowWaitMs) * time.Millisecond,
-	}
-}
-
-type Metrics struct {
-	mu             sync.Mutex
-	activeSessions int64
-	totalSessions  int64
-	totalBytesUp   int64
-	totalBytesDown int64
-	errors         int64
-}
-
-func (m *Metrics) incSession()     { m.mu.Lock(); m.activeSessions++; m.totalSessions++; m.mu.Unlock() }
-func (m *Metrics) decSession()     { m.mu.Lock(); m.activeSessions--; m.mu.Unlock() }
-func (m *Metrics) incUp(n int64)   { m.mu.Lock(); m.totalBytesUp += n; m.mu.Unlock() }
-func (m *Metrics) incDown(n int64) { m.mu.Lock(); m.totalBytesDown += n; m.mu.Unlock() }
-func (m *Metrics) incErr()         { m.mu.Lock(); m.errors++; m.mu.Unlock() }
-
-// ============================================================
-// Splitter
-// ============================================================
-
-// carrierHandle pairs a live carrier with its dispatcher completion.
-type carrierHandle struct {
-	carrier *mux.CarrierConn
-	done    chan struct{}
-}
-
-// close waits for the dispatcher to drain, then tears the carrier down.
-func (h *carrierHandle) close() {
-	<-h.done
-	h.carrier.Close()
-}
+// Phase 5 production wiring: ALL carrier ownership, carrier
+// generations, session/carrier attachments, the rebind protocol and
+// the grace-window logic live in pkg/node (the Phase 5 engine). This
+// binary only provides the TRANSPORTS:
+//
+//   - the SOCKS5 listener (local Xray → us),
+//   - the up-carrier WebSocket server (Germany dials /upload),
+//   - the down-carrier TCP dial (us → local Xray),
+//   - the metrics listener.
+//
+// Authenticated transport connections are handed to the node via
+// InstallUp/InstallDown; the node owns every carrier from that point
+// (dispatch, loss sweep, rebind sweep, replacement). There is no
+// second carrier- or session-management implementation in this file.
 
 type Splitter struct {
-	config  *config.Config
-	store   *session.SessionStore
-	metrics *Metrics
-	logger  *log.Logger
-	secret  []byte
-
-	mu   sync.RWMutex
-	up   *carrierHandle // up carrier: WS server, Germany dials /upload
-	down *carrierHandle // down carrier: TCP client → local Xray :10802
-
-	streamID uint32 // per-session stream ID, shared by both carriers
+	config *config.Config
+	node   *node.Node
+	logger *log.Logger
 
 	lnMu    sync.Mutex
 	socksLn net.Listener
 	upLn    net.Listener
 	mLn     net.Listener
 
-	// Up-carrier auth-failure backoff state (Phase 6).
+	// Up-carrier auth-failure backoff state (Phase 6): the node's
+	// UpReady() feeds the single-carrier rule; these counters feed the
+	// 429 backoff on repeated authentication failures.
 	authFailMu sync.Mutex
 	authFails  int
 	authFailAt time.Time
-}
-
-func (s *Splitter) getUp() *mux.CarrierConn {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.up != nil {
-		return s.up.carrier
-	}
-	return nil
-}
-
-func (s *Splitter) getDown() *mux.CarrierConn {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.down != nil {
-		return s.down.carrier
-	}
-	return nil
 }
 
 // closeListeners unblocks all accept loops for a clean shutdown.
@@ -162,20 +106,6 @@ func (s *Splitter) closeListeners() {
 			ln.Close()
 		}
 	}
-}
-
-// waitCarriers blocks until both carriers are live (30s timeout).
-func (s *Splitter) waitCarriers() (*mux.CarrierConn, *mux.CarrierConn, error) {
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		up := s.getUp()
-		down := s.getDown()
-		if up != nil && up.Ready() && down != nil && down.Ready() {
-			return up, down, nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return nil, nil, errors.New("carriers not ready")
 }
 
 func main() {
@@ -201,13 +131,20 @@ func main() {
 		log.Fatalf("iran-splitter: %v", err)
 	}
 
-	derived := mux.DeriveSecret(cfg.Secret)
+	logger := log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags)
+	n := node.NewNode(node.Config{
+		Role:              node.RoleIran,
+		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
+		BufferBytes:       cfg.SessionBufBytes,
+		RelayBufSize:      cfg.RelayBufSize,
+		KeepAliveInterval: cfg.KeepAliveInterval,
+		StreamLimits:      streamLimits(cfg),
+	}, logger, mux.DeriveSecret(cfg.Secret))
+
 	s := &Splitter{
-		config:  cfg,
-		store:   session.NewSessionStore(),
-		metrics: &Metrics{},
-		logger:  log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags),
-		secret:  derived,
+		config: cfg,
+		node:   n,
+		logger: logger,
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -236,18 +173,22 @@ func main() {
 
 	<-sigCh
 	s.logger.Println("Shutting down...")
-	s.store.CloseAll()
-	s.mu.Lock()
-	if s.up != nil {
-		s.up.carrier.Close()
-	}
-	if s.down != nil {
-		s.down.carrier.Close()
-	}
-	s.mu.Unlock()
+	s.node.Close() // Phase 4 authoritative session teardown + carrier close
 	s.closeListeners()
 	wg.Wait()
 	s.logger.Println("iran-splitter stopped")
+}
+
+// streamLimits builds the per-stream mailbox limits from config (Phase 3
+// backpressure policy, applied by the node to every installed carrier).
+// Zero values fall back to mux.DefaultStreamLimits via SanitizeLimits.
+func streamLimits(cfg *config.Config) mux.StreamLimits {
+	return mux.StreamLimits{
+		MaxBytesPerStream:  cfg.QueueBytesPerStream,
+		MaxFramesPerStream: cfg.QueueFramesPerStream,
+		MaxBytesTotal:      cfg.QueueBytesTotal,
+		OverflowWait:       time.Duration(cfg.OverflowWaitMs) * time.Millisecond,
+	}
 }
 
 // ============================================================
@@ -330,7 +271,9 @@ func (s *Splitter) uploadHandler(upgrader websocket.Upgrader) http.HandlerFunc {
 			http.Error(w, "too many concurrent handshakes", http.StatusServiceUnavailable)
 			return
 		}
-		if s.getUp() != nil {
+		// Single-carrier rule (Phase 6): the node's UpReady() reports
+		// whether a live up carrier is currently installed.
+		if s.node.UpReady() {
 			s.logger.Printf("Up-carrier: rejected %s (carrier already connected)", r.RemoteAddr)
 			http.Error(w, "up-carrier already connected", http.StatusConflict)
 			return
@@ -374,6 +317,13 @@ func (s *Splitter) authInBackoff() bool {
 	return s.authFails >= authFailBackoffLimit && time.Since(s.authFailAt) <= authFailBackoffWindow
 }
 
+// handleUpWsConn authenticates one accepted WebSocket connection (v1
+// challenge/response, Phase 6) and hands the transport to the node.
+// The handler returns only when the carrier's dispatcher has exited —
+// the node's InstallUp runs the loss sweep + rebind sweep for the
+// replacement lifecycle asynchronously, so a fast Germany reconnect
+// can be served from the ACCEPT loop while the previous carrier is
+// still settling.
 func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	wsc := &wsConn{conn: ws}
 
@@ -382,7 +332,7 @@ func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	watchdog := time.AfterFunc(15*time.Second, func() { ws.Close() })
 	defer watchdog.Stop()
 
-	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret)
+	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret())
 	if err != nil {
 		// The error is for LOCAL logging only; nothing about WHICH check
 		// failed is transmitted to the peer (the connection is simply
@@ -395,83 +345,69 @@ func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	s.clearAuthFails()
 	s.logger.Printf("Up-carrier authenticated from %s", ws.RemoteAddr())
 
-	carrier := mux.NewCarrierConn(wsc, s.config.KeepAliveInterval)
-	carrier.SetReadBuffer(br)
-	carrier.SetStreamLimits(s.streamLimits())
-	h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
-	go func() {
-		defer close(h.done)
-		carrier.Dispatch()
-	}()
-
-	s.mu.Lock()
-	s.up = h
-	s.mu.Unlock()
-	s.logger.Printf("Up-carrier established")
-
-	<-h.done
-	h.close()
-	s.mu.Lock()
-	if s.up == h {
-		s.up = nil
-	}
-	s.mu.Unlock()
-	s.logger.Printf("Up-carrier torn down")
+	h := s.node.InstallUp(wsc, br)
+	<-h.Done()
 }
+
+func (s *Splitter) secret() []byte { return s.node.Secret() }
 
 // ============================================================
 // Down-Carrier: TCP client → 127.0.0.1:10802 (local Xray inbound
 // that tunnels over VLESS+Reality to Germany's :9002)
 // ============================================================
+//
+// Reconnect loop with internal/backoff (2s → 60s, jittered, reset on
+// a successfully authenticated carrier; shutdown-cancellable via the
+// node context). Each authenticated transport is installed on the
+// node, which owns it from there.
+
+const downDialTimeout = 10 * time.Second
 
 func (s *Splitter) runDownCarrier() {
+	b := backoff.New(2*time.Second, 60*time.Second)
 	for {
-		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, 10*time.Second)
+		if s.node.Shutdown() {
+			return
+		}
+		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, downDialTimeout)
 		if err != nil {
-			s.logger.Printf("Down-carrier dial %s: %v (retrying in 5s)", s.config.DownCarrierAddr, err)
-			time.Sleep(5 * time.Second)
+			s.logger.Printf("Down-carrier dial %s: %v", s.config.DownCarrierAddr, err)
+			if s.backoffSleep(b) {
+				return
+			}
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		br, err := mux.CarrierAuth(ctx, conn, true, mux.RoleDownload, s.secret)
+		ctx, cancel := context.WithTimeout(s.node.Context(), 15*time.Second)
+		br, err := mux.CarrierAuth(ctx, conn, true, mux.RoleDownload, s.secret())
 		cancel()
 		if err != nil {
-			s.logger.Printf("Down-carrier auth to %s: %v (retrying in 2s)", s.config.DownCarrierAddr, err)
+			s.logger.Printf("Down-carrier auth to %s: %v", s.config.DownCarrierAddr, err)
 			conn.Close()
-			time.Sleep(2 * time.Second)
+			if s.backoffSleep(b) {
+				return
+			}
 			continue
 		}
 		s.logger.Printf("Down-carrier authenticated to %s", s.config.DownCarrierAddr)
 
-		carrier := mux.NewCarrierConn(conn, s.config.KeepAliveInterval)
-		carrier.SetReadBuffer(br)
-		carrier.SetStreamLimits(s.streamLimits())
-		h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
-		go func() {
-			defer close(h.done)
-			carrier.Dispatch()
-		}()
-
-		s.mu.Lock()
-		old := s.down
-		s.down = h
-		s.mu.Unlock()
-		s.logger.Printf("Down-carrier established")
-
-		<-h.done
-		h.close()
-		if old != nil {
-			old.close()
-		}
-		s.mu.Lock()
-		if s.down == h {
-			s.down = nil
-		}
-		s.mu.Unlock()
+		h := s.node.InstallDown(conn, br)
+		<-h.Done()
+		b.Reset() // a full authenticated carrier session ran
 		s.logger.Printf("Down-carrier torn down (reconnecting)")
-		time.Sleep(3 * time.Second)
+		if s.backoffSleep(b) {
+			return
+		}
 	}
+}
+
+// backoffSleep waits for the next jittered delay; returns true when the
+// node is shutting down and the loop must stop.
+func (s *Splitter) backoffSleep(b *backoff.Backoff) bool {
+	if err := b.Sleep(s.node.Context()); err != nil {
+		return true // node context cancelled — shutting down
+	}
+	return s.node.Shutdown()
 }
 
 // ============================================================
@@ -514,8 +450,13 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	_ = clientConn.SetDeadline(time.Time{})
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
 
-	// Wait until both carriers are live
-	upC, downC, err := s.waitCarriers()
+	// Hand the session to the Phase 5 engine (pkg/node): it waits for
+	// both carriers (30 s), allocates the stream ID, owns the client
+	// conn, runs the relays (with the bounded reconnect buffer) and
+	// rebinds the session across carrier losses. On success it returns
+	// the session; on failure it has already torn the session down
+	// (and closed the client conn) through the Phase 4 lifecycle.
+	sess, err := s.node.StartSession(clientConn, dest)
 	if err != nil {
 		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
 		socksReply(clientConn, 0x06) // general SOCKS server failure
@@ -523,167 +464,9 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 		return
 	}
 
-	// --- Create the session (Phase 4: the session owns the client conn) ---
-	rawSid, _ := session.GenerateSessionID()
-	var sid session.SessionID
-	copy(sid[:], rawSid)
-
-	streamID := atomic.AddUint32(&s.streamID, 1)
-	sess := session.NewSession(sid, dest, clientConn, nil, context.Background())
-	sess.StreamIDUp = streamID
-	sess.StreamIDDown = streamID
-	// Binary-owned teardown, run exactly once by Session.Close: carrier
-	// deregistration, store unindex, metric decrement.
-	sess.OnClose(func() {
-		upC.Deregister(streamID)
-		downC.Deregister(streamID)
-		s.store.Remove(sid)
-		s.metrics.decSession()
-		s.logger.Printf("Session %s cleaned up (%s)", sid.String(), sess.Reason())
-	})
-	s.store.Add(sid, sess)
-	s.store.AddStream(sess)
-	s.metrics.incSession()
-	s.logger.Printf("Session %s → %s:%d (stream %d)", sid.String(), dest.Addr, dest.Port, streamID)
-
-	// Register this session's streams in both carrier demuxers
-	upCh := upC.Register(streamID)
-	downCh := downC.Register(streamID)
-	if upCh == nil || downCh == nil {
-		sess.Close("carrier stream registration failed")
-		return
-	}
-	if !sess.Activate() {
-		sess.Close("session activate failed")
-		return
-	}
-
-	// SOCKS5 success reply
+	// SOCKS5 success reply — the node is now in charge of the conn.
 	socksReply(clientConn, 0x00)
-
-	// Send the initial Header frame (encoded destination) over the up-carrier
-	hdrBuf := make([]byte, session.MaxHeaderSize)
-	n := session.WriteDestinationBuffer(hdrBuf, dest)
-	if n <= 0 {
-		sess.Close("destination encode failed")
-		return
-	}
-	if err := upC.WriteFrame(streamID, mux.FrameHeader, hdrBuf[:n]); err != nil {
-		s.logger.Printf("Session %s up-carrier header: %v", sid.String(), err)
-		sess.Close("up-carrier header write failed")
-		return
-	}
-
-	upWatchDone := make(chan struct{})
-	downDone := make(chan struct{})
-	upRelayDone := make(chan struct{})
-
-	// Up-carrier stream watcher: a FrameClose from Germany (dial failure,
-	// down-carrier not ready) tears the session down. Unexpected data
-	// frames in this direction are ignored.
-	go func() {
-		defer close(upWatchDone)
-		for {
-			select {
-			case <-sess.Ctx.Done():
-				return
-			case frame, ok := <-upCh:
-				if !ok {
-					sess.Close("up carrier closed")
-					return
-				}
-				if frame == nil {
-					s.logger.Printf("Session %s: up-carrier closed by Germany", sid.String())
-					sess.Close("up stream closed by peer")
-					return
-				}
-			}
-		}
-	}()
-
-	// Down relay: down-carrier → client (download direction)
-	go func() {
-		defer close(downDone)
-		for {
-			select {
-			case <-sess.Ctx.Done():
-				return
-			case frame, ok := <-downCh:
-				if !ok {
-					sess.Close("down carrier closed")
-					return
-				}
-				if frame == nil {
-					// Target finished (FrameClose from Germany):
-					// half-close the client write side. Every frame has
-					// already been written, so the data the client has
-					// not read yet stays deliverable.
-					if tc, ok := clientConn.(*net.TCPConn); ok {
-						_ = tc.CloseWrite()
-					}
-					sess.MarkDirClosed(session.DirDown, "target EOF")
-					return
-				}
-				s.metrics.incDown(int64(len(frame)))
-				if _, werr := clientConn.Write(frame); werr != nil {
-					s.logger.Printf("Session %s client write: %v", sid.String(), werr)
-					sess.Close("client write failed")
-					return
-				}
-			}
-		}
-	}()
-
-	// Up relay: client → up-carrier (upload direction)
-	go func() {
-		defer close(upRelayDone)
-		buf := make([]byte, s.config.RelayBufSize)
-		for {
-			select {
-			case <-sess.Ctx.Done():
-				return
-			default:
-			}
-			n, rerr := clientConn.Read(buf)
-			if n > 0 {
-				s.metrics.incUp(int64(n))
-				if werr := upC.WriteFrame(streamID, mux.FrameData, buf[:n]); werr != nil {
-					s.logger.Printf("Session %s up-carrier write: %v", sid.String(), werr)
-					sess.Close("up-carrier write failed")
-					return
-				}
-				// Carrier replaced underneath us → tear down (the old
-				// carrier is torn down by its own run loop).
-				if s.getUp() != upC {
-					sess.Close("up carrier replaced")
-					return
-				}
-			}
-			if rerr != nil {
-				// Tell Germany the client side is finished (best effort).
-				_ = upC.WriteFrame(streamID, mux.FrameClose, nil)
-				if errors.Is(rerr, io.EOF) {
-					// Client FIN: half-close ONLY. Germany closes its
-					// target write side; the target may still send
-					// response data, which the down relay keeps
-					// delivering until the target EOF.
-					sess.MarkDirClosed(session.DirUp, "client EOF")
-				} else {
-					s.logger.Printf("Session %s client read: %v", sid.String(), rerr)
-					sess.Close("client read error")
-				}
-				return
-			}
-		}
-	}()
-
-	// Wait for both directions (and the watcher) to finish, then
-	// finalize. If a direction already closed the session, this is an
-	// idempotent no-op.
-	<-upRelayDone
-	<-downDone
-	<-upWatchDone
-	sess.Close("session ended")
+	s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
 }
 
 // ============================================================
@@ -693,12 +476,8 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 func (s *Splitter) runMetrics(addr string) error {
 	mhttp := http.NewServeMux()
 	mhttp.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		s.metrics.mu.Lock()
-		fmt.Fprintf(w, "active_sessions %d\ntotal_sessions %d\ntotal_bytes_up %d\ntotal_bytes_down %d\nerrors %d\n",
-			s.metrics.activeSessions, s.metrics.totalSessions,
-			s.metrics.totalBytesUp, s.metrics.totalBytesDown, s.metrics.errors)
-		s.metrics.mu.Unlock()
-		fmt.Fprintf(w, "session_count %d\n", s.store.Count())
+		fmt.Fprint(w, s.node.Metrics().Render())
+		fmt.Fprintf(w, "session_count %d\n", s.node.Store().Count())
 	})
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

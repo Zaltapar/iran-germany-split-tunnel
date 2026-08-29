@@ -45,19 +45,21 @@ const (
 
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen = "SPLIT_SOCKS_LISTEN"             // Iran
-	EnvWsListen    = "SPLIT_WS_LISTEN"                // Iran
-	EnvDownCarrier = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
-	EnvUpWsUrl     = "SPLIT_UP_WS_URL"                // Germany
-	EnvDownListen  = "SPLIT_DOWN_LISTEN"              // Germany
-	EnvSecret      = "SPLIT_SECRET"                   // both
-	EnvAllowWeak   = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
-	EnvMetricsPort = "SPLIT_METRICS_PORT"             // both
-	EnvRelayBuf    = "SPLIT_RELAY_BUF"                // both
-	EnvQueueBytes  = "SPLIT_STREAM_QUEUE_BYTES"       // both
-	EnvQueueFrames = "SPLIT_STREAM_QUEUE_FRAMES"      // both
-	EnvQueueTotal  = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
-	EnvOverflowMs  = "SPLIT_STREAM_OVERFLOW_MS"       // both
+	EnvSocksListen  = "SPLIT_SOCKS_LISTEN"             // Iran
+	EnvWsListen     = "SPLIT_WS_LISTEN"                // Iran
+	EnvDownCarrier  = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
+	EnvUpWsUrl      = "SPLIT_UP_WS_URL"                // Germany
+	EnvDownListen   = "SPLIT_DOWN_LISTEN"              // Germany
+	EnvSecret       = "SPLIT_SECRET"                   // both
+	EnvAllowWeak    = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
+	EnvMetricsPort  = "SPLIT_METRICS_PORT"             // both
+	EnvRelayBuf     = "SPLIT_RELAY_BUF"                // both
+	EnvQueueBytes   = "SPLIT_STREAM_QUEUE_BYTES"       // both
+	EnvQueueFrames  = "SPLIT_STREAM_QUEUE_FRAMES"      // both
+	EnvQueueTotal   = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
+	EnvOverflowMs   = "SPLIT_STREAM_OVERFLOW_MS"       // both
+	EnvCarrierGrace = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
+	EnvSessionBuf   = "SPLIT_SESSION_BUFFER_BYTES"     // both — Phase 5
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -89,6 +91,13 @@ const (
 	MaxQueueBytesTotal     = 256 << 20 // 256 MiB
 	MaxOverflowWaitMs      = 30000     // 30 s
 
+	// Phase 5 carrier-loss recovery bounds.
+	MinCarrierGraceMs = 500    // 0.5 s
+	MaxCarrierGraceMs = 600000 // 10 min
+	DefaultSessionBuf = 256 << 10
+	MinSessionBuf     = 4 << 10  // 4 KiB
+	MaxSessionBuf     = 16 << 20 // 16 MiB
+
 	MinPort = 1
 	MaxPort = 65535
 )
@@ -115,6 +124,10 @@ type Config struct {
 	QueueFramesPerStream int           // 0 = library default (max mux.MaxFrames)
 	QueueBytesTotal      int           // 0 = library default
 	OverflowWaitMs       int           // 0 = library default
+
+	// Phase 5 carrier-loss recovery (pkg/node engine).
+	CarrierGraceMs  int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
+	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -129,6 +142,8 @@ func Defaults() *Config {
 		MetricsPort:       0,
 		RelayBufSize:      DefaultRelayBuf,
 		KeepAliveInterval: DefaultKeepAlive,
+		CarrierGraceMs:    5000,
+		SessionBufBytes:   DefaultSessionBuf,
 	}
 }
 
@@ -169,6 +184,8 @@ func Load(role string) (*Config, error) {
 	c.QueueFramesPerStream = envInt(&problems, EnvQueueFrames, 0, 0, mux.MaxFrames)
 	c.QueueBytesTotal = envInt(&problems, EnvQueueTotal, 0, 0, MaxQueueBytesTotal)
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
+	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
+	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -265,6 +282,16 @@ func (c *Config) Validate(role string) error {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d: expected 0 (library default) .. %d milliseconds",
 			EnvOverflowMs, c.OverflowWaitMs, MaxOverflowWaitMs))
+	}
+	if c.CarrierGraceMs < MinCarrierGraceMs || c.CarrierGraceMs > MaxCarrierGraceMs {
+		problems = append(problems, fmt.Sprintf(
+			"%s=%d: expected %d..%d milliseconds (Phase 5 carrier-loss grace window)",
+			EnvCarrierGrace, c.CarrierGraceMs, MinCarrierGraceMs, MaxCarrierGraceMs))
+	}
+	if c.SessionBufBytes < MinSessionBuf || c.SessionBufBytes > MaxSessionBuf {
+		problems = append(problems, fmt.Sprintf(
+			"%s=%d: expected %d..%d bytes (Phase 5 per-direction reconnect buffer)",
+			EnvSessionBuf, c.SessionBufBytes, MinSessionBuf, MaxSessionBuf))
 	}
 	// Cross-field: the carrier-wide budget must cover one stream's share.
 	if c.QueueBytesPerStream > 0 && c.QueueBytesTotal > 0 &&

@@ -10,19 +10,29 @@ import (
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
-	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
 	"github.com/gorilla/websocket"
 )
 
 // newTestSplitter builds a Splitter with inert dependencies for HTTP
-// handler tests (no listeners, no carriers).
+// handler tests (no listeners, no carriers). The node is real but idle —
+// nothing installs carriers in these tests — so any handler path that
+// reaches into the node (secret, readiness) behaves like production.
 func newTestSplitter() *Splitter {
+	cfg := config.Defaults()
+	logger := log.New(io.Discard, "", 0)
+	n := node.NewNode(node.Config{
+		Role:              node.RoleIran,
+		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
+		BufferBytes:       cfg.SessionBufBytes,
+		RelayBufSize:      cfg.RelayBufSize,
+		KeepAliveInterval: cfg.KeepAliveInterval,
+		StreamLimits:      streamLimits(cfg),
+	}, logger, mux.DeriveSecret("test-secret-must-be-long-enough-0123456789"))
 	return &Splitter{
-		config:  config.Defaults(),
-		store:   session.NewSessionStore(),
-		metrics: &Metrics{},
-		logger:  log.New(io.Discard, "", 0),
-		secret:  mux.DeriveSecret("test-secret-must-be-long-enough-0123456789"),
+		config: cfg,
+		node:   n,
+		logger: logger,
 	}
 }
 
