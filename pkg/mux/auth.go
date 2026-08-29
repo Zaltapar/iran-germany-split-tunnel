@@ -234,8 +234,9 @@ func verifyResponse(secret []byte, role CarrierRole, challenge, r []byte) error 
 // stream can never be established before authentication completes.
 //
 // On success the returned bufio.Reader holds any bytes already
-// buffered from rwc — pass it to the new CarrierConn via
-// SetReadBuffer. On any failure the caller must close rwc.
+// buffered from rwc — pass it to NewCarrierConnWithReader (the carrier
+// must start its read loop on that reader, so pre-buffered frames are
+// not orphaned). On any failure the caller must close rwc.
 func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, role CarrierRole, secret []byte) (*bufio.Reader, error) {
 	if !role.valid() {
 		return nil, ErrAuthInvalidRole

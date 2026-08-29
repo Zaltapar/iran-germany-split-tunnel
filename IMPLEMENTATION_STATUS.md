@@ -275,13 +275,22 @@ Documented so later phases can verify each one is addressed:
 9. `WriteDestinationBuffer` silently truncates >255-char domains while
    `WriteDestination` rejects them — inconsistent; pinned by a test.
    (Behavior preserved; revisit in Phase 7.)
-10. **Startup race (not shutdown)**: the read loop starts in
-    `NewCarrierConn` and grabs its `bufio.Reader` at start; if the peer
-    sends bytes before `SetReadBuffer` is called, those bytes could be
-    left stranded in the auth reader. Works today because every call site
-    installs the buffer immediately after construction; making buffer
-    installation explicitly ordered is a small follow-up (noted here to
-    keep Phase 2's diff scoped to shutdown).
+10. **Startup race (not shutdown) — RESOLVED**: the read loop started in
+    `NewCarrierConn` grabbed its `bufio.Reader` on its first read, racing
+    `SetReadBuffer`; if the peer sent bytes in that window (e.g. a
+    `FrameRebind` written immediately after the auth handshake), they
+    were stranded in the auth reader and the rebind silently vanished,
+    closing the session on the grace timer. Fix: `NewCarrierConnWithReader`
+    binds the pre-auth reader inside the constructor, before the read
+    loop starts; `Node.install` uses it whenever an auth reader is
+    handed over. Regression tests: `TestWithReaderBindsReaderBeforeFirstRead`
+    / `TestLateSetReadBufferOrphansPrebufferedFrame` (pkg/mux) and
+    `TestInstallUpConsumesPrebufferedRebind` (pkg/node).
+    **Known boundary (not a bug):** bytes already in flight on a
+    direction at the instant that carrier fails are dropped (the dead
+    carrier's epoch; no retransmission). Phase 5 guarantees ordered
+    lossless delivery only for bytes READ into the bounded reconnect
+    buffer DURING the outage (the upload case).
 
 ## Tests passed
 

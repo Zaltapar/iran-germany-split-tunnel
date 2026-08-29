@@ -98,12 +98,12 @@ type CarrierConn struct {
 	OnNewStream func(streamID uint32, firstType uint8, ch chan []byte)
 }
 
-// NewCarrierConn starts the read loop, writer and keepalive ping loop.
-// The read loop consumes the stream exclusively from this point on; use
-// CarrierAuth BEFORE calling NewCarrierConn to run the auth handshake,
-// then install the auth bufio.Reader with SetReadBuffer so already
-// buffered bytes are not lost.
-func NewCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration) *CarrierConn {
+// newCarrierConn constructs a CarrierConn and starts its loops. If br is
+// non-nil it is bound as the read buffer BEFORE any loop is started, so
+// bytes already pulled out of rwc by a preceding handshake (e.g.
+// CarrierAuth's bufio over-read) are consumed by the read loop, never
+// orphaned in a second reader.
+func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufio.Reader) *CarrierConn {
 	c := &CarrierConn{
 		rwc:          rwc,
 		frames:       make(chan Frame, 256),
@@ -113,6 +113,7 @@ func NewCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration) *Carrier
 		shutdownDone: make(chan struct{}),
 		streams:      make(map[uint32]*streamRec),
 		limits:       DefaultStreamLimits,
+		buf:          br, // bound before readLoop starts (see NewCarrierConnWithReader)
 	}
 	c.mu.Lock()
 	c.live = 2 // readLoop + writeLoop
@@ -126,6 +127,31 @@ func NewCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration) *Carrier
 		go c.keepalive(pingInterval)
 	}
 	return c
+}
+
+// NewCarrierConn starts the read loop, writer and keepalive ping loop
+// over rwc. The read loop consumes the stream exclusively from this
+// point on. For an authenticated transport, run CarrierAuth FIRST and
+// construct the carrier with NewCarrierConnWithReader (passing the
+// auth's bufio.Reader) so already-buffered bytes are not lost.
+func NewCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration) *CarrierConn {
+	return newCarrierConn(rwc, pingInterval, nil)
+}
+
+// NewCarrierConnWithReader starts the read loop, writer and keepalive
+// ping loop over rwc, consuming from the provided pre-auth
+// bufio.Reader from the very first read. Run CarrierAuth FIRST (it
+// returns the bufio.Reader it used) and pass that reader here so bytes
+// it already pulled from rwc — e.g. a FrameRebind the peer wrote
+// immediately after the handshake — are delivered instead of orphaned.
+//
+// This is the only safe way to hand the auth reader to a carrier: the
+// read loop starts inside the constructor and latches its read buffer
+// on its first read, so installing the reader afterwards (SetReadBuffer
+// after NewCarrierConn) races that first read and can orphan the
+// pre-buffered bytes.
+func NewCarrierConnWithReader(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufio.Reader) *CarrierConn {
+	return newCarrierConn(rwc, pingInterval, br)
 }
 
 func (c *CarrierConn) readLoop() {
@@ -426,9 +452,13 @@ func (c *CarrierConn) keepalive(interval time.Duration) {
 // Conn returns the underlying io.ReadWriteCloser.
 func (c *CarrierConn) Conn() io.ReadWriteCloser { return c.rwc }
 
-// SetReadBuffer installs the bufio.Reader the read loop should consume
-// (e.g. the one used during the pre-protocol auth handshake). Call it
-// before starting Dispatch.
+// SetReadBuffer installs the bufio.Reader the read loop should
+// consume. For the pre-auth handshake reader, prefer
+// NewCarrierConnWithReader instead: the read loop starts inside the
+// constructor and latches its buffer on the first read, so installing
+// the reader after construction races that first read and can orphan
+// pre-buffered bytes. SetReadBuffer remains for tests that replace
+// the buffer on an idle carrier before any frame has been read.
 func (c *CarrierConn) SetReadBuffer(br *bufio.Reader) {
 	c.bufMu.Lock()
 	c.buf = br

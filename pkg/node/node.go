@@ -283,9 +283,18 @@ func (n *Node) InstallDown(conn io.ReadWriteCloser, br *bufio.Reader) *carrierHa
 }
 
 func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio.Reader) *carrierHandle {
-	c := mux.NewCarrierConn(conn, n.cfg.KeepAliveInterval)
+	// Bind the auth bufio.Reader inside the constructor: the carrier's
+	// read loop starts immediately and latches its read buffer on the
+	// first read, so any bytes the auth reader already pulled from the
+	// transport (e.g. a FrameRebind written right after the handshake)
+	// must be bound BEFORE the loop starts. Installing the reader
+	// afterwards (NewCarrierConn + SetReadBuffer) races the first read
+	// and can orphan those bytes.
+	var c *mux.CarrierConn
 	if br != nil {
-		c.SetReadBuffer(br)
+		c = mux.NewCarrierConnWithReader(conn, n.cfg.KeepAliveInterval, br)
+	} else {
+		c = mux.NewCarrierConn(conn, n.cfg.KeepAliveInterval)
 	}
 	c.SetStreamLimits(n.cfg.StreamLimits)
 
