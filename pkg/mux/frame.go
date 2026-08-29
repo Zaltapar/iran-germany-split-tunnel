@@ -21,6 +21,20 @@ const (
 	MaxPayload = 65535
 )
 
+// ErrPayloadTooLarge is returned by the frame encoders when the payload
+// exceeds the 16-bit Length field.
+var ErrPayloadTooLarge = errors.New("mux: frame payload too large")
+
+// ErrProtocolViolation is set as the carrier's ReadErr when a post-auth
+// frame violates the protocol's frame-context rules (see
+// CarrierConn.readLoop): FrameAuth is only valid during the handshake, and
+// application frames (Data/Header/Rebind/Close) are never valid on the
+// reserved control stream 0. Such a violation is a connection-level
+// failure: the carrier is terminated rather than the frame dropped,
+// because a peer producing it is either a v0 peer (incompatible with the
+// v1 auth, both ends must be upgraded together) or actively attacking.
+var ErrProtocolViolation = errors.New("mux: protocol violation")
+
 // Frame types
 const (
 	FrameData   uint8 = 0x00 // user data payload
@@ -29,6 +43,25 @@ const (
 	FramePong   uint8 = 0x03 // keepalive pong
 	FrameClose  uint8 = 0x04 // stream close / half-close
 	FrameHeader uint8 = 0x05 // stream header: encoded target destination
+	// FrameRebind (Phase 5): "this StreamID continues an EXISTING logical
+	// session — do not bootstrap a new one". Sent by the stream-originating
+	// node on a freshly (re)established carrier as the FIRST frame of the
+	// stream, before any user data. Payload (versioned, see
+	// session.EncodeRebind/ParseRebind):
+	//
+	//	[0]     protocol version (1)
+	//	[1:17]  SessionID (16 bytes) of the session to re-attach
+	//	[17:25] sender's carrier generation for this direction (uint64 BE)
+	//
+	// The generation is monotonically increasing per sender+direction, so a
+	// replayed/stale rebind (old carrier generation) is rejected. Rebinding
+	// never creates a session: the receiver resolves the existing session
+	// by the frame's StreamID (the identity shared by both nodes — each
+	// node keeps its own local SessionID, carried in the payload only as
+	// the sender's diagnostic identifier), and re-attaches it; anything
+	// it cannot validate is dropped (never a FrameClose — a refused
+	// rebind must not be mistaken for a peer half-close).
+	FrameRebind uint8 = 0x06
 )
 
 // Frame is a single decoded frame.
@@ -42,7 +75,7 @@ type Frame struct {
 // WriteFrame encodes one frame (header + payload) into w in a single write.
 func WriteFrame(w io.Writer, streamID uint32, typ uint8, payload []byte) error {
 	if len(payload) > MaxPayload {
-		return errors.New("mux: frame payload too large")
+		return ErrPayloadTooLarge
 	}
 	hdr := make([]byte, HeaderSize)
 	binary.BigEndian.PutUint32(hdr[0:4], streamID)

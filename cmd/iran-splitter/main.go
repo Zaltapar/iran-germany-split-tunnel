@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,12 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/backoff"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
-	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
 	"github.com/gorilla/websocket"
 )
 
@@ -61,85 +61,40 @@ func (w *wsConn) Write(p []byte) (int, error) {
 func (w *wsConn) Close() error { return w.conn.Close() }
 
 // ============================================================
-// Config & Metrics
+// Splitter — thin transport wrapper around pkg/node
 // ============================================================
-
-type Config struct {
-	SocksListen       string
-	WsListen          string
-	DownCarrierAddr   string
-	Secret            string
-	MetricsPort       int
-	RelayBufSize      int
-	KeepAliveInterval time.Duration
-}
-
-type Metrics struct {
-	mu             sync.Mutex
-	activeSessions int64
-	totalSessions  int64
-	totalBytesUp   int64
-	totalBytesDown int64
-	errors         int64
-}
-
-func (m *Metrics) incSession()     { m.mu.Lock(); m.activeSessions++; m.totalSessions++; m.mu.Unlock() }
-func (m *Metrics) decSession()     { m.mu.Lock(); m.activeSessions--; m.mu.Unlock() }
-func (m *Metrics) incUp(n int64)   { m.mu.Lock(); m.totalBytesUp += n; m.mu.Unlock() }
-func (m *Metrics) incDown(n int64) { m.mu.Lock(); m.totalBytesDown += n; m.mu.Unlock() }
-func (m *Metrics) incErr()         { m.mu.Lock(); m.errors++; m.mu.Unlock() }
-
-// ============================================================
-// Splitter
-// ============================================================
-
-// carrierHandle pairs a live carrier with its dispatcher completion.
-type carrierHandle struct {
-	carrier *mux.CarrierConn
-	done    chan struct{}
-}
-
-// close waits for the dispatcher to drain, then tears the carrier down.
-func (h *carrierHandle) close() {
-	<-h.done
-	h.carrier.Close()
-}
+//
+// Phase 5 production wiring: ALL carrier ownership, carrier
+// generations, session/carrier attachments, the rebind protocol and
+// the grace-window logic live in pkg/node (the Phase 5 engine). This
+// binary only provides the TRANSPORTS:
+//
+//   - the SOCKS5 listener (local Xray → us),
+//   - the up-carrier WebSocket server (Germany dials /upload),
+//   - the down-carrier TCP dial (us → local Xray),
+//   - the metrics listener.
+//
+// Authenticated transport connections are handed to the node via
+// InstallUp/InstallDown; the node owns every carrier from that point
+// (dispatch, loss sweep, rebind sweep, replacement). There is no
+// second carrier- or session-management implementation in this file.
 
 type Splitter struct {
-	config  *Config
-	store   *session.SessionStore
-	metrics *Metrics
-	logger  *log.Logger
-	secret  []byte
-
-	mu   sync.RWMutex
-	up   *carrierHandle // up carrier: WS server, Germany dials /upload
-	down *carrierHandle // down carrier: TCP client → local Xray :10802
-
-	streamID uint32 // per-session stream ID, shared by both carriers
+	config *config.Config
+	node   *node.Node
+	logger *log.Logger
 
 	lnMu    sync.Mutex
 	socksLn net.Listener
 	upLn    net.Listener
 	mLn     net.Listener
-}
 
-func (s *Splitter) getUp() *mux.CarrierConn {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.up != nil {
-		return s.up.carrier
-	}
-	return nil
-}
-
-func (s *Splitter) getDown() *mux.CarrierConn {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.down != nil {
-		return s.down.carrier
-	}
-	return nil
+	// Up-carrier auth-failure backoff state (Phase 6): the node's
+	// UpReady() feeds the single-carrier rule; these counters feed the
+	// 429 backoff on repeated authentication failures.
+	authFailMu sync.Mutex
+	authFails  int
+	authFailAt time.Time
 }
 
 // closeListeners unblocks all accept loops for a clean shutdown.
@@ -153,56 +108,43 @@ func (s *Splitter) closeListeners() {
 	}
 }
 
-// waitCarriers blocks until both carriers are live (30s timeout).
-func (s *Splitter) waitCarriers() (*mux.CarrierConn, *mux.CarrierConn, error) {
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		up := s.getUp()
-		down := s.getDown()
-		if up != nil && up.Ready() && down != nil && down.Ready() {
-			return up, down, nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return nil, nil, errors.New("carriers not ready")
-}
-
 func main() {
-	cfg := &Config{
-		SocksListen:       "127.0.0.1:10900",
-		WsListen:          "127.0.0.1:9001",
-		DownCarrierAddr:   "127.0.0.1:10802",
-		Secret:            "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING",
-		RelayBufSize:      32768,
-		KeepAliveInterval: 30 * time.Second,
+	// Phase 8 (installer): `--validate-config` runs the Phase 7
+	// load→parse→validate→construct path and exits BEFORE any listener
+	// is opened or goroutine started. install.sh uses this as a
+	// pre-install gate so a misconfigured deployment is reported before
+	// the systemd unit is written. No other argument is interpreted;
+	// normal startup is unchanged.
+	if len(os.Args) > 1 && os.Args[1] == "--validate-config" {
+		if _, err := config.Load(config.RoleIran); err != nil {
+			log.Fatalf("iran-splitter: %v", err)
+		}
+		log.Printf("iran-splitter: configuration OK (role: %s)", config.RoleIran)
+		return
 	}
 
-	if v := os.Getenv("SPLIT_SOCKS_LISTEN"); v != "" {
-		cfg.SocksListen = v
-	}
-	if v := os.Getenv("SPLIT_WS_LISTEN"); v != "" {
-		cfg.WsListen = v
-	}
-	if v := os.Getenv("SPLIT_DOWN_CARRIER_ADDR"); v != "" {
-		cfg.DownCarrierAddr = v
-	}
-	if v := os.Getenv("SPLIT_SECRET"); v != "" {
-		cfg.Secret = v
-	}
-	if v := os.Getenv("SPLIT_METRICS_PORT"); v != "" {
-		cfg.MetricsPort = parseInt(v)
-	}
-	if v := os.Getenv("SPLIT_RELAY_BUF"); v != "" {
-		cfg.RelayBufSize = parseInt(v)
+	// Phase 7: load → parse → validate the ENTIRE configuration before
+	// any listener opens or goroutine starts. Load reports every problem
+	// at once (aggregated) and enforces the Phase 6 secret policy.
+	cfg, err := config.Load(config.RoleIran)
+	if err != nil {
+		log.Fatalf("iran-splitter: %v", err)
 	}
 
-	derived := mux.DeriveSecret(cfg.Secret)
+	logger := log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags)
+	n := node.NewNode(node.Config{
+		Role:              node.RoleIran,
+		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
+		BufferBytes:       cfg.SessionBufBytes,
+		RelayBufSize:      cfg.RelayBufSize,
+		KeepAliveInterval: cfg.KeepAliveInterval,
+		StreamLimits:      streamLimits(cfg),
+	}, logger, mux.DeriveSecret(cfg.Secret))
+
 	s := &Splitter{
-		config:  cfg,
-		store:   session.NewSessionStore(),
-		metrics: &Metrics{},
-		logger:  log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags),
-		secret:  derived,
+		config: cfg,
+		node:   n,
+		logger: logger,
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -231,18 +173,22 @@ func main() {
 
 	<-sigCh
 	s.logger.Println("Shutting down...")
-	s.store.CloseAll()
-	s.mu.Lock()
-	if s.up != nil {
-		s.up.carrier.Close()
-	}
-	if s.down != nil {
-		s.down.carrier.Close()
-	}
-	s.mu.Unlock()
+	s.node.Close() // Phase 4 authoritative session teardown + carrier close
 	s.closeListeners()
 	wg.Wait()
 	s.logger.Println("iran-splitter stopped")
+}
+
+// streamLimits builds the per-stream mailbox limits from config (Phase 3
+// backpressure policy, applied by the node to every installed carrier).
+// Zero values fall back to mux.DefaultStreamLimits via SanitizeLimits.
+func streamLimits(cfg *config.Config) mux.StreamLimits {
+	return mux.StreamLimits{
+		MaxBytesPerStream:  cfg.QueueBytesPerStream,
+		MaxFramesPerStream: cfg.QueueFramesPerStream,
+		MaxBytesTotal:      cfg.QueueBytesTotal,
+		OverflowWait:       time.Duration(cfg.OverflowWaitMs) * time.Millisecond,
+	}
 }
 
 // ============================================================
@@ -250,16 +196,84 @@ func main() {
 // Germany dials wss://<cdn-domain>/upload → CDN → nginx → here
 // ============================================================
 
+// Up-carrier handshake resource limits (Phase 6): bound concurrent
+// in-flight handshakes, and back off new handshakes after a burst of
+// repeated authentication failures (a per-process counter, no
+// distributed state).
+const (
+	maxConcurrentHandshakes = 16
+	authFailBackoffLimit    = 10
+	authFailBackoffWindow   = 60 * time.Second
+)
+
 func (s *Splitter) runUpCarrier() {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
-		CheckOrigin:     func(r *http.Request) bool { return true },
+		// Machine-to-machine carrier: the Origin header is NOT a security
+		// boundary here (carrier dialers send no Origin; browsers are not
+		// legitimate clients of this endpoint). The real security boundary
+		// is the v1 challenge/response carrier authentication (plus
+		// TLS/Reality in the transport), so the permissive origin policy is
+		// deliberate and documented — do not "tighten" it without
+		// breaking CDN dial patterns.
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
 	muxHTTP := http.NewServeMux()
-	muxHTTP.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-		if s.getUp() != nil {
+	muxHTTP.HandleFunc("/upload", s.uploadHandler(upgrader))
+	// Every other path gets the mux's default 404; the carrier is only
+	// ever established on /upload.
+
+	ln, err := net.Listen("tcp", s.config.WsListen)
+	if err != nil {
+		s.logger.Fatalf("Up-carrier WS listener: %v", err)
+	}
+	s.lnMu.Lock()
+	s.upLn = ln
+	s.lnMu.Unlock()
+	defer ln.Close()
+	s.logger.Printf("Up-carrier WS server listening on %s (path /upload)", s.config.WsListen)
+
+	// ReadHeaderTimeout bounds the UNAUTHENTICATED request phase;
+	// IdleTimeout reclaims idle keep-alive sockets. Read/Write timeouts
+	// must stay ZERO: after the upgrade the connection is a long-lived
+	// authenticated carrier and must never be killed by a write timeout.
+	srv := &http.Server{
+		Handler:           muxHTTP,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		s.logger.Printf("Up-carrier WS server error: %v", err)
+	}
+}
+
+// uploadHandler is the /upload HTTP handler: method check, auth-failure
+// backoff, bounded handshake concurrency, single-carrier enforcement,
+// then the WebSocket upgrade.
+func (s *Splitter) uploadHandler(upgrader websocket.Upgrader) http.HandlerFunc {
+	sem := make(chan struct{}, maxConcurrentHandshakes)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.authInBackoff() {
+			s.logger.Printf("Up-carrier: rejected handshake from %s (auth-failure backoff active)", r.RemoteAddr)
+			http.Error(w, "too many failed authentications; retry later", http.StatusTooManyRequests)
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			http.Error(w, "too many concurrent handshakes", http.StatusServiceUnavailable)
+			return
+		}
+		// Single-carrier rule (Phase 6): the node's UpReady() reports
+		// whether a live up carrier is currently installed.
+		if s.node.UpReady() {
 			s.logger.Printf("Up-carrier: rejected %s (carrier already connected)", r.RemoteAddr)
 			http.Error(w, "up-carrier already connected", http.StatusConflict)
 			return
@@ -272,23 +286,44 @@ func (s *Splitter) runUpCarrier() {
 		s.logger.Printf("Up-carrier WS connected from %s", r.RemoteAddr)
 		s.handleUpWsConn(wsConn)
 		s.logger.Printf("Up-carrier WS disconnected from %s", r.RemoteAddr)
-	})
-
-	ln, err := net.Listen("tcp", s.config.WsListen)
-	if err != nil {
-		s.logger.Fatalf("Up-carrier WS listener: %v", err)
-	}
-	s.lnMu.Lock()
-	s.upLn = ln
-	s.lnMu.Unlock()
-	defer ln.Close()
-	s.logger.Printf("Up-carrier WS server listening on %s (path /upload)", s.config.WsListen)
-
-	if err := http.Serve(ln, muxHTTP); err != nil && err != http.ErrServerClosed {
-		s.logger.Printf("Up-carrier WS server error: %v", err)
 	}
 }
 
+// recordAuthFail / clearAuthFails / authInBackoff implement a lightweight
+// per-process backoff: after authFailBackoffLimit failures within
+// authFailBackoffWindow, new handshakes are rejected (HTTP 429) until the
+// window lapses. A successful authentication resets the counter.
+func (s *Splitter) recordAuthFail() {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	if s.authFails > 0 && time.Since(s.authFailAt) > authFailBackoffWindow {
+		s.authFails = 0 // burst window lapsed
+	}
+	s.authFails++
+	if s.authFails == 1 {
+		s.authFailAt = time.Now()
+	}
+}
+
+func (s *Splitter) clearAuthFails() {
+	s.authFailMu.Lock()
+	s.authFails = 0
+	s.authFailMu.Unlock()
+}
+
+func (s *Splitter) authInBackoff() bool {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	return s.authFails >= authFailBackoffLimit && time.Since(s.authFailAt) <= authFailBackoffWindow
+}
+
+// handleUpWsConn authenticates one accepted WebSocket connection (v1
+// challenge/response, Phase 6) and hands the transport to the node.
+// The handler returns only when the carrier's dispatcher has exited —
+// the node's InstallUp runs the loss sweep + rebind sweep for the
+// replacement lifecycle asynchronously, so a fast Germany reconnect
+// can be served from the ACCEPT loop while the previous carrier is
+// still settling.
 func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	wsc := &wsConn{conn: ws}
 
@@ -297,89 +332,82 @@ func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	watchdog := time.AfterFunc(15*time.Second, func() { ws.Close() })
 	defer watchdog.Stop()
 
-	br, err := mux.CarrierAuth(context.Background(), wsc, false, s.secret)
+	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret())
 	if err != nil {
+		// The error is for LOCAL logging only; nothing about WHICH check
+		// failed is transmitted to the peer (the connection is simply
+		// closed by the auth implementation).
 		s.logger.Printf("Up-carrier auth failed from %s: %v", ws.RemoteAddr(), err)
+		s.recordAuthFail()
 		ws.Close()
 		return
 	}
+	s.clearAuthFails()
 	s.logger.Printf("Up-carrier authenticated from %s", ws.RemoteAddr())
 
-	carrier := mux.NewCarrierConn(wsc, s.config.KeepAliveInterval)
-	carrier.SetReadBuffer(br)
-	h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
-	go func() {
-		defer close(h.done)
-		carrier.Dispatch()
-	}()
-
-	s.mu.Lock()
-	s.up = h
-	s.mu.Unlock()
-	s.logger.Printf("Up-carrier established")
-
-	<-h.done
-	h.close()
-	s.mu.Lock()
-	if s.up == h {
-		s.up = nil
-	}
-	s.mu.Unlock()
-	s.logger.Printf("Up-carrier torn down")
+	h := s.node.InstallUp(wsc, br)
+	<-h.Done()
 }
+
+func (s *Splitter) secret() []byte { return s.node.Secret() }
 
 // ============================================================
 // Down-Carrier: TCP client → 127.0.0.1:10802 (local Xray inbound
 // that tunnels over VLESS+Reality to Germany's :9002)
 // ============================================================
+//
+// Reconnect loop with internal/backoff (2s → 60s, jittered, reset on
+// a successfully authenticated carrier; shutdown-cancellable via the
+// node context). Each authenticated transport is installed on the
+// node, which owns it from there.
+
+const downDialTimeout = 10 * time.Second
 
 func (s *Splitter) runDownCarrier() {
+	b := backoff.New(2*time.Second, 60*time.Second)
 	for {
-		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, 10*time.Second)
+		if s.node.Shutdown() {
+			return
+		}
+		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, downDialTimeout)
 		if err != nil {
-			s.logger.Printf("Down-carrier dial %s: %v (retrying in 5s)", s.config.DownCarrierAddr, err)
-			time.Sleep(5 * time.Second)
+			s.logger.Printf("Down-carrier dial %s: %v", s.config.DownCarrierAddr, err)
+			if s.backoffSleep(b) {
+				return
+			}
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		br, err := mux.CarrierAuth(ctx, conn, true, s.secret)
+		ctx, cancel := context.WithTimeout(s.node.Context(), 15*time.Second)
+		br, err := mux.CarrierAuth(ctx, conn, true, mux.RoleDownload, s.secret())
 		cancel()
 		if err != nil {
-			s.logger.Printf("Down-carrier auth to %s: %v (retrying in 2s)", s.config.DownCarrierAddr, err)
+			s.logger.Printf("Down-carrier auth to %s: %v", s.config.DownCarrierAddr, err)
 			conn.Close()
-			time.Sleep(2 * time.Second)
+			if s.backoffSleep(b) {
+				return
+			}
 			continue
 		}
 		s.logger.Printf("Down-carrier authenticated to %s", s.config.DownCarrierAddr)
 
-		carrier := mux.NewCarrierConn(conn, s.config.KeepAliveInterval)
-		carrier.SetReadBuffer(br)
-		h := &carrierHandle{carrier: carrier, done: make(chan struct{})}
-		go func() {
-			defer close(h.done)
-			carrier.Dispatch()
-		}()
-
-		s.mu.Lock()
-		old := s.down
-		s.down = h
-		s.mu.Unlock()
-		s.logger.Printf("Down-carrier established")
-
-		<-h.done
-		h.close()
-		if old != nil {
-			old.close()
-		}
-		s.mu.Lock()
-		if s.down == h {
-			s.down = nil
-		}
-		s.mu.Unlock()
+		h := s.node.InstallDown(conn, br)
+		<-h.Done()
+		b.Reset() // a full authenticated carrier session ran
 		s.logger.Printf("Down-carrier torn down (reconnecting)")
-		time.Sleep(3 * time.Second)
+		if s.backoffSleep(b) {
+			return
+		}
 	}
+}
+
+// backoffSleep waits for the next jittered delay; returns true when the
+// node is shutting down and the loop must stop.
+func (s *Splitter) backoffSleep(b *backoff.Backoff) bool {
+	if err := b.Sleep(s.node.Context()); err != nil {
+		return true // node context cancelled — shutting down
+	}
+	return s.node.Shutdown()
 }
 
 // ============================================================
@@ -406,185 +434,39 @@ func (s *Splitter) runSocksServer() {
 }
 
 // socksReply sends a SOCKS5 reply (bind addr 0.0.0.0:0, atyp IPv4).
-func socksReply(clientConn net.Conn, status byte) {
-	_, _ = clientConn.Write([]byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+func socksReply(w io.Writer, status byte) {
+	_, _ = w.Write([]byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
 
 func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
-	defer clientConn.Close()
 	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	// --- SOCKS5 greeting: [0x05, NMETHODS, methods...] ---
-	greet := make([]byte, 2)
-	if _, err := io.ReadFull(clientConn, greet); err != nil || greet[0] != 0x05 {
-		return
-	}
-	methods := make([]byte, int(greet[1]))
-	if _, err := io.ReadFull(clientConn, methods); err != nil {
-		return
-	}
-	methodOK := false
-	for _, m := range methods {
-		if m == 0x00 {
-			methodOK = true
-			break
-		}
-	}
-	if !methodOK {
-		_, _ = clientConn.Write([]byte{0x05, 0xFF})
-		return
-	}
-	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	// --- SOCKS5 request: [0x05, CMD, 0x00, ATYP, ...] ---
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(clientConn, req); err != nil {
-		return
-	}
-	if req[0] != 0x05 || req[1] != 0x01 {
-		socksReply(clientConn, 0x07) // command not supported
-		return
-	}
-	dest, err := session.ReadDestinationEx(clientConn, req[3])
+	dest, err := socksNegotiate(clientConn)
 	if err != nil {
-		s.logger.Printf("SOCKS5 destination parse: %v", err)
+		s.logger.Printf("SOCKS5 negotiation: %v (from %s)", err, clientConn.RemoteAddr())
+		clientConn.Close()
 		return
 	}
 	_ = clientConn.SetDeadline(time.Time{})
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
 
-	// Wait until both carriers are live
-	upC, downC, err := s.waitCarriers()
+	// Hand the session to the Phase 5 engine (pkg/node): it waits for
+	// both carriers (30 s), allocates the stream ID, owns the client
+	// conn, runs the relays (with the bounded reconnect buffer) and
+	// rebinds the session across carrier losses. On success it returns
+	// the session; on failure it has already torn the session down
+	// (and closed the client conn) through the Phase 4 lifecycle.
+	sess, err := s.node.StartSession(clientConn, dest)
 	if err != nil {
 		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
 		socksReply(clientConn, 0x06) // general SOCKS server failure
+		clientConn.Close()
 		return
 	}
 
-	// --- Create session ---
-	rawSid, _ := session.GenerateSessionID()
-	var sid session.SessionID
-	copy(sid[:], rawSid)
-
-	streamID := atomic.AddUint32(&s.streamID, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := &session.Session{
-		ID:           sid,
-		Dest:         dest,
-		ClientConn:   clientConn,
-		StreamIDUp:   streamID,
-		StreamIDDown: streamID,
-		Ctx:          ctx,
-		Cancel:       cancel,
-	}
-	s.store.Add(sid, sess)
-	s.store.AddStream(sess)
-	s.metrics.incSession()
-	s.logger.Printf("Session %s → %s:%d (stream %d)", sid.String(), dest.Addr, dest.Port, streamID)
-
-	var once sync.Once
-	cleanup := func() {
-		once.Do(func() {
-			cancel()
-			s.store.RemoveStream(sess)
-			s.store.Remove(sid)
-			s.metrics.decSession()
-			s.logger.Printf("Session %s cleaned up", sid.String())
-		})
-	}
-
-	// Register this session's streams in both carrier demuxers
-	upCh := upC.Register(streamID)
-	downCh := downC.Register(streamID)
-	if upCh == nil || downCh == nil {
-		cleanup()
-		return
-	}
-
-	// SOCKS5 success reply
+	// SOCKS5 success reply — the node is now in charge of the conn.
 	socksReply(clientConn, 0x00)
-
-	// Send the initial Header frame (encoded destination) over the up-carrier
-	hdrBuf := make([]byte, session.MaxHeaderSize)
-	n := session.WriteDestinationBuffer(hdrBuf, dest)
-	if n <= 0 {
-		cleanup()
-		return
-	}
-	if err := upC.WriteFrame(streamID, mux.FrameHeader, hdrBuf[:n]); err != nil {
-		s.logger.Printf("Session %s up-carrier header: %v", sid.String(), err)
-		cleanup()
-		return
-	}
-
-	// Up-carrier stream watcher: a FrameClose from Germany tears the
-	// session down (unexpected data frames are ignored).
-	go func() {
-		defer upC.Deregister(streamID)
-		for frame := range upCh {
-			if frame == nil {
-				s.logger.Printf("Session %s: up-carrier closed by Germany", sid.String())
-				cleanup()
-				return
-			}
-		}
-		cleanup()
-	}()
-
-	// Down-carrier relay: Germany → client (download direction)
-	go func() {
-		defer downC.Deregister(streamID)
-		for frame := range downCh {
-			if frame == nil {
-				// target finished: half-close the client side
-				if tc, ok := clientConn.(*net.TCPConn); ok {
-					_ = tc.CloseWrite()
-				}
-				cleanup()
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			s.metrics.incDown(int64(len(frame)))
-			if _, werr := clientConn.Write(frame); werr != nil {
-				cleanup()
-				return
-			}
-		}
-		cleanup()
-	}()
-
-	// Relay: client → up-carrier (upload direction)
-	buf := make([]byte, s.config.RelayBufSize)
-	for {
-		n, rerr := clientConn.Read(buf)
-		if n > 0 {
-			s.metrics.incUp(int64(n))
-			if werr := upC.WriteFrame(streamID, mux.FrameData, buf[:n]); werr != nil {
-				s.logger.Printf("Session %s up-carrier write: %v", sid.String(), werr)
-				break
-			}
-			// carrier replaced underneath us → tear down
-			if s.getUp() != upC {
-				break
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				s.logger.Printf("Session %s client read: %v", sid.String(), rerr)
-			}
-			break
-		}
-	}
-	// Half-close: tell Germany the client side is finished
-	_ = upC.WriteFrame(streamID, mux.FrameClose, nil)
-	cleanup()
+	s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
 }
 
 // ============================================================
@@ -594,12 +476,8 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 func (s *Splitter) runMetrics(addr string) error {
 	mhttp := http.NewServeMux()
 	mhttp.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		s.metrics.mu.Lock()
-		fmt.Fprintf(w, "active_sessions %d\ntotal_sessions %d\ntotal_bytes_up %d\ntotal_bytes_down %d\nerrors %d\n",
-			s.metrics.activeSessions, s.metrics.totalSessions,
-			s.metrics.totalBytesUp, s.metrics.totalBytesDown, s.metrics.errors)
-		s.metrics.mu.Unlock()
-		fmt.Fprintf(w, "session_count %d\n", s.store.Count())
+		fmt.Fprint(w, s.node.Metrics().Render())
+		fmt.Fprintf(w, "session_count %d\n", s.node.Store().Count())
 	})
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -610,10 +488,4 @@ func (s *Splitter) runMetrics(addr string) error {
 	s.lnMu.Unlock()
 	defer ln.Close()
 	return http.Serve(ln, mhttp)
-}
-
-func parseInt(s string) int {
-	var n int
-	fmt.Sscanf(s, "%d", &n)
-	return n
 }
