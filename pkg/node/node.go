@@ -249,7 +249,12 @@ func (n *Node) dropIfCurrent(dir session.Direction, h *carrierHandle) {
 // within the process (wrap-around would take 2^32 sessions); the rebind
 // protocol cross-checks StreamID against SessionID regardless.
 func (n *Node) nextStreamID() uint32 {
-	return atomic.AddUint32(&n.streamSeq, 1)
+	for {
+		id := atomic.AddUint32(&n.streamSeq, 1)
+		if id != 0 {
+			return id
+		}
+	}
 }
 
 // onGraceTimeout is the attachment timer callback: the carrier-loss
