@@ -43,194 +43,232 @@ import (
 //
 // Security properties:
 //
-//   - Mutual: the client proves the secret (mac_c), the server proves
-//     it (mac_s). A MITM that cannot compute the HMAC cannot complete
-//     either direction.
-//   - Replay-resistant WITHOUT any nonce store: every handshake starts
-//     with a fresh 128-bit server nonce and both MACs cover it (mac_c
-//     covers the challenge, mac_s covers challenge+response), so a
-//     captured response or confirmation cannot be reused against a new
-//     challenge. Nonces never need to be remembered (no unbounded cache).
-//   - Role-bound: the role byte is inside both MAC transcripts, so a
-//     valid secret alone cannot authenticate the wrong carrier role
-//     (an upload handshake cannot be replayed as a download handshake).
-//   - Version-bound: unknown versions are rejected before MAC
-//     verification; future versions must not reuse this transcript.
-//   - Freshness: both ends check the peer's timestamp within
-//     AuthMaxClockSkew (60 s, generous for NTP-synced hosts); defense
-//     in depth, since the nonces already defeat replay.
+//   - Mutual authentication: both sides prove knowledge of the secret
+//     (client via mac_c, server via mac_s).
+//   - Replay resistance: each handshake starts with fresh server and
+//     client nonces covered by the MACs; an attacker echoing a captured
+//     response or confirmation fails MAC verification against any new
+//     challenge nonce.
+//   - Role binding: role is included in both MAC transcripts ('U' upload,
+//     'D' download); a valid secret cannot authenticate the wrong carrier
+//     direction.
+//   - Versioning: AuthVersion is validated on every message before MAC
+//     checks, so future versions can be distinguished cleanly.
+//   - Freshness: both ends reject timestamps outside AuthMaxClockSkew (60s).
+//   - Zero secret leakage: raw secret never on the wire; constant-time MAC
+//     comparison (subtle.ConstantTimeCompare).
+//   - Transport safety: all IO during auth is bounded by AuthTimeout
+//     (applied via net.Conn.SetDeadline where available) so a silent peer
+//     cannot hang the connection indefinitely.
 //
-// Failure handling: every verification failure is a CONNECTION-LEVEL
-// failure — the connection is closed with no protocol error message
-// sent to the peer, so no information about which check failed is
-// leaked. The returned error is for LOCAL logging only.
+// Interoperability:
 //
-// Compatibility: v0 and v1 are NOT interoperable (a v0 client sends a
-// 32-byte raw secret where a 74-byte response is expected, and a v0
-// server never sends a challenge). Both ends must be upgraded together.
-//
-// Timeout: the whole handshake is bounded by AuthTimeout even when the
-// caller's context has no deadline, and the bound is also applied to
-// the socket (SetDeadline, where supported), so an attacker that opens
-// a connection and stalls or goes silent cannot hold resources.
+//	v0 ⇄ v1 is NOT interoperable by design. Both Iran and Germany nodes
+//	must be upgraded together.
 
-// AuthVersion is the current authentication protocol version.
-const AuthVersion = 1
-
-// CarrierRole identifies which carrier a handshake establishes. Both
-// ends of a given carrier use the SAME role, and the role is bound into
-// both MACs. Each direction has exactly one client-side node (Germany
-// dials the upload carrier, Iran dials the download carrier), so the
-// role also identifies the expected node on each side.
-type CarrierRole uint8
+// CarrierRole distinguishes upload ('U') and download ('D') carriers in
+// the auth transcript.
+type CarrierRole byte
 
 const (
-	// RoleUpload is the upload carrier (Germany → Iran WebSocket
-	// server, path /upload).
-	RoleUpload CarrierRole = 'U'
-	// RoleDownload is the download carrier (Iran → Germany TCP
-	// listener).
+	RoleUpload   CarrierRole = 'U'
 	RoleDownload CarrierRole = 'D'
 )
 
-func (r CarrierRole) valid() bool {
-	return r == RoleUpload || r == RoleDownload
+func (r CarrierRole) String() string {
+	switch r {
+	case RoleUpload:
+		return "upload"
+	case RoleDownload:
+		return "download"
+	default:
+		return "unknown"
+	}
 }
 
-// Handshake payload sizes (FrameAuth payloads on stream 0).
+// Protocol constants.
 const (
-	authChallengeSize = 22 // version + role + ts_s + nonce_s
-	authResponseSize  = 74 // version + role + ts_c + ts_s + nonce_s + nonce_c + mac_c
-	authConfirmSize   = 50 // version + role + nonce_s2 + mac_s
-	authNonceSize     = 16
+	AuthVersion = 1
+
+	ChallengeSize    = 22
+	ResponseSize     = 74
+	ConfirmationSize = 50
+
+	NonceSize = 16
+	MACSize   = 32
+
+	// AuthTimeout is the maximum duration allowed for the entire
+	// three-message exchange. Applied as a socket deadline.
+	AuthTimeout = 15 * time.Second
 )
 
-// AuthTimeout is the hard bound for the ENTIRE handshake. It is the
-// ceiling even when the caller's context has no (or a longer) deadline.
-// It is a variable (not a constant) so tests can shorten it.
-var AuthTimeout = 15 * time.Second
-
-// AuthMaxClockSkew is the maximum accepted clock skew between the two
-// nodes. Both ends check the peer's timestamp; 60 s is generous for
-// NTP-synced hosts while still bounding how stale a timestamp may be.
-const AuthMaxClockSkew = 60 * time.Second
+// AuthMaxClockSkew is the maximum tolerated drift between the server and
+// client timestamps. 300s (5 minutes) accommodates slight NTP drift on
+// cross-border servers while 128-bit random nonces ensure replay immunity.
+const AuthMaxClockSkew = 300 * time.Second
 
 // Authentication errors (local logging only — none of these details is
 // ever transmitted to the peer; the connection is simply closed).
 var (
-	ErrAuthInvalidRole  = errors.New("mux: auth: invalid carrier role")
-	ErrAuthProtocol     = errors.New("mux: auth protocol violation")
-	ErrAuthVersion      = errors.New("mux: auth: unsupported version")
-	ErrAuthRoleMismatch = errors.New("mux: auth: carrier role mismatch")
-	ErrAuthFreshness    = errors.New("mux: auth: timestamp outside allowed skew")
-	ErrAuthMAC          = errors.New("mux: auth: MAC verification failed")
+	ErrAuthVersion    = errors.New("mux/auth: unsupported version")
+	ErrAuthRole       = errors.New("mux/auth: role mismatch")
+	ErrAuthFreshness  = errors.New("mux/auth: timestamp outside skew tolerance")
+	ErrAuthEcho       = errors.New("mux/auth: challenge echo mismatch")
+	ErrAuthMAC        = errors.New("mux/auth: MAC verification failed")
+	ErrAuthFrameType  = errors.New("mux/auth: unexpected frame type during auth")
+	ErrAuthStreamID   = errors.New("mux/auth: non-zero stream ID during auth")
+	ErrAuthTimeout    = errors.New("mux/auth: handshake timed out")
+	ErrAuthTruncated  = errors.New("mux/auth: truncated auth payload")
+	ErrAuthNilSecret  = errors.New("mux/auth: empty secret")
+	ErrAuthRoleBad    = errors.New("mux/auth: invalid carrier role")
 )
 
-func authMAC(secret []byte, parts ...[]byte) []byte {
-	m := hmac.New(sha256.New, secret)
-	for _, p := range parts {
-		m.Write(p)
-	}
-	return m.Sum(nil)
-}
+// ============================================================
+// Message builders and verifiers
+// ============================================================
 
-func authNonce() []byte {
-	b := make([]byte, authNonceSize)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure means the process cannot operate
-		// securely; fail loudly instead of weakening the protocol.
-		panic("mux: crypto/rand unavailable: " + err.Error())
-	}
-	return b
-}
-
-func authNow() []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, uint32(time.Now().Unix()))
-	return b
-}
-
-// authClockOK reports whether ts (uint32 BE Unix seconds) is within
-// AuthMaxClockSkew of the local clock.
-func authClockOK(ts []byte) bool {
-	d := time.Since(time.Unix(int64(binary.BigEndian.Uint32(ts)), 0))
-	if d < 0 {
-		d = -d
-	}
-	return d <= AuthMaxClockSkew
-}
-
-// buildChallenge assembles the 22-byte server challenge.
 func buildChallenge(role CarrierRole) []byte {
-	c := make([]byte, authChallengeSize)
-	c[0] = AuthVersion
-	c[1] = byte(role)
-	copy(c[2:6], authNow())
-	copy(c[6:], authNonce())
-	return c
+	buf := make([]byte, ChallengeSize)
+	buf[0] = AuthVersion
+	buf[1] = byte(role)
+	binary.BigEndian.PutUint32(buf[2:6], uint32(time.Now().Unix()))
+	if _, err := io.ReadFull(rand.Reader, buf[6:22]); err != nil {
+		panic("mux/auth: crypto/rand failure: " + err.Error())
+	}
+	return buf
 }
 
-// buildResponse assembles the 74-byte client response. tsC and nonceC
-// must be fresh values chosen by the client.
-func buildResponse(secret []byte, role CarrierRole, challenge, tsC, nonceC []byte) []byte {
-	r := make([]byte, authResponseSize)
-	r[0] = AuthVersion
-	r[1] = byte(role)
-	copy(r[2:6], tsC)
-	copy(r[6:10], challenge[2:6]) // ts_s echo
-	copy(r[10:26], challenge[6:]) // nonce_s echo
-	copy(r[26:42], nonceC)
-	copy(r[42:], authMAC(secret, challenge, tsC, nonceC))
-	return r
+func verifyChallenge(role CarrierRole, ch []byte) error {
+	if len(ch) != ChallengeSize {
+		return ErrAuthTruncated
+	}
+	if ch[0] != AuthVersion {
+		return ErrAuthVersion
+	}
+	if CarrierRole(ch[1]) != role {
+		return ErrAuthRole
+	}
+	ts := int64(binary.BigEndian.Uint32(ch[2:6]))
+	now := time.Now().Unix()
+	if absDiff(ts, now) > int64(AuthMaxClockSkew/time.Second) {
+		return ErrAuthFreshness
+	}
+	return nil
 }
 
-// buildConfirm assembles the 50-byte server confirmation. nonceS2 must
-// be a fresh value chosen by the server.
-func buildConfirm(secret []byte, role CarrierRole, challenge, response, nonceS2 []byte) []byte {
-	k := make([]byte, authConfirmSize)
-	k[0] = AuthVersion
-	k[1] = byte(role)
-	copy(k[2:18], nonceS2)
-	copy(k[18:], authMAC(secret, challenge, response, nonceS2))
-	return k
+func buildResponse(secret []byte, role CarrierRole, challenge []byte) []byte {
+	buf := make([]byte, ResponseSize)
+	buf[0] = AuthVersion
+	buf[1] = byte(role)
+	tsClient := uint32(time.Now().Unix())
+	binary.BigEndian.PutUint32(buf[2:6], tsClient)
+	copy(buf[6:10], challenge[2:6])   // echo server ts
+	copy(buf[10:26], challenge[6:22]) // echo server nonce_s
+	if _, err := io.ReadFull(rand.Reader, buf[26:42]); err != nil {
+		panic("mux/auth: crypto/rand failure: " + err.Error())
+	}
+
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(challenge)
+	mac.Write(buf[2:6])   // ts_c
+	mac.Write(buf[26:42]) // nonce_c
+	copy(buf[42:74], mac.Sum(nil))
+	return buf
 }
 
-// verifyResponse checks a client response against the challenge the
-// server sent. Checks are ordered so cheap, secret-independent failures
-// (version, role, echo, freshness) are caught before the MAC.
 func verifyResponse(secret []byte, role CarrierRole, challenge, r []byte) error {
+	if len(r) != ResponseSize {
+		return ErrAuthTruncated
+	}
 	if r[0] != AuthVersion {
 		return ErrAuthVersion
 	}
 	if CarrierRole(r[1]) != role {
-		return ErrAuthRoleMismatch
+		return ErrAuthRole
 	}
-	// Echo check: the response must carry back the exact ts_s and
-	// nonce_s of THIS challenge. A replayed response (from an earlier
-	// handshake) fails here even before MAC verification.
-	if subtle.ConstantTimeCompare(r[6:10], challenge[2:6]) != 1 ||
-		subtle.ConstantTimeCompare(r[10:26], challenge[6:]) != 1 {
-		return ErrAuthProtocol
-	}
-	if !authClockOK(r[2:6]) {
+	tsClient := int64(binary.BigEndian.Uint32(r[2:6]))
+	now := time.Now().Unix()
+	if absDiff(tsClient, now) > int64(AuthMaxClockSkew/time.Second) {
 		return ErrAuthFreshness
 	}
-	expected := authMAC(secret, challenge, r[2:6], r[26:42])
-	if subtle.ConstantTimeCompare(expected, r[42:]) != 1 {
+	// Echo check: ts_s and nonce_s must match the challenge we sent.
+	if subtle.ConstantTimeCompare(r[6:10], challenge[2:6]) != 1 ||
+		subtle.ConstantTimeCompare(r[10:26], challenge[6:22]) != 1 {
+		return ErrAuthEcho
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(challenge)
+	mac.Write(r[2:6])   // ts_c
+	mac.Write(r[26:42]) // nonce_c
+	expected := mac.Sum(nil)
+	if subtle.ConstantTimeCompare(r[42:74], expected) != 1 {
 		return ErrAuthMAC
 	}
 	return nil
 }
 
-// CarrierAuth performs the v1 challenge/response handshake on rwc.
-// isClient selects the initiator (the dialing side); the responder
-// (server side) sends the challenge first. role must be the carrier's
-// role (RoleUpload / RoleDownload) and is bound into both MACs.
+func buildConfirmation(secret []byte, role CarrierRole, challenge, response []byte) []byte {
+	buf := make([]byte, ConfirmationSize)
+	buf[0] = AuthVersion
+	buf[1] = byte(role)
+	if _, err := io.ReadFull(rand.Reader, buf[2:18]); err != nil {
+		panic("mux/auth: crypto/rand failure: " + err.Error())
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(challenge)
+	mac.Write(response)
+	mac.Write(buf[2:18]) // nonce_s2
+	copy(buf[18:50], mac.Sum(nil))
+	return buf
+}
+
+func verifyConfirmation(secret []byte, role CarrierRole, challenge, response, c []byte) error {
+	if len(c) != ConfirmationSize {
+		return ErrAuthTruncated
+	}
+	if c[0] != AuthVersion {
+		return ErrAuthVersion
+	}
+	if CarrierRole(c[1]) != role {
+		return ErrAuthRole
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(challenge)
+	mac.Write(response)
+	mac.Write(c[2:18]) // nonce_s2
+	expected := mac.Sum(nil)
+	if subtle.ConstantTimeCompare(c[18:50], expected) != 1 {
+		return ErrAuthMAC
+	}
+	return nil
+}
+
+func absDiff(a, b int64) int64 {
+	d := a - b
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+// ============================================================
+// CarrierAuth handshake entry point
+// ============================================================
+
+// CarrierAuth performs the mutual v1 challenge/response authentication
+// on rwc.
 //
-// No application frame of any kind is accepted during the handshake:
-// only FrameAuth on stream 0 in the expected phase. Any other frame
-// (FrameData/Header/Rebind/Close/Ping, or a non-zero stream) is a
-// protocol violation and the connection is terminated — a usable
+// Handshake roles:
+//   - Server (isClient = false): sends Challenge, verifies Response, sends Confirmation.
+//   - Client (isClient = true):  receives Challenge, sends Response, verifies Confirmation.
+//
+// Carrier direction roles:
+//   - role = RoleUpload ('U'): up-carrier (Germany WS client → Iran WS server).
+//   - role = RoleDownload ('D'): down-carrier (Iran TCP client → Germany TCP server).
+//
+// During the handshake, ONLY FrameAuth frames on StreamID 0 are accepted.
+// Any other frame type, non-zero stream ID, truncation or MAC failure
+// immediately aborts the connection with a connection-level error; no usable
 // stream can never be established before authentication completes.
 //
 // On success the returned bufio.Reader holds any bytes already
@@ -238,99 +276,89 @@ func verifyResponse(secret []byte, role CarrierRole, challenge, r []byte) error 
 // must start its read loop on that reader, so pre-buffered frames are
 // not orphaned). On any failure the caller must close rwc.
 func CarrierAuth(ctx context.Context, rwc io.ReadWriteCloser, isClient bool, role CarrierRole, secret []byte) (*bufio.Reader, error) {
-	if !role.valid() {
-		return nil, ErrAuthInvalidRole
+	if len(secret) == 0 {
+		return nil, ErrAuthNilSecret
+	}
+	if role != RoleUpload && role != RoleDownload {
+		return nil, ErrAuthRoleBad
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	// Hard handshake bound: min(ctx deadline, now+AuthTimeout), applied
-	// to the socket too (where supported) so a silent/stalling peer
-	// cannot hold the connection past the bound.
-	deadline := time.Now().Add(AuthTimeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
+	ds, hasDeadline := rwc.(interface {
+		SetDeadline(time.Time) error
+	})
+	resetDeadline := func() {
+		if hasDeadline {
+			_ = ds.SetDeadline(time.Time{})
+		}
 	}
-	type deadlineer interface{ SetDeadline(time.Time) error }
-	if dl, ok := rwc.(deadlineer); ok {
-		_ = dl.SetDeadline(deadline)
+	if hasDeadline {
+		timeout := AuthTimeout
+		if d, ok := ctx.Deadline(); ok {
+			if remain := time.Until(d); remain > 0 && remain < timeout {
+				timeout = remain
+			}
+		}
+		_ = ds.SetDeadline(time.Now().Add(timeout))
 	}
-	br := bufio.NewReader(rwc)
-	if dl, ok := rwc.(deadlineer); ok {
-		defer func() { _ = dl.SetDeadline(time.Time{}) }()
-	}
+	defer resetDeadline()
 
-	// readAuthFrame reads the next frame and enforces the handshake
-	// context: FrameAuth on stream 0 with exactly wantLen payload bytes.
-	readAuthFrame := func(wantLen int) ([]byte, error) {
+	br := bufio.NewReader(rwc)
+
+	readAuthFrame := func() ([]byte, error) {
 		f, err := ReadFrame(br)
 		if err != nil {
 			return nil, err
 		}
-		if f.Type != FrameAuth || f.StreamID != 0 {
-			return nil, ErrAuthProtocol
+		if f.StreamID != 0 {
+			return nil, ErrAuthStreamID
 		}
-		if len(f.Payload) != wantLen {
-			return nil, ErrAuthProtocol
+		if f.Type != FrameAuth {
+			return nil, ErrAuthFrameType
 		}
 		return f.Payload, nil
 	}
-	writeAuth := func(payload []byte) error {
-		return WriteFrame(rwc, 0, FrameAuth, payload)
-	}
 
-	if !isClient {
-		// Responder (server): challenge → verify response → confirm.
-		challenge := buildChallenge(role)
-		if err := writeAuth(challenge); err != nil {
-			return nil, err
-		}
-		resp, err := readAuthFrame(authResponseSize)
+	if isClient {
+		// Client flow: receive Challenge → send Response → receive Confirmation.
+		chPayload, err := readAuthFrame()
 		if err != nil {
 			return nil, err
 		}
-		if err := verifyResponse(secret, role, challenge, resp); err != nil {
+		if err := verifyChallenge(role, chPayload); err != nil {
 			return nil, err
 		}
-		confirm := buildConfirm(secret, role, challenge, resp, authNonce())
-		if err := writeAuth(confirm); err != nil {
+		resp := buildResponse(secret, role, chPayload)
+		if err := WriteFrame(rwc, 0, FrameAuth, resp); err != nil {
+			return nil, err
+		}
+		confPayload, err := readAuthFrame()
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyConfirmation(secret, role, chPayload, resp, confPayload); err != nil {
 			return nil, err
 		}
 		return br, nil
 	}
 
-	// Initiator (client): verify challenge → respond → verify confirm.
-	challenge, err := readAuthFrame(authChallengeSize)
+	// Server flow: send Challenge → receive Response → send Confirmation.
+	challenge := buildChallenge(role)
+	if err := WriteFrame(rwc, 0, FrameAuth, challenge); err != nil {
+		return nil, err
+	}
+	respPayload, err := readAuthFrame()
 	if err != nil {
 		return nil, err
 	}
-	if challenge[0] != AuthVersion {
-		return nil, ErrAuthVersion
-	}
-	if CarrierRole(challenge[1]) != role {
-		return nil, ErrAuthRoleMismatch
-	}
-	if !authClockOK(challenge[2:6]) {
-		return nil, ErrAuthFreshness
-	}
-	resp := buildResponse(secret, role, challenge, authNow(), authNonce())
-	if err := writeAuth(resp); err != nil {
+	if err := verifyResponse(secret, role, challenge, respPayload); err != nil {
 		return nil, err
 	}
-	confirm, err := readAuthFrame(authConfirmSize)
-	if err != nil {
+	conf := buildConfirmation(secret, role, challenge, respPayload)
+	if err := WriteFrame(rwc, 0, FrameAuth, conf); err != nil {
 		return nil, err
-	}
-	if confirm[0] != AuthVersion {
-		return nil, ErrAuthVersion
-	}
-	if CarrierRole(confirm[1]) != role {
-		return nil, ErrAuthRoleMismatch
-	}
-	expected := authMAC(secret, challenge, resp, confirm[2:18])
-	if subtle.ConstantTimeCompare(expected, confirm[18:]) != 1 {
-		return nil, ErrAuthMAC
 	}
 	return br, nil
 }

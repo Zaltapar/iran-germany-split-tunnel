@@ -249,7 +249,12 @@ func (n *Node) dropIfCurrent(dir session.Direction, h *carrierHandle) {
 // within the process (wrap-around would take 2^32 sessions); the rebind
 // protocol cross-checks StreamID against SessionID regardless.
 func (n *Node) nextStreamID() uint32 {
-	return atomic.AddUint32(&n.streamSeq, 1)
+	for {
+		id := atomic.AddUint32(&n.streamSeq, 1)
+		if id != 0 {
+			return id
+		}
+	}
 }
 
 // onGraceTimeout is the attachment timer callback: the carrier-loss
@@ -669,7 +674,7 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	var sid session.SessionID
 	copy(sid[:], raw)
 
-	sess := session.NewSession(sid, dest, clientConn, nil, n.ctx)
+	sess := session.NewSession(sid, dest, nil, nil, n.ctx)
 	sess.StreamIDUp = id
 	sess.StreamIDDown = id
 	sess.UpAtt = session.NewAttachment(n.cfg.Grace, func() { n.onGraceTimeout(sess, session.DirUp) })
@@ -705,6 +710,8 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 		return nil, fmt.Errorf("up-carrier header write: %w", err)
 	}
 
+	sess.ClientConn = clientConn
+	setKeepAlive(clientConn)
 	sess.UpAtt.Attach(upH.gen)
 	sess.DownAtt.Attach(downH.gen)
 
@@ -788,6 +795,7 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 		drop(fmt.Errorf("target %s dial failed: %w", dest.Addr, err))
 		return
 	}
+	setKeepAlive(targetConn)
 
 	downH := n.current(session.DirDown)
 	if downH == nil || !downH.carrier.Ready() {
@@ -887,5 +895,13 @@ func carrierTimeoutReason(dir session.Direction) string {
 func closeWrite(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.CloseWrite()
+	}
+}
+
+// setKeepAlive enables TCP keepalives to prevent silent connection dropouts.
+func setKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 }
