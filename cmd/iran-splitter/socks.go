@@ -66,5 +66,9 @@ func socksNegotiate(rw io.ReadWriteCloser) (*session.Destination, error) {
 	if err != nil {
 		return nil, fmt.Errorf("destination: %w", err)
 	}
+	if dest.AddrType == session.AddrTypeDomain && len(dest.Addr) > 255 {
+		socksReply(rw, 0x01) // general failure
+		return nil, errors.New("domain name exceeds 255 bytes")
+	}
 	return dest, nil
 }
