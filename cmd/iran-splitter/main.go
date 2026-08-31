@@ -450,11 +450,13 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
 
 	// Hand the session to the Phase 5 engine (pkg/node): it waits for
-	// both carriers (30 s), allocates the stream ID, owns the client
-	// conn, runs the relays (with the bounded reconnect buffer) and
-	// rebinds the session across carrier losses. On success it returns
-	// the session; on failure it has already torn the session down
-	// (and closed the client conn) through the Phase 4 lifecycle.
+	// both carriers (30 s), allocates the stream ID, runs the relays
+	// (with the bounded reconnect buffer) and rebinds the session
+	// across carrier losses. On success it ADOPTS the client conn (the
+	// session's Close becomes the only closer) and returns the session;
+	// on failure it tears the session down but returns the client conn
+	// to us still open, so the SOCKS error reply below is actually
+	// delivered.
 	sess, err := s.node.StartSession(clientConn, dest)
 	if err != nil {
 		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
@@ -463,7 +465,8 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 		return
 	}
 
-	// SOCKS5 success reply — the node is now in charge of the conn.
+	// SOCKS5 success reply. The conn may be read at any time now: from
+	// this point on the client is connected to the tunnel.
 	socksReply(clientConn, 0x00)
 	s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
 }

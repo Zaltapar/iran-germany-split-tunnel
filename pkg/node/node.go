@@ -663,10 +663,15 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 
 // StartSession (RoleIran) starts a new logical session for clientConn
 // toward dest. It blocks while either carrier is down (up to 30s or
-// node shutdown) and takes ownership of clientConn in ALL cases: on
-// success the session owns it, on failure it is closed through the
-// session's authoritative teardown. On success the caller sends the
-// SOCKS success reply; on failure no reply is possible (conn closed).
+// node shutdown).
+//
+// Ownership of clientConn: the CALLER owns it until setup succeeds.
+// On success the connection is adopted by the session (through
+// sess.AdoptConn, which refuses the transfer if teardown is already in
+// flight) and the caller sends the SOCKS success reply. On failure the
+// connection is returned to the caller still OPEN, so the caller can
+// deliver the SOCKS error reply before closing it — a session-bound
+// conn closed during setup would swallow that reply.
 func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*session.Session, error) {
 	upH, downH, err := n.waitCarriers()
 	if err != nil {
@@ -678,7 +683,12 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	var sid session.SessionID
 	copy(sid[:], raw)
 
-	sess := session.NewSession(sid, dest, clientConn, nil, n.ctx)
+	// The session does NOT own clientConn yet: setup can still fail
+	// (registration, activation, destination encoding, header write)
+	// and the caller must be able to send the SOCKS error reply after
+	// such a failure. Ownership is transferred below, once every
+	// failure point has passed.
+	sess := session.NewSession(sid, dest, nil, nil, n.ctx)
 	sess.StreamIDUp = id
 	sess.StreamIDDown = id
 	sess.UpAtt = session.NewAttachment(n.cfg.Grace, func() { n.onGraceTimeout(sess, session.DirUp) })
@@ -712,6 +722,20 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	if err := upH.carrier.WriteFrame(id, mux.FrameHeader, hdr[:nw]); err != nil {
 		sess.Close("up-carrier header write failed")
 		return nil, fmt.Errorf("up-carrier header write: %w", err)
+	}
+
+	// All setup failure points are behind us: hand the client conn over
+	// to the session so its authoritative Close is the only closer.
+	// This happens BEFORE the Attach calls on purpose: once attached, a
+	// carrier loss could start the grace window and close the session,
+	// and a conn not yet adopted by the session would leak (nobody
+	// else closes it). If a teardown raced in, the adopt is refused and
+	// the conn is returned to the caller still open (the caller closes
+	// it with the other failure paths, after its SOCKS error reply) —
+	// the session's ClientConn is nil, so its teardown will not touch
+	// it.
+	if !sess.AdoptConn(clientConn) {
+		return nil, errors.New("client conn adopt refused (session closing)")
 	}
 
 	sess.UpAtt.Attach(upH.gen)

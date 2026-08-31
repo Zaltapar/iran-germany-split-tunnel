@@ -13,6 +13,29 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
   test proven against pre-fix code; audit PRs #2/#3 disposition
   recorded in the "Follow-up — stream-ID wraparound to reserved
   stream 0" section at the bottom.
+- **SOCKS5 max domain length pinned** — the audit's "reject domain >
+  255 bytes" check is UNREACHABLE: the SOCKS5 domain length is a
+  uint8 field, so the parser (`readDestFromReader`) structurally caps
+  domains at 255 bytes. No production change; the boundary is pinned
+  by `TestSocksNegotiateMaxDomainLength` (test-only commit).
+- **SOCKS5 error reply lost on session-setup failure — RESOLVED (this
+  commit)**: `StartSession` handed `clientConn` to `NewSession` at
+  birth, so a setup failure (registration/activation/destination
+  encoding/header write) closed the client conn through the session
+  teardown and the caller's `socksReply(0x06)` was written to an
+  already-closed conn. Ownership now transfers via `Session.AdoptConn`
+  only after every setup failure point has passed. Regression test
+  proven against pre-fix code. Details in "Follow-up — SOCKS5 error
+  reply ownership" at the bottom.
+- **Flaky `TestSleepJitterBounds` — RESOLVED** (commit
+  `a09ac4b`): the test asserted a STRICT `elapsed < 100ms` against a
+  wall-clock measurement of a jitter whose range is INCLUSIVE of the
+  cap (a sleep of exactly `d` is legitimate production behavior, and
+  the cap is preserved by construction). On a loaded host the
+  boundary case measured 100.49 ms → false failure. Test-layer fix
+  (documented tolerance, correct doc in `backoff.go`); no production
+  behavior change. Details in "Follow-up — backoff jitter test" at
+  the bottom.
 - **CRITICAL send-on-closed-channel crash in the stream worker —
   RESOLVED (this commit)**: `CarrierConn.Close` closed a stream consumer
   channel that a worker could still be sending to, intermittently
@@ -1167,7 +1190,7 @@ Self-contained: `pkg/mux/carrier.go`, `pkg/mux/queue.go`,
 `pkg/mux/{queue,backpressure}_test.go`, the workflow trigger line, and
 this documentation update.
 
-## Follow-up — stream-ID wraparound to reserved stream 0 (this commit)
+## Follow-up — stream-ID wraparound to reserved stream 0 (commit 1745d60)
 
 ### The issue (from the repository audit; open PRs #2 / #3)
 
@@ -1239,3 +1262,117 @@ git revert <this-commit>
 
 Self-contained: `pkg/node/node.go`, `pkg/node/streamid_test.go`, and
 this documentation update.
+
+## Follow-up — SOCKS5 error reply ownership (this commit)
+
+### The issue (from the repository audit; PR #3 item 2)
+
+`Node.StartSession` constructed the session with the client conn
+already bound (`session.NewSession(sid, dest, clientConn, nil, ...)`).
+If setup then failed at one of the post-construction points (carrier
+`Register` returning nil, `Activate` failing, destination encoding
+returning 0, or the `FrameHeader` write failing), the session was torn
+down — and `Session.teardown` closed the client conn. The caller
+(`handleSOCKS5Conn`) then executed
+`socksReply(clientConn, 0x06); clientConn.Close()`: the reply was
+written to an already-closed conn and silently lost. The client saw a
+connection reset instead of the SOCKS5 "general failure" reply.
+
+PR #3's fix (bind the conn only after the header write) was in the
+right direction but would have introduced a data race: `StartSession`
+returns after `startStreamRelay` captures `sess.ClientConn` while the
+teardown goroutine could concurrently clear it — an unsynchronized
+read/write of the same `net.Conn` field (and the PR shipped it
+together with the rejected `auth.go` rewrite).
+
+### The fix (ownership transfer, protocol unchanged)
+
+- `pkg/session/session.go` — new `Session.AdoptConn(c net.Conn) bool`:
+  transfers ownership of a connection to the session's authoritative
+  `Close`. The check and the store are done under `s.mu`; if the
+  session is already Closing/Closed the conn is NOT adopted (returns
+  false) and the caller retains ownership.
+- `pkg/node/node.go` — `StartSession` now creates the session with a
+  NIL client conn. After the `FrameHeader` write succeeds (the last
+  setup failure point) it calls `sess.AdoptConn(clientConn)` — and
+  does so BEFORE the `Attach` calls on purpose: once attached, a
+  carrier loss could start the grace window and close the session,
+  and a not-yet-adopted conn would leak (nobody else would close it).
+  On adopt refusal the conn is closed and the failure is returned.
+  All earlier failure paths return the conn to the caller still open.
+- `cmd/iran-splitter/main.go` — caller behavior unchanged
+  (`socksReply(0x06); clientConn.Close()` on failure), now correct by
+  construction; comments updated to the new ownership contract.
+- The Germany side (`bootstrapUpStream`) is unaffected: it owns
+  `targetConn` itself and has no SOCKS reply; it already closes
+  `targetConn` explicitly on each failure path (behavior preserved —
+  noted for a possible later cleanup, not changed here).
+
+### Regression test
+
+`pkg/node/startsession_ownership_test.go` (new, external test on the
+existing topology harness): an invalid `AddrType` (0) deterministically
+fails the destination encoding — no carrier manipulation, no timing.
+Asserts: `StartSession` returns an error, AND the caller can still
+write the 12-byte SOCKS5 general-failure reply on the client conn and
+read it back intact. Proven to catch the bug: against the pre-fix
+code the reply write fails with `mempipe closed` (the session closed
+a conn it did not own); post-fix it passes at `-count=5`.
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean; `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- Focused test `-count=5` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+
+## Follow-up — backoff jitter test (commit a09ac4b)
+
+### The flake
+
+`TestSleepJitterBounds` (internal/backoff) asserted
+`elapsed < 100*time.Millisecond` — a STRICT upper bound — on a
+wall-clock measurement of `Backoff.Sleep`, whose jitter range is
+`[d/2, d]` INCLUSIVE (`Int63n(d/2+1)` can yield `j = d/2`, so a sleep
+of exactly `d` is legitimate production behavior; the cap is preserved
+by construction since `j = d/2 + [0, d/2] <= d`). On a loaded host the
+boundary case measured 100.4965 ms → false failure under
+`-count=2`.
+
+### Classification (flaky-test policy)
+
+Test-harness defect, not a production defect: the production cap is a
+real cap by construction; the test's strict inequality against an
+inclusive cap, measured with wall clock, is an incorrect timing
+assumption. Fix at the test layer, documented; no sleep added to
+production, no deadline weakened.
+
+### The fix (test + doc only)
+
+- `internal/backoff/backoff_test.go` — upper bound is now
+  `d + 20ms` (documented wall-clock tolerance, far smaller than any
+  real regression: a 2x delay still fails); lower bound
+  `d/2 - 5ms` (documented tolerance for the same reason).
+- `internal/backoff/backoff.go` — the package and function docs said
+  `[d/2, d)` while the code is `[d/2, d]`; corrected to match the
+  code (the doc/code mismatch is the root cause of the wrong test
+  assumption).
+- `go test ./internal/backoff -count=20` — PASS.
+
+## Audit PR disposition — consolidated
+
+PR #2: superseded by the `nextStreamID` fix (see the stream-ID
+section above).
+PR #3: REJECTED as a whole (see the auth.go analysis in the stream-ID
+section); its individual items are dispositioned:
+- streamID wraparound → adopted (rewritten with a regression test);
+- SOCKS5 domain > 255 → UNREACHABLE (uint8 length field); boundary
+  pinned by a test instead;
+- StartSession clientConn binding → adopted via `Session.AdoptConn`
+  (the PR's version was racy; see the ownership section above);
+- TCP keepalive on relay sockets → DEFERRED (see the next-task
+  notes; needs a dedicated, reviewed change — not adopted here);
+- clock skew 60s → 300s → REJECTED (NTP-synced VPS; nonces provide
+  replay protection independent of clock quality; no demonstrated
+  failure).

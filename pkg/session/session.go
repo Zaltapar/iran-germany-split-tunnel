@@ -474,6 +474,26 @@ func (s *Session) MarkDirClosed(dir Direction, reason string) bool {
 	return complete
 }
 
+// AdoptConn transfers ownership of a connection to the session so that
+// Close (and only Close) closes it. It is the ownership transfer for the
+// setup phase: the constructor takes the connections a session owns at
+// birth, but a connection handed over LATER (after the carrier setup has
+// succeeded) must not be owned by the session if teardown is already in
+// flight — a late transfer into a Closing/Closed session would leave a
+// reference Close will never release and a socket nobody closes. The
+// check and the store are done under the session lock: if the session is
+// already Closing/Closed the connection is NOT adopted and the caller
+// retains ownership (and must close it).
+func (s *Session) AdoptConn(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == StateClosed || s.state == StateClosing {
+		return false
+	}
+	s.ClientConn = c
+	return true
+}
+
 // Close is the single authoritative teardown path for the session. It
 // may be called concurrently from any goroutine, repeatedly, with
 // different reasons: teardown runs exactly once (the first reason
