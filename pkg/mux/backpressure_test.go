@@ -149,10 +149,14 @@ func TestAggregateBudgetEnforced(t *testing.T) {
 	// Build the streams directly WITHOUT starting workers: this test drives
 	// deliver() single-threaded (playing the dispatcher's role), so no
 	// concurrent mailbox drain can perturb the queued-byte accounting.
+	// The mailboxes carry the aggregate budget, exactly like
+	// createStreamLocked wires them, so the accounting assertions below
+	// exercise the production code path.
 	c.mu.Lock()
 	mk := func(id uint32) *streamRec {
-		s := &streamRec{id: id, q: NewStreamQueue(frames, perStream), ch: make(chan []byte, 1)}
+		s := &streamRec{id: id, q: NewStreamQueue(frames, perStream, &c.queuedBytes, int64(total)), ch: make(chan []byte, 1)}
 		c.streams[id] = s
+		c.allStreams = append(c.allStreams, s)
 		return s
 	}
 	s1, s2, s3 := mk(1), mk(2), mk(3)
@@ -160,12 +164,12 @@ func TestAggregateBudgetEnforced(t *testing.T) {
 
 	// The aggregate budget binds ACROSS streams: two stalled streams hold
 	// 900B together, leaving no room for a third. (SanitizeLimits requires
-	// total > perStream, so a single stream can never trip it.)
+	// total > perStream, so a single stream can never trip it.) The pushes
+	// themselves account the bytes in the aggregate budget.
 	if !s1.q.TryPush(queueItem{payload: make([]byte, 500)}) ||
 		!s2.q.TryPush(queueItem{payload: make([]byte, 400)}) {
 		t.Fatal("seed pushes to the mailboxes failed")
 	}
-	atomic.AddInt64(&c.queuedBytes, 900)
 
 	// A 200B frame for stream 3 fits ITS mailbox (200 <= 600) but would
 	// take the carrier to 1100 > 1000: refuse and pressurize stream 3.

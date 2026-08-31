@@ -2,7 +2,10 @@ name: Go
 
 on:
   push:
-    branches: [main]
+    # main gets every push; the production-hardening branch is listed too
+    # so its changes (which cannot run `go test -race` on the Windows dev
+    # host) are race-tested by this same Linux workflow.
+    branches: [main, hardening/production-reliability]
   pull_request:
 
 jobs:

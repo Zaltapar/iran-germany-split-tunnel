@@ -7,6 +7,17 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 - **All hardening phases (1–8) complete** — see the historical phase
   records below.
+- **CRITICAL send-on-closed-channel crash in the stream worker —
+  RESOLVED (this commit)**: `CarrierConn.Close` closed a stream consumer
+  channel that a worker could still be sending to, intermittently
+  panicking the whole splitter process (`panic: send on closed channel`
+  in `streamWorker`). Fixed by closing every stream channel only AFTER
+  `Close` has waited for all stream workers to exit (`workerWait`),
+  plus the aggregate `queuedBytes` accounting race the new stress test
+  exposed (byte accounting moved into the mailbox). Reproduction,
+  lifecycle fix, tests, and the Linux race CI run that validated it are
+  recorded in the "Follow-up — stream worker send-after-close crash"
+  section at the bottom.
 - **Phase 5 (reconnect/rebind) production wiring is COMPLETE** — commit
   `881d46d` (phase-5-production-wiring): both production binaries
   (`cmd/iran-splitter`, `cmd/germany-splitter`) run the `pkg/node`
@@ -34,7 +45,10 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 - `go test -race` cannot run on the Windows development host
   (race-instrumented binaries abort at startup with `0xc0000139` — a
   toolchain/environment issue that predates all hardening phases). It is
-  now covered by the Linux CI workflow on pushes to `main` and on PRs.
+  now covered by the Linux CI workflow on pushes to `main`, on PRs, and
+  (since the send-after-close fix) on pushes to
+  `hardening/production-reliability` — the branch the production
+  hardening actually lives on.
 - The Iran `/upload` `CheckOrigin` policy is permissive **by documented
   decision** (machine-to-machine endpoint; the security boundary is the
   v1 authentication plus TLS/Reality in the transport) — Phase 6 record.
@@ -990,3 +1004,153 @@ The commit is self-contained: `pkg/mux/auth.go`, both mains (refactor
 + watchdog removal), two new test files, the new workflow, `go.mod` /
 `go.sum`, and this documentation update. No `install.sh` changes, no
 wire-protocol changes, no session-lifecycle or backpressure changes.
+
+## Follow-up — stream worker send-after-close crash (this commit)
+
+### Original reproduction (confirmed CRITICAL, production impact)
+
+A read-only audit reproduced an intermittent
+
+```
+panic: send on closed channel
+    .../pkg/mux.(*CarrierConn).streamWorker(...)
+    .../pkg/mux/carrier.go:701  (case s.ch <- it.payload:)
+```
+
+in the running splitter: one worker popped an item from the
+`StreamQueue`, `CarrierConn.Close` ran `close(s.ch)` (old step 5, under
+`c.mu`), and the worker later executed its send on `s.ch` **outside
+`c.mu`** — the runtime panics the sending goroutine and takes down the
+whole process. The worker's `select` also had a `<-c.closed` arm, but
+probes against the real code showed that arm does **not** protect the
+window: a send on a closed channel is always "ready", so a worker that
+reaches the select after the close may pick the send arm and panic
+(≈50% per such event in an active-flood setup). The crash is a true
+ownership violation: the producer/dispatcher side closed a channel a
+worker could still send to.
+
+A second, pre-existing defect was exposed by the new stress test: the
+aggregate `queuedBytes` accounting in `deliver()` was an unguarded
+check-then-add against a plain atomic, so a worker pop could slip
+between the check and the add, over-counting the budget; `Close` then
+re-claimed the already-decremented bytes and drove the total negative
+(`queuedBytes after Close = -1`).
+
+### The fix (lifecycle + accounting, protocol unchanged)
+
+`pkg/mux/carrier.go`:
+- **`workerWait sync.WaitGroup`**: `createStreamLocked` does `Add(1)`
+  under `c.mu` **before** `go streamWorker`; the worker defers `Done()`.
+  Add/Wait ordering is race-free: `createStreamLocked` is only reachable
+  while `closing==false` under the same `c.mu` that `Close` latches
+  `closing=true` before it can reach `Wait` — no Add-after-Wait, no
+  worker starts uncounted.
+- **`allStreams []*streamRec`** (append-only slice, never shrunk):
+  `Deregister` and — crucially — **re-Register of the same ID** (Phase 5
+  rebind reuses stream IDs) create new records without losing the old
+  one. A map keyed by ID would have orphaned the previous generation's
+  parked worker and hung `Close` (observed as a 56-minute `pkg/node`
+  deadlock during validation).
+- **`Close` step 5, three sub-steps**: (a) close EVERY mailbox —
+  snapshot under `c.mu`, `q.Close()` calls outside it (lock ordering
+  stays acyclic; `q.mu` is never taken while holding `c.mu`); (b)
+  `workerWait.Wait()` **outside `c.mu`** (the last worker's exit path
+  takes `c.mu`); (c) close every `s.ch` and empty `streams`. By (c) no
+  worker can be sending: every mailbox is closed (no further `Pop` can
+  yield an item) and every in-flight handoff was aborted by the
+  `c.closed` open since step 2. The invariant now holds by
+  construction: **no worker can ever send on `s.ch` after it is
+  closed.** No `recover`, no sleeps, no timing.
+- `Deregister`/`Close`/`Register` docs updated to the new lifecycle.
+
+`pkg/mux/queue.go`:
+- Byte accounting moved **into the mailbox**: `NewStreamQueue` takes
+  the carrier-wide `queuedBytes` pointer + current `MaxBytesTotal`;
+  `TryPush` checks per-stream bounds **and** the aggregate budget, and
+  adds the accepted bytes, all under `q.mu`; `Pop` subtracts under
+  `q.mu`; `Close` reclaims the discarded bytes under `q.mu`. The
+  invariant `queuedBytes == Σ bytes in attached mailboxes` holds at all
+  times; the old carrier-level Load→TryPush→Add race is gone.
+  `SetBudgetLimit` (plain field, `q.mu`-only) keeps the limit in sync
+  on `SetStreamLimits` without nesting locks.
+- `deliver()` no longer touches `queuedBytes` or takes `c.mu` on the
+  hot path.
+
+Preserved: per-stream ordering (single mailbox → single worker → single
+channel), `FrameClose`/`nil` semantics, bounded per-stream backpressure
+and overflow policy, aggregate budget enforcement, stream-termination
+behavior, `ShutdownDone()`, concurrent/idempotent `Close()`, no
+goroutine leaks. Phase 2–8 behavior unchanged; no protocol,
+authentication, session-lifecycle, or `install.sh` changes.
+
+### Regression tests (`pkg/mux/carrier_close_race_test.go`, new)
+
+- `TestCloseRacesActiveWorkerFlood` — the production reproduction:
+  active traffic (8 streams, consumers keeping up, workers cycling
+  Pop→hand-off→Pop) while `Close` runs. **Against the pre-fix code it
+  panics `send on closed channel` at the data-delivery select on (nearly)
+  every iteration; post-fix it never does.** 200 iterations, run
+  `-count=100`.
+- `TestCloseRacesWorkerDeliveryGap` — deterministic parked-worker gap:
+  every worker verified (via `len(ch)==1` + `queueLen==0`) to have
+  popped its item and be in the gap/parked before `Close`.
+- `TestCloseRacesWorkerDeliveryWithFrameClose` — same race on the
+  FrameClose (`nil`) delivery path.
+- `TestCloseReleasesWorkerParkedInPop` — idle workers parked in `Pop`
+  are released; bytes reclaimed.
+- `TestCloseReleasesDeregisteredStreamWorker` — a `Deregister`ed stream's
+  worker (unreachable from `streams`) is still released and its channel
+  closed.
+- `TestCloseReleasesReboundStreamIDWorker` — rebind id-reuse: old and
+  new generation both torn down by one `Close` (the map-keyed
+  `allStreams` hung here for 56 min during validation).
+- `TestCloseRacesWorkerDeliveryStress` — 200×16-stream parked-worker
+  hammer.
+- `TestCloseOneCarrierLeavesOtherRunning` — closing carrier 1 leaves an
+  independent carrier 2 fully operational.
+
+All assert: no panic, workers exited (`ShutdownDone`), channels closed,
+`queuedBytes` back to 0, other carriers unaffected. A `queueLen`
+white-box helper reads `q.mu` **after** releasing `c.mu` (holding both
+would deadlock against the worker's `limitsLocked`).
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- `go test ./pkg/mux -count=100` — PASS (~430 s)
+- `go test ./pkg/node -count=50` — PASS (~266 s)
+- `go test ./... -count=20` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS ×3 (scenarios 1–4, incl. carrier
+  loss/recovery and deterministic rebind flaps)
+- Pre-fix/post-fix validation of the regression: the flood test was run
+  against the pre-fix `carrier.go` (restored via `git show
+  HEAD:pkg/mux/carrier.go`) and panicked exactly as in production; with
+  the fix it passes at every count above.
+
+### Linux race CI (this branch)
+
+The existing `.github/workflows/go.yml` previously ran only on pushes to
+`main` and PRs, so this hardening branch had never executed
+`go test -race` in CI. Smallest change: `hardening/production-reliability`
+added to the `push.branches` trigger of the SAME workflow (no second
+workflow, no retry/hiding of failures). The workflow runs `gofmt`,
+`go vet`, `go test`, `go test -race ./...`, and host + linux/amd64
+builds on `ubuntu-latest` (Go 1.21).
+
+**Status: PENDING** — the race run on this branch is recorded as
+validated only once the push of this commit completes the workflow
+successfully; no Linux race success is claimed before that. (The
+`go test -race ./...` line is unchanged from the existing workflow.)
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+Self-contained: `pkg/mux/carrier.go`, `pkg/mux/queue.go`,
+`pkg/mux/carrier_close_race_test.go`, test call-site updates in
+`pkg/mux/{queue,backpressure}_test.go`, the workflow trigger line, and
+this documentation update.
