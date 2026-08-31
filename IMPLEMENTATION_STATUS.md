@@ -1139,10 +1139,16 @@ workflow, no retry/hiding of failures). The workflow runs `gofmt`,
 `go vet`, `go test`, `go test -race ./...`, and host + linux/amd64
 builds on `ubuntu-latest` (Go 1.21).
 
-**Status: PENDING** — the race run on this branch is recorded as
-validated only once the push of this commit completes the workflow
-successfully; no Linux race success is claimed before that. (The
-`go test -race ./...` line is unchanged from the existing workflow.)
+**Status: VALIDATED** — the run of the existing workflow triggered by
+the push of this commit
+(`Zaltapar/iran-germany-split-tunnel` actions run **33343847977**,
+`https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33343847977`,
+head SHA `53e62b9`) completed `success` on `ubuntu-latest` (Go 1.21)
+with every step green: `gofmt`, `go vet`, `go test`, **`go test
+-race`** (`go test -race ./...`, unchanged from the existing
+workflow), `go build (host)`, `go build (linux/amd64)`. No retries, no
+skipped steps. This is the first `go test -race` execution on the
+hardening branch.
 
 ### Rollback
 
