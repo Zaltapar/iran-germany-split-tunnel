@@ -1502,8 +1502,15 @@ in a blackhole.
 - Focused: `./pkg/mux -run Liveness -count=20`, `./pkg/node -run
   Liveness -count=20`, `./pkg/mux -count=3` — PASS
 - `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
-- Linux race CI: pending (this commit triggers the workflow; the run
-  must be inspected before claiming race coverage).
+- Linux race CI: **VALIDATED** — push of this commit ran the workflow
+  (actions run **33445968119**, head `3320968`,
+  `https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33445968119`)
+  on `ubuntu-latest` (Go 1.21); every step verified from the job
+  report: `gofmt`, `go vet`, `go test`, **`go test -race`**,
+  `go build (host)`, `go build (linux/amd64)` — all `success`, no
+  retries. This is the Linux race + cross-arch verification for the
+  liveness goroutine (which calls `Close` from its own goroutine) and
+  the pong latch.
 
 ### Intentional limitations
 
