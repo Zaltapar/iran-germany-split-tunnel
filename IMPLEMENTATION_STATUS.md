@@ -7,6 +7,12 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 - **All hardening phases (1–8) complete** — see the historical phase
   records below.
+- **Stream-ID wraparound to reserved stream 0 — RESOLVED (this
+  commit)**: `Node.nextStreamID` could return `0` (the control-stream
+  ID) after a 2^32 wrap. Fixed with a zero-skipping retry; regression
+  test proven against pre-fix code; audit PRs #2/#3 disposition
+  recorded in the "Follow-up — stream-ID wraparound to reserved
+  stream 0" section at the bottom.
 - **CRITICAL send-on-closed-channel crash in the stream worker —
   RESOLVED (this commit)**: `CarrierConn.Close` closed a stream consumer
   channel that a worker could still be sending to, intermittently
@@ -1159,4 +1165,77 @@ git revert <this-commit>
 Self-contained: `pkg/mux/carrier.go`, `pkg/mux/queue.go`,
 `pkg/mux/carrier_close_race_test.go`, test call-site updates in
 `pkg/mux/{queue,backpressure}_test.go`, the workflow trigger line, and
+this documentation update.
+
+## Follow-up — stream-ID wraparound to reserved stream 0 (this commit)
+
+### The issue (from the repository audit; open PRs #2 / #3)
+
+`Node.nextStreamID` returned `atomic.AddUint32(&n.streamSeq, 1)`
+verbatim. After 2^32 sessions the counter wraps through `0` — the
+StreamID reserved for protocol/control frames (`FrameAuth`,
+`FramePing`/`FramePong` on stream 0). `StartSession` would then fail
+at `Register(0)` (which the carrier refuses), and any application
+frame on stream 0 is a carrier-terminating protocol violation — an
+invariant violation on an extremely long-lived node.
+
+### The fix (minimal, protocol-unchanged)
+
+`pkg/node/node.go` — `nextStreamID` skips `0` on wrap (retry loop
+around the atomic Add). The counter passes through 0 only once per
+2^32 cycle, and the only caller that observed 0 retries and receives
+the NEXT distinct atomic value, so concurrent allocations cannot
+collide and the loop terminates deterministically. No protocol,
+authentication, or lifecycle change.
+
+### Regression test
+
+`pkg/node/streamid_test.go` (new, white-box `package node`): normal
+allocation (1, 2); counter forced to `0xFFFFFFFE` → next ID
+`0xFFFFFFFF`; the following allocation must skip 0 and return 1; plus
+a 4-ID sweep around the wrap point (no 0, no repeats). Deterministic
+(no sleeps/timers). Proven to catch the bug: it FAILS against the
+pre-fix `node.go` (`ID after wrap = 0, want 1`) and passes post-fix.
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- Focused test `-count=5` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+- Architect review (independent, read-only): CRITICAL = 0, HIGH = 0.
+  The pre-existing limitation that IDs repeat from 1 after a FULL
+  2^32 cycle (a still-live ancient session could theoretically
+  collide) is unchanged and remains documented in the function
+  comment (the rebind protocol cross-checks StreamID against
+  SessionID).
+
+### Audit PR disposition
+
+This fix supersedes the `nextStreamID` changes in the open audit PRs:
+PR #2 (`fix/streamid-zero-wraparound`) is REDUNDANT (identical
+single-function change, no tests); PR #3 (`fix/reliability-hardening`)
+is REJECTED as a whole: its `auth.go` rewrite (a) turns `AuthTimeout`
+from a variable into a constant, breaking the documented test hook
+used by `auth_test.go`, `auth_ws_timeout_test.go` and
+`up_carrier_ws_test.go`; (b) REMOVES the deadline-less-transport read
+race that `d8c5a39` added (validated by Linux race CI run 33343847977)
+— the production `wsConn` adapter has no `SetDeadline`, so a silent
+peer would again hold the Germany dial goroutine indefinitely; (c)
+widens `AuthMaxClockSkew` 60 s → 300 s without demonstrated need
+(NTP-synced VPS; the 128-bit nonces already provide replay
+protection independent of clock quality). PR #3's remaining items
+(SOCKS5 domain length check, `StartSession` clientConn binding
+order, TCP keepalive) are being evaluated individually on this branch
+before any adoption.
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+Self-contained: `pkg/node/node.go`, `pkg/node/streamid_test.go`, and
 this documentation update.

@@ -247,9 +247,18 @@ func (n *Node) dropIfCurrent(dir session.Direction, h *carrierHandle) {
 
 // nextStreamID allocates the next logical stream ID. It never repeats
 // within the process (wrap-around would take 2^32 sessions); the rebind
-// protocol cross-checks StreamID against SessionID regardless.
+// protocol cross-checks StreamID against SessionID regardless. On the
+// 32-bit wrap the counter passes through 0 — the stream ID reserved for
+// protocol/control frames — so that value is skipped: a session can never
+// be allocated stream 0 (Register(0) is refused, and a session with ID 0
+// would collide with FrameAuth/Ping/Pong/Close on the control stream).
 func (n *Node) nextStreamID() uint32 {
-	return atomic.AddUint32(&n.streamSeq, 1)
+	for {
+		id := atomic.AddUint32(&n.streamSeq, 1)
+		if id != 0 {
+			return id
+		}
+	}
 }
 
 // onGraceTimeout is the attachment timer callback: the carrier-loss
