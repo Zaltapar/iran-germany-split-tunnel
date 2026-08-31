@@ -8,7 +8,7 @@ import (
 // TestStreamQueueFrameBound verifies the mailbox enforces MaxFrames even
 // for tiny payloads (the frame bound is a hard ceiling on item count).
 func TestStreamQueueFrameBound(t *testing.T) {
-	q := NewStreamQueue(3, 1<<20)
+	q := NewStreamQueue(3, 1<<20, nil, 0)
 	for i := 0; i < 3; i++ {
 		if !q.TryPush(queueItem{payload: []byte("x")}) {
 			t.Fatalf("push %d refused before the frame bound was reached", i)
@@ -26,7 +26,7 @@ func TestStreamQueueFrameBound(t *testing.T) {
 // TestStreamQueueByteBound verifies the mailbox enforces MaxBytes even for
 // short payloads (the byte bound is what actually caps memory).
 func TestStreamQueueByteBound(t *testing.T) {
-	q := NewStreamQueue(1<<20, 4)
+	q := NewStreamQueue(1<<20, 4, nil, 0)
 	if !q.TryPush(queueItem{payload: []byte("ab")}) {
 		t.Fatal("first 2-byte push refused")
 	}
@@ -45,7 +45,7 @@ func TestStreamQueueByteBound(t *testing.T) {
 // TestStreamQueueFIFOAndWake verifies Pop returns items in push order and
 // that a parked Pop is woken by a later TryPush.
 func TestStreamQueueFIFOAndWake(t *testing.T) {
-	q := NewStreamQueue(8, 1<<20)
+	q := NewStreamQueue(8, 1<<20, nil, 0)
 	want := []string{"a", "b", "c"}
 	for _, s := range want {
 		if !q.TryPush(queueItem{payload: []byte(s)}) {
@@ -86,7 +86,7 @@ func TestStreamQueueFIFOAndWake(t *testing.T) {
 // TestStreamQueueCloseAccountsBytes verifies Close discards queued items,
 // returns their payload bytes exactly once, and leaves the queue unusable.
 func TestStreamQueueCloseAccountsBytes(t *testing.T) {
-	q := NewStreamQueue(8, 1<<20)
+	q := NewStreamQueue(8, 1<<20, nil, 0)
 	q.TryPush(queueItem{payload: make([]byte, 3)})
 	q.TryPush(queueItem{payload: make([]byte, 4)})
 	if n := q.Close(); n != 7 {
@@ -106,7 +106,7 @@ func TestStreamQueueCloseAccountsBytes(t *testing.T) {
 // TestStreamQueueCloseWakesParkedPop verifies a Pop parked on an empty
 // queue is released by Close with ok=false.
 func TestStreamQueueCloseWakesParkedPop(t *testing.T) {
-	q := NewStreamQueue(8, 1<<20)
+	q := NewStreamQueue(8, 1<<20, nil, 0)
 	okCh := make(chan bool, 1)
 	go func() { _, ok := q.Pop(); okCh <- ok }()
 	time.Sleep(20 * time.Millisecond) // let Pop park

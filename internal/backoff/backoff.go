@@ -4,7 +4,8 @@
 // sleeps so process shutdown never waits out a pending reconnect delay.
 //
 // Schedule (base 2s, cap 60s): 2, 4, 8, 16, 32, 60, 60, ... seconds,
-// each randomized into [d/2, d) — no reconnect storm, no busy-loop.
+// each randomized into [d/2, d] (inclusive) — no reconnect storm, no
+// busy-loop; the cap is a real cap (the jitter never exceeds d).
 package backoff
 
 import (
@@ -78,8 +79,9 @@ func (b *Backoff) Reset() {
 // block on a pending reconnect delay.
 func (b *Backoff) Sleep(ctx context.Context) error {
 	d := b.Next()
-	// Jitter into [d/2, d): keeps the worst case at d (so the cap stays
-	// a real cap) while decorrelating nodes that share a failure.
+	// Jitter into [d/2, d] (inclusive): keeps the worst case at d (so
+	// the cap stays a real cap) while decorrelating nodes that share a
+	// failure.
 	j := d / 2
 	if d/2 > 0 {
 		j += time.Duration(b.rnd.Int63n(int64(d/2) + 1))

@@ -1,0 +1,42 @@
+name: Go
+
+on:
+  push:
+    # main gets every push; the production-hardening branch is listed too
+    # so its changes (which cannot run `go test -race` on the Windows dev
+    # host) are race-tested by this same Linux workflow.
+    branches: [main, hardening/production-reliability]
+  pull_request:
+
+jobs:
+  test:
+    name: Linux build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: go build (host)
+        run: go build ./...
+
+      - name: go build (linux/amd64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: go build ./...

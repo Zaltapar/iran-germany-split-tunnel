@@ -45,21 +45,22 @@ const (
 
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen  = "SPLIT_SOCKS_LISTEN"             // Iran
-	EnvWsListen     = "SPLIT_WS_LISTEN"                // Iran
-	EnvDownCarrier  = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
-	EnvUpWsUrl      = "SPLIT_UP_WS_URL"                // Germany
-	EnvDownListen   = "SPLIT_DOWN_LISTEN"              // Germany
-	EnvSecret       = "SPLIT_SECRET"                   // both
-	EnvAllowWeak    = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
-	EnvMetricsPort  = "SPLIT_METRICS_PORT"             // both
-	EnvRelayBuf     = "SPLIT_RELAY_BUF"                // both
-	EnvQueueBytes   = "SPLIT_STREAM_QUEUE_BYTES"       // both
-	EnvQueueFrames  = "SPLIT_STREAM_QUEUE_FRAMES"      // both
-	EnvQueueTotal   = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
-	EnvOverflowMs   = "SPLIT_STREAM_OVERFLOW_MS"       // both
-	EnvCarrierGrace = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
-	EnvSessionBuf   = "SPLIT_SESSION_BUFFER_BYTES"     // both — Phase 5
+	EnvSocksListen    = "SPLIT_SOCKS_LISTEN"             // Iran
+	EnvWsListen       = "SPLIT_WS_LISTEN"                // Iran
+	EnvDownCarrier    = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
+	EnvUpWsUrl        = "SPLIT_UP_WS_URL"                // Germany
+	EnvDownListen     = "SPLIT_DOWN_LISTEN"              // Germany
+	EnvSecret         = "SPLIT_SECRET"                   // both
+	EnvAllowWeak      = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
+	EnvMetricsPort    = "SPLIT_METRICS_PORT"             // both
+	EnvRelayBuf       = "SPLIT_RELAY_BUF"                // both
+	EnvQueueBytes     = "SPLIT_STREAM_QUEUE_BYTES"       // both
+	EnvQueueFrames    = "SPLIT_STREAM_QUEUE_FRAMES"      // both
+	EnvQueueTotal     = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
+	EnvOverflowMs     = "SPLIT_STREAM_OVERFLOW_MS"       // both
+	EnvCarrierGrace   = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
+	EnvSessionBuf     = "SPLIT_SESSION_BUFFER_BYTES"     // both — Phase 5
+	EnvLivenessRounds = "SPLIT_LIVENESS_ROUNDS"          // both — blackhole detection
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -98,6 +99,17 @@ const (
 	MinSessionBuf     = 4 << 10  // 4 KiB
 	MaxSessionBuf     = 16 << 20 // 16 MiB
 
+	// Carrier liveness (blackhole detection): consecutive unanswered
+	// keepalive pings after which the carrier is declared dead. Zero is
+	// the "library default" sentinel (mux.DefaultLivenessRounds = 3,
+	// ~45 s at the 30 s default ping period) — the same 0-means-default
+	// convention as the queue fields. The maximum keeps a
+	// misconfiguration from making detection effectively unbounded
+	// (20 rounds ≈ 10 min at the default ping period).
+	DefaultLivenessRounds = 0
+	MinLivenessRounds     = 0
+	MaxLivenessRounds     = 20
+
 	MinPort = 1
 	MaxPort = 65535
 )
@@ -128,6 +140,11 @@ type Config struct {
 	// Phase 5 carrier-loss recovery (pkg/node engine).
 	CarrierGraceMs  int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
+
+	// Carrier liveness (blackhole detection): consecutive unanswered
+	// keepalive pings before the carrier is torn down through the normal
+	// loss/rebind machinery. 0 = library default (mux.DefaultLivenessRounds).
+	LivenessRounds int // SPLIT_LIVENESS_ROUNDS
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -186,6 +203,7 @@ func Load(role string) (*Config, error) {
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
 	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
+	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -287,6 +305,11 @@ func (c *Config) Validate(role string) error {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d: expected %d..%d milliseconds (Phase 5 carrier-loss grace window)",
 			EnvCarrierGrace, c.CarrierGraceMs, MinCarrierGraceMs, MaxCarrierGraceMs))
+	}
+	if c.LivenessRounds < MinLivenessRounds || c.LivenessRounds > MaxLivenessRounds {
+		problems = append(problems, fmt.Sprintf(
+			"%s=%d: expected 0 (library default) .. %d (blackhole detection: consecutive unanswered keepalive pings)",
+			EnvLivenessRounds, c.LivenessRounds, MaxLivenessRounds))
 	}
 	if c.SessionBufBytes < MinSessionBuf || c.SessionBufBytes > MaxSessionBuf {
 		problems = append(problems, fmt.Sprintf(

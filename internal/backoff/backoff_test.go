@@ -34,10 +34,25 @@ func TestReset(t *testing.T) {
 	}
 }
 
-// TestSleepJitterBounds verifies Sleep waits within [d/2, d) of the
+// TestSleepJitterBounds verifies Sleep waits within [d/2, d] of the
 // scheduled delay — no faster (busy-loop risk), no slower than the cap.
+//
+// The cap check carries a small wall-clock tolerance: the jitter range
+// is INCLUSIVE of d (Int63n(d/2+1) can yield j = d/2, so a sleep of
+// exactly the cap is legitimate production behavior, and the cap is
+// preserved by construction: j = d/2 + [0, d/2] <= d). Measuring that
+// exact-boundary sleep with wall clock on a loaded host can overshoot by
+// a few milliseconds (timer + scheduling granularity), so the upper
+// bound is d + tolerance, NOT a strict d. The tolerance is sized to be
+// far smaller than any real regression (a 2x delay would still fail).
 func TestSleepJitterBounds(t *testing.T) {
-	b := New(100*time.Millisecond, 100*time.Millisecond) // d always 100ms
+	const (
+		delay = 100 * time.Millisecond
+		// tolerance: wall-clock measurement error on a loaded host for a
+		// timer whose legitimate worst case is exactly the cap.
+		tolerance = 20 * time.Millisecond
+	)
+	b := New(delay, delay) // d always 100ms
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	start := time.Now()
@@ -45,11 +60,11 @@ func TestSleepJitterBounds(t *testing.T) {
 		t.Fatalf("Sleep: %v", err)
 	}
 	elapsed := time.Since(start)
-	if elapsed < 45*time.Millisecond {
+	if elapsed < delay/2-5*time.Millisecond {
 		t.Fatalf("Sleep returned after %v, jitter lower bound ~50ms violated", elapsed)
 	}
-	if elapsed >= 100*time.Millisecond {
-		t.Fatalf("Sleep returned after %v, cap 100ms violated", elapsed)
+	if elapsed > delay+tolerance {
+		t.Fatalf("Sleep returned after %v, cap 100ms (+%v tolerance) violated", elapsed, tolerance)
 	}
 }
 

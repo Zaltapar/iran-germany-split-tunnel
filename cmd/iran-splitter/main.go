@@ -138,6 +138,7 @@ func main() {
 		BufferBytes:       cfg.SessionBufBytes,
 		RelayBufSize:      cfg.RelayBufSize,
 		KeepAliveInterval: cfg.KeepAliveInterval,
+		LivenessRounds:    cfg.LivenessRounds,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
@@ -327,11 +328,10 @@ func (s *Splitter) authInBackoff() bool {
 func (s *Splitter) handleUpWsConn(ws *websocket.Conn) {
 	wsc := &wsConn{conn: ws}
 
-	// The WS adapter cannot enforce deadlines, so watchdog any
-	// connection that does not complete the auth handshake in time.
-	watchdog := time.AfterFunc(15*time.Second, func() { ws.Close() })
-	defer watchdog.Stop()
-
+	// The WS adapter cannot enforce deadlines, so CarrierAuth itself
+	// bounds this handshake: it races each read against AuthTimeout
+	// (and the context, where one is given) and closes the connection
+	// on expiry, which interrupts the blocked read.
 	br, err := mux.CarrierAuth(context.Background(), wsc, false, mux.RoleUpload, s.secret())
 	if err != nil {
 		// The error is for LOCAL logging only; nothing about WHICH check
@@ -451,11 +451,13 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
 
 	// Hand the session to the Phase 5 engine (pkg/node): it waits for
-	// both carriers (30 s), allocates the stream ID, owns the client
-	// conn, runs the relays (with the bounded reconnect buffer) and
-	// rebinds the session across carrier losses. On success it returns
-	// the session; on failure it has already torn the session down
-	// (and closed the client conn) through the Phase 4 lifecycle.
+	// both carriers (30 s), allocates the stream ID, runs the relays
+	// (with the bounded reconnect buffer) and rebinds the session
+	// across carrier losses. On success it ADOPTS the client conn (the
+	// session's Close becomes the only closer) and returns the session;
+	// on failure it tears the session down but returns the client conn
+	// to us still open, so the SOCKS error reply below is actually
+	// delivered.
 	sess, err := s.node.StartSession(clientConn, dest)
 	if err != nil {
 		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
@@ -464,7 +466,8 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 		return
 	}
 
-	// SOCKS5 success reply — the node is now in charge of the conn.
+	// SOCKS5 success reply. The conn may be read at any time now: from
+	// this point on the client is connected to the tunnel.
 	socksReply(clientConn, 0x00)
 	s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
 }

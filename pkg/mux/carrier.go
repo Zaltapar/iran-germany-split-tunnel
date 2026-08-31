@@ -82,9 +82,55 @@ type CarrierConn struct {
 	// SetStreamLimits before starting Dispatch or calling Register.
 	limits StreamLimits
 	// queuedBytes is the total payload bytes currently sitting in this
-	// carrier's stream mailboxes; the dispatcher refuses pushes that
-	// would exceed limits.MaxBytesTotal (aggregate memory budget).
+	// carrier's stream mailboxes. The MAILBOXES own the accounting (each
+	// StreamQueue is attached to this counter and updates it under its
+	// own lock on push/pop/close — see StreamQueue), so the value always
+	// equals the sum over mailboxes; the per-mailbox budget check in
+	// TryPush enforces limits.MaxBytesTotal (aggregate memory budget).
 	queuedBytes int64
+	// workerWait counts stream workers that have started but not yet
+	// exited. Close's step 5 (a) closes EVERY mailbox (allStreams, which
+	// Deregister does not shrink), which is the only thing that can
+	// release a worker parked in Pop; step 5 (b) then waits for all
+	// workers to exit — OUTSIDE c.mu, because the last worker's final
+	// goroutineStopped() takes c.mu; and only then does step 5 (c)
+	// close any s.ch. That ordering is what makes "send on a closed
+	// channel" impossible: by the time Close closes s.ch, every worker
+	// has exited or is provably unable to send (its mailbox is closed,
+	// so no further Pop, and the closed channel has been open since
+	// step 2, which aborts every in-flight handoff select).
+	//
+	// Add/Wait ordering under concurrent Register/createStream/Close:
+	// the Add happens under c.mu, and createStreamLocked is only
+	// reachable while closing==false (Register and Dispatch both check
+	// closing under c.mu before calling it) — the same c.mu Close uses
+	// to latch closing=true before it can reach Wait. So every Add is
+	// mutex-ordered either before the latch (hence before the Wait) or
+	// never happens; no Add can follow the Wait, and no worker can
+	// start without having been counted (the Add precedes the go).
+	workerWait sync.WaitGroup
+	// allStreams tracks every stream record this carrier has EVER
+	// created. It is an append-only slice (not a map) and is never
+	// shrunk: neither Deregister nor re-Register of the same ID may
+	// remove an entry, because an old record's worker may still be
+	// parked in Pop (its mailbox is the only object that can wake it).
+	// Losing it would hang Close's worker wait (and the
+	// live/shutdownDone accounting) — e.g. a deregistered stream, or
+	// the previous generation of a re-bound stream ID (Phase 5 rebind
+	// reuses IDs: Deregister + Register on the same ID creates a NEW
+	// record while the old one's worker is still alive).
+	// Dispatcher-owned; appended under c.mu; iterated under c.mu.
+	allStreams []*streamRec
+
+	// Liveness state (see liveness). livenessRounds is the configured
+	// number of consecutive unanswered pings before the carrier is
+	// declared blackholed (set via SetLivenessRounds before the loop
+	// starts; the liveness loop reads it under c.mu). sawPong latches
+	// that a FramePong was seen since the previous ping round; the
+	// liveness loop (the only writer of the decision) clears it under
+	// c.mu after each round.
+	livenessRounds int
+	sawPong        bool
 
 	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
 	// goroutine) when the first frame for a previously unknown stream
@@ -117,6 +163,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 	}
 	c.mu.Lock()
 	c.live = 2 // readLoop + writeLoop
+	c.livenessRounds = DefaultLivenessRounds
 	c.mu.Unlock()
 	go c.writeLoop()
 	go c.readLoop()
@@ -124,7 +171,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 		c.mu.Lock()
 		c.live++
 		c.mu.Unlock()
-		go c.keepalive(pingInterval)
+		go c.liveness(pingInterval)
 	}
 	return c
 }
@@ -343,11 +390,22 @@ func SanitizeLimits(l StreamLimits) StreamLimits {
 
 // SetStreamLimits configures the per-stream mailbox bounds. Values are
 // sanitized (see SanitizeLimits). Call it before starting Dispatch or
-// calling Register, like SetReadBuffer.
+// calling Register, like SetReadBuffer. Changing MaxBytesTotal also
+// re-syncs the aggregate limit of every already-created mailbox.
 func (c *CarrierConn) SetStreamLimits(l StreamLimits) {
 	c.mu.Lock()
 	c.limits = SanitizeLimits(l)
+	limit := int64(c.limits.MaxBytesTotal)
+	qs := make([]*StreamQueue, 0, len(c.allStreams))
+	for _, s := range c.allStreams {
+		qs = append(qs, s.q)
+	}
 	c.mu.Unlock()
+	// SetBudgetLimit takes each mailbox's own lock — never c.mu — so
+	// calling it outside c.mu keeps the lock ordering acyclic.
+	for _, q := range qs {
+		q.SetBudgetLimit(limit)
+	}
 }
 
 // streamRec is one multiplexed stream: its bounded mailbox, its consumer
@@ -378,13 +436,20 @@ func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
 		return s
 	}
 	s := &streamRec{
-		id:       id,
-		q:        NewStreamQueue(c.limits.MaxFramesPerStream, c.limits.MaxBytesPerStream),
+		id: id,
+		// The mailbox owns its slice of the aggregate byte budget
+		// (queuedBytes); see StreamQueue. The limit is a plain value
+		// (c.mu is held by the caller); SetStreamLimits re-syncs it on
+		// existing mailboxes.
+		q: NewStreamQueue(c.limits.MaxFramesPerStream, c.limits.MaxBytesPerStream,
+			&c.queuedBytes, int64(c.limits.MaxBytesTotal)),
 		ch:       make(chan []byte, 1),
 		callback: callback,
 	}
 	c.streams[id] = s
+	c.allStreams = append(c.allStreams, s)
 	c.live++
+	c.workerWait.Add(1) // under c.mu, before the go — see the field's doc
 	go c.streamWorker(s)
 	return s
 }
@@ -410,8 +475,11 @@ func (c *CarrierConn) Register(id uint32) chan []byte {
 // mailbox, its worker and the consumer channel are left as they are (the
 // channel is only closed by Close), so a consumer that is done reading
 // but not yet unwound keeps its existing semantics. The worker exits
-// when the carrier closes (or when the stream is terminated). Further
-// frames for the ID start a NEW stream, same as before Phase 3.
+// when the carrier closes (Close also closes the mailbox of a
+// deregistered stream — see allStreams — which is what actually wakes a
+// worker parked in Pop) or when the stream is terminated by the overflow
+// policy. Further frames for the ID start a NEW stream, same as before
+// Phase 3.
 func (c *CarrierConn) Deregister(id uint32) {
 	c.mu.Lock()
 	delete(c.streams, id)
@@ -431,18 +499,78 @@ func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) err
 	return c.write(buf)
 }
 
-// keepalive sends FramePing periodically. It exits promptly when the
-// carrier closes and always stops its ticker, so no ticker leaks.
-func (c *CarrierConn) keepalive(interval time.Duration) {
+// Liveness: the keepalive loop is a round-trip detector. It sends one
+// FramePing every `interval`; a live peer answers each ping with a
+// FramePong (Dispatch does this). If NO pong arrives for
+// DefaultLivenessRounds consecutive pings, the carrier is declared
+// blackholed — reachable writes but no traffic comes back (a dropped
+// path the OS will never time out on its own) — and the carrier is
+// torn down through the STANDARD Close path. Close interrupts the
+// stuck read (rwc.Close), which ends the read loop, ends Dispatch,
+// and drives the normal carrier-loss/rebind machinery — there is no
+// second teardown path.
+//
+// The decision is deterministic (a round counter, not a wall-clock
+// timer): a healthy long-lived connection is never declared dead
+// because a pong resets the counter each round, and detection is
+// bounded to LivenessRounds * interval (45 s at the defaults) —
+// independent of OS TCP timeouts, which may never fire.
+const DefaultLivenessRounds = 3
+
+// LivenessRounds is the configured number of consecutive unanswered
+// pings after which the carrier is declared blackholed. The value is
+// read under c.mu by the liveness loop at every ping round, so a call
+// takes effect from the next round onward (mutex-ordered with the
+// loop's read; the loop's first decision is at least one interval
+// after the constructor returns). rounds <= 0 are ignored (the
+// default stays in force).
+func (c *CarrierConn) SetLivenessRounds(rounds int) {
+	c.mu.Lock()
+	if rounds > 0 {
+		c.livenessRounds = rounds
+	}
+	c.mu.Unlock()
+}
+
+// liveness runs the keepalive ping loop AND the blackhole detection.
+// The carrier closes and always stops its ticker, so no ticker leaks.
+// Termination signal: c.closed (Close). Write failures are IGNORED for
+// the liveness decision: a failed write means the path is broken and
+// the READ side will observe the error (readErr) — the read loop is
+// the authoritative "carrier is gone" signal, and Close() is
+// idempotent, so declaring it on write failure too would at worst
+// close the carrier a moment earlier. Counting write failures as
+// "missed rounds" instead would risk a false positive: a single
+// transient write error on a healthy path must not start the death
+// clock.
+func (c *CarrierConn) liveness(interval time.Duration) {
 	defer c.goroutineStopped()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	ping := make([]byte, HeaderSize) // StreamID 0, FramePing, Length 0
 	ping[4] = FramePing
+	missed := 0
 	for {
 		select {
 		case <-t.C:
-			_ = c.write(ping)
+			c.mu.Lock()
+			rounds := c.livenessRounds
+			c.mu.Unlock()
+			_ = c.write(ping) // best effort; see the method doc
+			c.mu.Lock()
+			if c.sawPong {
+				c.sawPong = false
+				missed = 0
+			} else {
+				missed++
+			}
+			dead := missed >= rounds
+			c.mu.Unlock()
+			if dead {
+				// Blackhole detected: standard teardown. Close is
+				// idempotent and safe from any goroutine.
+				c.Close()
+			}
 		case <-c.closed:
 			return
 		}
@@ -570,7 +698,11 @@ func (c *CarrierConn) Dispatch() {
 			pong[7] = 0
 			_ = c.write(pong)
 		case FramePong:
-			// keepalive ack, nothing to do
+			// keepalive ack: latch for the liveness loop, which reads
+			// and clears it under c.mu after each ping round.
+			c.mu.Lock()
+			c.sawPong = true
+			c.mu.Unlock()
 		default:
 			// unknown frame type: drop
 		}
@@ -607,16 +739,13 @@ func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 		}
 		return
 	}
-	n := int64(len(it.payload))
-	// Aggregate budget: refuse if this push would take the carrier-wide
-	// queued bytes over the limit (pressure applies to THIS stream).
-	if atomic.LoadInt64(&c.queuedBytes)+n > int64(c.limitsLocked().MaxBytesTotal) {
-		c.applyPressure(s)
-		return
-	}
+	// TryPush atomically checks the per-stream bounds AND the carrier-wide
+	// aggregate byte budget (all under the mailbox lock — see
+	// StreamQueue), adds the accepted bytes to the aggregate, and reports
+	// false if the push was refused for any reason. Pressure applies to
+	// THIS stream only; other streams are never affected.
 	if s.q.TryPush(it) {
 		s.pressureStart = time.Time{}
-		atomic.AddInt64(&c.queuedBytes, n)
 		return
 	}
 	c.applyPressure(s)
@@ -655,9 +784,10 @@ func (c *CarrierConn) applyPressure(s *streamRec) {
 func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 	s.stopOnce.Do(func() {
 		s.terminated.Store(true)
-		if discarded := s.q.Close(); discarded > 0 {
-			atomic.AddInt64(&c.queuedBytes, -int64(discarded))
-		}
+		// Closing the mailbox discards what is still queued; the bytes
+		// come back to the aggregate budget inside q.Close (under
+		// q.mu, so a concurrent Pop cannot reclaim them again).
+		s.q.Close()
 		if signalPeer {
 			_ = c.WriteFrame(s.id, FrameClose, nil) // best effort; ErrCarrierClosed if closing
 		}
@@ -672,7 +802,15 @@ func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 
 // streamWorker drains one stream's mailbox into its consumer channel.
 // One worker per stream; it is a carrier-owned goroutine (counted in
-// live, exits via the Phase 2 lifecycle: queue Close or carrier close).
+// live and in workerWait; it exits via the Phase 2 lifecycle: queue
+// Close — which Close performs for every stream, deregistered or not —
+// or carrier close aborting one of its handoff selects).
+//
+// Send/closure contract: this worker is the ONLY sender on s.ch besides
+// terminateStream (dispatcher-side), and Close is the ONLY closer of
+// s.ch. Close waits for every worker to exit (workerWait) before it
+// closes any s.ch, so a send on a closed channel is structurally
+// impossible — no select arm here can ever mask one.
 //
 // Per-stream ordering is preserved: single mailbox (FIFO) → single worker
 // → single consumer channel. A worker blocked on a full consumer channel
@@ -680,6 +818,7 @@ func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 // consumer's deadline.
 func (c *CarrierConn) streamWorker(s *streamRec) {
 	defer c.goroutineStopped()
+	defer c.workerWait.Done()
 	for {
 		it, ok := s.q.Pop()
 		if !ok {
@@ -697,7 +836,9 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 			}
 			return
 		}
-		atomic.AddInt64(&c.queuedBytes, -int64(len(it.payload)))
+		// The popped item's payload bytes were already returned to the
+		// aggregate budget by Pop itself (under the mailbox lock) — do
+		// NOT touch queuedBytes here again.
 		select {
 		case s.ch <- it.payload:
 		case <-c.closed:
@@ -723,9 +864,20 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 //  4. wait for in-flight write callers, then fail every still-queued
 //     write with ErrCarrierClosed — after Close returns, no WriteFrame
 //     caller is still waiting;
-//  5. close every stream mailbox (reclaiming its discarded bytes from the
-//     aggregate budget) — unblocks stream workers parked in Pop — then
-//     close all stream channels, waking stream consumers.
+//  5. shut down the streams, in three sub-steps:
+//     (a) close EVERY stream mailbox — allStreams, which also includes
+//     streams removed by Deregister — reclaiming discarded bytes
+//     from the aggregate budget; closing the mailbox is the only
+//     thing that releases a worker parked in Pop;
+//     (b) wait for every stream worker to exit — OUTSIDE c.mu, because
+//     the last worker's exit path takes c.mu. By the time the wait
+//     returns, no worker can send on any s.ch: a worker is either
+//     gone, or (it cannot exist) it would have to hold a mailbox
+//     item, which requires a Pop from a still-open mailbox, and all
+//     mailboxes are now closed;
+//     (c) close every stream channel, waking stream consumers. No send
+//     on s.ch can ever race this close, so "send on closed channel"
+//     is impossible.
 //
 // As a consequence the read loop (read error on the closed connection or
 // the closed channel), the writer, the keepalive and every stream worker
@@ -750,16 +902,40 @@ func (c *CarrierConn) Close() {
 		c.writeWG.Wait()
 		c.drainWrites()
 
+		// (a) Close every mailbox — all streams, including ones Deregister
+		// removed from c.streams. Workers parked in Pop return via the
+		// closed queue; the bytes discarded by each mailbox are returned
+		// to the aggregate budget inside q.Close (under q.mu, so no
+		// concurrent Pop can reclaim the same bytes). The channels are
+		// NOT closed yet. The snapshot is taken under c.mu, but the
+		// q.Close calls run OUTSIDE it: a mailbox close only takes q.mu,
+		// and q.mu is never taken while c.mu is held anywhere else, so
+		// the lock ordering stays acyclic.
 		c.mu.Lock()
-		for id, s := range c.streams {
-			// Close the mailbox first: workers parked in Pop return via
-			// the closed queue (no send to a closed channel can happen).
-			// Bytes discarded here are returned to the aggregate budget.
-			if discarded := s.q.Close(); discarded > 0 {
-				atomic.AddInt64(&c.queuedBytes, -int64(discarded))
-			}
+		qs := make([]*StreamQueue, 0, len(c.allStreams))
+		for _, s := range c.allStreams {
+			qs = append(qs, s.q)
+		}
+		c.mu.Unlock()
+		for _, q := range qs {
+			q.Close()
+		}
+
+		// (b) Wait for every stream worker to exit, WITHOUT c.mu held
+		// (the last worker's goroutineStopped takes it). Safe and
+		// bounded: every worker is either gone or will exit because its
+		// mailbox is closed and c.closed has been open since step 2.
+		c.workerWait.Wait()
+
+		// (c) Now — and only now — close every stream channel, waking
+		// the consumers. No worker can be sending when this runs.
+		// allStreams may contain several records for one ID (re-bind
+		// generations); each channel is closed exactly once, and the
+		// streams map is emptied.
+		c.mu.Lock()
+		for _, s := range c.allStreams {
 			close(s.ch) // wakes the consumer (Phase 2 contract)
-			delete(c.streams, id)
+			delete(c.streams, s.id)
 		}
 		c.mu.Unlock()
 	})

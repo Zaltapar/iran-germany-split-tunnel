@@ -3,5 +3,3 @@ module github.com/Zaltapar/iran-germany-split-tunnel
 go 1.21
 
 require github.com/gorilla/websocket v1.5.3
-
-require github.com/hashicorp/yamux v0.1.2

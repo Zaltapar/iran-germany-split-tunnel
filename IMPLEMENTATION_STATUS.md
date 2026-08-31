@@ -3,7 +3,140 @@
 Branch: `hardening/production-reliability`
 Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
-## Current phase: Phase 8 (interactive installer) — COMPLETE
+## Current state
+
+- **All hardening phases (1–8) complete** — see the historical phase
+  records below.
+- **Stream-ID wraparound to reserved stream 0 — RESOLVED (this
+  commit)**: `Node.nextStreamID` could return `0` (the control-stream
+  ID) after a 2^32 wrap. Fixed with a zero-skipping retry; regression
+  test proven against pre-fix code; audit PRs #2/#3 disposition
+  recorded in the "Follow-up — stream-ID wraparound to reserved
+  stream 0" section at the bottom.
+- **SOCKS5 max domain length pinned** — the audit's "reject domain >
+  255 bytes" check is UNREACHABLE: the SOCKS5 domain length is a
+  uint8 field, so the parser (`readDestFromReader`) structurally caps
+  domains at 255 bytes. No production change; the boundary is pinned
+  by `TestSocksNegotiateMaxDomainLength` (test-only commit).
+- **SOCKS5 error reply lost on session-setup failure — RESOLVED (this
+  commit)**: `StartSession` handed `clientConn` to `NewSession` at
+  birth, so a setup failure (registration/activation/destination
+  encoding/header write) closed the client conn through the session
+  teardown and the caller's `socksReply(0x06)` was written to an
+  already-closed conn. Ownership now transfers via `Session.AdoptConn`
+  only after every setup failure point has passed. Regression test
+  proven against pre-fix code. Details in "Follow-up — SOCKS5 error
+  reply ownership" at the bottom.
+- **Flaky `TestSleepJitterBounds` — RESOLVED** (commit
+  `a09ac4b`): the test asserted a STRICT `elapsed < 100ms` against a
+  wall-clock measurement of a jitter whose range is INCLUSIVE of the
+  cap (a sleep of exactly `d` is legitimate production behavior, and
+  the cap is preserved by construction). On a loaded host the
+  boundary case measured 100.49 ms → false failure. Test-layer fix
+  (documented tolerance, correct doc in `backoff.go`); no production
+  behavior change. Details in "Follow-up — backoff jitter test" at
+  the bottom.
+- **Carrier liveness (blackhole detection) — IMPLEMENTED (this
+  commit)**: a blackholed carrier (writes succeed, no traffic
+  returns — a path the OS never times out) used to stay
+  `Ready()=true` FOREVER, because pongs were ignored and the read
+  loop never errored. The keepalive loop is now a round-trip
+  detector: after `SPLIT_LIVENESS_ROUNDS` (default 3, i.e. ~45 s at
+  the 30 s ping period; 0 = library default, bounded 0..20)
+  consecutive unanswered pings the carrier is torn down through the
+  STANDARD `Close` path → blocked read interrupted → normal
+  carrier-loss/rebind machinery (no second teardown path). No false
+  positives: a healthy peer's pong resets the counter each round
+  (deterministic round counter, not a wall-clock timer).
+  Deterministic tests: mux-level detection + no-false-positive +
+  disabled-without-ping; node-level blackhole→grace→rebind
+  integration with end-to-end data after recovery. Details in
+  "Follow-up — carrier liveness" at the bottom.
+- **CRITICAL send-on-closed-channel crash in the stream worker —
+  RESOLVED (this commit)**: `CarrierConn.Close` closed a stream consumer
+  channel that a worker could still be sending to, intermittently
+  panicking the whole splitter process (`panic: send on closed channel`
+  in `streamWorker`). Fixed by closing every stream channel only AFTER
+  `Close` has waited for all stream workers to exit (`workerWait`),
+  plus the aggregate `queuedBytes` accounting race the new stress test
+  exposed (byte accounting moved into the mailbox). Reproduction,
+  lifecycle fix, tests, and the Linux race CI run that validated it are
+  recorded in the "Follow-up — stream worker send-after-close crash"
+  section at the bottom.
+- **Phase 5 (reconnect/rebind) production wiring is COMPLETE** — commit
+  `881d46d` (phase-5-production-wiring): both production binaries
+  (`cmd/iran-splitter`, `cmd/germany-splitter`) run the `pkg/node`
+  engine (carrier generations, rebind protocol, grace windows); the
+  Phase 5 design/commit records below are historical context for the
+  wiring, not pending work.
+- **Fix A (authenticated bufio.Reader handoff race) fixed** — commit
+  `9d4e2f2`: the reader returned by `CarrierAuth` is bound into the
+  carrier before its read loop starts, so pre-buffered frames are never
+  orphaned.
+- **Follow-up maintenance (this commit)**: the WebSocket carrier auth
+  handshake is now bounded even on transports that cannot enforce socket
+  deadlines (the production `wsConn` adapter exposes only Read/Write/
+  Close); deterministic regression tests; Linux GitHub Actions CI
+  (`.github/workflows/go.yml`): `gofmt`, `go vet`, `go test`,
+  `go test -race`, `go build` (host + linux/amd64 cross-build); the
+  unused historical `hashicorp/yamux` dependency removed via
+  `go mod tidy`. No changes to `install.sh`, the v1 protocol, session
+  lifecycle, reconnect/rebind, or backpressure.
+- Full verification for the follow-up is recorded in the
+  "Follow-up — bounded WebSocket auth handshake" section at the bottom.
+
+### Deferred / next tasks (as of the carrier-liveness commit)
+
+The open audit PRs #2/#3 are fully dispositioned (see the "Audit PR
+disposition — consolidated" section at the bottom). Remaining known
+items, in priority order:
+
+- **DEFERRED — TCP keepalive on relay sockets** (PR #3 item 4): a
+  reasonable reliability improvement (detects NAT/firewall zombie
+  client/target sessions at the OS level) but NOT yet adopted: it
+  changes socket behavior on both the client and target sides, needs
+  its own scoped change + review, and is not a correctness blocker.
+  (The carrier-level blackhole gap this was partly meant to cover is
+  now closed by the round-based carrier liveness, this commit.)
+- **Roadmap B — down-carrier auth resource limits** (Germany `:9002`
+  listener: bound concurrent unauthenticated auth goroutines).
+- **Roadmap C — aggregate session-buffer budget** (per-session buffer
+  is bounded; total memory still scales with session count).
+- **Roadmap D — upload bootstrap grace during a short down-carrier
+  outage** (determine whether a legitimate session is discarded
+  unnecessarily when the down carrier is momentarily unavailable).
+- **Roadmap E/J — config/installer consistency + documentation**
+  pass over the whole tree (internal/config vs install.sh vs systemd
+  units vs README).
+
+### Known limitations (current, honest list)
+
+- `go test -race` cannot run on the Windows development host
+  (race-instrumented binaries abort at startup with `0xc0000139` — a
+  toolchain/environment issue that predates all hardening phases). It is
+  now covered by the Linux CI workflow on pushes to `main`, on PRs, and
+  (since the send-after-close fix) on pushes to
+  `hardening/production-reliability` — the branch the production
+  hardening actually lives on.
+- The Iran `/upload` `CheckOrigin` policy is permissive **by documented
+  decision** (machine-to-machine endpoint; the security boundary is the
+  v1 authentication plus TLS/Reality in the transport) — Phase 6 record.
+- `KeepAliveInterval` is a fixed 30 s default with no env variable on
+  purpose — Phase 7 notes.
+- Configuration validation is lexical/structural; it does not probe the
+  network (e.g. CDN DNS) — Phase 7 notes.
+- The up-carrier WebSocket auth handshake bound is 15 s (`mux.AuthTimeout`);
+  a peer that upgrades but never sends the challenge now costs at most
+  that long per attempt before the connection is closed (before this
+  follow-up, the Germany-side dial path could block indefinitely on a
+  silent peer because `wsConn` has no `SetDeadline`).
+
+## Historical phase records
+
+The sections below are the phase-by-phase records, kept as written at
+the time — including their own "next phase" forward pointers, which are
+superseded as the work progressed (each is marked where it has been
+superseded).
 
 ## Baseline (measured before any change)
 
@@ -307,7 +440,11 @@ Documented so later phases can verify each one is addressed:
 by construction: all state under `s.mu`, teardown under `sync.Once`;
 `-race` should be run in any Linux CI as a final confirmation.
 
-## Next phase
+## Next phase (SUPERSEDED — Phase 5 is complete)
+
+The historical Phase 4 record pointed forward to Phase 5, which has
+since been completed (design in the Phase 5 section below; production
+wiring in commit `881d46d`). Kept for the record:
 
 Phase 5 — reconnect/rebind (Issue A: sessions bound to a CarrierConn):
 make sessions survive carrier replacement by rebinding them to a new
@@ -843,3 +980,561 @@ Phase 8 touches `install.sh`, `test-install.sh`, both `systemd/*.service`,
 the README/this file, and only ADDS the `--validate-config` early-exit in
 both mains (reverting the commit removes it cleanly; no protocol,
 lifecycle, or queue code was modified).
+
+## Follow-up — bounded WebSocket auth handshake (this commit)
+
+### The gap (audited and confirmed in source)
+
+`mux.CarrierAuth` bounds the handshake by `AuthTimeout` and applied that
+bound to the socket only when the transport implemented
+`SetDeadline` (a type assertion on the `io.ReadWriteCloser`). The
+production WebSocket adapter (`wsConn` in both mains) exposes only
+`Read`/`Write`/`Close` — no `SetDeadline` — and the Germany up-carrier
+client path (`runUpCarrier`) passed it to `CarrierAuth` with a 15 s
+context, but the context was checked only ONCE at the top of the
+handshake, so a blocked `Read` was never interrupted by it. A peer that
+completed the WebSocket upgrade but never sent the authentication
+challenge could therefore hold the Germany-side dial goroutine
+indefinitely (the Iran-side server path was covered only by an external
+`time.AfterFunc` watchdog in `handleUpWsConn`).
+
+### The fix (minimal, protocol-unchanged)
+
+- `pkg/mux/auth.go` — on a transport WITHOUT `SetDeadline`, each
+  handshake read now runs in a short-lived goroutine and is raced
+  against `ctx.Done()` and the handshake bound (`min(ctx deadline,
+  now+AuthTimeout)`). On expiry/cancellation the connection is closed —
+  which interrupts the blocked read (the adapter's `Close` closes the
+  underlying TCP conn) — and the read result is handed back through a
+  buffered channel so the reader goroutine can always finish (no shared
+  state, no goroutine leak). On transports WITH `SetDeadline` (all TCP
+  paths) the code path is byte-for-byte the old one. The v1 protocol,
+  role binding, replay protection, and post-auth long-lived behavior are
+  unchanged; no deadline survives past the handshake.
+- `cmd/germany-splitter/main.go` — `runUpCarrier` split into the loop
+  plus `runUpCarrierOnce` (behavior-preserving extraction, made the
+  production path directly testable; the 15 s auth context is
+  unchanged).
+- `cmd/iran-splitter/main.go` — the now-redundant `time.AfterFunc`
+  watchdog in `handleUpWsConn` removed; `CarrierAuth` itself bounds the
+  handshake for the deadline-less `wsConn` (same 15 s `AuthTimeout`).
+
+### Regression tests (deterministic, no real 30 s waits)
+
+- `pkg/mux/auth_ws_timeout_test.go` (new): deadline-less transport
+  (mirrors `wsConn`) against a silent peer — (a) `AuthTimeout` bound
+  fires (`context.DeadlineExceeded`, conn closed, no goroutine leak),
+  (b) a shorter caller context deadline is respected, (c) context
+  CANCELLATION interrupts the blocked handshake with
+  `context.Canceled` and closes the connection. All use 100–300 ms
+  test-specific bounds.
+- `cmd/germany-splitter/up_carrier_ws_test.go` (new): the PRODUCTION
+  path — real gorilla server that upgrades then goes silent; the
+  Germany `runUpCarrierOnce` (dial → `wsConn` → `CarrierAuth`) returns
+  in ~0.3 s (test-specific `AuthTimeout`) with the connection closed;
+  plus a live-peer success test proving normal authenticated handshakes
+  over `wsConn` are unaffected.
+
+### CI (new)
+
+- `.github/workflows/go.yml` (new, first workflow in the repo): Linux
+  (`ubuntu-latest`, Go `1.21` per `go.mod`) — `gofmt -l` clean check,
+  `go vet ./...`, `go test ./...`, `go test -race ./...`, `go build
+  ./...` (host) and `GOOS=linux GOARCH=amd64 go build ./...`. No
+  release/build automation. This also gives a permanent home for the
+  `-race` suite that cannot run on the Windows dev host.
+
+### Dependency cleanup
+
+- `hashicorp/yamux` was imported by no Go code (historical dependency);
+  removed via `go mod tidy` — `go.mod`/`go.sum` now carry only
+  `gorilla/websocket`. Full test suite re-run confirms no behavior
+  change.
+
+### Verification
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS (windows/amd64)
+- `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- `go test ./... -count=5` — PASS (all packages)
+- New regression tests re-run repeatedly (5× each) — deterministic
+- `go run ./e2e-pipe-test` — PASS
+- `go test -race ./...` — see Linux CI (Windows-host toolchain crash
+  `0xc0000139` unchanged, pre-existing)
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+The commit is self-contained: `pkg/mux/auth.go`, both mains (refactor
++ watchdog removal), two new test files, the new workflow, `go.mod` /
+`go.sum`, and this documentation update. No `install.sh` changes, no
+wire-protocol changes, no session-lifecycle or backpressure changes.
+
+## Follow-up — stream worker send-after-close crash (this commit)
+
+### Original reproduction (confirmed CRITICAL, production impact)
+
+A read-only audit reproduced an intermittent
+
+```
+panic: send on closed channel
+    .../pkg/mux.(*CarrierConn).streamWorker(...)
+    .../pkg/mux/carrier.go:701  (case s.ch <- it.payload:)
+```
+
+in the running splitter: one worker popped an item from the
+`StreamQueue`, `CarrierConn.Close` ran `close(s.ch)` (old step 5, under
+`c.mu`), and the worker later executed its send on `s.ch` **outside
+`c.mu`** — the runtime panics the sending goroutine and takes down the
+whole process. The worker's `select` also had a `<-c.closed` arm, but
+probes against the real code showed that arm does **not** protect the
+window: a send on a closed channel is always "ready", so a worker that
+reaches the select after the close may pick the send arm and panic
+(≈50% per such event in an active-flood setup). The crash is a true
+ownership violation: the producer/dispatcher side closed a channel a
+worker could still send to.
+
+A second, pre-existing defect was exposed by the new stress test: the
+aggregate `queuedBytes` accounting in `deliver()` was an unguarded
+check-then-add against a plain atomic, so a worker pop could slip
+between the check and the add, over-counting the budget; `Close` then
+re-claimed the already-decremented bytes and drove the total negative
+(`queuedBytes after Close = -1`).
+
+### The fix (lifecycle + accounting, protocol unchanged)
+
+`pkg/mux/carrier.go`:
+- **`workerWait sync.WaitGroup`**: `createStreamLocked` does `Add(1)`
+  under `c.mu` **before** `go streamWorker`; the worker defers `Done()`.
+  Add/Wait ordering is race-free: `createStreamLocked` is only reachable
+  while `closing==false` under the same `c.mu` that `Close` latches
+  `closing=true` before it can reach `Wait` — no Add-after-Wait, no
+  worker starts uncounted.
+- **`allStreams []*streamRec`** (append-only slice, never shrunk):
+  `Deregister` and — crucially — **re-Register of the same ID** (Phase 5
+  rebind reuses stream IDs) create new records without losing the old
+  one. A map keyed by ID would have orphaned the previous generation's
+  parked worker and hung `Close` (observed as a 56-minute `pkg/node`
+  deadlock during validation).
+- **`Close` step 5, three sub-steps**: (a) close EVERY mailbox —
+  snapshot under `c.mu`, `q.Close()` calls outside it (lock ordering
+  stays acyclic; `q.mu` is never taken while holding `c.mu`); (b)
+  `workerWait.Wait()` **outside `c.mu`** (the last worker's exit path
+  takes `c.mu`); (c) close every `s.ch` and empty `streams`. By (c) no
+  worker can be sending: every mailbox is closed (no further `Pop` can
+  yield an item) and every in-flight handoff was aborted by the
+  `c.closed` open since step 2. The invariant now holds by
+  construction: **no worker can ever send on `s.ch` after it is
+  closed.** No `recover`, no sleeps, no timing.
+- `Deregister`/`Close`/`Register` docs updated to the new lifecycle.
+
+`pkg/mux/queue.go`:
+- Byte accounting moved **into the mailbox**: `NewStreamQueue` takes
+  the carrier-wide `queuedBytes` pointer + current `MaxBytesTotal`;
+  `TryPush` checks per-stream bounds **and** the aggregate budget, and
+  adds the accepted bytes, all under `q.mu`; `Pop` subtracts under
+  `q.mu`; `Close` reclaims the discarded bytes under `q.mu`. The
+  invariant `queuedBytes == Σ bytes in attached mailboxes` holds at all
+  times; the old carrier-level Load→TryPush→Add race is gone.
+  `SetBudgetLimit` (plain field, `q.mu`-only) keeps the limit in sync
+  on `SetStreamLimits` without nesting locks.
+- `deliver()` no longer touches `queuedBytes` or takes `c.mu` on the
+  hot path.
+
+Preserved: per-stream ordering (single mailbox → single worker → single
+channel), `FrameClose`/`nil` semantics, bounded per-stream backpressure
+and overflow policy, aggregate budget enforcement, stream-termination
+behavior, `ShutdownDone()`, concurrent/idempotent `Close()`, no
+goroutine leaks. Phase 2–8 behavior unchanged; no protocol,
+authentication, session-lifecycle, or `install.sh` changes.
+
+### Regression tests (`pkg/mux/carrier_close_race_test.go`, new)
+
+- `TestCloseRacesActiveWorkerFlood` — the production reproduction:
+  active traffic (8 streams, consumers keeping up, workers cycling
+  Pop→hand-off→Pop) while `Close` runs. **Against the pre-fix code it
+  panics `send on closed channel` at the data-delivery select on (nearly)
+  every iteration; post-fix it never does.** 200 iterations, run
+  `-count=100`.
+- `TestCloseRacesWorkerDeliveryGap` — deterministic parked-worker gap:
+  every worker verified (via `len(ch)==1` + `queueLen==0`) to have
+  popped its item and be in the gap/parked before `Close`.
+- `TestCloseRacesWorkerDeliveryWithFrameClose` — same race on the
+  FrameClose (`nil`) delivery path.
+- `TestCloseReleasesWorkerParkedInPop` — idle workers parked in `Pop`
+  are released; bytes reclaimed.
+- `TestCloseReleasesDeregisteredStreamWorker` — a `Deregister`ed stream's
+  worker (unreachable from `streams`) is still released and its channel
+  closed.
+- `TestCloseReleasesReboundStreamIDWorker` — rebind id-reuse: old and
+  new generation both torn down by one `Close` (the map-keyed
+  `allStreams` hung here for 56 min during validation).
+- `TestCloseRacesWorkerDeliveryStress` — 200×16-stream parked-worker
+  hammer.
+- `TestCloseOneCarrierLeavesOtherRunning` — closing carrier 1 leaves an
+  independent carrier 2 fully operational.
+
+All assert: no panic, workers exited (`ShutdownDone`), channels closed,
+`queuedBytes` back to 0, other carriers unaffected. A `queueLen`
+white-box helper reads `q.mu` **after** releasing `c.mu` (holding both
+would deadlock against the worker's `limitsLocked`).
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- `go test ./pkg/mux -count=100` — PASS (~430 s)
+- `go test ./pkg/node -count=50` — PASS (~266 s)
+- `go test ./... -count=20` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS ×3 (scenarios 1–4, incl. carrier
+  loss/recovery and deterministic rebind flaps)
+- Pre-fix/post-fix validation of the regression: the flood test was run
+  against the pre-fix `carrier.go` (restored via `git show
+  HEAD:pkg/mux/carrier.go`) and panicked exactly as in production; with
+  the fix it passes at every count above.
+
+### Linux race CI (this branch)
+
+The existing `.github/workflows/go.yml` previously ran only on pushes to
+`main` and PRs, so this hardening branch had never executed
+`go test -race` in CI. Smallest change: `hardening/production-reliability`
+added to the `push.branches` trigger of the SAME workflow (no second
+workflow, no retry/hiding of failures). The workflow runs `gofmt`,
+`go vet`, `go test`, `go test -race ./...`, and host + linux/amd64
+builds on `ubuntu-latest` (Go 1.21).
+
+**Status: VALIDATED** — the run of the existing workflow triggered by
+the push of this commit
+(`Zaltapar/iran-germany-split-tunnel` actions run **33343847977**,
+`https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33343847977`,
+head SHA `53e62b9`) completed `success` on `ubuntu-latest` (Go 1.21)
+with every step green: `gofmt`, `go vet`, `go test`, **`go test
+-race`** (`go test -race ./...`, unchanged from the existing
+workflow), `go build (host)`, `go build (linux/amd64)`. No retries, no
+skipped steps. This is the first `go test -race` execution on the
+hardening branch.
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+Self-contained: `pkg/mux/carrier.go`, `pkg/mux/queue.go`,
+`pkg/mux/carrier_close_race_test.go`, test call-site updates in
+`pkg/mux/{queue,backpressure}_test.go`, the workflow trigger line, and
+this documentation update.
+
+## Follow-up — stream-ID wraparound to reserved stream 0 (commit 1745d60)
+
+### The issue (from the repository audit; open PRs #2 / #3)
+
+`Node.nextStreamID` returned `atomic.AddUint32(&n.streamSeq, 1)`
+verbatim. After 2^32 sessions the counter wraps through `0` — the
+StreamID reserved for protocol/control frames (`FrameAuth`,
+`FramePing`/`FramePong` on stream 0). `StartSession` would then fail
+at `Register(0)` (which the carrier refuses), and any application
+frame on stream 0 is a carrier-terminating protocol violation — an
+invariant violation on an extremely long-lived node.
+
+### The fix (minimal, protocol-unchanged)
+
+`pkg/node/node.go` — `nextStreamID` skips `0` on wrap (retry loop
+around the atomic Add). The counter passes through 0 only once per
+2^32 cycle, and the only caller that observed 0 retries and receives
+the NEXT distinct atomic value, so concurrent allocations cannot
+collide and the loop terminates deterministically. No protocol,
+authentication, or lifecycle change.
+
+### Regression test
+
+`pkg/node/streamid_test.go` (new, white-box `package node`): normal
+allocation (1, 2); counter forced to `0xFFFFFFFE` → next ID
+`0xFFFFFFFF`; the following allocation must skip 0 and return 1; plus
+a 4-ID sweep around the wrap point (no 0, no repeats). Deterministic
+(no sleeps/timers). Proven to catch the bug: it FAILS against the
+pre-fix `node.go` (`ID after wrap = 0, want 1`) and passes post-fix.
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean
+- `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- Focused test `-count=5` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+- Architect review (independent, read-only): CRITICAL = 0, HIGH = 0.
+  The pre-existing limitation that IDs repeat from 1 after a FULL
+  2^32 cycle (a still-live ancient session could theoretically
+  collide) is unchanged and remains documented in the function
+  comment (the rebind protocol cross-checks StreamID against
+  SessionID).
+
+### Audit PR disposition
+
+This fix supersedes the `nextStreamID` changes in the open audit PRs:
+PR #2 (`fix/streamid-zero-wraparound`) is REDUNDANT (identical
+single-function change, no tests); PR #3 (`fix/reliability-hardening`)
+is REJECTED as a whole: its `auth.go` rewrite (a) turns `AuthTimeout`
+from a variable into a constant, breaking the documented test hook
+used by `auth_test.go`, `auth_ws_timeout_test.go` and
+`up_carrier_ws_test.go`; (b) REMOVES the deadline-less-transport read
+race that `d8c5a39` added (validated by Linux race CI run 33343847977)
+— the production `wsConn` adapter has no `SetDeadline`, so a silent
+peer would again hold the Germany dial goroutine indefinitely; (c)
+widens `AuthMaxClockSkew` 60 s → 300 s without demonstrated need
+(NTP-synced VPS; the 128-bit nonces already provide replay
+protection independent of clock quality). PR #3's remaining items
+(SOCKS5 domain length check, `StartSession` clientConn binding
+order, TCP keepalive) are being evaluated individually on this branch
+before any adoption.
+
+### Rollback
+
+```
+git revert <this-commit>
+```
+
+Self-contained: `pkg/node/node.go`, `pkg/node/streamid_test.go`, and
+this documentation update.
+
+## Follow-up — SOCKS5 error reply ownership (commit 4cf65cf)
+
+### The issue (from the repository audit; PR #3 item 2)
+
+`Node.StartSession` constructed the session with the client conn
+already bound (`session.NewSession(sid, dest, clientConn, nil, ...)`).
+If setup then failed at one of the post-construction points (carrier
+`Register` returning nil, `Activate` failing, destination encoding
+returning 0, or the `FrameHeader` write failing), the session was torn
+down — and `Session.teardown` closed the client conn. The caller
+(`handleSOCKS5Conn`) then executed
+`socksReply(clientConn, 0x06); clientConn.Close()`: the reply was
+written to an already-closed conn and silently lost. The client saw a
+connection reset instead of the SOCKS5 "general failure" reply.
+
+PR #3's fix (bind the conn only after the header write) was in the
+right direction but would have introduced a data race: `StartSession`
+returns after `startStreamRelay` captures `sess.ClientConn` while the
+teardown goroutine could concurrently clear it — an unsynchronized
+read/write of the same `net.Conn` field (and the PR shipped it
+together with the rejected `auth.go` rewrite).
+
+### The fix (ownership transfer, protocol unchanged)
+
+- `pkg/session/session.go` — new `Session.AdoptConn(c net.Conn) bool`:
+  transfers ownership of a connection to the session's authoritative
+  `Close`. The check and the store are done under `s.mu`; if the
+  session is already Closing/Closed the conn is NOT adopted (returns
+  false) and the caller retains ownership.
+- `pkg/node/node.go` — `StartSession` now creates the session with a
+  NIL client conn. After the `FrameHeader` write succeeds (the last
+  setup failure point) it calls `sess.AdoptConn(clientConn)` — and
+  does so BEFORE the `Attach` calls on purpose: once attached, a
+  carrier loss could start the grace window and close the session,
+  and a not-yet-adopted conn would leak (nobody else would close it).
+  On adopt refusal the conn is closed and the failure is returned.
+  All earlier failure paths return the conn to the caller still open.
+- `cmd/iran-splitter/main.go` — caller behavior unchanged
+  (`socksReply(0x06); clientConn.Close()` on failure), now correct by
+  construction; comments updated to the new ownership contract.
+- The Germany side (`bootstrapUpStream`) is unaffected: it owns
+  `targetConn` itself and has no SOCKS reply; it already closes
+  `targetConn` explicitly on each failure path (behavior preserved —
+  noted for a possible later cleanup, not changed here).
+
+### Regression test
+
+`pkg/node/startsession_ownership_test.go` (new, external test on the
+existing topology harness): an invalid `AddrType` (0) deterministically
+fails the destination encoding — no carrier manipulation, no timing.
+Asserts: `StartSession` returns an error, AND the caller can still
+write the 12-byte SOCKS5 general-failure reply on the client conn and
+read it back intact. Proven to catch the bug: against the pre-fix
+code the reply write fails with `mempipe closed` (the session closed
+a conn it did not own); post-fix it passes at `-count=5`.
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l .` — clean; `go vet ./...` — PASS
+- `go build ./...` — PASS; `GOOS=linux GOARCH=amd64 go build ./...` — PASS
+- Focused test `-count=5` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+
+### Linux race CI (commits 361a6f6 / a09ac4b / 4cf65cf)
+
+**Status: VALIDATED** — the push of `4cf65cf` triggered the existing
+workflow (`Zaltapar/iran-germany-split-tunnel` actions run
+**33432486448**,
+`https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33432486448`,
+head SHA `4cf65cf`) which completed `success` on `ubuntu-latest`
+(Go 1.21). Every step verified individually from the job report:
+`gofmt`, `go vet`, `go test`, **`go test -race`** (`go test -race
+./...`, ran 19:47:48–19:47:57Z), `go build (host)`, `go build
+(linux/amd64)` — all `success`, no retries, no skipped steps. This is
+the Linux race verification for the `AdoptConn` ownership transfer
+(the only concurrency-sensitive change in this set) and for the
+stream-ID / backoff commits.
+
+## Follow-up — backoff jitter test (commit a09ac4b)
+
+### The flake
+
+`TestSleepJitterBounds` (internal/backoff) asserted
+`elapsed < 100*time.Millisecond` — a STRICT upper bound — on a
+wall-clock measurement of `Backoff.Sleep`, whose jitter range is
+`[d/2, d]` INCLUSIVE (`Int63n(d/2+1)` can yield `j = d/2`, so a sleep
+of exactly `d` is legitimate production behavior; the cap is preserved
+by construction since `j = d/2 + [0, d/2] <= d`). On a loaded host the
+boundary case measured 100.4965 ms → false failure under
+`-count=2`.
+
+### Classification (flaky-test policy)
+
+Test-harness defect, not a production defect: the production cap is a
+real cap by construction; the test's strict inequality against an
+inclusive cap, measured with wall clock, is an incorrect timing
+assumption. Fix at the test layer, documented; no sleep added to
+production, no deadline weakened.
+
+### The fix (test + doc only)
+
+- `internal/backoff/backoff_test.go` — upper bound is now
+  `d + 20ms` (documented wall-clock tolerance, far smaller than any
+  real regression: a 2x delay still fails); lower bound
+  `d/2 - 5ms` (documented tolerance for the same reason).
+- `internal/backoff/backoff.go` — the package and function docs said
+  `[d/2, d)` while the code is `[d/2, d]`; corrected to match the
+  code (the doc/code mismatch is the root cause of the wrong test
+  assumption).
+- `go test ./internal/backoff -count=20` — PASS.
+
+## Follow-up — carrier liveness / blackhole detection (this commit)
+
+### The issue (roadmap A)
+
+The keepalive was one-way: `keepalive()` sent a `FramePing` every
+interval, but `Dispatch()` **ignored `FramePong`** ("keepalive ack,
+nothing to do"), and a blackholed path (packets dropped — no RST/FIN,
+read blocks forever) never errors the read loop. So a blackholed
+carrier reported `Ready()=true` **forever**: the sessions on it
+stalled (their streams terminate after the 30 s overflow wait, but the
+carrier itself — and the Phase 5 loss/rebind machinery — never
+engaged), and detection relied on OS TCP timeouts that may never fire
+in a blackhole.
+
+### The fix (round-based liveness, standard teardown path)
+
+- `pkg/mux/carrier.go`:
+  - The keepalive goroutine is now `liveness`: it still sends one
+    `FramePing` per interval, but it now **decides** on the
+    round-trip. A `FramePong` latches `c.sawPong` (set by `Dispatch`
+    under `c.mu`). After each ping round, the liveness loop (under
+    `c.mu`) clears the latch and increments a `missed` counter when no
+    pong was seen. When `missed >= livenessRounds` it calls
+    **`c.Close()`** — the STANDARD, idempotent teardown.
+  - `Close` is the single teardown path: it interrupts the stuck read
+    (`rwc.Close` → read errors), the read loop ends, `Dispatch`
+    returns, `onCarrierLost` runs the normal carrier-loss sweep
+    (generation-guarded detach + grace window), and the replacement /
+    rebind machinery takes over. **No independent/bypass teardown
+    path was added.**
+  - `SetLivenessRounds(n)` (n>0) configures the threshold before the
+    loop starts; the constructor defaults it to
+    `DefaultLivenessRounds = 3`.
+  - `pingInterval <= 0` starts no liveness loop (preserves the
+    historical raw-carrier behavior used by some tests).
+- **No false positives:** detection is a deterministic **round
+  counter**, not a wall-clock timer. A healthy peer answers every
+  ping, so the counter resets every round — a long-lived healthy
+  connection is never declared dead. Bounded detection time:
+  `rounds * interval` (≈45 s at defaults).
+- **Write failures are intentionally ignored** for the liveness
+  decision: a failed write means the path is broken and the READ side
+  observes the error (`readErr`); counting write failures as "missed
+  rounds" would risk a false positive (one transient write error on a
+  healthy path would start the death clock). `Close()` is idempotent,
+  so the read-side error closing the carrier is the authoritative
+  signal.
+- `internal/config`: new authoritative, validated setting
+  `SPLIT_LIVENESS_ROUNDS` (0 = library default, bounded 0..20), wired
+  through `cmd/iran-splitter` and `cmd/germany-splitter` into
+  `node.Config.LivenessRounds`.
+- `internal/testutil`: `MemConn.Blackhole()` — a deterministic
+  in-memory blackhole (writes succeed into the void, reads block
+  forever until `Close`), the in-memory equivalent of a dropped path.
+- `pkg/node`: `node.Config.LivenessRounds` is passed to the carrier in
+  `install` (applied to every new carrier, including replacements).
+
+### Tests (deterministic, no public network)
+
+- `pkg/mux/liveness_test.go` (new):
+  - `TestLivenessBlackholeDetected` — a silent peer causes the carrier
+    to declare itself dead after the configured rounds and tear down
+    through the standard path (`ReadErr == io.EOF`, `ShutdownDone`).
+  - `TestLivenessNoFalsePositiveThenDetect` — a pong-answering peer
+    keeps the carrier alive for 400 ms (≈30+ rounds; a false positive
+    would kill it in ~30 ms), then `Blackhole()` drops the path and the
+    carrier detects it within the configured rounds.
+  - `TestLivenessDisabledWithoutPing` — `pingInterval=0` means no
+    liveness loop; a silent peer does not kill the carrier.
+- `pkg/node/liveness_integration_test.go` (new):
+  - `TestNodeLivenessBlackholeRebind` — end-to-end: a live session, the
+    up path is blackholed, the liveness detects it (standard Close),
+    the session survives in its grace window, a fresh authenticated up
+    carrier is re-established, the Phase 5 rebind sweep re-attaches the
+    session (same stream ID), and data flows again end-to-end.
+- Regression: the existing `TestKeepaliveSendsPings`,
+  `TestCloseWithKeepaliveActive`, and the full `pkg/mux`/`pkg/node`
+  suites still pass (the rename `keepalive`→`liveness` and the pong
+  latch did not alter ping emission or shutdown semantics).
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l` clean; `go vet ./...` — PASS; `go build ./...` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- Focused: `./pkg/mux -run Liveness -count=20`, `./pkg/node -run
+  Liveness -count=20`, `./pkg/mux -count=3` — PASS
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+- Linux race CI: **VALIDATED** — push of this commit ran the workflow
+  (actions run **33445968119**, head `3320968`,
+  `https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33445968119`)
+  on `ubuntu-latest` (Go 1.21); every step verified from the job
+  report: `gofmt`, `go vet`, `go test`, **`go test -race`**,
+  `go build (host)`, `go build (linux/amd64)` — all `success`, no
+  retries. This is the Linux race + cross-arch verification for the
+  liveness goroutine (which calls `Close` from its own goroutine) and
+  the pong latch.
+
+### Intentional limitations
+
+- Detection is **bounded but not instant** (~45 s at defaults). A
+  blackhole is never detected faster than `rounds * interval`; this is
+  the configured trade-off between detection latency and false
+  positives. Operators can tune `SPLIT_LIVENESS_ROUNDS` (and the fixed
+  30 s ping period) per environment.
+- The 30 s ping period (`DefaultKeepAlive`) is still a fixed default
+  (no env), unchanged by this task; only the detection policy is new.
+
+## Audit PR disposition — consolidated
+
+PR #2: superseded by the `nextStreamID` fix (see the stream-ID
+section above).
+PR #3: REJECTED as a whole (see the auth.go analysis in the stream-ID
+section); its individual items are dispositioned:
+- streamID wraparound → adopted (rewritten with a regression test);
+- SOCKS5 domain > 255 → UNREACHABLE (uint8 length field); boundary
+  pinned by a test instead;
+- StartSession clientConn binding → adopted via `Session.AdoptConn`
+  (the PR's version was racy; see the ownership section above);
+- TCP keepalive on relay sockets → DEFERRED (see the next-task
+  notes; needs a dedicated, reviewed change — not adopted here);
+- clock skew 60s → 300s → REJECTED (NTP-synced VPS; nonces provide
+  replay protection independent of clock quality; no demonstrated
+  failure).

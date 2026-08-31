@@ -132,6 +132,7 @@ func main() {
 		BufferBytes:       cfg.SessionBufBytes,
 		RelayBufSize:      cfg.RelayBufSize,
 		KeepAliveInterval: cfg.KeepAliveInterval,
+		LivenessRounds:    cfg.LivenessRounds,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
@@ -188,44 +189,66 @@ func streamLimits(cfg *config.Config) mux.StreamLimits {
 // node context).
 // ============================================================
 
+// runUpCarrier is the reconnect loop (exponential backoff, reset on a
+// successfully authenticated carrier, shutdown-cancellable). Each
+// iteration runs one full connection attempt via runUpCarrierOnce.
 func (s *Splitter) runUpCarrier() {
 	b := backoff.New(2*time.Second, 60*time.Second)
 	for {
 		if s.node.Shutdown() {
 			return
 		}
-		conn, resp, err := websocket.DefaultDialer.Dial(s.config.UpWsUrl, nil)
+		err := s.runUpCarrierOnce(s.config.UpWsUrl)
 		if err != nil {
-			s.logger.Printf("Up-carrier dial %s: %v", s.config.UpWsUrl, err)
 			if s.backoffSleep(b) {
 				return
 			}
 			continue
 		}
-		s.logger.Printf("Up-carrier WS connected (HTTP %s)", resp.Status)
-
-		wsc := &wsConn{conn: conn}
-		ctx, cancel := context.WithTimeout(s.node.Context(), 15*time.Second)
-		br, err := mux.CarrierAuth(ctx, wsc, true, mux.RoleUpload, s.node.Secret())
-		cancel()
-		if err != nil {
-			s.logger.Printf("Up-carrier auth failed: %v", err)
-			conn.Close()
-			if s.backoffSleep(b) {
-				return
-			}
-			continue
-		}
-		s.logger.Printf("Up-carrier authenticated")
-
-		h := s.node.InstallUp(wsc, br)
-		<-h.Done()
-		b.Reset() // a full authenticated carrier session ran
-		s.logger.Printf("Up-carrier torn down (reconnecting)")
+		// A full authenticated carrier session ran (or was torn down
+		// after installing): reset the backoff and reconnect.
+		b.Reset()
 		if s.backoffSleep(b) {
 			return
 		}
 	}
+}
+
+// runUpCarrierOnce performs a single up-carrier connection attempt:
+// dial, WebSocket upgrade, v1 carrier authentication, and install. It
+// returns an error when the attempt fails BEFORE a full authenticated
+// carrier session ran (dial or auth failure — the connection is closed),
+// and nil once the installed carrier has completed its session (normal
+// teardown, the caller reconnects).
+//
+// The authentication handshake is bounded: the context deadline (15 s,
+// derived from the node context) plus CarrierAuth's hard AuthTimeout cap
+// apply to the wsConn adapter even though it cannot enforce socket
+// deadlines — a peer that upgrades but never sends the challenge cannot
+// hold this goroutine (or the connection) forever.
+func (s *Splitter) runUpCarrierOnce(url string) error {
+	conn, resp, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		s.logger.Printf("Up-carrier dial %s: %v", url, err)
+		return err
+	}
+	s.logger.Printf("Up-carrier WS connected (HTTP %s)", resp.Status)
+
+	wsc := &wsConn{conn: conn}
+	ctx, cancel := context.WithTimeout(s.node.Context(), 15*time.Second)
+	br, err := mux.CarrierAuth(ctx, wsc, true, mux.RoleUpload, s.node.Secret())
+	cancel()
+	if err != nil {
+		s.logger.Printf("Up-carrier auth failed: %v", err)
+		conn.Close()
+		return err
+	}
+	s.logger.Printf("Up-carrier authenticated")
+
+	h := s.node.InstallUp(wsc, br)
+	<-h.Done()
+	s.logger.Printf("Up-carrier torn down (reconnecting)")
+	return nil
 }
 
 // backoffSleep waits for the next jittered delay; returns true when the
