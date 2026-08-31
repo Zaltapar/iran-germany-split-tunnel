@@ -69,6 +69,36 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 - Full verification for the follow-up is recorded in the
   "Follow-up — bounded WebSocket auth handshake" section at the bottom.
 
+### Deferred / next tasks (as of commit 4cf65cf)
+
+The open audit PRs #2/#3 are fully dispositioned (see the "Audit PR
+disposition — consolidated" section at the bottom). Remaining known
+items, in priority order:
+
+- **DEFERRED — TCP keepalive on relay sockets** (PR #3 item 4): a
+  reasonable reliability improvement (detects NAT/firewall zombie
+  sessions) but NOT yet adopted: it changes socket behavior on both
+  the client and target sides, needs its own scoped change + review
+  (e.g. does the 30 s keepalive period interact with the carrier
+  ping/pong liveness?), and is not a correctness blocker.
+- **Roadmap A — carrier liveness**: review whether a blackholed
+  carrier (packets dropped, no RST) can remain apparently alive for
+  an unacceptable period given the current ping/pong system; if so,
+  add an explicit pong/liveness deadline that fails into the normal
+  carrier-loss/rebind machinery (no independent teardown path, no
+  false positives on healthy long-lived connections, bounded timing,
+  deterministic + flapping tests).
+- **Roadmap B — down-carrier auth resource limits** (Germany `:9002`
+  listener: bound concurrent unauthenticated auth goroutines).
+- **Roadmap C — aggregate session-buffer budget** (per-session buffer
+  is bounded; total memory still scales with session count).
+- **Roadmap D — upload bootstrap grace during a short down-carrier
+  outage** (determine whether a legitimate session is discarded
+  unnecessarily when the down carrier is momentarily unavailable).
+- **Roadmap E/J — config/installer consistency + documentation**
+  pass over the whole tree (internal/config vs install.sh vs systemd
+  units vs README).
+
 ### Known limitations (current, honest list)
 
 - `go test -race` cannot run on the Windows development host
@@ -1263,7 +1293,7 @@ git revert <this-commit>
 Self-contained: `pkg/node/node.go`, `pkg/node/streamid_test.go`, and
 this documentation update.
 
-## Follow-up — SOCKS5 error reply ownership (this commit)
+## Follow-up — SOCKS5 error reply ownership (commit 4cf65cf)
 
 ### The issue (from the repository audit; PR #3 item 2)
 
@@ -1326,6 +1356,21 @@ a conn it did not own); post-fix it passes at `-count=5`.
 - Focused test `-count=5` — PASS
 - `go test ./... -count=2` — PASS (all packages)
 - `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+
+### Linux race CI (commits 361a6f6 / a09ac4b / 4cf65cf)
+
+**Status: VALIDATED** — the push of `4cf65cf` triggered the existing
+workflow (`Zaltapar/iran-germany-split-tunnel` actions run
+**33432486448**,
+`https://github.com/Zaltapar/iran-germany-split-tunnel/actions/runs/33432486448`,
+head SHA `4cf65cf`) which completed `success` on `ubuntu-latest`
+(Go 1.21). Every step verified individually from the job report:
+`gofmt`, `go vet`, `go test`, **`go test -race`** (`go test -race
+./...`, ran 19:47:48–19:47:57Z), `go build (host)`, `go build
+(linux/amd64)` — all `success`, no retries, no skipped steps. This is
+the Linux race verification for the `AdoptConn` ownership transfer
+(the only concurrency-sensitive change in this set) and for the
+stream-ID / backoff commits.
 
 ## Follow-up — backoff jitter test (commit a09ac4b)
 
