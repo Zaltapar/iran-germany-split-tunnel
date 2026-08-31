@@ -122,6 +122,16 @@ type CarrierConn struct {
 	// Dispatcher-owned; appended under c.mu; iterated under c.mu.
 	allStreams []*streamRec
 
+	// Liveness state (see liveness). livenessRounds is the configured
+	// number of consecutive unanswered pings before the carrier is
+	// declared blackholed (set via SetLivenessRounds before the loop
+	// starts; the liveness loop reads it under c.mu). sawPong latches
+	// that a FramePong was seen since the previous ping round; the
+	// liveness loop (the only writer of the decision) clears it under
+	// c.mu after each round.
+	livenessRounds int
+	sawPong        bool
+
 	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
 	// goroutine) when the first frame for a previously unknown stream
 	// arrives. The dispatcher creates and registers the stream channel and
@@ -153,6 +163,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 	}
 	c.mu.Lock()
 	c.live = 2 // readLoop + writeLoop
+	c.livenessRounds = DefaultLivenessRounds
 	c.mu.Unlock()
 	go c.writeLoop()
 	go c.readLoop()
@@ -160,7 +171,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 		c.mu.Lock()
 		c.live++
 		c.mu.Unlock()
-		go c.keepalive(pingInterval)
+		go c.liveness(pingInterval)
 	}
 	return c
 }
@@ -488,18 +499,78 @@ func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) err
 	return c.write(buf)
 }
 
-// keepalive sends FramePing periodically. It exits promptly when the
-// carrier closes and always stops its ticker, so no ticker leaks.
-func (c *CarrierConn) keepalive(interval time.Duration) {
+// Liveness: the keepalive loop is a round-trip detector. It sends one
+// FramePing every `interval`; a live peer answers each ping with a
+// FramePong (Dispatch does this). If NO pong arrives for
+// DefaultLivenessRounds consecutive pings, the carrier is declared
+// blackholed — reachable writes but no traffic comes back (a dropped
+// path the OS will never time out on its own) — and the carrier is
+// torn down through the STANDARD Close path. Close interrupts the
+// stuck read (rwc.Close), which ends the read loop, ends Dispatch,
+// and drives the normal carrier-loss/rebind machinery — there is no
+// second teardown path.
+//
+// The decision is deterministic (a round counter, not a wall-clock
+// timer): a healthy long-lived connection is never declared dead
+// because a pong resets the counter each round, and detection is
+// bounded to LivenessRounds * interval (45 s at the defaults) —
+// independent of OS TCP timeouts, which may never fire.
+const DefaultLivenessRounds = 3
+
+// LivenessRounds is the configured number of consecutive unanswered
+// pings after which the carrier is declared blackholed. The value is
+// read under c.mu by the liveness loop at every ping round, so a call
+// takes effect from the next round onward (mutex-ordered with the
+// loop's read; the loop's first decision is at least one interval
+// after the constructor returns). rounds <= 0 are ignored (the
+// default stays in force).
+func (c *CarrierConn) SetLivenessRounds(rounds int) {
+	c.mu.Lock()
+	if rounds > 0 {
+		c.livenessRounds = rounds
+	}
+	c.mu.Unlock()
+}
+
+// liveness runs the keepalive ping loop AND the blackhole detection.
+// The carrier closes and always stops its ticker, so no ticker leaks.
+// Termination signal: c.closed (Close). Write failures are IGNORED for
+// the liveness decision: a failed write means the path is broken and
+// the READ side will observe the error (readErr) — the read loop is
+// the authoritative "carrier is gone" signal, and Close() is
+// idempotent, so declaring it on write failure too would at worst
+// close the carrier a moment earlier. Counting write failures as
+// "missed rounds" instead would risk a false positive: a single
+// transient write error on a healthy path must not start the death
+// clock.
+func (c *CarrierConn) liveness(interval time.Duration) {
 	defer c.goroutineStopped()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	ping := make([]byte, HeaderSize) // StreamID 0, FramePing, Length 0
 	ping[4] = FramePing
+	missed := 0
 	for {
 		select {
 		case <-t.C:
-			_ = c.write(ping)
+			c.mu.Lock()
+			rounds := c.livenessRounds
+			c.mu.Unlock()
+			_ = c.write(ping) // best effort; see the method doc
+			c.mu.Lock()
+			if c.sawPong {
+				c.sawPong = false
+				missed = 0
+			} else {
+				missed++
+			}
+			dead := missed >= rounds
+			c.mu.Unlock()
+			if dead {
+				// Blackhole detected: standard teardown. Close is
+				// idempotent and safe from any goroutine.
+				c.Close()
+			}
 		case <-c.closed:
 			return
 		}
@@ -627,7 +698,11 @@ func (c *CarrierConn) Dispatch() {
 			pong[7] = 0
 			_ = c.write(pong)
 		case FramePong:
-			// keepalive ack, nothing to do
+			// keepalive ack: latch for the liveness loop, which reads
+			// and clears it under c.mu after each ping round.
+			c.mu.Lock()
+			c.sawPong = true
+			c.mu.Unlock()
 		default:
 			// unknown frame type: drop
 		}

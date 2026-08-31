@@ -18,6 +18,7 @@ type queue struct {
 	mu            sync.Mutex
 	buf           []byte
 	closed        bool
+	blackhole     bool      // swallow writes; reads block until closed (see Blackhole)
 	readDeadline  time.Time // enforced by take (the peer's read side)
 	writeDeadline time.Time // enforced by push (the writer's write side)
 }
@@ -27,6 +28,9 @@ func (q *queue) push(p []byte) (int, error) {
 	defer q.mu.Unlock()
 	if q.closed {
 		return 0, errClosed
+	}
+	if q.blackhole {
+		return len(p), nil // dropped: the write "succeeds" into the void
 	}
 	if !q.writeDeadline.IsZero() && !time.Now().Before(q.writeDeadline) {
 		return 0, os.ErrDeadlineExceeded
@@ -38,6 +42,18 @@ func (q *queue) push(p []byte) (int, error) {
 func (q *queue) take(p []byte) (int, error) {
 	for {
 		q.mu.Lock()
+		if q.blackhole {
+			// A blackholed read blocks forever (no error, no EOF) —
+			// exactly like a dropped network path. Close() ends the
+			// block (the carrier's liveness teardown relies on this).
+			if q.closed {
+				q.mu.Unlock()
+				return 0, io.EOF
+			}
+			q.mu.Unlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
 		if len(q.buf) > 0 {
 			n := copy(p, q.buf)
 			q.buf = q.buf[n:]
@@ -60,6 +76,12 @@ func (q *queue) take(p []byte) (int, error) {
 func (q *queue) setReadDeadline(t time.Time) {
 	q.mu.Lock()
 	q.readDeadline = t
+	q.mu.Unlock()
+}
+
+func (q *queue) setBlackhole() {
+	q.mu.Lock()
+	q.blackhole = true
 	q.mu.Unlock()
 }
 
@@ -104,6 +126,18 @@ func (m *MemConn) Close() error {
 func (m *MemConn) SetDeadline(t time.Time) error {
 	m.SetReadDeadline(t)
 	return m.SetWriteDeadline(t)
+}
+
+// Blackhole makes this end simulate a DROPPED network path in both
+// directions: every subsequent write succeeds but the bytes vanish, and
+// every subsequent read blocks forever — no error, no EOF, no RST/FIN
+// (a blackholed connection the OS will never time out on its own).
+// Close still ends both directions, which is how the carrier's
+// liveness teardown interrupts a blackholed read. Test-only primitive;
+// used to exercise liveness detection deterministically.
+func (m *MemConn) Blackhole() {
+	m.in.setBlackhole()
+	m.out.setBlackhole()
 }
 
 // SetReadDeadline bounds reads from this end.

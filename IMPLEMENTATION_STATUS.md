@@ -36,6 +36,22 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
   (documented tolerance, correct doc in `backoff.go`); no production
   behavior change. Details in "Follow-up — backoff jitter test" at
   the bottom.
+- **Carrier liveness (blackhole detection) — IMPLEMENTED (this
+  commit)**: a blackholed carrier (writes succeed, no traffic
+  returns — a path the OS never times out) used to stay
+  `Ready()=true` FOREVER, because pongs were ignored and the read
+  loop never errored. The keepalive loop is now a round-trip
+  detector: after `SPLIT_LIVENESS_ROUNDS` (default 3, i.e. ~45 s at
+  the 30 s ping period; 0 = library default, bounded 0..20)
+  consecutive unanswered pings the carrier is torn down through the
+  STANDARD `Close` path → blocked read interrupted → normal
+  carrier-loss/rebind machinery (no second teardown path). No false
+  positives: a healthy peer's pong resets the counter each round
+  (deterministic round counter, not a wall-clock timer).
+  Deterministic tests: mux-level detection + no-false-positive +
+  disabled-without-ping; node-level blackhole→grace→rebind
+  integration with end-to-end data after recovery. Details in
+  "Follow-up — carrier liveness" at the bottom.
 - **CRITICAL send-on-closed-channel crash in the stream worker —
   RESOLVED (this commit)**: `CarrierConn.Close` closed a stream consumer
   channel that a worker could still be sending to, intermittently
@@ -69,7 +85,7 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 - Full verification for the follow-up is recorded in the
   "Follow-up — bounded WebSocket auth handshake" section at the bottom.
 
-### Deferred / next tasks (as of commit 4cf65cf)
+### Deferred / next tasks (as of the carrier-liveness commit)
 
 The open audit PRs #2/#3 are fully dispositioned (see the "Audit PR
 disposition — consolidated" section at the bottom). Remaining known
@@ -77,17 +93,11 @@ items, in priority order:
 
 - **DEFERRED — TCP keepalive on relay sockets** (PR #3 item 4): a
   reasonable reliability improvement (detects NAT/firewall zombie
-  sessions) but NOT yet adopted: it changes socket behavior on both
-  the client and target sides, needs its own scoped change + review
-  (e.g. does the 30 s keepalive period interact with the carrier
-  ping/pong liveness?), and is not a correctness blocker.
-- **Roadmap A — carrier liveness**: review whether a blackholed
-  carrier (packets dropped, no RST) can remain apparently alive for
-  an unacceptable period given the current ping/pong system; if so,
-  add an explicit pong/liveness deadline that fails into the normal
-  carrier-loss/rebind machinery (no independent teardown path, no
-  false positives on healthy long-lived connections, bounded timing,
-  deterministic + flapping tests).
+  client/target sessions at the OS level) but NOT yet adopted: it
+  changes socket behavior on both the client and target sides, needs
+  its own scoped change + review, and is not a correctness blocker.
+  (The carrier-level blackhole gap this was partly meant to cover is
+  now closed by the round-based carrier liveness, this commit.)
 - **Roadmap B — down-carrier auth resource limits** (Germany `:9002`
   listener: bound concurrent unauthenticated auth goroutines).
 - **Roadmap C — aggregate session-buffer budget** (per-session buffer
@@ -1404,6 +1414,106 @@ production, no deadline weakened.
   code (the doc/code mismatch is the root cause of the wrong test
   assumption).
 - `go test ./internal/backoff -count=20` — PASS.
+
+## Follow-up — carrier liveness / blackhole detection (this commit)
+
+### The issue (roadmap A)
+
+The keepalive was one-way: `keepalive()` sent a `FramePing` every
+interval, but `Dispatch()` **ignored `FramePong`** ("keepalive ack,
+nothing to do"), and a blackholed path (packets dropped — no RST/FIN,
+read blocks forever) never errors the read loop. So a blackholed
+carrier reported `Ready()=true` **forever**: the sessions on it
+stalled (their streams terminate after the 30 s overflow wait, but the
+carrier itself — and the Phase 5 loss/rebind machinery — never
+engaged), and detection relied on OS TCP timeouts that may never fire
+in a blackhole.
+
+### The fix (round-based liveness, standard teardown path)
+
+- `pkg/mux/carrier.go`:
+  - The keepalive goroutine is now `liveness`: it still sends one
+    `FramePing` per interval, but it now **decides** on the
+    round-trip. A `FramePong` latches `c.sawPong` (set by `Dispatch`
+    under `c.mu`). After each ping round, the liveness loop (under
+    `c.mu`) clears the latch and increments a `missed` counter when no
+    pong was seen. When `missed >= livenessRounds` it calls
+    **`c.Close()`** — the STANDARD, idempotent teardown.
+  - `Close` is the single teardown path: it interrupts the stuck read
+    (`rwc.Close` → read errors), the read loop ends, `Dispatch`
+    returns, `onCarrierLost` runs the normal carrier-loss sweep
+    (generation-guarded detach + grace window), and the replacement /
+    rebind machinery takes over. **No independent/bypass teardown
+    path was added.**
+  - `SetLivenessRounds(n)` (n>0) configures the threshold before the
+    loop starts; the constructor defaults it to
+    `DefaultLivenessRounds = 3`.
+  - `pingInterval <= 0` starts no liveness loop (preserves the
+    historical raw-carrier behavior used by some tests).
+- **No false positives:** detection is a deterministic **round
+  counter**, not a wall-clock timer. A healthy peer answers every
+  ping, so the counter resets every round — a long-lived healthy
+  connection is never declared dead. Bounded detection time:
+  `rounds * interval` (≈45 s at defaults).
+- **Write failures are intentionally ignored** for the liveness
+  decision: a failed write means the path is broken and the READ side
+  observes the error (`readErr`); counting write failures as "missed
+  rounds" would risk a false positive (one transient write error on a
+  healthy path would start the death clock). `Close()` is idempotent,
+  so the read-side error closing the carrier is the authoritative
+  signal.
+- `internal/config`: new authoritative, validated setting
+  `SPLIT_LIVENESS_ROUNDS` (0 = library default, bounded 0..20), wired
+  through `cmd/iran-splitter` and `cmd/germany-splitter` into
+  `node.Config.LivenessRounds`.
+- `internal/testutil`: `MemConn.Blackhole()` — a deterministic
+  in-memory blackhole (writes succeed into the void, reads block
+  forever until `Close`), the in-memory equivalent of a dropped path.
+- `pkg/node`: `node.Config.LivenessRounds` is passed to the carrier in
+  `install` (applied to every new carrier, including replacements).
+
+### Tests (deterministic, no public network)
+
+- `pkg/mux/liveness_test.go` (new):
+  - `TestLivenessBlackholeDetected` — a silent peer causes the carrier
+    to declare itself dead after the configured rounds and tear down
+    through the standard path (`ReadErr == io.EOF`, `ShutdownDone`).
+  - `TestLivenessNoFalsePositiveThenDetect` — a pong-answering peer
+    keeps the carrier alive for 400 ms (≈30+ rounds; a false positive
+    would kill it in ~30 ms), then `Blackhole()` drops the path and the
+    carrier detects it within the configured rounds.
+  - `TestLivenessDisabledWithoutPing` — `pingInterval=0` means no
+    liveness loop; a silent peer does not kill the carrier.
+- `pkg/node/liveness_integration_test.go` (new):
+  - `TestNodeLivenessBlackholeRebind` — end-to-end: a live session, the
+    up path is blackholed, the liveness detects it (standard Close),
+    the session survives in its grace window, a fresh authenticated up
+    carrier is re-established, the Phase 5 rebind sweep re-attaches the
+    session (same stream ID), and data flows again end-to-end.
+- Regression: the existing `TestKeepaliveSendsPings`,
+  `TestCloseWithKeepaliveActive`, and the full `pkg/mux`/`pkg/node`
+  suites still pass (the rename `keepalive`→`liveness` and the pong
+  latch did not alter ping emission or shutdown semantics).
+
+### Verification (Windows host, go1.27.0)
+
+- `gofmt -l` clean; `go vet ./...` — PASS; `go build ./...` — PASS
+- `go test ./... -count=2` — PASS (all packages)
+- Focused: `./pkg/mux -run Liveness -count=20`, `./pkg/node -run
+  Liveness -count=20`, `./pkg/mux -count=3` — PASS
+- `go run ./e2e-pipe-test` — PASS (scenarios 1–4)
+- Linux race CI: pending (this commit triggers the workflow; the run
+  must be inspected before claiming race coverage).
+
+### Intentional limitations
+
+- Detection is **bounded but not instant** (~45 s at defaults). A
+  blackhole is never detected faster than `rounds * interval`; this is
+  the configured trade-off between detection latency and false
+  positives. Operators can tune `SPLIT_LIVENESS_ROUNDS` (and the fixed
+  30 s ping period) per environment.
+- The 30 s ping period (`DefaultKeepAlive`) is still a fixed default
+  (no env), unchanged by this task; only the detection policy is new.
 
 ## Audit PR disposition — consolidated
 

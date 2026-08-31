@@ -87,8 +87,14 @@ type Config struct {
 	BufferBytes int
 	// RelayBufSize is the socket read-buffer size (default 32 KiB).
 	RelayBufSize int
-	// KeepAliveInterval is the carrier ping period (default 15s).
+	// KeepAliveInterval is the carrier ping period (default 30s).
 	KeepAliveInterval time.Duration
+	// LivenessRounds is the number of consecutive unanswered keepalive
+	// pings after which the carrier is declared blackholed and torn down
+	// through the normal carrier-loss/rebind machinery (default 3, i.e.
+	// ~45s at the default ping period). <=0 falls back to the library
+	// default (mux.DefaultLivenessRounds).
+	LivenessRounds int
 	// StreamLimits is the carrier backpressure policy (Phase 3).
 	StreamLimits mux.StreamLimits
 	// TargetDial dials a logical destination (RoleGermany only).
@@ -306,6 +312,9 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		c = mux.NewCarrierConn(conn, n.cfg.KeepAliveInterval)
 	}
 	c.SetStreamLimits(n.cfg.StreamLimits)
+	if n.cfg.LivenessRounds > 0 {
+		c.SetLivenessRounds(n.cfg.LivenessRounds)
+	}
 
 	n.mu.Lock()
 	n.genSeq++

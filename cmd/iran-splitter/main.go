@@ -138,6 +138,7 @@ func main() {
 		BufferBytes:       cfg.SessionBufBytes,
 		RelayBufSize:      cfg.RelayBufSize,
 		KeepAliveInterval: cfg.KeepAliveInterval,
+		LivenessRounds:    cfg.LivenessRounds,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
