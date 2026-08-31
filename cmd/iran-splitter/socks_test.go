@@ -171,3 +171,29 @@ func TestSocksNegotiateTruncatedDestination(t *testing.T) {
 		t.Fatal("truncated destination accepted")
 	}
 }
+
+// TestSocksNegotiateMaxDomainLength pins the SOCKS5 domain-length
+// boundary: the domain length is a single uint8 field, so 255 bytes is
+// the protocol maximum and must be accepted. A domain longer than 255
+// bytes is NOT representable in a SOCKS5 request (the parser reads the
+// length byte and then exactly that many bytes), so no separate
+// "domain too long" rejection exists in socksNegotiate — the protocol
+// itself makes the audit's `len(dest.Addr) > 255` check unreachable.
+func TestSocksNegotiateMaxDomainLength(t *testing.T) {
+	domain := make([]byte, 255)
+	for i := range domain {
+		domain[i] = 'a'
+	}
+	req := append(append([]byte{}, socksGreetingNoAuth...),
+		buildSocksRequest(0x01, 0x03, domain, 443)...)
+	dest, err, reply := negotiate(t, req)
+	if err != nil {
+		t.Fatalf("negotiate: %v", err)
+	}
+	if dest.AddrType != session.AddrTypeDomain || len(dest.Addr) != 255 || dest.Port != 443 {
+		t.Fatalf("dest = %+v, want 255-byte domain on port 443", dest)
+	}
+	if len(reply) < 2 || reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("reply = %v, want method-OK prefix", reply)
+	}
+}
