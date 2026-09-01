@@ -285,6 +285,17 @@ endpoint returns HTTP 429 until the window lapses. The permissive
 browsers are not legitimate clients) — the security boundary is the v1
 authentication plus TLS/Reality in the transport.
 
+**Down-carrier exposure (Germany `:9002`).** The down-carrier TCP listener
+is the Internet-exposed carrier endpoint. Concurrent *unauthenticated*
+handshakes are capped at 16 (a non-blocking gate acquired before
+`CarrierAuth`): connections beyond the cap are closed immediately in the
+accept loop — no auth goroutine is spawned for them — so the bound is
+enforced without ever blocking the accept loop. The slot is held only while
+the connection is unauthenticated, so an installed carrier never consumes a
+slot and a legitimate reconnect is never starved (a real carrier can only
+authenticate while no carrier is installed). The single-carrier `DownReady()`
+rejection and the 15 s handshake bound are unchanged.
+
 **Metrics.** The metrics endpoint binds to `127.0.0.1` only and exposes
 counts and byte totals — no secrets, tokens or destination details.
 
