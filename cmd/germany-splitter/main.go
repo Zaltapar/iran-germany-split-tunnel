@@ -98,8 +98,11 @@ type Splitter struct {
 	// legitimate reconnect is never blocked. It is created by the goroutine
 	// that spawns runDownCarrier (main in production; the test helpers in
 	// tests) so the field write happens before the accept loop or any
-	// handler reads it (no data race). Sized to maxDownHandshakes at
-	// runtime so tests can shrink the bound.
+	// handler reads it (no data race). Its CAPACITY is the unauthenticated-
+	// handshake bound: main sizes it to maxDownHandshakes; tests size it to
+	// a smaller value to make saturation deterministic. The accept loop
+	// reads the bound as cap(downAuthGate) (immutable instance state), never
+	// a mutable global.
 	downAuthGate chan struct{}
 	// downH waits for in-flight down-carrier handlers (one per accepted
 	// conn) so shutdown and tests can confirm every handler exits — no
@@ -298,10 +301,13 @@ func (s *Splitter) backoffSleep(b *backoff.Backoff) bool {
 // goroutine is spawned for them. This mirrors the Iran /upload WebSocket
 // endpoint's maxConcurrentHandshakes, adapted to raw TCP where there are no
 // status codes: the equivalent is an immediate close plus a rate-limited log
-// line (downAuthLogInterval). It is a var (not a const) only so tests can
-// shrink the bound; 16 matches the Iran WS limit and is ample for the 1–2
-// concurrent handshakes seen in legitimate operation.
-var maxDownHandshakes = 16
+// line (downAuthLogInterval). It is a CONST (immutable), NOT mutable global
+// state: each Splitter's gate channel is sized to a capacity at construction
+// (main uses maxDownHandshakes; tests pass a smaller one), and the accept
+// loop reads the bound as cap(s.downAuthGate). 16 matches the Iran WS limit
+// and is ample for the 1–2 concurrent handshakes seen in legitimate
+// operation.
+const maxDownHandshakes = 16
 
 // downAuthLogInterval rate-limits the saturation log: while the gate is
 // saturated the accept loop closes a connection on every iteration, so an
@@ -332,7 +338,7 @@ func (s *Splitter) runDownCarrier() {
 	if s.downAuthGate == nil {
 		s.downAuthGate = make(chan struct{}, maxDownHandshakes)
 	}
-	s.logger.Printf("Down-carrier listening on %s (max %d concurrent handshakes)", ln.Addr(), maxDownHandshakes)
+	s.logger.Printf("Down-carrier listening on %s (max %d concurrent handshakes)", ln.Addr(), cap(s.downAuthGate))
 	var lastSatLog time.Time
 	for {
 		conn, err := ln.Accept()
@@ -356,7 +362,7 @@ func (s *Splitter) runDownCarrier() {
 			now := time.Now()
 			if now.Sub(lastSatLog) >= downAuthLogInterval {
 				lastSatLog = now
-				s.logger.Printf("Down-carrier: rejected %s (max %d concurrent handshakes)", conn.RemoteAddr(), maxDownHandshakes)
+				s.logger.Printf("Down-carrier: rejected %s (max %d concurrent handshakes)", conn.RemoteAddr(), cap(s.downAuthGate))
 			}
 			conn.Close()
 		}

@@ -16,13 +16,17 @@ import (
 
 // Issue #5: the Germany down-carrier TCP listener bounds concurrent
 // UNAUTHENTICATED handshakes. The bound is a non-blocking gate in the accept
-// loop (maxDownHandshakes); saturated connections are closed promptly in the
-// accept loop without consuming an auth goroutine.
+// loop (a buffered channel on the Splitter); saturated connections are closed
+// promptly in the accept loop without consuming an auth goroutine.
 //
-// Production uses a bound of 16. These tests shrink it via the maxDownHand
-// test hook (so a small N makes saturation/rejection/leak assertions
-// deterministic and fast) and shorten mux.AuthTimeout so stalling peers do
-// not hold a slot for the full 15 s.
+// Production uses a bound of 16 (maxDownHandshakes, a const). The gate is
+// per-Splitter state: each test creates its own gate sized to a small N (via
+// startDownCarrier's gateCap) so saturation/rejection/leak assertions are
+// deterministic and fast. There is no mutable global to shrink — the accept
+// loop reads the bound as cap(s.downAuthGate), immutable instance state.
+// Tests also shorten mux.AuthTimeout so stalling peers do not hold a slot
+// for the full 15 s; that write happens before the accept-loop goroutine is
+// spawned (a `go` statement), so it is ordered before every handler's read.
 //
 // The test plays the DIALING Iran CLIENT. A "silent" peer reads the server's
 // auth challenge and then NEVER sends the response, so the server blocks in
@@ -76,17 +80,20 @@ func newTestDownSplitter(t *testing.T) *Splitter {
 // startDownCarrier starts runDownCarrier against a fresh loopback listener
 // (port 0) so tests never contend for the real :9002. It creates the
 // unauthenticated-handshake gate HERE (the spawning goroutine) so the gate
-// field write happens-before the accept loop and any handler read it.
-// Closing the returned listener unblocks the accept loop; a cleanup also
-// closes it so the accept goroutine can never leak.
-func startDownCarrier(t *testing.T, s *Splitter) net.Listener {
+// field write happens-before the accept loop and any handler read it; the
+// gate's CAPACITY is the unauthenticated-handshake bound (main sizes it to
+// maxDownHandshakes, tests pass a smaller one) — there is no mutable global
+// to shrink, so no test ever races the accept loop on the bound. Closing the
+// returned listener unblocks the accept loop; a cleanup also closes it so the
+// accept goroutine can never leak.
+func startDownCarrier(t *testing.T, s *Splitter, gateCap int) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	s.downLn = ln
-	s.downAuthGate = make(chan struct{}, maxDownHandshakes)
+	s.downAuthGate = make(chan struct{}, gateCap)
 	go s.runDownCarrier()
 	t.Cleanup(func() { ln.Close() })
 	return ln
@@ -202,7 +209,7 @@ func TestDownCarrierNormalAuth(t *testing.T) {
 	defer func() { mux.AuthTimeout = orig }()
 
 	s := newTestDownSplitter(t)
-	ln := startDownCarrier(t, s)
+	ln := startDownCarrier(t, s, maxDownHandshakes)
 
 	// A single legitimate client: the gate admits it, the handshake
 	// completes, and the handler installs the carrier.
@@ -233,12 +240,8 @@ func TestDownCarrierSaturationRejects(t *testing.T) {
 	mux.AuthTimeout = 1 * time.Second
 	defer func() { mux.AuthTimeout = orig }()
 
-	origLimit := maxDownHandshakes
-	maxDownHandshakes = N
-	defer func() { maxDownHandshakes = origLimit }()
-
 	s := newTestDownSplitter(t)
-	ln := startDownCarrier(t, s)
+	ln := startDownCarrier(t, s, N)
 
 	// N stalling clients: each is admitted (reads the challenge ⇒ holds a
 	// gate slot). Wait for all N to be admitted, which means the gate is full.
@@ -275,8 +278,8 @@ func TestDownCarrierDownReadyUnchanged(t *testing.T) {
 	mux.AuthTimeout = 1 * time.Second
 	defer func() { mux.AuthTimeout = orig }()
 
-	s := newTestDownSplitter(t) // maxDownHandshakes stays at its default (16)
-	ln := startDownCarrier(t, s)
+	s := newTestDownSplitter(t) // gate kept at the production bound (16)
+	ln := startDownCarrier(t, s, maxDownHandshakes)
 
 	// Complete first carrier.
 	trustedCarrier(t, ln, s.node.Secret())
@@ -310,13 +313,9 @@ func TestDownCarrierShutdownTerminatesInFlight(t *testing.T) {
 	mux.AuthTimeout = 1 * time.Second
 	defer func() { mux.AuthTimeout = orig }()
 
-	origLimit := maxDownHandshakes
-	maxDownHandshakes = N
-	defer func() { maxDownHandshakes = origLimit }()
-
 	baseline := runtime.NumGoroutine()
 	s := newTestDownSplitter(t)
-	ln := startDownCarrier(t, s)
+	ln := startDownCarrier(t, s, N)
 
 	peers := make([]peerSignal, N)
 	for i := range peers {
@@ -358,13 +357,9 @@ func TestDownCarrierStressNoLeak(t *testing.T) {
 	mux.AuthTimeout = 500 * time.Millisecond
 	defer func() { mux.AuthTimeout = orig }()
 
-	origLimit := maxDownHandshakes
-	maxDownHandshakes = N
-	defer func() { maxDownHandshakes = origLimit }()
-
 	baseline := runtime.NumGoroutine()
 	s := newTestDownSplitter(t)
-	ln := startDownCarrier(t, s)
+	ln := startDownCarrier(t, s, N)
 
 	// K stalling peers. The first N hold slots until the auth timeout; the
 	// rest are rejected immediately at the gate. All K connections are closed
