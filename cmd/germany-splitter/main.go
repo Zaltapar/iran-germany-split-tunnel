@@ -89,6 +89,25 @@ type Splitter struct {
 	lnMu   sync.Mutex
 	downLn net.Listener
 	mLn    net.Listener
+
+	// Down-carrier unauthenticated-handshake gate (Issue #5): a buffered
+	// semaphore bounding how many v1 handshakes may run concurrently on
+	// the Internet-exposed :9002 listener. Slots are held ONLY while the
+	// connection is unauthenticated (released as soon as it authenticates
+	// or auth fails), so an installed carrier never consumes a slot and a
+	// legitimate reconnect is never blocked. It is created by the goroutine
+	// that spawns runDownCarrier (main in production; the test helpers in
+	// tests) so the field write happens before the accept loop or any
+	// handler reads it (no data race). Its CAPACITY is the unauthenticated-
+	// handshake bound: main sizes it to maxDownHandshakes; tests size it to
+	// a smaller value to make saturation deterministic. The accept loop
+	// reads the bound as cap(downAuthGate) (immutable instance state), never
+	// a mutable global.
+	downAuthGate chan struct{}
+	// downH waits for in-flight down-carrier handlers (one per accepted
+	// conn) so shutdown and tests can confirm every handler exits — no
+	// goroutine leak.
+	downH sync.WaitGroup
 }
 
 // closeListeners unblocks all accept loops for a clean shutdown.
@@ -155,7 +174,11 @@ func main() {
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runUpCarrier() }()
 
-	// Down-Carrier: TCP server ← Iran
+	// Down-Carrier: TCP server ← Iran. The unauthenticated-handshake gate
+	// is created here (the spawning goroutine) so its write happens-before
+	// the accept loop and every handler read it; runDownCarrier treats a
+	// pre-created gate as authoritative and only creates one if absent.
+	s.downAuthGate = make(chan struct{}, maxDownHandshakes)
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runDownCarrier() }()
 
@@ -167,6 +190,11 @@ func main() {
 	s.node.Close() // Phase 4 authoritative session teardown + carrier close
 	s.closeListeners()
 	wg.Wait()
+	// Issue #5: every in-flight down-carrier handler must exit before we
+	// stop. Each is bounded (auth by AuthTimeout, install by the node
+	// context / carrier close), so this completes; it guarantees no
+	// goroutine is leaked past shutdown.
+	s.downH.Wait()
 	s.logger.Println("germany-splitter stopped")
 }
 
@@ -266,29 +294,95 @@ func (s *Splitter) backoffSleep(b *backoff.Backoff) bool {
 // connection lands here.
 // ============================================================
 
+// Down-carrier unauthenticated-handshake concurrency bound (Issue #5):
+// the maximum number of v1 authentication handshakes that may run
+// concurrently on the Internet-exposed down-carrier listener. Connections
+// beyond the bound are closed promptly in the accept loop — no auth
+// goroutine is spawned for them. This mirrors the Iran /upload WebSocket
+// endpoint's maxConcurrentHandshakes, adapted to raw TCP where there are no
+// status codes: the equivalent is an immediate close plus a rate-limited log
+// line (downAuthLogInterval). It is a CONST (immutable), NOT mutable global
+// state: each Splitter's gate channel is sized to a capacity at construction
+// (main uses maxDownHandshakes; tests pass a smaller one), and the accept
+// loop reads the bound as cap(s.downAuthGate). 16 matches the Iran WS limit
+// and is ample for the 1–2 concurrent handshakes seen in legitimate
+// operation.
+const maxDownHandshakes = 16
+
+// downAuthLogInterval rate-limits the saturation log: while the gate is
+// saturated the accept loop closes a connection on every iteration, so an
+// unthrottled log would itself become a resource-exhaustion vector.
+const downAuthLogInterval = time.Second
+
+// runDownCarrier is the down-carrier accept loop. It gates each accepted
+// connection through a non-blocking handshake semaphore (maxDownHandshakes)
+// BEFORE spawning a handler: the gate is acquired in the accept loop and is
+// never blocked on, so saturation closes the connection immediately without
+// consuming an auth goroutine and the accept loop itself stays responsive.
 func (s *Splitter) runDownCarrier() {
-	ln, err := net.Listen("tcp", s.config.DownListen)
-	if err != nil {
-		s.logger.Fatalf("Down-carrier listener: %v", err)
+	ln := s.downLn // may be pre-configured (tests); production leaves it nil
+	if ln == nil {
+		var err error
+		ln, err = net.Listen("tcp", s.config.DownListen)
+		if err != nil {
+			s.logger.Fatalf("Down-carrier listener: %v", err)
+		}
+		s.lnMu.Lock()
+		s.downLn = ln
+		s.lnMu.Unlock()
 	}
-	s.lnMu.Lock()
-	s.downLn = ln
-	s.lnMu.Unlock()
 	defer ln.Close()
-	s.logger.Printf("Down-carrier listening on %s", s.config.DownListen)
+	// The gate is normally created by the spawning goroutine (see main),
+	// so its field write happens-before the accept loop reads it. Only
+	// create it here if the caller (a test) did not pre-create one.
+	if s.downAuthGate == nil {
+		s.downAuthGate = make(chan struct{}, maxDownHandshakes)
+	}
+	s.logger.Printf("Down-carrier listening on %s (max %d concurrent handshakes)", ln.Addr(), cap(s.downAuthGate))
+	var lastSatLog time.Time
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go s.handleDownConn(conn)
+		// Gate the UNAUTHENTICATED handshake. The slot is held only while
+		// the connection is unauthenticated (handleDownConn releases it as
+		// soon as auth completes or fails), so a long-lived installed
+		// carrier never occupies a slot and a legitimate reconnect can
+		// never be starved by the gate: a legit carrier can only begin
+		// authenticating when DownReady() is false, i.e. when no carrier
+		// is installed holding a slot.
+		select {
+		case s.downAuthGate <- struct{}{}:
+			s.downH.Add(1)
+			go s.handleDownConn(conn, func() { <-s.downAuthGate })
+		default:
+			// Saturated: close promptly. Rate-limited log (the TCP
+			// analogue of the WS endpoint's 429/503 backoff).
+			now := time.Now()
+			if now.Sub(lastSatLog) >= downAuthLogInterval {
+				lastSatLog = now
+				s.logger.Printf("Down-carrier: rejected %s (max %d concurrent handshakes)", conn.RemoteAddr(), cap(s.downAuthGate))
+			}
+			conn.Close()
+		}
 	}
 }
 
-func (s *Splitter) handleDownConn(conn net.Conn) {
+// handleDownConn processes one accepted down-carrier connection: the
+// single-carrier DownReady() check, the bounded v1 authentication
+// handshake, and installation of the authenticated carrier on the node.
+// releaseSlot frees the accept-loop handshake slot; it is invoked exactly
+// once per connection, as soon as the connection is no longer
+// unauthenticated (auth success or failure) so the installed carrier holds
+// no slot.
+func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
+	defer s.downH.Done()
+
 	// Only one down-carrier at a time — reject secondaries cleanly
 	// (the node's DownReady() reports whether one is installed).
 	if s.node.DownReady() {
+		releaseSlot()
 		s.logger.Printf("Down-carrier: rejected %s (already connected)", conn.RemoteAddr())
 		conn.Close()
 		return
@@ -297,6 +391,9 @@ func (s *Splitter) handleDownConn(conn net.Conn) {
 	ctx, cancel := context.WithTimeout(s.node.Context(), 15*time.Second)
 	br, err := mux.CarrierAuth(ctx, conn, false, mux.RoleDownload, s.node.Secret())
 	cancel()
+	// Authentication has concluded (succeeded or failed): release the
+	// handshake slot. The carrier must not keep it for its lifetime.
+	releaseSlot()
 	if err != nil {
 		s.logger.Printf("Down-carrier auth failed from %s: %v", conn.RemoteAddr(), err)
 		conn.Close()
