@@ -1538,3 +1538,78 @@ section); its individual items are dispositioned:
 - clock skew 60s → 300s → REJECTED (NTP-synced VPS; nonces provide
   replay protection independent of clock quality; no demonstrated
   failure).
+
+## Follow-up — down-carrier handshake bound data race (PR #13, commit `a68f81c`)
+
+### The race (GitHub Linux `go test -race`, PR #13 on `cf2bc7b`)
+
+```
+WARNING: DATA RACE
+  Write: down_carrier_auth_limit_test.go:238 (maxDownHandshakes restore via defer)
+  Read:  cmd/germany-splitter/main.go:359 (saturation log in the accept loop)
+Failing test: TestDownCarrierSaturationRejects
+```
+
+### Root cause + classification
+
+The unauthenticated-handshake bound was a **mutable package-global**
+(`var maxDownHandshakes = 16`). The production **accept-loop goroutine**
+read it on every iteration (gate sizing + saturation log), while three
+tests **wrote** it (`TestDownCarrierSaturationRejects`,
+`TestDownCarrierShutdownTerminatesInFlight`, `TestDownCarrierStressNoLeak`)
+and restored it via `defer` at test exit — concurrent with the still-running
+accept loop. **Classification: test-triggered, but the root cause is an
+unsuitable ownership model in production code** — the bound had no owner;
+it was global mutable state that the long-lived accept loop depended on.
+
+### The fix (no mutex)
+
+Eliminate the mutable global; give the bound explicit owner/lifecycle
+semantics — **the bound is now per-`Splitter` immutable state, carried by
+the gate channel's capacity**:
+
+- `maxDownHandshakes` is now a `const` (16). It is never written by anyone.
+- `main()` sizes the gate `make(chan struct{}, maxDownHandshakes)` at spawn
+  time; each test sizes its own gate to a small N via
+  `startDownCarrier(t, s, gateCap)`. The accept loop reads the bound as
+  `cap(s.downAuthGate)` — immutable, owned by the `Splitter`, with a clean
+  happens-before edge from the spawning goroutine (the `go s.runDownCarrier()`
+  statement) to the accept loop. There is no write after the gate exists.
+- Behavior is unchanged: non-blocking gate in the accept loop, prompt close
+  on saturation (no auth goroutine), slot held only while unauthenticated,
+  `DownReady()` single-carrier rejection unchanged, 15 s auth bound
+  unchanged, `downH` WaitGroup shutdown unchanged. No protocol change.
+- The tests' write of `mux.AuthTimeout` is NOT racy: it happens before the
+  `go` statement that spawns the accept loop (a happens-before edge), and
+  all Issue #5 tests run sequentially (no `t.Parallel`), so no handler is
+  running when it is restored.
+
+### Verification (Windows dev host)
+
+- `go build ./...`, `go vet ./...`, `go test ./...` — green (all 8 packages).
+- `go test ./cmd/germany-splitter -count=20` — stable (45 s, no flakes).
+- All 5 Issue #5 tests pass: NormalAuth, SaturationRejects,
+  DownReadyUnchanged, ShutdownTerminatesInFlight, StressNoLeak.
+- `go run ./e2e-pipe-test` — PASS.
+- `go test -race` cannot run on the Windows dev host (`0xc0000139`,
+  documented toolchain limitation) — the Linux CI run is the authoritative
+  gate.
+
+### CI state (honest record)
+
+The Linux `go test -race ./...` result for `a68f81c` was **NOT yet
+observable** through the available tool at the time of this record: the
+status endpoint returned `pending` with zero recorded check runs for the
+new SHA (the run was still starting), and subsequent status queries failed
+with a transient API `fetch failed` (the core PR API responded normally,
+confirming the push landed: head = `a68f81c`, pushed 2026-09-02T10:32Z).
+Per the bounded-CI policy, no polling loop was run. **PR #13 is NOT
+merged and Issue #5 is NOT closed until the Linux race workflow is
+actually green.** Merge on green: `Fixes #5` closes the issue automatically.
+
+### Rollback
+
+`git revert a68f81c` (or rebase the branch back to `cf2bc7b` if unmerged).
+The race fix is test/ownership-scoped: no production behavior change, so
+reverting it restores the racy bound (the pre-`a68f81c` state) without
+affecting the Issue #5 gate itself.
