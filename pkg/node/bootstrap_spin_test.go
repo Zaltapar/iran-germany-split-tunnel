@@ -9,29 +9,50 @@ import (
 	"time"
 )
 
-// TestWaitCarriersNoBusySpin (Issue #7 busy-spin regression): while one
-// direction is already READY (its ready channel is CLOSED), a
-// waitCarriers that selects on both signals re-selects the closed
-// channel every iteration and spins at full CPU until the deadline.
-// The fix selects only on the NOT-READY direction (nil channel disables
-// the other case), so the waiter BLOCKS.
+// TestWaitCarriersNoBusySpin (Issue #7 busy-spin regression).
 //
-// Deterministic discriminator: a blocked waiter's goroutine stack state
-// is "[select]" (parked in selectgo, no ready case); a spinner's state
-// is "[running]" (selectgo always finds the closed case ready). We
-// sample the waiter's state from a dedicated goroutine (so the test
-// thread being descheduled on a loaded host cannot mask the sample)
-// with a generous bounded window.
+// Property under test: when ONE direction is already READY (its ready
+// channel is CLOSED) and the other is absent, waitCarriers must BLOCK
+// (park in the select) -- it must NOT select on the closed ready
+// channel, which would leave a ready case on every iteration and spin
+// the loop at full CPU until the deadline.
+//
+// The fix: waitCarriers selects only on the NOT-READY direction(s); a
+// nil channel disables that case, so the already-ready (closed) channel
+// can never be selected.
+//
+// Deterministic discriminator (a STABLE state, not a transient one):
+//   - A correctly-blocking waiter parks in the select (goroutine state
+//     "[select]") and HOLDS it for the whole wait, because no case is
+//     ever ready. It reaches the parked state within microseconds of
+//     starting and stays there until the deadline.
+//   - A busy-spinner ALWAYS has a ready case (the closed channel) and
+//     therefore NEVER parks: its state is only ever "running" or
+//     "runnable", never "[select]".
+//
+// So "reaches and holds the parked [select] state" is a SOUND
+// discriminator: the correct implementation produces it; the buggy one
+// structurally cannot.
+//
+// We POLL for that stable state (bounded window), deliberately IGNORING
+// the transient "running"/"runnable" states the goroutine passes through
+// while getting to its first select. (An earlier version took a SINGLE
+// early sample and failed on a transient "runnable" -- invalid, because
+// any goroutine, including a correctly-blocking one, is "runnable"
+// before it parks, and under the -race detector that pre-park window is
+// wide enough that an early sample lands on it.) Polling for the stable
+// end state removes the scheduler dependence without weakening the
+// assertion: a spinner still fails, on the window timeout.
 func TestWaitCarriersNoBusySpin(t *testing.T) {
 	n := NewNode(Config{
 		Role: RoleIran, Grace: time.Second,
 		RelayBufSize: 4096, BufferBytes: 64 << 10,
-		BootstrapWait:     3 * time.Second,
+		BootstrapWait:     3 * time.Second, // long: the waiter outlives the probe
 		KeepAliveInterval: time.Hour,
 	}, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
 	defer n.Close()
 	a, _ := pipePair(t)
-	n.InstallUp(a, nil) // up ready, down absent → the busy-spin scenario
+	n.InstallUp(a, nil) // up ready (closed channel), down absent -> the spin scenario
 
 	waitDone := make(chan error, 1)
 	go func() {
@@ -39,44 +60,16 @@ func TestWaitCarriersNoBusySpin(t *testing.T) {
 		waitDone <- err
 	}()
 
-	// Sample the waiter's stack state from a separate goroutine: the
-	// first time its frame appears, record the state. (A spinner would
-	// show "running"; a blocked waiter shows "select".)
-	type sample struct {
-		state string
-		found bool
-	}
-	sampleCh := make(chan sample, 1)
-	go func() {
-		deadline := time.Now().Add(2 * time.Second)
-		for {
-			state, found := goroutineState(t, "(*Node).waitCarriers")
-			if found {
-				sampleCh <- sample{state, true}
-				return
-			}
-			if time.Now().After(deadline) {
-				sampleCh <- sample{"", false}
-				return
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-	}()
-
-	var got sample
-	select {
-	case got = <-sampleCh:
-	case <-time.After(10 * time.Second): // generous on loaded hosts
-		t.Fatal("could not observe the waitCarriers goroutine (sampler timed out)")
-	}
-	if !got.found {
-		t.Fatal("waitCarriers goroutine never observed on the stack (did it return early?)")
-	}
-	if strings.Contains(got.state, "running") {
-		t.Fatalf("waitCarriers goroutine state is %q — BUSY-SPIN (selecting the closed ready channel); want blocked [select]", got.state)
-	}
-	if !strings.Contains(got.state, "select") {
-		t.Fatalf("waitCarriers goroutine state is %q, want blocked [select]", got.state)
+	// Wait for the waiter to reach AND hold the stable parked [select]
+	// state. Fails (window timeout) iff it never parks -- i.e., it is
+	// spinning (keeps a ready select case, i.e. selects the closed
+	// ready channel).
+	parked := pollGoroutineState(t, 2*time.Second, "(*Node).waitCarriers",
+		func(state string) bool { return state == "select" })
+	if !parked {
+		t.Fatal("waitCarriers never reached a stable parked [select] state within 2s -- " +
+			"BUSY-SPIN suspected (a ready select case is present, i.e. it selects the " +
+			"closed ready channel); want the waiter blocked in [select]")
 	}
 
 	// The wait itself must still be bounded (deadline fires at 3s).
@@ -90,15 +83,37 @@ func TestWaitCarriersNoBusySpin(t *testing.T) {
 	}
 }
 
+// pollGoroutineState polls the stack state of the (unique) goroutine
+// whose stack contains frame until want(state) holds or the window
+// expires; returns whether want was satisfied. Transient states that do
+// not satisfy want are re-polled (not failed on), so this asserts a
+// STABLE end state rather than a single transient sample. The 5 ms poll
+// interval is a scheduling allowance for the goroutine to reach its
+// first select (guaranteed for the correct implementation); it is not a
+// synchronization dependency -- the asserted state, once reached, is
+// stable for the remainder of the wait.
+func pollGoroutineState(t *testing.T, window time.Duration, frame string, want func(string) bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for {
+		if state, found := goroutineState(t, frame); found && want(state) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // goroutineState returns the runtime stack state (e.g. "select",
-// "running") of the (unique) goroutine whose stack contains the given
-// frame, for white-box assertions.
+// "running", "runnable") of the (unique) goroutine whose stack contains
+// the given frame, for white-box assertions.
 func goroutineState(t *testing.T, frame string) (string, bool) {
 	t.Helper()
 	buf := make([]byte, 64<<10)
 	for {
-		// all=true: every goroutine (false would dump only this one).
-		nb := runtime.Stack(buf, true)
+		nb := runtime.Stack(buf, true) // all=true: dump every goroutine
 		if nb <= len(buf) {
 			break
 		}
