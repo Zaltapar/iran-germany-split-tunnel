@@ -25,6 +25,13 @@ type Metrics struct {
 	carrierRebindFailures int64
 	sessionsRecovered     int64
 	sessionsLostAfterCarF int64
+
+	// Issue #6: aggregate session-buffer budget. sessionBufferReclaimed
+	// counts bytes returned to (or force-reclaimed by) the budget — a
+	// health signal: steady growth with a flat gauge means normal
+	// flush/discard churn; a jump at Node.Close means shutdown
+	// reclamation.
+	sessionBufferReclaimed int64
 }
 
 // NewMetrics creates a zeroed metrics set.
@@ -108,36 +115,50 @@ func (m *Metrics) SessionLostAfterFailure() {
 	m.mu.Unlock()
 }
 
+// AddSessionBufferReclaimed adds bytes reclaimed from the aggregate
+// session-buffer budget (flushed, discarded, or force-reclaimed at
+// Node.Close).
+func (m *Metrics) AddSessionBufferReclaimed(n int64) {
+	if n <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.sessionBufferReclaimed += n
+	m.mu.Unlock()
+}
+
 // Snapshot is a point-in-time copy of all counters.
 type Snapshot struct {
-	ActiveSessions        int64
-	TotalSessions         int64
-	TotalBytesUp          int64
-	TotalBytesDown        int64
-	Errors                int64
-	CarrierLossEvents     int64
-	CarrierReconnects     int64
-	CarrierRebinds        int64
-	CarrierRebindFailures int64
-	SessionsRecovered     int64
-	SessionsLostAfterCarF int64
+	ActiveSessions         int64
+	TotalSessions          int64
+	TotalBytesUp           int64
+	TotalBytesDown         int64
+	Errors                 int64
+	CarrierLossEvents      int64
+	CarrierReconnects      int64
+	CarrierRebinds         int64
+	CarrierRebindFailures  int64
+	SessionsRecovered      int64
+	SessionsLostAfterCarF  int64
+	SessionBufferReclaimed int64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
-		ActiveSessions:        m.activeSessions,
-		TotalSessions:         m.totalSessions,
-		TotalBytesUp:          m.bytesUp,
-		TotalBytesDown:        m.bytesDown,
-		Errors:                m.errs,
-		CarrierLossEvents:     m.carrierLossEvents,
-		CarrierReconnects:     m.carrierReconnects,
-		CarrierRebinds:        m.carrierRebinds,
-		CarrierRebindFailures: m.carrierRebindFailures,
-		SessionsRecovered:     m.sessionsRecovered,
-		SessionsLostAfterCarF: m.sessionsLostAfterCarF,
+		ActiveSessions:         m.activeSessions,
+		TotalSessions:          m.totalSessions,
+		TotalBytesUp:           m.bytesUp,
+		TotalBytesDown:         m.bytesDown,
+		Errors:                 m.errs,
+		CarrierLossEvents:      m.carrierLossEvents,
+		CarrierReconnects:      m.carrierReconnects,
+		CarrierRebinds:         m.carrierRebinds,
+		CarrierRebindFailures:  m.carrierRebindFailures,
+		SessionsRecovered:      m.sessionsRecovered,
+		SessionsLostAfterCarF:  m.sessionsLostAfterCarF,
+		SessionBufferReclaimed: m.sessionBufferReclaimed,
 	}
 }
 
@@ -156,5 +177,6 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "carrier_rebind_failures %d\n", s.CarrierRebindFailures)
 	fmt.Fprintf(&b, "sessions_recovered %d\n", s.SessionsRecovered)
 	fmt.Fprintf(&b, "sessions_lost_after_carrier_failure %d\n", s.SessionsLostAfterCarF)
+	fmt.Fprintf(&b, "session_buffer_reclaimed %d\n", s.SessionBufferReclaimed)
 	return b.String()
 }

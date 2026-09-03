@@ -45,22 +45,23 @@ const (
 
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen    = "SPLIT_SOCKS_LISTEN"             // Iran
-	EnvWsListen       = "SPLIT_WS_LISTEN"                // Iran
-	EnvDownCarrier    = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
-	EnvUpWsUrl        = "SPLIT_UP_WS_URL"                // Germany
-	EnvDownListen     = "SPLIT_DOWN_LISTEN"              // Germany
-	EnvSecret         = "SPLIT_SECRET"                   // both
-	EnvAllowWeak      = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
-	EnvMetricsPort    = "SPLIT_METRICS_PORT"             // both
-	EnvRelayBuf       = "SPLIT_RELAY_BUF"                // both
-	EnvQueueBytes     = "SPLIT_STREAM_QUEUE_BYTES"       // both
-	EnvQueueFrames    = "SPLIT_STREAM_QUEUE_FRAMES"      // both
-	EnvQueueTotal     = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
-	EnvOverflowMs     = "SPLIT_STREAM_OVERFLOW_MS"       // both
-	EnvCarrierGrace   = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
-	EnvSessionBuf     = "SPLIT_SESSION_BUFFER_BYTES"     // both — Phase 5
-	EnvLivenessRounds = "SPLIT_LIVENESS_ROUNDS"          // both — blackhole detection
+	EnvSocksListen     = "SPLIT_SOCKS_LISTEN"               // Iran
+	EnvWsListen        = "SPLIT_WS_LISTEN"                  // Iran
+	EnvDownCarrier     = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
+	EnvUpWsUrl         = "SPLIT_UP_WS_URL"                  // Germany
+	EnvDownListen      = "SPLIT_DOWN_LISTEN"                // Germany
+	EnvSecret          = "SPLIT_SECRET"                     // both
+	EnvAllowWeak       = "SPLIT_ALLOW_WEAK_SECRET"          // both (bool)
+	EnvMetricsPort     = "SPLIT_METRICS_PORT"               // both
+	EnvRelayBuf        = "SPLIT_RELAY_BUF"                  // both
+	EnvQueueBytes      = "SPLIT_STREAM_QUEUE_BYTES"         // both
+	EnvQueueFrames     = "SPLIT_STREAM_QUEUE_FRAMES"        // both
+	EnvQueueTotal      = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
+	EnvOverflowMs      = "SPLIT_STREAM_OVERFLOW_MS"         // both
+	EnvCarrierGrace    = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
+	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
+	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
+	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -98,6 +99,15 @@ const (
 	DefaultSessionBuf = 256 << 10
 	MinSessionBuf     = 4 << 10  // 4 KiB
 	MaxSessionBuf     = 16 << 20 // 16 MiB
+
+	// Issue #6: node-level aggregate session-buffer budget bounds.
+	// 0 = library default (node.DefaultSessionBufferTotal, 32 MiB) —
+	// the same 0-means-default convention as the queue fields. The
+	// maximum keeps a misconfiguration from reserving gigabytes up
+	// front; the per-buffer SPLIT_SESSION_BUFFER_BYTES bound is
+	// unchanged and still applies on top of the aggregate.
+	DefaultSessionBufTotal = 0
+	MaxSessionBufTotal     = 512 << 20 // 512 MiB
 
 	// Carrier liveness (blackhole detection): consecutive unanswered
 	// keepalive pings after which the carrier is declared dead. Zero is
@@ -140,6 +150,7 @@ type Config struct {
 	// Phase 5 carrier-loss recovery (pkg/node engine).
 	CarrierGraceMs  int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
+	SessionBufTotal int // SPLIT_SESSION_BUFFER_TOTAL_BYTES: node-level aggregate (0 = library default)
 
 	// Carrier liveness (blackhole detection): consecutive unanswered
 	// keepalive pings before the carrier is torn down through the normal
@@ -203,6 +214,7 @@ func Load(role string) (*Config, error) {
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
 	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
+	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
@@ -315,6 +327,11 @@ func (c *Config) Validate(role string) error {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d: expected %d..%d bytes (Phase 5 per-direction reconnect buffer)",
 			EnvSessionBuf, c.SessionBufBytes, MinSessionBuf, MaxSessionBuf))
+	}
+	if c.SessionBufTotal < 0 || c.SessionBufTotal > MaxSessionBufTotal {
+		problems = append(problems, fmt.Sprintf(
+			"%s=%d: expected 0 (library default) .. %d bytes (Issue #6 node-level aggregate session-buffer budget)",
+			EnvSessionBufTotal, c.SessionBufTotal, MaxSessionBufTotal))
 	}
 	// Cross-field: the carrier-wide budget must cover one stream's share.
 	if c.QueueBytesPerStream > 0 && c.QueueBytesTotal > 0 &&

@@ -85,6 +85,16 @@ type Config struct {
 	// relay applies backpressure (stops reading the socket) instead of
 	// growing memory.
 	BufferBytes int
+	// SessionBufferTotalBytes bounds the SUM of ALL shape-A pending
+	// reconnect buffers on this node (Issue #6; SPLIT_SESSION_BUFFER_
+	// TOTAL_BYTES; default 32 MiB, see defaultSessionBufferTotal). When
+	// exhausted, additional buffer fills are refused and the relays stop
+	// reading their sockets — backpressure to the client/target, exactly
+	// as the per-buffer-full case — so the aggregate can never silently
+	// exceed the budget. 0 is lifted to the default by Sanitize. See
+	// budget.go for the exact accounting invariant and the fair-refusal
+	// policy.
+	SessionBufferTotalBytes int
 	// RelayBufSize is the socket read-buffer size (default 32 KiB).
 	RelayBufSize int
 	// KeepAliveInterval is the carrier ping period (default 30s).
@@ -109,6 +119,9 @@ func (c *Config) Sanitize() {
 	}
 	if c.BufferBytes <= 0 {
 		c.BufferBytes = 256 << 10
+	}
+	if c.SessionBufferTotalBytes <= 0 {
+		c.SessionBufferTotalBytes = defaultSessionBufferTotal
 	}
 	if c.RelayBufSize <= 0 {
 		c.RelayBufSize = 32 << 10
@@ -147,6 +160,16 @@ func (h *carrierHandle) Carrier() *mux.CarrierConn { return h.carrier }
 // Gen is the carrier's generation.
 func (h *carrierHandle) Gen() uint64 { return h.gen }
 
+// defaultSessionBufferTotal is the node-level aggregate session-buffer
+// budget default (Issue #6): 32 MiB. At the default per-buffer bound
+// (256 KiB) that covers ~128 fully-stalled session-directions before the
+// aggregate engages — ample for a healthy node (each buffer fills only
+// while its carrier is down AND the peer keeps sending), yet far below
+// the OOM territory the unbounded sum reached (hundreds of sessions at
+// the 16 MiB per-buffer max setting). Operators raise it for very large
+// concurrent-session deployments.
+const defaultSessionBufferTotal = 32 << 20 // 32 MiB
+
 // Node is the per-side engine.
 type Node struct {
 	cfg     Config
@@ -154,6 +177,11 @@ type Node struct {
 	metrics *Metrics
 	logger  *log.Logger
 	secret  []byte
+
+	// buf is the node-level aggregate budget for shape-A reconnect
+	// buffers (Issue #6). It is immutable after NewNode (created with
+	// the sanitized limit) — explicit ownership, no mutable global.
+	buf *sessionBufferBudget
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -181,6 +209,7 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 		secret:  secret,
 		ctx:     ctx,
 		cancel:  cancel,
+		buf:     newSessionBufferBudget(cfg.SessionBufferTotalBytes),
 	}
 }
 
@@ -204,7 +233,14 @@ func (n *Node) Context() context.Context { return n.ctx }
 func (n *Node) Shutdown() bool { return n.ctx.Err() != nil }
 
 // Close shuts the node down: cancel the context, close every session
-// (Phase 4 authoritative path), close the current carriers. Idempotent.
+// (Phase 4 authoritative path), close the current carriers, and force-
+// reclaim every outstanding session-buffer reservation. Idempotent.
+//
+// The budget reclamation is authoritative (budget.go): even a relay
+// that is parked in a socket read with a partially-reserved chunk at
+// this instant has its bytes reclaimed here, so after Close the
+// aggregate reports zero accounted bytes and zero active relays and
+// main's wg.Wait() completes with no buffer bytes outstanding.
 func (n *Node) Close() {
 	n.cancel()
 	n.store.CloseAll()
@@ -216,7 +252,20 @@ func (n *Node) Close() {
 		n.down.carrier.Close()
 	}
 	n.mu.Unlock()
+	if reclaimed := n.buf.Close(); reclaimed > 0 {
+		n.metrics.AddSessionBufferReclaimed(reclaimed)
+	}
 }
+
+// SessionBufferAccounted is the current node-level aggregate usage of
+// the shape-A reconnect buffers in bytes (the session_buffered_bytes
+// /metrics gauge, Issue #6).
+func (n *Node) SessionBufferAccounted() int64 { return n.buf.AccountedBytes() }
+
+// SessionBufferActiveRelays is the number of shape-A relays currently
+// registered with the aggregate budget (white-box leak check; must be
+// 0 after Close).
+func (n *Node) SessionBufferActiveRelays() int { return n.buf.ActiveRelays() }
 
 // UpReady reports whether a live up carrier is currently installed.
 func (n *Node) UpReady() bool {

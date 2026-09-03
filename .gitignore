@@ -1,5 +1,11 @@
 # Binaries
 *.exe
+
+# Local agent/tooling artifacts (not part of the Go project)
+node_modules/
+package.json
+package-lock.json
+.roo/
 *.bin
 
 # Build artifacts
