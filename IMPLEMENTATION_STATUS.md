@@ -5,6 +5,33 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Issue #6 — aggregate session-buffer budget (this branch,
+  `fix/issue-6-session-buffer-budget`, commit `d522ff1` off `main`
+  @ `ea2cf4d` — rebased onto the Issue #5 merge)**:
+  `SPLIT_SESSION_BUFFER_TOTAL_BYTES` (new, both roles;
+  0 = node default 32 MiB, max 512 MiB) bounds the SUM of the
+  per-direction reconnect buffers across ALL sessions on a node; the
+  per-buffer bound is unchanged and still applies on top. Primitive:
+  `pkg/node/budget.go` (`sessionBufferBudget`), the session-side
+  mirror of the Phase 3 carrier `StreamQueue.budget` — check-then-
+  charge under one mutex, clamped refunds (never negative),
+  authoritative `Close` reclaim. The gauge
+  (`/metrics session_buffered_bytes`) is EXACTLY the sum of the
+  relays' pending-slice lengths. A relay only charges after reading
+  from its socket (a blocked reader holds zero budget, so stalled
+  peers can never starve the aggregate; a reservation-first design
+  was prototyped and rejected for exactly that reason). Saturated
+  policy: `chargeWait` parks the relay until a refund frees space or
+  the session ends — no session monopolizes the budget, no deadlock
+  path (grace window + `Node.Close` always resolve). Tests: budget
+  unit tests (fill/refusal/park, clamp, 64-chargers-no-over-admit,
+  Close-reclaim) + node-level two-node integration (cap under
+  concurrent stalls with byte-exact delivery and gauge→0,
+  refusal/freed-space reuse, 200-session stress with 3 carrier
+  cycles + goroutine-leak check, clean shutdown with pending bytes),
+  with a continuous `0 <= gauge <= limit` invariant sampler. Full
+  `go build/vet/test ./...` green (Windows, no -race), e2e-pipe-test
+  PASS, `pkg/node` 3x stable; committed blobs gofmt-clean (LF).
 - **All hardening phases (1–8) complete** — see the historical phase
   records below.
 - **Stream-ID wraparound to reserved stream 0 — RESOLVED (this

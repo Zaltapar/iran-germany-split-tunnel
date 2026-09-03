@@ -29,6 +29,20 @@ type netConn = net.Conn
 
 // relayShapeA pumps sock → carrier for one direction (Iran: client→up;
 // Germany: target→down).
+//
+// Memory is bounded at TWO levels (Issue #6):
+//  1. the per-buffer cap (capacity, SPLIT_SESSION_BUFFER_BYTES) — the
+//     existing Phase 5 bound;
+//  2. the node-level AGGREGATE budget (n.buf,
+//     SPLIT_SESSION_BUFFER_TOTAL_BYTES) — the sum over all sessions and
+//     directions on this node.
+//
+// Both apply the same backpressure when full: stop reading the socket,
+// park in waitAttach (bounded by the grace timer / shutdown). A read is
+// only attempted after the budget grants a reservation for the chunk
+// about to be read, so the aggregate can never silently exceed its
+// budget (budget.go documents the exact accounting invariant and the
+// fair-refusal policy).
 func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock netConn) {
 	att := sess.Att(dir)
 	buf := make([]byte, n.cfg.RelayBufSize)
@@ -36,6 +50,18 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 	capacity := n.cfg.BufferBytes
 	socketEOF := false
 	finSent := false
+
+	// Aggregate-budget registration (Issue #6). bufKey{sess,dir} is the
+	// relay's identity; begin/end are called from this goroutine only
+	// (the single owner of `pending`), and end reclaims any bytes still
+	// held so no path can leak reservations.
+	bk := bufKey{sess: sess, dir: dir}
+	n.buf.begin(bk)
+	defer func() {
+		if reclaimed := n.buf.end(bk); reclaimed > 0 {
+			n.metrics.AddSessionBufferReclaimed(reclaimed)
+		}
+	}()
 
 	for {
 		select {
@@ -59,7 +85,7 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 				// timer) for a rebind so the half-close is delivered
 				// after all buffered data.
 				n.waitAttach(sess, att)
-			} else if !n.flushPending(sess, dir, &pending) {
+			} else if !n.flushPending(sess, dir, &pending, bk) {
 				n.waitAttach(sess, att)
 			}
 			continue
@@ -70,7 +96,7 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 		// deliver its pending bytes on rebind even if the peer sends no
 		// further data. (A no-op when pending is empty.)
 		if len(pending) > 0 {
-			if !n.flushPending(sess, dir, &pending) {
+			if !n.flushPending(sess, dir, &pending, bk) {
 				n.waitAttach(sess, att)
 				continue
 			}
@@ -89,6 +115,23 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 				n.metrics.AddUp(int64(nread))
 			} else {
 				n.metrics.AddDown(int64(nread))
+			}
+			// Aggregate backpressure (Issue #6): charge the bytes to
+			// the node-level budget at the moment they enter the
+			// pending slice. If the budget is saturated the charge
+			// parks (the bytes sit in the fixed read buffer, NOT in
+			// the pending slice, NOT in the gauge) until a refund
+			// frees space or the session ends — a relay blocked in a
+			// socket Read holds zero budget, so stalled/idle peers
+			// can never starve the budget. Parking is bounded: the
+			// carrier-loss grace window closes stalled sessions and
+			// Node.Close force-reclaims everything (budget.go).
+			if !n.buf.chargeWait(bk, nread, sess.Ctx) {
+				// Session ended (grace timeout / shutdown): discard
+				// this chunk and exit; the pending slice's bytes are
+				// reclaimed by the deferred end().
+				sess.Close("session-buffer budget: node shutting down")
+				return
 			}
 			pending = append(pending, buf[:nread]...)
 		}
@@ -122,7 +165,12 @@ func sockReadErr(dir session.Direction) string {
 // self-detaching the attachment if the bound carrier died mid-write.
 // A byte leaves the buffer only after WriteFrame succeeds, so the
 // buffer is the lossless reconnect window.
-func (n *Node) flushPending(sess *session.Session, dir session.Direction, pending *[]byte) bool {
+//
+// Aggregate accounting (Issue #6): each successfully written chunk is
+// refunded to the node-level budget at the exact moment it leaves the
+// pending slice, so the budget invariant (accounted == bytes still in
+// the pending slices) holds between calls as well as inside them.
+func (n *Node) flushPending(sess *session.Session, dir session.Direction, pending *[]byte, bk bufKey) bool {
 	att := sess.Att(dir)
 	st, gen := att.State()
 	if st != session.AttAttached {
@@ -145,6 +193,9 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 			return false
 		}
 		*pending = (*pending)[len(chunk):]
+		if r := n.buf.refund(bk, len(chunk)); r > 0 {
+			n.metrics.AddSessionBufferReclaimed(r)
+		}
 	}
 	return true
 }

@@ -133,13 +133,16 @@ func main() {
 
 	logger := log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags)
 	n := node.NewNode(node.Config{
-		Role:              node.RoleIran,
-		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
-		BufferBytes:       cfg.SessionBufBytes,
-		RelayBufSize:      cfg.RelayBufSize,
-		KeepAliveInterval: cfg.KeepAliveInterval,
-		LivenessRounds:    cfg.LivenessRounds,
-		StreamLimits:      streamLimits(cfg),
+		Role:        node.RoleIran,
+		Grace:       time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
+		BufferBytes: cfg.SessionBufBytes,
+		// Issue #6: node-level aggregate session-buffer budget (0 =
+		// node's library default, 32 MiB).
+		SessionBufferTotalBytes: cfg.SessionBufTotal,
+		RelayBufSize:            cfg.RelayBufSize,
+		KeepAliveInterval:       cfg.KeepAliveInterval,
+		LivenessRounds:          cfg.LivenessRounds,
+		StreamLimits:            streamLimits(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
 	s := &Splitter{
@@ -481,6 +484,9 @@ func (s *Splitter) runMetrics(addr string) error {
 	mhttp.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, s.node.Metrics().Render())
 		fmt.Fprintf(w, "session_count %d\n", s.node.Store().Count())
+		// Issue #6: current node-level aggregate usage of the shape-A
+		// reconnect buffers (gauge).
+		fmt.Fprintf(w, "session_buffered_bytes %d\n", s.node.SessionBufferAccounted())
 	})
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

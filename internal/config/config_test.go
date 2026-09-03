@@ -29,6 +29,7 @@ func isolatedEnv(t *testing.T) {
 		EnvSocksListen, EnvWsListen, EnvDownCarrier, EnvUpWsUrl, EnvDownListen,
 		EnvSecret, EnvAllowWeak, EnvMetricsPort, EnvRelayBuf,
 		EnvQueueBytes, EnvQueueFrames, EnvQueueTotal, EnvOverflowMs,
+		EnvSessionBufTotal,
 	} {
 		t.Setenv(name, "")
 	}
@@ -76,6 +77,11 @@ func TestDefaults(t *testing.T) {
 	if c.QueueBytesPerStream != 0 || c.QueueFramesPerStream != 0 ||
 		c.QueueBytesTotal != 0 || c.OverflowWaitMs != 0 {
 		t.Fatalf("queue fields must default to 0: %+v", c)
+	}
+	// Issue #6: the aggregate session-buffer budget also uses the
+	// 0 = library default sentinel (node lifts it in Sanitize).
+	if c.SessionBufTotal != 0 {
+		t.Fatalf("SessionBufTotal must default to 0 (library default sentinel): %+v", c)
 	}
 }
 
@@ -258,6 +264,62 @@ func TestQueueFields(t *testing.T) {
 				t.Fatal("want error, got nil")
 			}
 		})
+	}
+}
+
+// TestSessionBufTotal (Issue #6): the node-level aggregate session-buffer
+// budget — parse, bounds, and the 0-sentinel behavior, matching the
+// existing queue-field patterns.
+func TestSessionBufTotal(t *testing.T) {
+	// 0 = library default: valid.
+	if err := validIran().Validate(RoleIran); err != nil {
+		t.Fatalf("zero SessionBufTotal must be valid: %v", err)
+	}
+
+	// Explicit values within bounds: valid (including the max).
+	for _, v := range []int{1 << 20, MaxSessionBufTotal} {
+		c := validIran()
+		c.SessionBufTotal = v
+		if err := c.Validate(RoleIran); err != nil {
+			t.Fatalf("SessionBufTotal=%d must be valid: %v", v, err)
+		}
+	}
+
+	// Out-of-range values: errors naming the variable.
+	cases := []struct {
+		name string
+		v    int
+	}{
+		{"negative", -1},
+		{"over max", MaxSessionBufTotal + 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validIran()
+			c.SessionBufTotal = tc.v
+			ps := problemsOf(t, c.Validate(RoleIran))
+			if !strings.Contains(joinedProblems(ps), EnvSessionBufTotal) {
+				t.Fatalf("want problem naming %s, got: %v", EnvSessionBufTotal, ps)
+			}
+		})
+	}
+
+	// Load path: env parsing.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSessionBufTotal, "67108864") // 64 MiB
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load with %s=67108864: %v", EnvSessionBufTotal, err)
+	}
+	if cfg.SessionBufTotal != 67108864 {
+		t.Fatalf("SessionBufTotal = %d, want 67108864", cfg.SessionBufTotal)
+	}
+
+	// Load path: out-of-range env value is a parse/validation problem.
+	t.Setenv(EnvSessionBufTotal, "999999999999")
+	if _, err := Load(RoleIran); err == nil {
+		t.Fatalf("Load with %s=999999999999 must fail", EnvSessionBufTotal)
 	}
 }
 
