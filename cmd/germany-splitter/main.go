@@ -146,9 +146,12 @@ func main() {
 
 	logger := log.New(os.Stderr, "[germany-splitter] ", log.LstdFlags)
 	n := node.NewNode(node.Config{
-		Role:        node.RoleGermany,
-		Grace:       time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
-		BufferBytes: cfg.SessionBufBytes,
+		Role:  node.RoleGermany,
+		Grace: time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
+		// Issue #7: bounded bootstrap wait for a temporarily down carrier
+		// (0 = node's library default, 30 s).
+		BootstrapWait: time.Duration(cfg.BootstrapWaitMs) * time.Millisecond,
+		BufferBytes:   cfg.SessionBufBytes,
 		// Issue #6: node-level aggregate session-buffer budget (0 =
 		// node's library default, 32 MiB).
 		SessionBufferTotalBytes: cfg.SessionBufTotal,

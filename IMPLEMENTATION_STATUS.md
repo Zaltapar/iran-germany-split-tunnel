@@ -5,6 +5,34 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Issue #7 — bounded bootstrap wait for a temporarily down carrier
+  (branch `fix/issue-7-bootstrap-wait`)**: a NEW session was dropped
+  outright when the "other" carrier was momentarily down at bootstrap —
+  Iran's `waitCarriers` had a fixed 30 s poll window, and Germany's
+  `bootstrapUpStream` dropped IMMEDIATELY (no wait) when the down carrier
+  was not ready at FrameHeader arrival. Now: a new validated setting
+  `SPLIT_BOOTSTRAP_WAIT_MS` (both roles; 0 = library default 30 s,
+  explicit 500..120000 ms) bounds BOTH bootstrap waits. The waits are
+  **signal-driven, not polled**: node-level per-direction carrier-ready
+  channels (the `Attachment.ReadySignal` pattern at node scope — closed
+  while a ready carrier is installed, re-created open on loss, maintained
+  under `n.mu` so signal and carrier state never disagree), and each wait
+  re-checks an **atomic snapshot** (`currentIfReady`/
+  `currentIfReadyBoth`) so a bootstrap attaches to the generation that
+  was ready at capture — no stale-gen attachment, no pairing a live up
+  carrier with a dead down one. Bounded (never extends past the deadline,
+  even mid-backoff) and cancelable immediately on `Node.Close` (ctx done).
+  On expiry: Iran returns an error (SOCKS 0x06), Germany drops exactly
+  once (FrameClose + deregister + target conn closed + one `errors`
+  metric — the `down stream registration failed` path now routes through
+  the same `drop` helper for consistent accounting). Tests: white-box
+  (`pkg/node/bootstrap_test.go`: sanitize, immediate-ready,
+  block-then-install wake, expiry, shutdown unblock, ready-signal
+  lifecycle) + full-topology integration
+  (`pkg/node/bootstrap_integration_test.go`: Iran success/drop, Germany
+  success/drop, generation-change mid-wait, shutdown mid-wait). Full
+  `go build/vet/test ./...` green (Windows, no -race); **Linux `-race`
+  pending GitHub Actions**.
 - **Issue #6 — aggregate session-buffer budget (this branch,
   `fix/issue-6-session-buffer-budget`, commit `d522ff1` off `main`
   @ `ea2cf4d` — rebased onto the Issue #5 merge)**:

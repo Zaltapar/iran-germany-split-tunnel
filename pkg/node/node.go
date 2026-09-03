@@ -105,6 +105,13 @@ type Config struct {
 	// ~45s at the default ping period). <=0 falls back to the library
 	// default (mux.DefaultLivenessRounds).
 	LivenessRounds int
+	// BootstrapWait bounds the bootstrap wait for a carrier that is
+	// temporarily down (SPLIT_BOOTSTRAP_WAIT_MS; default 30s). Iran: how
+	// long StartSession waits for BOTH carriers to be ready before
+	// failing the SOCKS connection. Germany: how long an up bootstrap
+	// waits for the down carrier to become ready before dropping the
+	// session (Issue #7). 0 → defaultBootstrapWait.
+	BootstrapWait time.Duration
 	// StreamLimits is the carrier backpressure policy (Phase 3).
 	StreamLimits mux.StreamLimits
 	// TargetDial dials a logical destination (RoleGermany only).
@@ -128,6 +135,9 @@ func (c *Config) Sanitize() {
 	}
 	if c.KeepAliveInterval <= 0 {
 		c.KeepAliveInterval = 15 * time.Second
+	}
+	if c.BootstrapWait <= 0 {
+		c.BootstrapWait = defaultBootstrapWait
 	}
 	c.StreamLimits = mux.SanitizeLimits(c.StreamLimits)
 	if c.TargetDial == nil {
@@ -170,6 +180,16 @@ func (h *carrierHandle) Gen() uint64 { return h.gen }
 // concurrent-session deployments.
 const defaultSessionBufferTotal = 32 << 20 // 32 MiB
 
+// defaultBootstrapWait is the default bootstrap wait for a temporarily
+// down carrier (Issue #7): 30s, the historical fixed waitCarriers
+// deadline, now explicit and configurable. It is sized to cover the
+// carrier reconnect backoff's typical early attempts (2s → 60s cap):
+// a carrier that is merely flapping reconnects within a few seconds,
+// well inside this window; a carrier that is genuinely down for the
+// whole window is treated as down and the bootstrap fails cleanly
+// (bounded, cancelable — never an infinite wait).
+const defaultBootstrapWait = 30 * time.Second
+
 // Node is the per-side engine.
 type Node struct {
 	cfg     Config
@@ -193,6 +213,28 @@ type Node struct {
 	lostDown  bool
 	genSeq    uint64
 	streamSeq uint32 // atomic counter for logical stream IDs
+
+	// Carrier-readiness signals (Issue #7), the node-level mirror of
+	// session.Attachment.ReadySignal: per direction, a channel that is
+	// CLOSED while a ready carrier is installed and re-created (open)
+	// on loss. Waiters (the bootstrap paths) select on it and MUST
+	// re-check ready(dir) after a wake — a wake only means "state
+	// changed", not "ready now". They are maintained inside n.mu
+	// alongside up/down/lost*, so the signal and the carrier state can
+	// never disagree. A closed signal is re-created (open) by
+	// onCarrierLost under n.mu the moment the direction becomes not
+	// ready, and closed again by install — so a waiter that observes
+	// a closed channel always re-checks currentIfReady, and a waiter
+	// that observes an open channel knows the direction is down (or
+	// was down since its last wake).
+	upReady   chan struct{}
+	downReady chan struct{}
+	// readyClosed mirrors the state of the ready channels (Issue #7):
+	// true once the channel is closed, reset when the channel is
+	// re-created. Maintained under n.mu, exactly like
+	// session.Attachment.readyClosed.
+	upReadyClosed   bool
+	downReadyClosed bool
 }
 
 // NewNode creates a Node with the given role, config (sanitized),
@@ -210,6 +252,11 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 		ctx:     ctx,
 		cancel:  cancel,
 		buf:     newSessionBufferBudget(cfg.SessionBufferTotalBytes),
+		// No carrier installed yet: both directions start NOT ready
+		// (open ready channels) — the bootstrap waits must block until
+		// a carrier is actually installed (Issue #7).
+		upReady:   make(chan struct{}),
+		downReady: make(chan struct{}),
 	}
 }
 
@@ -286,6 +333,44 @@ func (n *Node) current(dir session.Direction) *carrierHandle {
 		return n.up
 	}
 	return n.down
+}
+
+// currentIfReady returns the current carrier handle for dir if it is
+// installed and READY (read loop alive), atomically under the node
+// lock. "Installed" alone is not enough: a handle can still be current
+// while its read loop has just stopped (loss sweep in flight), and
+// Ready() covers that window. The atomic check-and-capture is what
+// makes the bootstrap paths (Issue #7) attach to a genuinely live
+// generation, never a stale one.
+func (n *Node) currentIfReady(dir session.Direction) *carrierHandle {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if dir == session.DirUp {
+		if n.up != nil && n.up.carrier.Ready() {
+			return n.up
+		}
+		return nil
+	}
+	if n.down != nil && n.down.carrier.Ready() {
+		return n.down
+	}
+	return nil
+}
+
+// currentIfReadyBoth is the two-direction snapshot: both handles are
+// captured under ONE lock, so the waiters that need both (Iran
+// StartSession) never pair a ready up carrier with an already-dead
+// down carrier (Issue #7).
+func (n *Node) currentIfReadyBoth() (upH, downH *carrierHandle) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.up != nil && n.up.carrier.Ready() {
+		upH = n.up
+	}
+	if n.down != nil && n.down.carrier.Ready() {
+		downH = n.down
+	}
+	return upH, downH
 }
 
 // dropIfCurrent clears the handle slot if it still points at h.
@@ -375,11 +460,22 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		n.up = h
 		wasLost = n.lostUp
 		n.lostUp = false
+		// Carrier installed and (by construction) ready: mark the ready
+		// signal so the bootstrap waits can wake (Issue #7). Flag-
+		// guarded so a still-closed channel is not double-closed.
+		if !n.upReadyClosed {
+			close(n.upReady)
+			n.upReadyClosed = true
+		}
 	} else {
 		old = n.down
 		n.down = h
 		wasLost = n.lostDown
 		n.lostDown = false
+		if !n.downReadyClosed {
+			close(n.downReady)
+			n.downReadyClosed = true
+		}
 	}
 	n.mu.Unlock()
 
@@ -464,8 +560,16 @@ func (n *Node) onCarrierLost(dir session.Direction, h *carrierHandle) {
 	n.mu.Lock()
 	if dir == session.DirUp {
 		n.lostUp = true
+		// Not ready: re-create the ready signal (open) so bootstrap
+		// waiters that parked on the now-stale closed channel wake and
+		// re-check ready() (Issue #7). Waiters always re-check state
+		// after a wake, so the wake itself only means "state changed".
+		n.upReady = make(chan struct{})
+		n.upReadyClosed = false
 	} else {
 		n.lostDown = true
+		n.downReady = make(chan struct{})
+		n.downReadyClosed = false
 	}
 	n.mu.Unlock()
 
@@ -827,26 +931,92 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 	n.logger.Printf("session %s closed: %s", shortID(sess.ID), sess.Reason())
 }
 
-// waitCarriers blocks until both carriers are ready: up to 30s, or
-// immediately on node shutdown.
+// waitCarriers blocks until BOTH carriers are ready (Iran bootstrap):
+// bounded by Config.BootstrapWait (SPLIT_BOOTSTRAP_WAIT_MS, Issue #7),
+// and cancelable immediately on node shutdown. It is signal-driven,
+// not polled: each wake comes from a carrier install or a carrier loss
+// (the ready channels), so a carrier that reconnects mid-wait is
+// observed without any polling interval. On wake the wait re-checks a
+// single atomic snapshot (currentIfReadyBoth) — the returned handles
+// are captured under the node lock, so they are attached to a
+// generation that was ready at the moment of capture (no stale-gen
+// attachment, no pairing a live up carrier with a dead down one).
+//
+// The wait never extends beyond the deadline, even while the carrier
+// reconnect loop is mid-attempt: the backoff is bounded (2s..60s) and
+// the bootstrap window is explicitly configured to cover it.
 func (n *Node) waitCarriers() (upH, downH *carrierHandle, err error) {
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.NewTimer(n.cfg.BootstrapWait)
+	defer deadline.Stop()
 	for {
-		upH, downH = n.current(session.DirUp), n.current(session.DirDown)
-		if upH != nil && upH.carrier.Ready() && downH != nil && downH.carrier.Ready() {
+		upH, downH = n.currentIfReadyBoth()
+		if upH != nil && downH != nil {
 			return upH, downH, nil
 		}
-		if time.Now().After(deadline) {
-			return nil, nil, errors.New("carriers not ready after 30s")
+		// Wait ONLY on the directions that are not ready: a nil
+		// channel disables its select case, so an already-ready
+		// direction (whose ready channel is therefore CLOSED) can
+		// never be selected — selecting a closed channel every
+		// iteration would spin the loop at full CPU until the
+		// deadline (regression: TestWaitCarriersNoBusySpin). A ready
+		// direction that is later lost and reinstalled is
+		// re-captured on the next wake (handles are re-fetched from
+		// currentIfReadyBoth on every loop), so no stale handle is
+		// ever returned.
+		var sigU, sigD <-chan struct{}
+		if upH == nil {
+			sigU = n.readySig(session.DirUp)
 		}
-		t := time.NewTimer(50 * time.Millisecond)
+		if downH == nil {
+			sigD = n.readySig(session.DirDown)
+		}
 		select {
-		case <-t.C:
+		case <-sigU:
+		case <-sigD:
 		case <-n.ctx.Done():
-			t.Stop()
 			return nil, nil, n.ctx.Err()
+		case <-deadline.C:
+			return nil, nil, fmt.Errorf("carriers not ready after %s", n.cfg.BootstrapWait)
 		}
 	}
+}
+
+// waitCarrierReady blocks until the single direction's carrier is
+// ready (Germany up-bootstrap, Issue #7): bounded by
+// Config.BootstrapWait, cancelable on node shutdown, signal-driven.
+// Returns the carrier handle captured atomically at the ready moment.
+func (n *Node) waitCarrierReady(dir session.Direction) (*carrierHandle, error) {
+	deadline := time.NewTimer(n.cfg.BootstrapWait)
+	defer deadline.Stop()
+	for {
+		if h := n.currentIfReady(dir); h != nil {
+			return h, nil
+		}
+		sig := n.readySig(dir)
+		select {
+		case <-sig:
+		case <-n.ctx.Done():
+			return nil, n.ctx.Err()
+		case <-deadline.C:
+			return nil, fmt.Errorf("%s carrier not ready after %s", dirName(dir), n.cfg.BootstrapWait)
+		}
+	}
+}
+
+// readySig returns the carrier-ready signal for one direction: closed
+// while a ready carrier is installed, re-created (open) on loss.
+// Waiters must re-check ready state after a wake (a wake means "state
+// changed", not "ready now"). The returned channel must be used in a
+// select that also has a non-channel exit (deadline/ctx), and a
+// direction whose carrier is ready must not be selected on (its
+// channel is closed — see waitCarriers).
+func (n *Node) readySig(dir session.Direction) <-chan struct{} {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if dir == session.DirUp {
+		return n.upReady
+	}
+	return n.downReady
 }
 
 // bootstrapUpStream (RoleGermany) handles a NEW up stream: decode the
@@ -880,13 +1050,18 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 		return
 	}
 
-	downH := n.current(session.DirDown)
-	if downH == nil || !downH.carrier.Ready() {
-		h.carrier.WriteFrame(id, mux.FrameClose, nil)
-		h.carrier.Deregister(id)
+	// Bounded bootstrap wait for the down carrier (Issue #7): if it is
+	// down at FrameHeader arrival but reconnects within BootstrapWait
+	// (SPLIT_BOOTSTRAP_WAIT_MS), the session bootstraps successfully
+	// instead of being dropped. Signal-driven (carrier-ready channel),
+	// bounded, and cancelable on Node.Close. On success the handle is
+	// captured atomically at the ready moment, so the session attaches
+	// to the CURRENT generation (acceptance #5) — a carrier that
+	// reconnects mid-wait is seen as a fresh install, never a stale gen.
+	downH, err := n.waitCarrierReady(session.DirDown)
+	if err != nil {
 		targetConn.Close()
-		n.metrics.Error()
-		n.logger.Printf("up carrier stream %d: down carrier not ready, dropping", id)
+		drop(fmt.Errorf("down carrier not ready: %w", err))
 		return
 	}
 
@@ -903,10 +1078,8 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 
 	downCh := downH.carrier.Register(id)
 	if downCh == nil {
-		h.carrier.WriteFrame(id, mux.FrameClose, nil)
-		h.carrier.Deregister(id)
 		targetConn.Close()
-		n.logger.Printf("up carrier stream %d: down stream registration failed", id)
+		drop(errors.New("down stream registration failed"))
 		return
 	}
 
