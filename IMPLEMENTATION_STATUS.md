@@ -10,7 +10,7 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
   reconciliation pass over `internal/config` ↔ `install.sh` ↔
   `systemd/*.service` ↔ `README.md` ↔ `config/*` ↔ `deploy.sh`. No
   production Go source changes. Findings fixed:
-  - README configuration table now lists **all 19** validated env vars
+  - README configuration table now lists **all 18** validated env vars
     (added `SPLIT_CARRIER_GRACE`, `SPLIT_SESSION_BUFFER_BYTES`,
     `SPLIT_SESSION_BUFFER_TOTAL_BYTES`, `SPLIT_LIVENESS_ROUNDS`; corrected
     the queue/bootstrap defaults to the `0` = library-default convention).
