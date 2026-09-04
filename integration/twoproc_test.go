@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -140,13 +141,34 @@ func (p *tcpProxy) acceptLoop() {
 		p.conns = append(p.conns, a, b)
 		p.mu.Unlock()
 		go func(a, b net.Conn) {
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() { defer wg.Done(); io.Copy(b, a) }()
-			go func() { defer wg.Done(); io.Copy(a, b) }()
-			wg.Wait()
+			// a = the client side, b = the upstream side. Propagation of a
+			// peer death: when one direction hits EOF/error, HALF-CLOSE
+			// the corresponding end of the other conn (CloseWrite) so the
+			// peer's read loop terminates (EOF) — exactly how a real
+			// transport leg dropping the connection behaves. A plain
+			// two-way io.Copy without this leaves the far side blocked
+			// (and the loss undetected) when the peer DIES instead of
+			// closing cleanly.
+			done := make(chan struct{}, 2)
+			go func() {
+				io.Copy(b, a)
+				if tc, ok := b.(*net.TCPConn); ok {
+					tc.CloseWrite()
+				}
+				done <- struct{}{}
+			}()
+			go func() {
+				io.Copy(a, b)
+				if tc, ok := a.(*net.TCPConn); ok {
+					tc.CloseWrite()
+				}
+				done <- struct{}{}
+			}()
+			<-done
+			<-done
 			a.Close()
 			b.Close()
+			p.t.Logf("proxy→%s: conn pair torn down", p.upstream)
 		}(a, b)
 	}
 }
@@ -182,6 +204,7 @@ type proc struct {
 	log     *logbuf
 	exit    chan error
 	exitErr error // captured by stopGraceful / exitCode
+	reaped  bool  // true once kill/stop has observed the exit
 }
 
 // buildBinaries compiles both production binaries from the tree under
@@ -201,7 +224,7 @@ func buildBinaries(t *testing.T) (string, string) {
 		"iran-splitter":    repo + "/cmd/iran-splitter",
 		"germany-splitter": repo + "/cmd/germany-splitter",
 	} {
-		out := filepath.Join(dir, name)
+		out := filepath.Join(dir, name+execExt())
 		args := append([]string{"build"}, race...)
 		args = append(args, "-o", out, pkg)
 		cmd := exec.Command("go", args...)
@@ -209,7 +232,16 @@ func buildBinaries(t *testing.T) (string, string) {
 			t.Fatalf("go build %s: %v\n%s", name, err, data)
 		}
 	}
-	return filepath.Join(dir, "iran-splitter"), filepath.Join(dir, "germany-splitter")
+	return filepath.Join(dir, "iran-splitter"+execExt()), filepath.Join(dir, "germany-splitter"+execExt())
+}
+
+// execExt is the OS-specific executable suffix (".exe" on Windows, ""
+// elsewhere) so the harness builds and launches the right binary name.
+func execExt() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
 }
 
 func freePort(t *testing.T) int {
@@ -291,7 +323,8 @@ func (p *proc) stopGraceful(t *testing.T, d time.Duration) {
 		t.Fatalf("%s: SIGINT: %v", p.name, err)
 	}
 	select {
-	case <-p.exit:
+	case p.exitErr = <-p.exit:
+		p.reaped = true
 	case <-time.After(d):
 		p.kill()
 		t.Fatalf("%s: no clean exit within %v\n--- log ---\n%s", p.name, d, p.log.String())
@@ -301,34 +334,41 @@ func (p *proc) stopGraceful(t *testing.T, d time.Duration) {
 	}
 }
 
-// kill force-kills and reaps (cleanup path; no assertions).
+// kill force-kills and reaps (cleanup path; no assertions). On return,
+// p.reaped is true when the exit was observed (the exit channel is a
+// one-shot: whatever drained it first owns the value).
 func (p *proc) kill() {
 	if p.cmd.Process == nil {
 		return
 	}
 	select {
 	case <-p.exit:
+		p.reaped = true
 	default:
 		_ = p.cmd.Process.Kill()
 		select {
 		case <-p.exit:
+			p.reaped = true
 		case <-time.After(5 * time.Second):
 		}
 	}
 }
 
-// exitCode returns the process exit code once it has exited (blocks).
+// exitCode returns the captured exit code (valid after stopGraceful has
+// reaped the process).
 func (p *proc) exitCode(t *testing.T) int {
 	t.Helper()
-	err := <-p.exit
-	if err == nil {
+	if !p.reaped {
+		t.Fatalf("%s: exitCode before the process was reaped", p.name)
+	}
+	if p.exitErr == nil {
 		return 0
 	}
 	var ee *exec.ExitError
-	if errors.As(err, &ee) {
+	if errors.As(p.exitErr, &ee) {
 		return ee.ExitCode()
 	}
-	t.Fatalf("%s: unexpected exit: %v", p.name, err)
+	t.Fatalf("%s: unexpected exit: %v", p.name, p.exitErr)
 	return -1
 }
 
@@ -589,6 +629,67 @@ func wsUpgrade(addr, path string, timeout time.Duration) (net.Conn, string, erro
 	return c, strings.TrimSpace(line), nil
 }
 
+// wsReadFrame reads ONE WebSocket data frame from the server (server
+// frames are unmasked per RFC 6455) and returns its opcode + payload.
+// Used by the rogue-client auth scenario; the rest of the harness uses
+// the SOCKS5 client, not raw WS.
+func wsReadFrame(r io.Reader) (opcode byte, payload []byte, err error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	opcode = hdr[0] & 0x0F
+	ln := int(hdr[1] & 0x7F)
+	switch {
+	case ln < 126:
+	case ln == 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		ln = int(binary.BigEndian.Uint16(ext[:]))
+	default:
+		var ext [8]byte
+		if _, err := io.ReadFull(r, ext[:]); err != nil {
+			return 0, nil, err
+		}
+		ln = int(binary.BigEndian.Uint64(ext[:]))
+	}
+	payload = make([]byte, ln)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	return opcode, payload, nil
+}
+
+// wsWriteBinary writes ONE masked client→server binary frame (client
+// frames MUST be masked per RFC 6455 — raw unmasked writes are
+// malformed and are dropped by compliant servers).
+func wsWriteBinary(c net.Conn, payload []byte) error {
+	hdr := []byte{0x82} // FIN + binary opcode
+	switch {
+	case len(payload) < 126:
+		hdr = append(hdr, byte(len(payload)))
+	case len(payload) < 65536:
+		hdr = append(hdr, 126, byte(len(payload)>>8), byte(len(payload)))
+	default:
+		hdr = append(hdr, 127)
+		for i := 7; i >= 0; i-- {
+			hdr = append(hdr, byte(len(payload)>>(8*i)))
+		}
+	}
+	var mask [4]byte
+	rand.Read(mask[:])
+	hdr = append(hdr, mask[:]...)
+	masked := make([]byte, len(payload))
+	for i, b := range payload {
+		masked[i] = b ^ mask[i%4]
+	}
+	hdr = append(hdr, masked...)
+	_, err := c.Write(hdr)
+	return err
+}
+
 // ============================================================
 // scenario helpers
 // ============================================================
@@ -656,9 +757,10 @@ func TestTwoProcessLocal(t *testing.T) {
 		t.Skip("L4 two-process gate: set RUN_TWOPROC=1 to run " +
 			"(real processes + real sockets; not part of CI)")
 	}
-	if runtime.GOOS == "windows" {
-		t.Skip("L4 requires POSIX signals and TCP half-close (Linux/macOS)")
-	}
+	// Note: most scenarios are platform-portable (real processes, real
+	// sockets, os.Kill). The POSIX-only ones (S5 client half-close, S11
+	// SIGINT graceful stop) skip themselves on Windows; run the full
+	// gate on Linux (workflow_dispatch or a local POSIX host).
 
 	secret := make([]byte, 32)
 	rand.Read(secret)
@@ -805,6 +907,9 @@ func TestTwoProcessLocal(t *testing.T) {
 
 	// ---------- S5: client half-close (upload-only FIN) ----------
 	t.Run("S5_client_halfclose", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("S5 requires TCP half-close (CloseWrite); POSIX-only here")
+		}
 		payload := make([]byte, 4096)
 		rand.Read(payload)
 		c, err := socks5.Dial(socksAddr, "127.0.0.1", target.Port(), 10*time.Second)
@@ -979,6 +1084,9 @@ func TestTwoProcessLocal(t *testing.T) {
 		// losses before a new CONNECT is issued (deterministic ordering).
 		irOff := iran.logLen() // "carrier up lost" may exist from S7
 		de.kill()
+		if !de.reaped {
+			t.Fatalf("de did not exit within 5s after kill\nde log:\n%s", de.log.String())
+		}
 		iran.waitForLogAfter(t, "carrier up lost", irOff, 15*time.Second)
 		iran.waitForLogAfter(t, "carrier down lost", irOff, 15*time.Second)
 
@@ -1012,16 +1120,43 @@ func TestTwoProcessLocal(t *testing.T) {
 			t.Fatalf("S10b: expected 101 (upgrade) with no carrier active, got: %s", status)
 		}
 		rogue.SetDeadline(time.Now().Add(20 * time.Second))
-		ch := make([]byte, 22) // version+role+ts+nonce
-		if _, err := io.ReadFull(rogue, ch); err != nil {
+		op, ch, err := wsReadFrame(rogue)
+		if err != nil {
 			rogue.Close()
-			t.Fatalf("S10b: no challenge from peer: %v", err)
+			t.Fatalf("S10b: no challenge frame from peer: %v", err)
 		}
-		// Garbage FrameAuth response (stream 0, 74 bytes, wrong MAC).
-		rogue.Write([]byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x4A})
-		rogue.Write(make([]byte, 74))
-		_, err = rogue.Read(make([]byte, 1))
-		if err == nil {
+		// The WS frame carries the WHOLE protocol frame: 7-byte header
+		// (stream 0, type FrameAuth=0x01, len) + 22-byte challenge.
+		if op != 0x02 || len(ch) != 7+22 || ch[1] != 0 || ch[2] != 0 || ch[3] != 0 || ch[4] != 0x01 {
+			rogue.Close()
+			t.Fatalf("S10b: bad challenge frame (op=0x%x len=%d hdr=% x), want binary/29 stream0 type0x01", op, len(ch), ch[:min(7, len(ch))])
+		}
+		// Garbage FrameAuth response (stream 0, 74 bytes, wrong version+MAC).
+		resp := append([]byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x4A}, make([]byte, 74)...)
+		if err := wsWriteBinary(rogue, resp); err != nil {
+			rogue.Close()
+			t.Fatalf("S10b: write garbage auth: %v", err)
+		}
+		// The peer must reject the handshake and close the connection
+		// (version/MAC check) — a close (read error or close frame) within
+		// the bound; a deadline means it did NOT close = a real failure.
+		closed := false
+		for i := 0; i < 10; i++ {
+			fop, _, rerr := wsReadFrame(rogue)
+			if rerr != nil {
+				if os.IsTimeout(rerr) {
+					rogue.Close()
+					t.Fatalf("S10b: peer did not close within the bound (auth failure undetected?)")
+				}
+				closed = true
+				break
+			}
+			if fop == 0x08 { // WebSocket close frame
+				closed = true
+				break
+			}
+		}
+		if !closed {
 			rogue.Close()
 			t.Fatal("S10b: wrong-secret peer was not rejected")
 		}
@@ -1042,6 +1177,10 @@ func TestTwoProcessLocal(t *testing.T) {
 
 	// ---------- S11: graceful shutdown of both nodes ----------
 	t.Run("S11_graceful_shutdown", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("S11 requires POSIX signals (SIGINT graceful stop); " +
+				"covered on the Linux run (CI workflow_dispatch / staging)")
+		}
 		_ = waitMetric(t, mIran, 10*time.Second, "no active sessions before shutdown", func(m metrics) bool {
 			return m.ActiveSessions == 0 && m.SessionCount == 0
 		})
