@@ -76,6 +76,8 @@ reset_state() {
   XRAY_INBOUND_TAG="" XRAY_SERVICE="" DOWN_LISTEN="" UP_WS_URL=""
   METRICS_PORT="" RELAY_BUF="" ASSUME_YES=0 UNINSTALL=0
   SECRET_FROM_STORE=0 SHOW_SECRET=0
+  CARRIER_GRACE="" BOOTSTRAP_WAIT="" SESSION_BUF=""
+  SESSION_BUF_TOTAL="" LIVENESS_ROUNDS=""
 }
 
 UNIT_IRAN="$SYSTEMD_DIR/iran-splitter.service"
@@ -88,7 +90,8 @@ LONG_SECRET="aaaaaaaa-bbbbbbbb-cccccccc-dddddddd-eeeeeeee"
 echo ""
 echo "=== Test 1: interactive 'iran' wizard (custom + default answers) ==="
 # role passed as arg -> questions in order: secret, socks, ws, down,
-# cdn-domain, nginx?, nginx-port, xray-config, xray-service, metrics, relay
+# cdn-domain, nginx?, nginx-port, xray-config, xray-service, metrics, relay,
+# carrier-grace, bootstrap-wait, session-buffer, session-buffer-total, liveness
 # (printf: heredocs strip TRAILING blank lines, which would shift the answers)
 reset_state
 printf '%s\n' \
@@ -103,6 +106,11 @@ printf '%s\n' \
   "3x-ui" \
   "" \
   "" \
+  "" \
+  "" \
+  "" \
+  "" \
+  "" \
   "__sentinel__" > "$WORK/ans1"
 if ( main iran ) < "$WORK/ans1" > "$WORK/out1" 2>&1; then ok "exit code 0"; else fail "exit code 0 (see out1)"; fi
 if [ -f "$UNIT_IRAN" ]; then ok "unit file created"; else fail "unit file created"; fi
@@ -112,6 +120,11 @@ assert_contains "$UNIT_IRAN" "Environment=SPLIT_WS_LISTEN=127.0.0.1:9001"       
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_DOWN_CARRIER_ADDR=127.0.0.1:10802" "unit: down-carrier default"
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_METRICS_PORT=0"                  "unit: metrics default"
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_RELAY_BUF=32768"                 "unit: relay default"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_CARRIER_GRACE=5000"              "unit: carrier grace default"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_BOOTSTRAP_WAIT_MS=0"             "unit: bootstrap wait default"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_SESSION_BUFFER_BYTES=262144"     "unit: session buffer default"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=0"    "unit: session buffer total default"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_LIVENESS_ROUNDS=0"               "unit: liveness default"
 assert_contains "$UNIT_IRAN" "After=network-online.target 3x-ui.service"         "unit: xray ordering"
 assert_contains "$UNIT_IRAN" "ExecStart=$INSTALL_DIR/iran-splitter"              "unit: execstart"
 assert_contains "$WORK/out1" "wss://cdn.test.com/upload"                         "summary: CDN URL for Germany"
@@ -139,10 +152,10 @@ esac
 echo ""
 echo "=== Test 2: interactive 'germany' wizard (validation + defaults) ==="
 # questions: secret, down-listen (invalid then valid), up-ws-url,
-# xray-service, metrics, relay
+# xray-service, metrics, relay, then the 5 tuning knobs (defaults)
 reset_state
-# 7 answers: 1 secret(gen), 2 down-listen invalid, 3 down-listen ok,
-# 4 up-ws-url, 5 xray-service, 6 metrics, 7 relay
+# 12 answers: 1 secret(gen), 2 down-listen invalid, 3 down-listen ok,
+# 4 up-ws-url, 5 xray-service, 6 metrics, 7 relay, 8-12 tuning defaults
 printf '%s\n' \
   "" \
   "9002" \
@@ -150,7 +163,12 @@ printf '%s\n' \
   "wss://cdn.test.com/upload" \
   "" \
   "9101" \
-  "16384" > "$WORK/ans2"
+  "16384" \
+  "8000" \
+  "0" \
+  "512000" \
+  "0" \
+  "5" > "$WORK/ans2"
 if ( main germany ) < "$WORK/ans2" > "$WORK/out2" 2>&1; then ok "exit code 0"; else fail "exit code 0 (see out2)"; fi
 if [ -f "$UNIT_GERMANY" ]; then ok "unit file created"; else fail "unit file created"; fi
 assert_contains "$WORK/out2" "Invalid value"                                     "re-prompted on invalid port"
@@ -158,6 +176,11 @@ assert_contains "$UNIT_GERMANY" "Environment=SPLIT_DOWN_LISTEN=127.0.0.1:9002"  
 assert_contains "$UNIT_GERMANY" "Environment=SPLIT_UP_WS_URL=wss://cdn.test.com/upload" "unit: up ws url"
 assert_contains "$UNIT_GERMANY" "Environment=SPLIT_METRICS_PORT=9101"            "unit: metrics custom"
 assert_contains "$UNIT_GERMANY" "Environment=SPLIT_RELAY_BUF=16384"              "unit: relay custom"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_CARRIER_GRACE=8000"           "unit: carrier grace custom"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_BOOTSTRAP_WAIT_MS=0"          "unit: bootstrap wait custom"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_SESSION_BUFFER_BYTES=512000"  "unit: session buffer custom"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=0" "unit: session buffer total custom"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_LIVENESS_ROUNDS=5"            "unit: liveness custom"
 assert_contains "$UNIT_GERMANY" "After=network-online.target"                    "unit: after line"
 assert_not_contains "$UNIT_GERMANY" "xray.service"                               "unit: no xray ordering"
 # Phase 8: auto-generated secret is 64 hex chars (256 bits)
@@ -228,6 +251,37 @@ assert_contains "$UNIT_IRAN" "Environment=SPLIT_SOCKS_LISTEN=[::1]:10910"       
 
 # ======================================================================
 echo ""
+echo "=== Test 4i: tuning knobs via flags (custom + defaults) ==="
+reset_state
+if ( main germany --yes --up-ws-url wss://cdn.test.com/upload \
+      --secret "$LONG_SECRET" \
+      --carrier-grace 2000 --bootstrap-wait 0 --session-buffer-bytes 8192 \
+      --session-buffer-total 4194304 --liveness-rounds 10 ) < /dev/null > "$WORK/out4i" 2>&1
+then ok "exit code 0 (flags accepted)"; else fail "exit code 0 (see out4i)"; fi
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_CARRIER_GRACE=2000"          "unit: flag carrier grace"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_BOOTSTRAP_WAIT_MS=0"         "unit: flag bootstrap wait"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_SESSION_BUFFER_BYTES=8192"   "unit: flag session buffer"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=4194304" "unit: flag session buffer total"
+assert_contains "$UNIT_GERMANY" "Environment=SPLIT_LIVENESS_ROUNDS=10"          "unit: flag liveness rounds"
+# invalid tuning flag values must fail cleanly
+reset_state
+if ( main germany --yes --up-ws-url wss://cdn.test.com/upload \
+      --secret "$LONG_SECRET" --carrier-grace 10 ) < /dev/null > "$WORK/out4i2" 2>&1
+then fail "carrier-grace below minimum must be rejected"; else ok "carrier-grace below minimum rejected"; fi
+assert_contains "$WORK/out4i2" "is invalid"                                     "carrier-grace error message"
+reset_state
+if ( main germany --yes --up-ws-url wss://cdn.test.com/upload \
+      --secret "$LONG_SECRET" --liveness-rounds 21 ) < /dev/null > "$WORK/out4i3" 2>&1
+then fail "liveness-rounds above maximum must be rejected"; else ok "liveness-rounds above maximum rejected"; fi
+assert_contains "$WORK/out4i3" "is invalid"                                     "liveness error message"
+reset_state
+if ( main germany --yes --up-ws-url wss://cdn.test.com/upload \
+      --secret "$LONG_SECRET" --bootstrap-wait 100 ) < /dev/null > "$WORK/out4i4" 2>&1
+then fail "bootstrap-wait below minimum (non-zero) must be rejected"; else ok "bootstrap-wait below minimum rejected"; fi
+assert_contains "$WORK/out4i4" "is invalid"                                     "bootstrap-wait error message"
+
+# ======================================================================
+echo ""
 echo "=== Test 4e: configuration gate failure aborts BEFORE install ==="
 rm -f "$UNIT_GERMANY"
 reset_state
@@ -275,6 +329,11 @@ Environment=SPLIT_DOWN_CARRIER_ADDR=127.0.0.1:10899
 Environment=SPLIT_SECRET=${LONG_SECRET}
 Environment=SPLIT_METRICS_PORT=9150
 Environment=SPLIT_RELAY_BUF=16384
+Environment=SPLIT_CARRIER_GRACE=9000
+Environment=SPLIT_BOOTSTRAP_WAIT_MS=15000
+Environment=SPLIT_SESSION_BUFFER_BYTES=1024000
+Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=67108864
+Environment=SPLIT_LIVENESS_ROUNDS=7
 
 [Install]
 WantedBy=multi-user.target
@@ -288,6 +347,11 @@ assert_contains "$UNIT_IRAN" "Environment=SPLIT_DOWN_CARRIER_ADDR=127.0.0.1:1089
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_SECRET=${LONG_SECRET}"           "upgrade: kept secret"
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_METRICS_PORT=9150"               "upgrade: kept metrics"
 assert_contains "$UNIT_IRAN" "Environment=SPLIT_RELAY_BUF=16384"                 "upgrade: kept relay"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_CARRIER_GRACE=9000"              "upgrade: kept carrier grace"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_BOOTSTRAP_WAIT_MS=15000"         "upgrade: kept bootstrap wait"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_SESSION_BUFFER_BYTES=1024000"    "upgrade: kept session buffer"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=67108864" "upgrade: kept session buffer total"
+assert_contains "$UNIT_IRAN" "Environment=SPLIT_LIVENESS_ROUNDS=7"               "upgrade: kept liveness rounds"
 if ls "$SYSTEMD_DIR"/iran-splitter.service.bak.* >/dev/null 2>&1; then ok "old unit backed up"; else fail "old unit backed up"; fi
 assert_contains "$WORK/out4h" "Existing installation detected"                   "upgrade: detection message"
 

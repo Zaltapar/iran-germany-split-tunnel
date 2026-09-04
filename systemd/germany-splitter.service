@@ -15,7 +15,8 @@ RestartSec=5
 #   SPLIT_UP_WS_URL=wss://your-cdn-domain.com/upload
 Environment=SPLIT_UP_WS_URL=wss://up.domain.com/upload
 # Down-carrier TCP listener - Iran reaches it via VLESS+Reality
-Environment=SPLIT_DOWN_LISTEN=0.0.0.0:9002
+# (bare :port binds all interfaces; matches the code default)
+Environment=SPLIT_DOWN_LISTEN=:9002
 # MUST match SPLIT_SECRET on the Iran node. The shipped placeholder below
 # is REJECTED at startup (Phase 6 policy) - replace it, e.g.:
 #   openssl rand -hex 32
@@ -27,6 +28,11 @@ Environment=SPLIT_SECRET=YOUR-SECRET-HERE
 #Environment=SPLIT_STREAM_QUEUE_FRAMES=0
 #Environment=SPLIT_STREAM_QUEUE_TOTAL_BYTES=0
 #Environment=SPLIT_STREAM_OVERFLOW_MS=0
+#Environment=SPLIT_CARRIER_GRACE=5000
+#Environment=SPLIT_BOOTSTRAP_WAIT_MS=0
+#Environment=SPLIT_SESSION_BUFFER_BYTES=262144
+#Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=0
+#Environment=SPLIT_LIVENESS_ROUNDS=0
 
 LimitNOFILE=65535
 StandardOutput=journal
