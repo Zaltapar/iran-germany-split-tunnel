@@ -6,6 +6,7 @@ node_modules/
 package.json
 package-lock.json
 .roo/
+.playwright-mcp/
 *.bin
 
 # Build artifacts

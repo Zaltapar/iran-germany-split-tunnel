@@ -5,6 +5,52 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Issue #8 — configuration / installer / systemd / README / Xray-example
+  consistency (branch `fix/issue-8-config-consistency`)**: audit +
+  reconciliation pass over `internal/config` ↔ `install.sh` ↔
+  `systemd/*.service` ↔ `README.md` ↔ `config/*` ↔ `deploy.sh`. No
+  production Go source changes. Findings fixed:
+  - README configuration table now lists **all 19** validated env vars
+    (added `SPLIT_CARRIER_GRACE`, `SPLIT_SESSION_BUFFER_BYTES`,
+    `SPLIT_SESSION_BUFFER_TOTAL_BYTES`, `SPLIT_LIVENESS_ROUNDS`; corrected
+    the queue/bootstrap defaults to the `0` = library-default convention).
+  - README frame protocol table now lists all **7** frame types
+    (added `Rebind` 0x06, matching `pkg/mux/frame.go`) and notes the
+    StreamID-0 reservation.
+  - README states the **Xray-consumer relationship** explicitly (splitter
+    = SOCKS5 service; Xray/3x-ui = client of it; conceptual flow), and the
+    manual-deploy path now **warns** that the shipped unit placeholders
+    (`SPLIT_SECRET=YOUR-SECRET-HERE`, Germany's placeholder `SPLIT_UP_WS_URL`)
+    are rejected at startup and must be edited first.
+  - `config/iran-xray-config.json` corrected to the documented
+    VLESS+Reality inbound (was plain TLS — contradicting the README
+    architecture). It is a labeled template (UUID/SNI/key placeholders).
+  - `config/germany-xray-config.json` **deleted**: it described a
+    non-existent design (two inbounds routed to SOCKS outbounds on
+    10901/10902 — no such listeners exist; the Germany node has no SOCKS
+    at all) and contradicted the VLESS+Reality down-carrier model. The
+    README now describes the Germany-side wiring in prose (the
+    VLESS+Reality inbound reaching `SPLIT_DOWN_LISTEN` is the operator's
+    own Xray configuration).
+  - `systemd/*.service`: documented the Phase 5+ tuning variables
+    (commented, like the queue vars); aligned Germany's
+    `SPLIT_DOWN_LISTEN` to the code default `:9002` (bare `:port` = bind
+    all interfaces, same semantics as `0.0.0.0:9002`).
+  - `install.sh`: new flags + prompts + validators for `--carrier-grace`,
+    `--bootstrap-wait`, `--session-buffer-bytes`, `--session-buffer-total`,
+    `--liveness-rounds` (bounds mirror `internal/config` exactly; the
+    `--validate-config` gate remains the authority). Values are written to
+    the systemd unit and pre-filled on upgrade (best-effort, since unset
+    is legal). The Phase 8 invariant holds: shell checks are never
+    stricter than `internal/config`.
+  - `deploy.sh` marked **DEPRECATED** in its header (superseded by
+    `install.sh`; copies startup-rejected placeholders, no gate, no
+    backup/rollback).
+  - `test-install.sh`: new scenarios (interactive tuning knobs with custom
+    + default answers; flag-based values incl. invalid-value rejection;
+    upgrade pre-fill of the tuning knobs). `bash test-install.sh` =
+    117 PASS / 0 FAIL (Windows git-bash; the mode-640 assertion is
+    Linux-only as before).
 - **Issue #7 — bounded bootstrap wait for a temporarily down carrier
   (branch `fix/issue-7-bootstrap-wait`)**: a NEW session was dropped
   outright when the "other" carrier was momentarily down at bootstrap —
@@ -31,8 +77,12 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
   lifecycle) + full-topology integration
   (`pkg/node/bootstrap_integration_test.go`: Iran success/drop, Germany
   success/drop, generation-change mid-wait, shutdown mid-wait). Full
-  `go build/vet/test ./...` green (Windows, no -race); **Linux `-race`
-  pending GitHub Actions**.
+  `go build/vet/test ./...` green (Windows, no -race). **Merged to
+  `main` as `8038a56` (PR #15, 2026-09-04); Linux `-race` GREEN**
+  (Actions run 33858911765, "Linux build & test" succeeded on head
+  `6330a01` after the spin-test was rewritten to assert a STABLE parked
+  `[select]` state instead of a single transient sample — see commit
+  `3132bcc`).
 - **Issue #6 — aggregate session-buffer budget (this branch,
   `fix/issue-6-session-buffer-budget`, commit `d522ff1` off `main`
   @ `ea2cf4d` — rebased onto the Issue #5 merge)**:

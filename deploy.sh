@@ -1,7 +1,15 @@
 #!/bin/bash
 #
-# Deploy script for Iran-Germany Asymmetric Split-Tunnel
-# Usage: ./deploy.sh [iran|germany|both|status] [--build]
+# DEPRECATED — superseded by install.sh.
+#
+# This legacy manual deploy script is kept only for reference. It copies the
+# checked-in systemd units (which carry startup-REJECTED placeholder secrets
+# and a placeholder up-carrier URL), performs no configuration validation
+# gate, and has no backup/rollback. Do NOT use it to deploy.
+#
+# Use the interactive installer instead:  sudo bash install.sh
+#
+# (Legacy usage, if you really need it: ./deploy.sh [iran|germany|both|status] [--build])
 #
 set -euo pipefail
 

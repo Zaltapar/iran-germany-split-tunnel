@@ -84,9 +84,19 @@ go build -o germany-splitter ./cmd/germany-splitter
 
 ### Deploy Iran Server
 
+> **Warning — shipped placeholders.** The checked-in `systemd/*.service`
+> units ship `SPLIT_SECRET=YOUR-SECRET-HERE` (and Germany's
+> `SPLIT_UP_WS_URL=wss://up.domain.com/upload`) as **placeholders that are
+> REJECTED at startup** by the configuration gate. Edit the unit (at minimum
+> `SPLIT_SECRET` on both nodes, and `SPLIT_UP_WS_URL` on Germany) before
+> `systemctl enable --now`, or the service will fail to start and restart in
+> a loop. The interactive installer (`install.sh`) handles all of this for
+> you — it is the recommended path.
+
 ```bash
 sudo cp iran-splitter /usr/local/bin/
 sudo cp systemd/iran-splitter.service /etc/systemd/system/
+# EDIT: set SPLIT_SECRET (match on both nodes) before enabling
 sudo systemctl daemon-reload
 sudo systemctl enable --now iran-splitter
 ```
@@ -96,6 +106,7 @@ sudo systemctl enable --now iran-splitter
 ```bash
 sudo cp germany-splitter /usr/local/bin/
 sudo cp systemd/germany-splitter.service /etc/systemd/system/
+# EDIT: set SPLIT_SECRET + SPLIT_UP_WS_URL (your real CDN URL) before enabling
 sudo systemctl daemon-reload
 sudo systemctl enable --now germany-splitter
 ```
@@ -115,9 +126,13 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_RELAY_BUF` | ✓ | ✓ | `32768` | Relay buffer size in bytes |
 | `SPLIT_STREAM_QUEUE_BYTES` | ✓ | ✓ | `1048576` (1 MiB) | Max payload bytes buffered per stream before that stream (not the carrier) is terminated |
 | `SPLIT_STREAM_QUEUE_FRAMES` | ✓ | ✓ | `16` | Max frames buffered per stream |
-| `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `33554432` (32 MiB) | Aggregate queued bytes across all streams per carrier |
-| `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `100` | How long a stalled stream may hold its buffer (ms) before termination |
-| `SPLIT_BOOTSTRAP_WAIT_MS` | ✓ | ✓ | `30000` (0 = default) | Bounded wait for a temporarily down carrier at session bootstrap (ms; `0` = library default 30 s, explicit values 500..120000) |
+| `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Aggregate queued bytes across all streams per carrier (`0` = library default) |
+| `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `0` (100) | How long a stalled stream may hold its buffer (ms; `0` = library default) |
+| `SPLIT_CARRIER_GRACE` | ✓ | ✓ | `5000` | Carrier-loss grace window in ms: how long a session survives a carrier blip before being torn down (500..600000) |
+| `SPLIT_BOOTSTRAP_WAIT_MS` | ✓ | ✓ | `0` (30000) | Bounded wait for a temporarily down carrier at session bootstrap (ms; `0` = library default 30 s, explicit values 500..120000) |
+| `SPLIT_SESSION_BUFFER_BYTES` | ✓ | ✓ | `262144` (256 KiB) | Per-direction reconnect buffer per session (4 KiB..16 MiB) |
+| `SPLIT_SESSION_BUFFER_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Node-level aggregate session-buffer budget (`0` = library default) |
+| `SPLIT_LIVENESS_ROUNDS` | ✓ | ✓ | `0` (3) | Blackhole detection: consecutive unanswered keepalive pings before the carrier is torn down (`0` = library default, 0..20) |
 
 ### Configuration validation
 
@@ -163,6 +178,18 @@ SPLIT_SECRET=... SPLIT_UP_WS_URL=wss://cdn.example.org/upload \
 
 ## Xray Config (Iran)
 
+**Xray/3x-ui is a CONSUMER of this project, not a managed component.** The
+Iran splitter exposes a SOCKS5 service (`SPLIT_SOCKS_LISTEN`, default
+`127.0.0.1:10900`); your existing Xray installation routes client traffic
+into it with a SOCKS outbound. This project does not manage, generate or
+validate Xray inbounds/outbounds/routing beyond the snippet below (the
+installer's Iran Xray-merge adds only the `to-splitter` outbound and the one
+routing rule shown here).
+
+**Conceptual flow:** Xray inbound → existing Xray routing → SOCKS5 outbound
+(`to-splitter`) → Iran splitter → asymmetric multiplexed tunnel → Germany
+splitter → target Internet.
+
 ```json
 {
   "outbounds": [
@@ -182,9 +209,18 @@ SPLIT_SECRET=... SPLIT_UP_WS_URL=wss://cdn.example.org/upload \
 }
 ```
 
+> `config/iran-xray-config.json` is a full, labeled **template** for the Iran
+> node (placeholders for your UUID/SNI/Reality key). The Germany node needs
+> no local SOCKS wiring: the up-carrier does not use Xray at all (the
+> germany-splitter dials your CDN `wss://` URL directly), and the down-carrier
+> arrives through **your own** VLESS+Reality inbound, which must deliver the
+> tunneled TCP bytes to `127.0.0.1:9002` (`SPLIT_DOWN_LISTEN`). That inbound
+> and its port-forwarding rule are your Xray/3x-ui configuration — this
+> project neither ships nor manages them.
+
 ## Frame Protocol
 
-Header (7 bytes): `StreamID uint32 BE | Type uint8 | Length uint16 BE` — payload max 65535 bytes.
+Header (7 bytes): `StreamID uint32 BE | Type uint8 | Length uint16 BE` — payload max 65535 bytes. StreamID 0 is reserved for control traffic (auth/ping/pong) and can never be registered as a stream.
 
 | Type | Value | Description |
 |------|-------|-------------|
@@ -192,8 +228,9 @@ Header (7 bytes): `StreamID uint32 BE | Type uint8 | Length uint16 BE` — paylo
 | Auth | 0x01 | v1 challenge/response authentication (StreamID 0, handshake phase only) |
 | Ping | 0x02 | Keepalive ping (StreamID 0) |
 | Pong | 0x03 | Keepalive pong (StreamID 0) |
-| Close | 0x04 | Stream close |
+| Close | 0x04 | Stream close / half-close |
 | Header | 0x05 | Stream destination (first frame of a new stream, up-carrier only) |
+| Rebind | 0x06 | Re-attach an existing session after a carrier loss (generation-checked; never creates sessions) |
 
 **Carrier handshake** (both directions, v1 — see below): a three-message
 HMAC challenge/response. The raw secret (or any function of it) is never

@@ -95,6 +95,11 @@ DOWN_LISTEN=""
 UP_WS_URL=""
 METRICS_PORT=""
 RELAY_BUF=""
+CARRIER_GRACE=""
+BOOTSTRAP_WAIT=""
+SESSION_BUF=""
+SESSION_BUF_TOTAL=""
+LIVENESS_ROUNDS=""
 SHOW_SECRET=0
 ASSUME_YES=0
 UNINSTALL=0
@@ -131,6 +136,11 @@ Common options:
   --show-secret          show the full secret in the summary (default: masked)
   --metrics-port PORT    local metrics HTTP port, 0 = off (default 0)
   --relay-buf BYTES      relay buffer size in bytes (default 32768)
+  --carrier-grace MS     carrier-loss grace window, 500..600000 (default 5000)
+  --bootstrap-wait MS    bootstrap wait for a down carrier; 0 = 30s default, else 500..120000
+  --session-buffer-bytes BYTES   per-session reconnect buffer, 4096..16777216 (default 262144)
+  --session-buffer-total BYTES   node aggregate buffer budget; 0 = 32MiB default, max 536870912
+  --liveness-rounds N    blackhole detection rounds, 0 = 3 (default), 0..20
   --xray-service NAME    xray/3x-ui systemd service for ordering (default: auto-detect)
   --yes, -y              non-interactive: never prompt, use flags/defaults
   --help                 show this help
@@ -185,6 +195,34 @@ is_wss_url() {
 # 1024..8 MiB — internal/config's SPLIT_RELAY_BUF bounds.
 is_uint() {
   [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= 1024 && 10#$1 <= 8388608 ))
+}
+
+# 500..600000 ms — internal/config's SPLIT_CARRIER_GRACE bounds.
+is_grace_ms() {
+  [[ "$1" =~ ^[0-9]{1,6}$ ]] && (( 10#$1 >= 500 && 10#$1 <= 600000 ))
+}
+
+# 0 (library default 30 s) or 500..120000 ms — SPLIT_BOOTSTRAP_WAIT_MS bounds.
+is_bootstrap_ms() {
+  [[ "$1" =~ ^[0-9]{1,6}$ ]] || return 1
+  local n=$((10#$1))
+  [ "$n" -eq 0 ] && return 0
+  (( n >= 500 && n <= 120000 ))
+}
+
+# 4 KiB..16 MiB — internal/config's SPLIT_SESSION_BUFFER_BYTES bounds.
+is_session_buf() {
+  [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= 4096 && 10#$1 <= 16777216 ))
+}
+
+# 0 (library default 32 MiB)..512 MiB — SPLIT_SESSION_BUFFER_TOTAL_BYTES bounds.
+is_session_buf_total() {
+  [[ "$1" =~ ^[0-9]{1,9}$ ]] && (( 10#$1 >= 0 && 10#$1 <= 536870912 ))
+}
+
+# 0 (library default 3)..20 — SPLIT_LIVENESS_ROUNDS bounds.
+is_liveness_rounds() {
+  [[ "$1" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 0 && 10#$1 <= 20 ))
 }
 
 # Secret: matches the Phase 6 policy (internal/config delegates to
@@ -364,6 +402,14 @@ load_existing_config() {
   esac
   v="$(unit_env "$unit" SPLIT_METRICS_PORT)"; [ -n "$v" ] && [ -z "$METRICS_PORT" ] && METRICS_PORT="$v"
   v="$(unit_env "$unit" SPLIT_RELAY_BUF)";    [ -n "$v" ] && [ -z "$RELAY_BUF" ]    && RELAY_BUF="$v"
+  # Tuning knobs (Phase 5+): keep an existing installation's values on upgrade.
+  # Unset/empty in the unit is legal (the binary applies its defaults), so
+  # these pre-fills are best-effort only.
+  v="$(unit_env "$unit" SPLIT_CARRIER_GRACE)";            [ -n "$v" ] && [ -z "$CARRIER_GRACE" ]     && CARRIER_GRACE="$v"
+  v="$(unit_env "$unit" SPLIT_BOOTSTRAP_WAIT_MS)";        [ -n "$v" ] && [ -z "$BOOTSTRAP_WAIT" ]    && BOOTSTRAP_WAIT="$v"
+  v="$(unit_env "$unit" SPLIT_SESSION_BUFFER_BYTES)";     [ -n "$v" ] && [ -z "$SESSION_BUF" ]       && SESSION_BUF="$v"
+  v="$(unit_env "$unit" SPLIT_SESSION_BUFFER_TOTAL_BYTES)"; [ -n "$v" ] && [ -z "$SESSION_BUF_TOTAL" ] && SESSION_BUF_TOTAL="$v"
+  v="$(unit_env "$unit" SPLIT_LIVENESS_ROUNDS)";          [ -n "$v" ] && [ -z "$LIVENESS_ROUNDS" ]   && LIVENESS_ROUNDS="$v"
   return 0
 }
 
@@ -479,6 +525,16 @@ parse_args() {
         require_arg "$@"; METRICS_PORT="$2"; shift 2 ;;
       --relay-buf)
         require_arg "$@"; RELAY_BUF="$2"; shift 2 ;;
+      --carrier-grace)
+        require_arg "$@"; CARRIER_GRACE="$2"; shift 2 ;;
+      --bootstrap-wait)
+        require_arg "$@"; BOOTSTRAP_WAIT="$2"; shift 2 ;;
+      --session-buffer-bytes)
+        require_arg "$@"; SESSION_BUF="$2"; shift 2 ;;
+      --session-buffer-total)
+        require_arg "$@"; SESSION_BUF_TOTAL="$2"; shift 2 ;;
+      --liveness-rounds)
+        require_arg "$@"; LIVENESS_ROUNDS="$2"; shift 2 ;;
       *)
         error "Unknown option: $1"
         usage
@@ -644,6 +700,33 @@ gather_params() {
     RELAY_BUF="${REPLY_VALUE}"
   fi
 
+  # ---- Tuning knobs (Phase 5+; 0 = library default where applicable) ----
+  if [ -z "$CARRIER_GRACE" ]; then
+    ask_valid "Carrier-loss grace window in ms (how long a session survives a carrier blip)" \
+      "5000" is_grace_ms "expected an integer between 500 and 600000"
+    CARRIER_GRACE="${REPLY_VALUE}"
+  fi
+  if [ -z "$BOOTSTRAP_WAIT" ]; then
+    ask_valid "Bootstrap wait for a temporarily down carrier in ms (0 = 30 s default)" \
+      "0" is_bootstrap_ms "expected 0 (default) or an integer between 500 and 120000"
+    BOOTSTRAP_WAIT="${REPLY_VALUE}"
+  fi
+  if [ -z "$SESSION_BUF" ]; then
+    ask_valid "Per-session reconnect buffer in bytes" \
+      "262144" is_session_buf "expected an integer between 4096 and 16777216"
+    SESSION_BUF="${REPLY_VALUE}"
+  fi
+  if [ -z "$SESSION_BUF_TOTAL" ]; then
+    ask_valid "Node-level aggregate session-buffer budget in bytes (0 = 32 MiB default)" \
+      "0" is_session_buf_total "expected 0 (default) or an integer up to 536870912"
+    SESSION_BUF_TOTAL="${REPLY_VALUE}"
+  fi
+  if [ -z "$LIVENESS_ROUNDS" ]; then
+    ask_valid "Carrier liveness rounds: unanswered keepalive pings before a blackholed carrier is torn down (0 = 3 default)" \
+      "0" is_liveness_rounds "expected an integer between 0 and 20"
+    LIVENESS_ROUNDS="${REPLY_VALUE}"
+  fi
+
   # Final safety net: also validate values that came from flags.
   local bad=0
   case "${ROLE}" in
@@ -660,6 +743,11 @@ gather_params() {
   esac
   if ! is_port "$METRICS_PORT"; then error "Metrics port '${METRICS_PORT}' is invalid (expected 0-65535)"; bad=1; fi
   if ! is_uint "$RELAY_BUF"; then error "Relay buffer '${RELAY_BUF}' is invalid (expected 1024..8388608)"; bad=1; fi
+  if ! is_grace_ms "$CARRIER_GRACE"; then error "Carrier grace '${CARRIER_GRACE}' is invalid (expected 500..600000 ms)"; bad=1; fi
+  if ! is_bootstrap_ms "$BOOTSTRAP_WAIT"; then error "Bootstrap wait '${BOOTSTRAP_WAIT}' is invalid (expected 0 or 500..120000 ms)"; bad=1; fi
+  if ! is_session_buf "$SESSION_BUF"; then error "Session buffer '${SESSION_BUF}' is invalid (expected 4096..16777216 bytes)"; bad=1; fi
+  if ! is_session_buf_total "$SESSION_BUF_TOTAL"; then error "Session buffer total '${SESSION_BUF_TOTAL}' is invalid (expected 0..536870912 bytes)"; bad=1; fi
+  if ! is_liveness_rounds "$LIVENESS_ROUNDS"; then error "Liveness rounds '${LIVENESS_ROUNDS}' is invalid (expected 0..20)"; bad=1; fi
   if [ -n "$XRAY_INBOUND_TAG" ] && [[ "$XRAY_INBOUND_TAG" =~ [[:space:]] ]]; then
     error "Xray inbound tag '${XRAY_INBOUND_TAG}' must not contain spaces"
     bad=1
@@ -775,6 +863,11 @@ validate_config_gate() {
     SPLIT_SECRET="$SECRET" \
     SPLIT_METRICS_PORT="$METRICS_PORT" \
     SPLIT_RELAY_BUF="$RELAY_BUF" \
+    SPLIT_CARRIER_GRACE="$CARRIER_GRACE" \
+    SPLIT_BOOTSTRAP_WAIT_MS="$BOOTSTRAP_WAIT" \
+    SPLIT_SESSION_BUFFER_BYTES="$SESSION_BUF" \
+    SPLIT_SESSION_BUFFER_TOTAL_BYTES="$SESSION_BUF_TOTAL" \
+    SPLIT_LIVENESS_ROUNDS="$LIVENESS_ROUNDS" \
     "$bin" --validate-config 2>&1
   )"; then
     info "$out"
@@ -833,6 +926,11 @@ ${env_lines}
 Environment=SPLIT_SECRET=${SECRET}
 Environment=SPLIT_METRICS_PORT=${METRICS_PORT}
 Environment=SPLIT_RELAY_BUF=${RELAY_BUF}
+Environment=SPLIT_CARRIER_GRACE=${CARRIER_GRACE}
+Environment=SPLIT_BOOTSTRAP_WAIT_MS=${BOOTSTRAP_WAIT}
+Environment=SPLIT_SESSION_BUFFER_BYTES=${SESSION_BUF}
+Environment=SPLIT_SESSION_BUFFER_TOTAL_BYTES=${SESSION_BUF_TOTAL}
+Environment=SPLIT_LIVENESS_ROUNDS=${LIVENESS_ROUNDS}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -1204,6 +1302,10 @@ print_summary() {
   info " Secret:        $(secret_display)"
   info " Secret file:   ${SECRET_STORE} (mode 600)"
   info " Metrics:       ${metrics_line}"
+  info " Carrier grace: ${CARRIER_GRACE} ms (session survives a carrier blip this long)"
+  info " Bootstrap wait: ${BOOTSTRAP_WAIT} ms (0 = 30 s library default)"
+  info " Session buffer: ${SESSION_BUF} B per session/dir; aggregate ${SESSION_BUF_TOTAL} B (0 = 32 MiB)"
+  info " Liveness:      ${LIVENESS_ROUNDS} unanswered pings (0 = 3)"
   info " Status:        systemctl status ${ROLE}-splitter"
   info " Logs:          journalctl -u ${ROLE}-splitter -f"
 
