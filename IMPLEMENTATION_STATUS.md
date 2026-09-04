@@ -5,6 +5,46 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Issue #9 — real two-server integration / production acceptance
+  (branch `feat/issue-9-two-server-acceptance`)**: the harness for the
+  acceptance gate is built. Two levels, per the re-baselined test strategy:
+  - **L4 two-process local gate** (`integration/twoproc_test.go`): builds
+    the REAL `iran-splitter`/`germany-splitter` binaries from the tree
+    under test and runs them as two OS processes on 127.0.0.1 — real
+    WebSocket upgrade, real TCP down-carrier, real SOCKS5 client (new
+    stdlib-only `integration/socks5` client, unit-tested for the 0x06,
+    timeout and half-close failure modes), real echo/scripted/IPv6
+    targets. Carrier failure is injected through two controllable TCP
+    proxies that stand in for the CDN (up) and Xray/Reality (down) —
+    Kill() tears down the carrier WITHOUT killing the splitter, which is
+    the only way an in-flight rebind is observable with a live Germany
+    node. Scenarios: S1 CONNECT+256KiB up/down (checksums + byte-exact
+    metric deltas + settle), S2 domain dest, S3 IPv6 dest, S4 8
+    simultaneous sessions, S5 client half-close, S6 target half-close
+    (EOF through the tunnel), S7 up-carrier loss mid-transfer → rebind
+    (deterministic: loss + reattach log markers on both nodes, data
+    intact), S8 down-carrier loss mid-response → rebind, S9 auth failure
+    (409 duplicate carrier; wrong-secret handshake rejected; tunnel
+    unaffected), S10 Germany kill → SOCKS 0x06 after the bounded
+    bootstrap wait → restart → sessions flow again, S11 graceful
+    shutdown (SIGINT → "stopped" → exit 0). Opt-in (`RUN_TWOPROC=1`),
+    POSIX-only (SIGINT/half-close/fd semantics), documented test tuning:
+    `SPLIT_CARRIER_GRACE=15000` in the harness env so a ~2 s reconnect
+    backoff always lands inside the rebind window (the grace boundary
+    itself is covered by pkg/node unit tests at the production default).
+    Also available on-demand in CI (workflow_dispatch job with an
+    optional `-race` build of the splitters). NOT part of the automatic
+    PR gate, per the issue.
+  - **L5 real two-server acceptance** (`integration/RUNBOOK.md`): full
+    20-scenario matrix with objective assertions (checksums, metric
+    deltas, log markers, fd/RSS settling), the exact staging topology
+    (required/optional/test-only dependency table, per-host OS/ports/
+    firewall/config), the CDN-stand-in decision (direct TLS origin is
+    sufficient; real CDN optional), and the mandatory results-record
+    format. **STATUS: AWAITING STAGING INFRASTRUCTURE** — the issue
+    stays open until the matrix has actually been executed on two real
+    endpoints (twice, once with race builds) and recorded here. This is
+    the explicit human-only dependency.
 - **Issue #8 — configuration / installer / systemd / README / Xray-example
   consistency (branch `fix/issue-8-config-consistency`)**: audit +
   reconciliation pass over `internal/config` ↔ `install.sh` ↔
