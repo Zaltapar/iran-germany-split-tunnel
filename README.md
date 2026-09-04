@@ -117,6 +117,7 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_STREAM_QUEUE_FRAMES` | ✓ | ✓ | `16` | Max frames buffered per stream |
 | `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `33554432` (32 MiB) | Aggregate queued bytes across all streams per carrier |
 | `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `100` | How long a stalled stream may hold its buffer (ms) before termination |
+| `SPLIT_BOOTSTRAP_WAIT_MS` | ✓ | ✓ | `30000` (0 = default) | Bounded wait for a temporarily down carrier at session bootstrap (ms; `0` = library default 30 s, explicit values 500..120000) |
 
 ### Configuration validation
 
@@ -204,10 +205,20 @@ dispatcher, serialized writes, keepalive pings). No application frame is
 accepted before authentication completes.
 
 **Session lifecycle**:
-1. Iran accepts a SOCKS5 `CONNECT`, waits for both carriers, sends `FrameHeader(destination)`
-   on the up-carrier, then relays client bytes as `FrameData` (upload only).
-2. Germany's dispatcher creates the stream on the first `FrameHeader` (`OnNewStream`), dials the
-   target (`net.DialTimeout` 10 s), registers the session, and starts:
+1. Iran accepts a SOCKS5 `CONNECT`, waits for both carriers — **bounded by
+   `SPLIT_BOOTSTRAP_WAIT_MS`** (signal-driven, cancelable on shutdown, default
+   30 s) — then sends `FrameHeader(destination)` on the up-carrier and relays
+   client bytes as `FrameData` (upload only). A carrier that is down at the
+   moment of the `CONNECT` but reconnects within the window is observed
+   without polling; if the window expires, the SOCKS connection fails with
+   `0x06` (documented drop, never an infinite wait).
+2. Germany's dispatcher creates the stream on the first `FrameHeader`
+   (`OnNewStream`), dials the target (`net.DialTimeout` 10 s), and — if the
+   down-carrier is down at that instant — **waits for it, bounded by the same
+   `SPLIT_BOOTSTRAP_WAIT_MS`**; on success the session attaches to the
+   current carrier generation, on expiry the stream is dropped exactly once
+   (`FrameClose` + deregister + target conn closed + one `errors` metric).
+   The session then registers and starts:
    - up relay: up-carrier `FrameData` → target socket
    - down relay: target socket → down-carrier `FrameData` (download only)
 3. Teardown: each session runs an explicit state machine

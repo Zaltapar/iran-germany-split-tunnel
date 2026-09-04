@@ -30,6 +30,7 @@ func isolatedEnv(t *testing.T) {
 		EnvSecret, EnvAllowWeak, EnvMetricsPort, EnvRelayBuf,
 		EnvQueueBytes, EnvQueueFrames, EnvQueueTotal, EnvOverflowMs,
 		EnvSessionBufTotal,
+		EnvBootstrapWait,
 	} {
 		t.Setenv(name, "")
 	}
@@ -82,6 +83,11 @@ func TestDefaults(t *testing.T) {
 	// 0 = library default sentinel (node lifts it in Sanitize).
 	if c.SessionBufTotal != 0 {
 		t.Fatalf("SessionBufTotal must default to 0 (library default sentinel): %+v", c)
+	}
+	// Issue #7: the bootstrap wait uses the same 0 = library default
+	// sentinel (node lifts it in Sanitize).
+	if c.BootstrapWaitMs != 0 {
+		t.Fatalf("BootstrapWaitMs must default to 0 (library default sentinel): %+v", c)
 	}
 }
 
@@ -320,6 +326,53 @@ func TestSessionBufTotal(t *testing.T) {
 	t.Setenv(EnvSessionBufTotal, "999999999999")
 	if _, err := Load(RoleIran); err == nil {
 		t.Fatalf("Load with %s=999999999999 must fail", EnvSessionBufTotal)
+	}
+}
+
+// TestBootstrapWait (Issue #7): the bounded bootstrap wait — parse,
+// bounds, and the 0-sentinel behavior, matching the existing envInt
+// patterns.
+func TestBootstrapWait(t *testing.T) {
+	// 0 = library default: valid.
+	if err := validIran().Validate(RoleIran); err != nil {
+		t.Fatalf("zero BootstrapWaitMs must be valid: %v", err)
+	}
+
+	// Explicit values within bounds: valid (including the max).
+	for _, v := range []int{MinBootstrapWaitMs, 30000, MaxBootstrapWaitMs} {
+		c := validIran()
+		c.BootstrapWaitMs = v
+		if err := c.Validate(RoleIran); err != nil {
+			t.Fatalf("BootstrapWaitMs=%d must be valid: %v", v, err)
+		}
+	}
+
+	// Out-of-range values: errors naming the variable.
+	for _, v := range []int{499, MaxBootstrapWaitMs + 1} {
+		c := validIran()
+		c.BootstrapWaitMs = v
+		ps := problemsOf(t, c.Validate(RoleIran))
+		if !strings.Contains(joinedProblems(ps), EnvBootstrapWait) {
+			t.Fatalf("want problem naming %s for %d, got: %v", EnvBootstrapWait, v, ps)
+		}
+	}
+
+	// Load path: env parsing.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvBootstrapWait, "45000")
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load with %s=45000: %v", EnvBootstrapWait, err)
+	}
+	if cfg.BootstrapWaitMs != 45000 {
+		t.Fatalf("BootstrapWaitMs = %d, want 45000", cfg.BootstrapWaitMs)
+	}
+
+	// Load path: out-of-range env value is a parse/validation problem.
+	t.Setenv(EnvBootstrapWait, "999999999")
+	if _, err := Load(RoleIran); err == nil {
+		t.Fatalf("Load with %s=999999999 must fail", EnvBootstrapWait)
 	}
 }
 

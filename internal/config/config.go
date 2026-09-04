@@ -59,6 +59,7 @@ const (
 	EnvQueueTotal      = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
 	EnvOverflowMs      = "SPLIT_STREAM_OVERFLOW_MS"         // both
 	EnvCarrierGrace    = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
+	EnvBootstrapWait   = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
 	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
 	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
 	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
@@ -96,9 +97,18 @@ const (
 	// Phase 5 carrier-loss recovery bounds.
 	MinCarrierGraceMs = 500    // 0.5 s
 	MaxCarrierGraceMs = 600000 // 10 min
-	DefaultSessionBuf = 256 << 10
-	MinSessionBuf     = 4 << 10  // 4 KiB
-	MaxSessionBuf     = 16 << 20 // 16 MiB
+
+	// Issue #7 bootstrap wait bounds (ms). 0 = library default
+	// (node.defaultBootstrapWait, 30 s). The maximum keeps a
+	// misconfiguration from holding a new session hostage for hours;
+	// the minimum keeps a genuinely broken carrier from being retried
+	// pointlessly.
+	DefaultBootstrapWaitMs = 0
+	MinBootstrapWaitMs     = 500    // 0.5 s
+	MaxBootstrapWaitMs     = 120000 // 2 min
+	DefaultSessionBuf      = 256 << 10
+	MinSessionBuf          = 4 << 10  // 4 KiB
+	MaxSessionBuf          = 16 << 20 // 16 MiB
 
 	// Issue #6: node-level aggregate session-buffer budget bounds.
 	// 0 = library default (node.DefaultSessionBufferTotal, 32 MiB) —
@@ -148,7 +158,9 @@ type Config struct {
 	OverflowWaitMs       int           // 0 = library default
 
 	// Phase 5 carrier-loss recovery (pkg/node engine).
-	CarrierGraceMs  int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
+	CarrierGraceMs int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
+	// Issue #7 bootstrap wait (pkg/node engine).
+	BootstrapWaitMs int // SPLIT_BOOTSTRAP_WAIT_MS: bounded bootstrap wait for a down carrier (ms; 0 = library default)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
 	SessionBufTotal int // SPLIT_SESSION_BUFFER_TOTAL_BYTES: node-level aggregate (0 = library default)
 
@@ -213,6 +225,7 @@ func Load(role string) (*Config, error) {
 	c.QueueBytesTotal = envInt(&problems, EnvQueueTotal, 0, 0, MaxQueueBytesTotal)
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
 	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
+	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs) // 0 = library default
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
@@ -317,6 +330,14 @@ func (c *Config) Validate(role string) error {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d: expected %d..%d milliseconds (Phase 5 carrier-loss grace window)",
 			EnvCarrierGrace, c.CarrierGraceMs, MinCarrierGraceMs, MaxCarrierGraceMs))
+	}
+	// 0 is the library-default sentinel; any explicit value must be
+	// within MinBootstrapWaitMs..MaxBootstrapWaitMs (Issue #7).
+	if (c.BootstrapWaitMs != 0 && c.BootstrapWaitMs < MinBootstrapWaitMs) ||
+		c.BootstrapWaitMs > MaxBootstrapWaitMs {
+		problems = append(problems, fmt.Sprintf(
+			"%s=%d: expected 0 (library default) .. %d milliseconds, or %d..%d (Issue #7 bootstrap wait for a temporarily down carrier)",
+			EnvBootstrapWait, c.BootstrapWaitMs, MaxBootstrapWaitMs, MinBootstrapWaitMs, MaxBootstrapWaitMs))
 	}
 	if c.LivenessRounds < MinLivenessRounds || c.LivenessRounds > MaxLivenessRounds {
 		problems = append(problems, fmt.Sprintf(
