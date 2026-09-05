@@ -32,7 +32,6 @@
 package integration
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
@@ -375,6 +374,20 @@ func (p *proc) exitCode(t *testing.T) int {
 	return -1
 }
 
+// alive reports whether the process is still running. S11 uses this to
+// distinguish "a node process already died because a PRIOR scenario failed
+// and aborted the test (Goexit) before a later restart ran" (a cascade —
+// the real failure is that prior scenario, already reported) from a genuine
+// S11 shutdown bug. Without this probe, S11's stopGraceful surfaces only
+// 'process already finished' and masks the actual root cause.
+//
+// It keys off cmd.ProcessState, which Wait() sets once and never clears —
+// unlike the buffered exit channel, which kill()/stopGraceful consume, so a
+// channel-peek would wrongly report a reaped (dead) process as alive.
+func (p *proc) alive() bool {
+	return p.cmd.ProcessState == nil
+}
+
 // ============================================================
 // metrics
 // ============================================================
@@ -635,20 +648,36 @@ func wsUpgrade(addr, path string, timeout time.Duration) (net.Conn, string, erro
 		c.Close()
 		return nil, "", err
 	}
-	br := bufio.NewReader(c)
-	line, err := br.ReadString('\n')
-	if err != nil {
-		c.Close()
-		return nil, "", err
-	}
-	// Drain the rest of the header (101 has no body).
+	// Read the HTTP response header ONE BYTE AT A TIME directly from the
+	// conn — NOT via bufio.Reader. A buffered reader over-consumes: when the
+	// 101 response and the FIRST WebSocket frame (the auth challenge) arrive
+	// in the same socket read, bufio pulls the challenge into its buffer, and
+	// because we return the raw conn (not the bufio.Reader) the caller's
+	// wsReadFrame(c) then sees EOF and never receives the challenge. That
+	// over-read is what made S10b flaky (timing-dependent on TCP
+	// segmentation). Single-byte reads never over-consume, so any bytes past
+	// the blank line stay on the conn for the frame reads that follow.
+	var hdr []byte
+	one := make([]byte, 1)
 	for {
-		l, rerr := br.ReadString('\n')
-		if rerr != nil || l == "\r\n" {
+		if _, err := c.Read(one); err != nil {
+			c.Close()
+			return nil, "", err
+		}
+		hdr = append(hdr, one[0])
+		if len(hdr) >= 4 && hdr[len(hdr)-4] == '\r' && hdr[len(hdr)-3] == '\n' &&
+			hdr[len(hdr)-2] == '\r' && hdr[len(hdr)-1] == '\n' {
 			break
 		}
 	}
-	return c, strings.TrimSpace(line), nil
+	var statusLine string
+	for i, b := range hdr {
+		if b == '\n' {
+			statusLine = string(hdr[:i])
+			break
+		}
+	}
+	return c, strings.TrimSpace(statusLine), nil
 }
 
 // wsReadFrame reads ONE WebSocket data frame from the server (server
@@ -1216,6 +1245,18 @@ func TestTwoProcessLocal(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("S11 requires POSIX signals (SIGINT graceful stop); " +
 				"covered on the Linux run (CI workflow_dispatch / staging)")
+		}
+		// Cascade guard: if an earlier scenario FAILED and aborted the test
+		// (Goexit skips the rest of its subtest, e.g. S10c's Germany
+		// restart), a node process may already be dead here. The true
+		// failure is that earlier scenario (already reported above); S11
+		// must not re-report it as its own 'process already finished' bug,
+		// which would mask the root cause.
+		if !de.alive() || !iran.alive() {
+			t.Skipf("S11 skipped: a preceding scenario left a node process dead "+
+				"(de alive=%v, iran alive=%v) — the true failure is the earlier "+
+				"scenario's (see its log above), not graceful shutdown",
+				de.alive(), iran.alive())
 		}
 		_ = waitMetric(t, mIran, 10*time.Second, "no active sessions before shutdown", func(m metrics) bool {
 			return m.ActiveSessions == 0 && m.SessionCount == 0
