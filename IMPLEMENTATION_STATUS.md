@@ -62,6 +62,29 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
     5–20× race slowdown) was fixed with a work-proportional
     `readDeadline(n) = 10 s + 1 ms/byte` (finite; a stuck relay still
     fails) — commit `70d72c5`.
+    **L4 EXECUTION RECORD (Linux, 2026-09-05, CI dispatch run
+    `33964110954`, branch `fix/issue-9-l4-settle` @ `9ade419`):** the
+    **full 11-scenario gate is GREEN on Linux** — `go test`,
+    `go test -race`, and the on-demand L4 job all pass; S5 (client
+    half-close) and S11 (SIGINT graceful stop) — the two POSIX-only
+    scenarios — **run and pass** (S11: "both nodes shut down
+    gracefully (SIGINT → clean exit 0)"). The first four Linux
+    dispatch runs (`33934042239`, `33957175580`, `33958481188`,
+    `33960460546`) failed only at S11 while S1–S10 passed; log
+    forensics (the captured-process dump added in this work) proved
+    the cause was a TEST-HARNESS defect, not a product defect: the
+    S10c Germany restart was registered on the S10 subtest's
+    `t.Cleanup`, which SIGKILLed the fresh process ~1 ms before S11.
+    Fixed by registering the kill cleanup on the top-level test
+    (`startProc(t, cleanupT, ...)`); also fixed in this branch: the
+    S10b `wsUpgrade` helper used a `bufio.Reader` that over-read the
+    101 response and could swallow the first WS frame (the auth
+    challenge) when both arrived in one TCP segment — a segmentation-
+    dependent flake, now byte-at-a-time header reads; per-scenario
+    settle assertions (any session leak fails its own scenario); and
+    `stopGraceful` dumps the dead process's captured log (no more
+    invisible deaths). Local: gate green ×3 on the Windows dev host
+    (S5/S11 skipped there as designed).
   - **L5 real two-server acceptance** (`integration/RUNBOOK.md`): full
     20-scenario matrix with objective assertions (checksums, metric
     deltas, log markers, fd/RSS settling), the exact staging topology
