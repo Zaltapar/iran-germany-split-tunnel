@@ -7,6 +7,17 @@ on:
     # host) are race-tested by this same Linux workflow.
     branches: [main, hardening/production-reliability]
   pull_request:
+  # Issue #9: the L4 two-process local integration gate runs the REAL
+  # production binaries as two OS processes (real sockets, real
+  # WebSocket, real SOCKS5, failure injection). It is NOT part of the
+  # automatic PR gate (it takes minutes and is meant for acceptance
+  # verification); run it on demand from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      twoproc_race:
+        description: "Build the splitters with -race for the L4 gate (slower)"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -34,6 +45,13 @@ jobs:
 
       - name: go build (host)
         run: go build ./...
+      # The L4 two-process gate (Issue #9): only on manual dispatch.
+      - name: L4 two-process local gate (on-demand)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUN_TWOPROC: "1"
+          TWOPROC_RACE: ${{ github.event.inputs.twoproc_race == 'true' && '1' || '0' }}
+        run: go test -count=1 -v -timeout 10m -run TestTwoProcessLocal ./integration/
 
       - name: go build (linux/amd64)
         env:

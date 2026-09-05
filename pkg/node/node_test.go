@@ -221,9 +221,25 @@ func (tp *topo) write(c *testutil.MemConn, s string) {
 	}
 }
 
+// readDeadline bounds a read of n bytes. The 10 s base covers a fast
+// machine; the per-byte margin keeps the bound PROPORTIONAL TO THE
+// AMOUNT OF WORK when the suite runs under the race detector (5–20x
+// slower), so the 200-session stress test's per-session 32 KiB drain
+// does not time out for a scheduling artifact (observed under CI
+// `go test -race`: budget drain just past the flat 10 s). The bound
+// stays finite — a stuck relay still fails the test, so this is a
+// corrected bound, not a mask.
+func readDeadline(n int) time.Duration {
+	d := 10*time.Second + time.Duration(n)*time.Millisecond
+	if d < 10*time.Second {
+		d = 10 * time.Second
+	}
+	return d
+}
+
 func (tp *topo) readN(c *testutil.MemConn, n int, what string) string {
 	tp.t.Helper()
-	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	c.SetReadDeadline(time.Now().Add(readDeadline(n)))
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(c, buf); err != nil {
 		tp.t.Fatalf("reading %s: %v", what, err)

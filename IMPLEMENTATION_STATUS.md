@@ -5,6 +5,73 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Issue #9 — real two-server integration / production acceptance
+  (branch `feat/issue-9-two-server-acceptance`)**: the harness for the
+  acceptance gate is built. Two levels, per the re-baselined test strategy:
+  - **L4 two-process local gate** (`integration/twoproc_test.go`): builds
+    the REAL `iran-splitter`/`germany-splitter` binaries from the tree
+    under test and runs them as two OS processes on 127.0.0.1 — real
+    WebSocket upgrade, real TCP down-carrier, real SOCKS5 client (new
+    stdlib-only `integration/socks5` client, unit-tested for the 0x06,
+    timeout and half-close failure modes), real echo/scripted/IPv6
+    targets. Carrier failure is injected through two controllable TCP
+    proxies that stand in for the CDN (up) and Xray/Reality (down) —
+    Kill() tears down the carrier WITHOUT killing the splitter, which is
+    the only way an in-flight rebind is observable with a live Germany
+    node. Scenarios: S1 CONNECT+256KiB up/down (checksums + byte-exact
+    metric deltas + settle), S2 domain dest, S3 IPv6 dest, S4 8
+    simultaneous sessions, S5 client half-close, S6 target half-close
+    (EOF through the tunnel), S7 up-carrier loss mid-transfer → rebind
+    (deterministic: loss + reattach log markers on both nodes, data
+    intact), S8 down-carrier loss mid-response → rebind, S9 auth failure
+    (409 duplicate carrier; wrong-secret handshake rejected; tunnel
+    unaffected), S10 Germany kill → SOCKS 0x06 after the bounded
+    bootstrap wait → restart → sessions flow again, S11 graceful
+    shutdown (SIGINT → "stopped" → exit 0). Opt-in (`RUN_TWOPROC=1`),
+    POSIX-only (SIGINT/half-close/fd semantics), documented test tuning:
+    `SPLIT_CARRIER_GRACE=15000` in the harness env so a ~2 s reconnect
+    backoff always lands inside the rebind window (the grace boundary
+    itself is covered by pkg/node unit tests at the production default).
+    Also available on-demand in CI (workflow_dispatch job with an
+    optional `-race` build of the splitters). NOT part of the automatic
+    PR gate, per the issue.
+    **L4 EXECUTION RECORD (first real runs, 2026-09-05, Windows 11 dev
+    host, commit `4c9aeae`):** 3 consecutive full gate runs GREEN
+    (~23 s each) — S1–S4, S6–S10 pass against the real binaries; S5
+    (client half-close) and S11 (SIGINT graceful stop) are POSIX-only
+    and SKIP on Windows, so they still require the Linux dispatch run.
+    Highlights: 256 KiB up + 256 KiB down with sha256 in both
+    directions and byte-exact `total_bytes_*` metric deltas; domain and
+    IPv6 destinations; 8 simultaneous sessions; target half-close
+    delivered as `io.EOF` through the tunnel; in-flight up- AND
+    down-carrier rebind with data intact (1.2–2.2 s end-to-end,
+    generation markers `carrier up lost (gen 1)` → `reattached to
+    carrier gen 3` on both nodes); duplicate up-carrier rejected 409;
+    Germany kill → both losses detected → SOCKS 0x06 after exactly the
+    2.0 s bounded bootstrap wait → wrong-secret v1 handshake rejected
+    (challenge received, garbage response MAC-fails, peer closes) →
+    restart → sessions flow again. The runs exposed and fixed harness
+    defects (NOT product defects): the proxy stand-in must
+    half-close-propagate a peer's death (plain two-way io.Copy left the
+    far side blocked when a peer DIES, masking carrier loss — the same
+    flaw a naive staging stand-in would have), one-shot exit-channel
+    reaping, RFC 6455 framing for the rogue client (masked client
+    frames; WS payload = 7-byte protocol header + challenge), and
+    Windows `.exe` handling. A `pkg/node` pre-existing race-mode
+    timing bound (`readN` flat 10 s vs 200×32 KiB drain under the
+    5–20× race slowdown) was fixed with a work-proportional
+    `readDeadline(n) = 10 s + 1 ms/byte` (finite; a stuck relay still
+    fails) — commit `70d72c5`.
+  - **L5 real two-server acceptance** (`integration/RUNBOOK.md`): full
+    20-scenario matrix with objective assertions (checksums, metric
+    deltas, log markers, fd/RSS settling), the exact staging topology
+    (required/optional/test-only dependency table, per-host OS/ports/
+    firewall/config), the CDN-stand-in decision (direct TLS origin is
+    sufficient; real CDN optional), and the mandatory results-record
+    format. **STATUS: AWAITING STAGING INFRASTRUCTURE** — the issue
+    stays open until the matrix has actually been executed on two real
+    endpoints (twice, once with race builds) and recorded here. This is
+    the explicit human-only dependency.
 - **Issue #8 — configuration / installer / systemd / README / Xray-example
   consistency (branch `fix/issue-8-config-consistency`)**: audit +
   reconciliation pass over `internal/config` ↔ `install.sh` ↔

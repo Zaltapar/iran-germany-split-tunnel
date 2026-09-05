@@ -274,6 +274,36 @@ accepted before authentication completes.
 `go run ./e2e-pipe-test` runs the full protocol (auth on both carriers, header bootstrap,
 upload/download relays, teardown) in-process over `net.Pipe` — no real network needed.
 
+### Two-process local integration (L4) and two-server acceptance (L5)
+
+`go run ./e2e-pipe-test` is the fast in-process gate. On top of it,
+`integration/` adds two levels for production acceptance (Issue #9):
+
+* **L4 — two-process local gate** (`integration/twoproc_test.go`): builds
+  and runs the ACTUAL `iran-splitter` and `germany-splitter` binaries as two
+  OS processes over real 127.0.0.1 sockets — real WebSocket upgrade, real
+  SOCKS5 client, real echo target — and injects carrier failure through
+  controllable stand-in proxies. Run it explicitly on a POSIX host (Linux/
+  macOS; not part of the automatic CI gate):
+
+  ```bash
+  RUN_TWOPROC=1 go test -count=1 -timeout 10m -run TestTwoProcessLocal ./integration/
+  # optional: build the splitters with -race for the run
+  RUN_TWOPROC=1 TWOPROC_RACE=1 go test -count=1 -timeout 10m -run TestTwoProcessLocal ./integration/
+  ```
+
+  It is also available on demand from GitHub Actions (workflow_dispatch,
+  "L4 two-process local gate").
+
+* **L5 — real two-server acceptance**: the full 20-scenario matrix over two
+  real staging endpoints (real CDN/Reality carrier paths, real Xray
+  consumer, blackhole, repeated flapping, host-level resource settling).
+  See **[`integration/RUNBOOK.md`](integration/RUNBOOK.md)** for the staging
+  topology, firewall, the objective acceptance matrix, and the required
+  results record. The issue stays open until L5 has actually been executed
+  on staging (twice, once with race builds) and the results are recorded in
+  `IMPLEMENTATION_STATUS.md`.
+
 ## Security
 
 **Shared secret.** Set `SPLIT_SECRET` identically on both nodes. Generate it with
