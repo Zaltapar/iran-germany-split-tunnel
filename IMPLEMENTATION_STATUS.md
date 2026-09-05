@@ -35,6 +35,33 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
     Also available on-demand in CI (workflow_dispatch job with an
     optional `-race` build of the splitters). NOT part of the automatic
     PR gate, per the issue.
+    **L4 EXECUTION RECORD (first real runs, 2026-09-05, Windows 11 dev
+    host, commit `4c9aeae`):** 3 consecutive full gate runs GREEN
+    (~23 s each) — S1–S4, S6–S10 pass against the real binaries; S5
+    (client half-close) and S11 (SIGINT graceful stop) are POSIX-only
+    and SKIP on Windows, so they still require the Linux dispatch run.
+    Highlights: 256 KiB up + 256 KiB down with sha256 in both
+    directions and byte-exact `total_bytes_*` metric deltas; domain and
+    IPv6 destinations; 8 simultaneous sessions; target half-close
+    delivered as `io.EOF` through the tunnel; in-flight up- AND
+    down-carrier rebind with data intact (1.2–2.2 s end-to-end,
+    generation markers `carrier up lost (gen 1)` → `reattached to
+    carrier gen 3` on both nodes); duplicate up-carrier rejected 409;
+    Germany kill → both losses detected → SOCKS 0x06 after exactly the
+    2.0 s bounded bootstrap wait → wrong-secret v1 handshake rejected
+    (challenge received, garbage response MAC-fails, peer closes) →
+    restart → sessions flow again. The runs exposed and fixed harness
+    defects (NOT product defects): the proxy stand-in must
+    half-close-propagate a peer's death (plain two-way io.Copy left the
+    far side blocked when a peer DIES, masking carrier loss — the same
+    flaw a naive staging stand-in would have), one-shot exit-channel
+    reaping, RFC 6455 framing for the rogue client (masked client
+    frames; WS payload = 7-byte protocol header + challenge), and
+    Windows `.exe` handling. A `pkg/node` pre-existing race-mode
+    timing bound (`readN` flat 10 s vs 200×32 KiB drain under the
+    5–20× race slowdown) was fixed with a work-proportional
+    `readDeadline(n) = 10 s + 1 ms/byte` (finite; a stuck relay still
+    fails) — commit `70d72c5`.
   - **L5 real two-server acceptance** (`integration/RUNBOOK.md`): full
     20-scenario matrix with objective assertions (checksums, metric
     deltas, log markers, fd/RSS settling), the exact staging topology
