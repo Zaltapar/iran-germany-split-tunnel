@@ -253,10 +253,18 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-func startProc(t *testing.T, name, bin string, extraEnv map[string]string) *proc {
+// startProc launches a splitter binary. t is the test marked on a start
+// failure; cleanupT is the (longer-lived) test whose Cleanup runs the final
+// kill and owns the working dir. They differ when a proc is (re)started
+// inside a SUBtest that must outlive that subtest: registering the kill on
+// the subtest's t.Cleanup SIGKILLs the process the moment the subtest
+// returns. Observed consequence: the S10c Germany restart was killed by the
+// S10 subtest's cleanup ~1ms before S11, masquerading as a "spontaneous"
+// death. For parent-scope procs, cleanupT == t.
+func startProc(t, cleanupT *testing.T, name, bin string, extraEnv map[string]string) *proc {
 	t.Helper()
 	cmd := exec.Command(bin)
-	cmd.Dir = t.TempDir()
+	cmd.Dir = cleanupT.TempDir()
 	env := append([]string{}, os.Environ()...)
 	for k, v := range extraEnv {
 		env = append(env, k+"="+v)
@@ -270,7 +278,7 @@ func startProc(t *testing.T, name, bin string, extraEnv map[string]string) *proc
 	}
 	p := &proc{t: t, name: name, cmd: cmd, log: l, exit: make(chan error, 1)}
 	go func() { p.exit <- cmd.Wait() }()
-	t.Cleanup(p.kill)
+	cleanupT.Cleanup(p.kill)
 	return p
 }
 
@@ -372,20 +380,6 @@ func (p *proc) exitCode(t *testing.T) int {
 	}
 	t.Fatalf("%s: unexpected exit: %v", p.name, p.exitErr)
 	return -1
-}
-
-// alive reports whether the process is still running. S11 uses this to
-// distinguish "a node process already died because a PRIOR scenario failed
-// and aborted the test (Goexit) before a later restart ran" (a cascade —
-// the real failure is that prior scenario, already reported) from a genuine
-// S11 shutdown bug. Without this probe, S11's stopGraceful surfaces only
-// 'process already finished' and masks the actual root cause.
-//
-// It keys off cmd.ProcessState, which Wait() sets once and never clears —
-// unlike the buffered exit channel, which kill()/stopGraceful consume, so a
-// channel-peek would wrongly report a reaped (dead) process as alive.
-func (p *proc) alive() bool {
-	return p.cmd.ProcessState == nil
 }
 
 // ============================================================
@@ -832,8 +826,14 @@ func TestTwoProcessLocal(t *testing.T) {
 	scripted := newTarget(t, modeScripted)
 	v6Port := newTargetV6(t)
 
+	// root aliases the TOP-LEVEL test for procs (re)started inside a
+	// subtest that must outlive it (the S10c Germany restart). Subtest
+	// closures shadow t, so the root test is captured here.
+	root := t
+
 	// Iran: bootstrap wait short (2 s) so the 0x06 scenario is fast.
-	iran := startProc(t, "iran", iranBin, map[string]string{
+	// (Parent scope: cleanupT == t, the top-level test.)
+	iran := startProc(t, t, "iran", iranBin, map[string]string{
 		"SPLIT_SECRET":            secretHex,
 		"SPLIT_SOCKS_LISTEN":      fmt.Sprintf("127.0.0.1:%d", socksPort),
 		"SPLIT_WS_LISTEN":         fmt.Sprintf("127.0.0.1:%d", iranWsPort),
@@ -855,7 +855,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		"SPLIT_METRICS_PORT":  strconv.Itoa(mDe),
 		"SPLIT_CARRIER_GRACE": "15000",
 	}
-	de := startProc(t, "germany", deBin, deEnv)
+	de := startProc(t, t, "germany", deBin, deEnv)
 
 	// Both carriers must authenticate over the REAL production paths:
 	// a real WebSocket upgrade through the up proxy, a real TCP v1
@@ -1229,7 +1229,10 @@ func TestTwoProcessLocal(t *testing.T) {
 		// S10c: restart Germany: carriers re-establish, a new session works.
 		// (The new Germany proc has a fresh log, so its wait is plain;
 		// Iran's must be offset-scoped against its own earlier auth log.)
-		de = startProc(t, "germany", deBin, deEnv)
+		// Restart Germany. cleanupT = root (the top-level test), NOT the S10
+		// subtest: registering the kill on the subtest would SIGKILL this
+		// fresh process the moment S10 returns — before S11 runs.
+		de = startProc(t, root, "germany", deBin, deEnv)
 		de.waitForLog(t, "Up-carrier authenticated", 25*time.Second)
 		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 25*time.Second)
 		payload := make([]byte, 128)
@@ -1246,18 +1249,10 @@ func TestTwoProcessLocal(t *testing.T) {
 			t.Skip("S11 requires POSIX signals (SIGINT graceful stop); " +
 				"covered on the Linux run (CI workflow_dispatch / staging)")
 		}
-		// Cascade guard: if an earlier scenario FAILED and aborted the test
-		// (Goexit skips the rest of its subtest, e.g. S10c's Germany
-		// restart), a node process may already be dead here. The true
-		// failure is that earlier scenario (already reported above); S11
-		// must not re-report it as its own 'process already finished' bug,
-		// which would mask the root cause.
-		if !de.alive() || !iran.alive() {
-			t.Skipf("S11 skipped: a preceding scenario left a node process dead "+
-				"(de alive=%v, iran alive=%v) — the true failure is the earlier "+
-				"scenario's (see its log above), not graceful shutdown",
-				de.alive(), iran.alive())
-		}
+		// If a node is already dead here (a prior scenario's failure aborted
+		// the test before a restart ran, or a genuine crash), stopGraceful
+		// reports it WITH the process's full captured log, so the root cause
+		// is never masked. No separate liveness pre-check.
 		_ = waitMetric(t, mIran, 10*time.Second, "no active sessions before shutdown", func(m metrics) bool {
 			return m.ActiveSessions == 0 && m.SessionCount == 0
 		})
