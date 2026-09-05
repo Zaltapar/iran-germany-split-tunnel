@@ -319,8 +319,11 @@ func (p *proc) stopGraceful(t *testing.T, d time.Duration) {
 	if runtime.GOOS == "windows" {
 		t.Fatalf("graceful stop requires POSIX signals")
 	}
+	// If the process already exited on its own (crash, OOM, stray
+	// signal), dumping its captured log is the ONLY way to see the panic
+	// trace or fatal message — otherwise the failure is invisible in CI.
 	if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatalf("%s: SIGINT: %v", p.name, err)
+		t.Fatalf("%s: SIGINT: %v\n--- captured log ---\n%s", p.name, err, p.log.String())
 	}
 	select {
 	case p.exitErr = <-p.exit:
