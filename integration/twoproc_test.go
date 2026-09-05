@@ -459,6 +459,25 @@ func waitMetric(t *testing.T, port int, d time.Duration, what string, pred func(
 	return last
 }
 
+// settleBoth asserts the invariant "a closed session is torn down on BOTH
+// nodes within d": no active sessions, no session still in the store.
+// Every scenario that creates+close a session MUST settle this way —
+// otherwise a single non-settling session silently leaks into a later
+// scenario's precondition (observed on Linux: S11's "no active sessions
+// before shutdown" precondition saw ActiveSessions:1 left by an earlier,
+// settle-unverified scenario). Asserting it per-scenario localizes any
+// real session/goroutine/fd leak to the exact scenario that caused it,
+// and keeps the S11 graceful-shutdown precondition deterministic.
+func settleBoth(t *testing.T, iranPort, dePort int, d time.Duration, what string) {
+	t.Helper()
+	_ = waitMetric(t, iranPort, d, what+" (iran settled)", func(m metrics) bool {
+		return m.ActiveSessions == 0 && m.SessionCount == 0
+	})
+	_ = waitMetric(t, dePort, d, what+" (germany settled)", func(m metrics) bool {
+		return m.ActiveSessions == 0 && m.SessionCount == 0
+	})
+}
+
 // ============================================================
 // echo / scripted target server
 // ============================================================
@@ -855,6 +874,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		rand.Read(payload)
 		c := transfer(t, socksAddr, "localhost", target.Port(), payload, 10*time.Second)
 		c.Close()
+		settleBoth(t, mIran, mDe, 10*time.Second, "S2")
 		t.Log("S2 ok: domain destination through the real resolver path")
 	})
 
@@ -867,6 +887,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		rand.Read(payload)
 		c := transfer(t, socksAddr, "::1", v6Port, payload, 10*time.Second)
 		c.Close()
+		settleBoth(t, mIran, mDe, 10*time.Second, "S3")
 		t.Log("S3 ok: IPv6 destination")
 	})
 
@@ -972,6 +993,7 @@ func TestTwoProcessLocal(t *testing.T) {
 			t.Fatalf("expected io.EOF after target half-close, got %v", err)
 		}
 		c.Close()
+		settleBoth(t, mIran, mDe, 10*time.Second, "S6")
 		t.Log("S6 ok: target half-close delivered as EOF through the tunnel")
 	})
 
@@ -1016,6 +1038,11 @@ func TestTwoProcessLocal(t *testing.T) {
 		_ = waitMetric(t, mDe, 15*time.Second, "germany up reconnect counted", func(m metrics) bool {
 			return m.CarrierReconnects >= 1
 		})
+		// Explicit teardown: close the client, then both nodes must settle
+		// (the deferred Close alone would leave this session unverified and
+		// could leak into S11's quiescence precondition).
+		c.Close()
+		settleBoth(t, mIran, mDe, 15*time.Second, "S7")
 		t.Log("S7 ok: in-flight session survived up-carrier loss; rebind logged on both nodes; data intact")
 	})
 
@@ -1049,6 +1076,10 @@ func TestTwoProcessLocal(t *testing.T) {
 		if !bytes.Equal(got, targetResp) {
 			t.Fatal("down-carrier flap: response mismatch")
 		}
+		// Explicit teardown before the next scenario (see S7): the
+		// deferred Close alone leaves this session unverified.
+		c.Close()
+		settleBoth(t, mIran, mDe, 15*time.Second, "S8")
 		// Iran must have re-dialed the down carrier (its reconnect loop);
 		// the startup "Down-carrier authenticated to" must not satisfy it.
 		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 30*time.Second)
@@ -1075,6 +1106,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		rand.Read(payload)
 		cc := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second)
 		cc.Close()
+		settleBoth(t, mIran, mDe, 10*time.Second, "S9")
 		t.Log("S9 ok: duplicate up-carrier rejected 409; tunnel unaffected")
 	})
 
@@ -1172,6 +1204,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		rand.Read(payload)
 		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second)
 		c.Close()
+		settleBoth(t, mIran, mDe, 10*time.Second, "S10c")
 		t.Log("S10c ok: Germany restart → carriers re-established → sessions flow again")
 	})
 
