@@ -515,15 +515,25 @@ func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) err
 // because a pong resets the counter each round, and detection is
 // bounded to LivenessRounds * interval (45 s at the defaults) —
 // independent of OS TCP timeouts, which may never fire.
+//
+// The FIRST tick after construction is a priming round: it sends the
+// ping but never counts a miss, because that ping's pong cannot have
+// been latched yet (it is at least one RTT away, and the same-tick
+// decision precedes it). Counting it would make rounds=1 declare
+// EVERY freshly established carrier dead one interval after the
+// handshake — a guaranteed false positive on a healthy path (L5
+// staging finding: sustained carrier flapping). With priming, a
+// truly silent peer is detected in (LivenessRounds + 1) * interval
+// (50 s at rounds=1, the RUNBOOK's blackhole value).
 const DefaultLivenessRounds = 3
 
 // LivenessRounds is the configured number of consecutive unanswered
 // pings after which the carrier is declared blackholed. The value is
 // read under c.mu by the liveness loop at every ping round, so a call
 // takes effect from the next round onward (mutex-ordered with the
-// loop's read; the loop's first decision is at least one interval
-// after the constructor returns). rounds <= 0 are ignored (the
-// default stays in force).
+// loop's read; the loop's first decision is at least TWO intervals
+// after the constructor returns because the first tick is a priming
+// round). rounds <= 0 are ignored (the default stays in force).
 func (c *CarrierConn) SetLivenessRounds(rounds int) {
 	c.mu.Lock()
 	if rounds > 0 {
@@ -549,6 +559,7 @@ func (c *CarrierConn) liveness(interval time.Duration) {
 	defer t.Stop()
 	ping := make([]byte, HeaderSize) // StreamID 0, FramePing, Length 0
 	ping[4] = FramePing
+	primed := false
 	missed := 0
 	for {
 		select {
@@ -558,6 +569,17 @@ func (c *CarrierConn) liveness(interval time.Duration) {
 			c.mu.Unlock()
 			_ = c.write(ping) // best effort; see the method doc
 			c.mu.Lock()
+			if !primed {
+				// Priming round (see the method doc): the ping just
+				// written cannot have been answered yet, so this tick
+				// only establishes the cadence and never counts a
+				// miss. Its pong, latched by Dispatch, resets the
+				// counter at the next round on a healthy path.
+				primed = true
+				c.sawPong = false
+				c.mu.Unlock()
+				break
+			}
 			if c.sawPong {
 				c.sawPong = false
 				missed = 0

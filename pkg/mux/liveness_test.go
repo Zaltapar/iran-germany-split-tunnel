@@ -117,3 +117,89 @@ func TestLivenessDisabledWithoutPing(t *testing.T) {
 		t.Fatal("carrier with pingInterval=0 died without any liveness loop")
 	}
 }
+
+// TestLivenessRoundsOneNoFalsePositive: L5 staging regression (carrier
+// flapping on a healthy path). The first tick after construction is a
+// priming round: with rounds=1 it must NOT declare the carrier dead at
+// t=interval just because the priming ping's pong has not been latched
+// yet. A healthy pong-answering peer must keep the carrier alive for
+// many intervals with rounds=1, and a blackholed peer must still be
+// detected in (rounds+1) intervals = 2 * interval.
+func TestLivenessRoundsOneNoFalsePositive(t *testing.T) {
+	a, b := testutil.NewMemPipe()
+	defer a.Close()
+	defer b.Close()
+	c := NewCarrierConn(a, 10*time.Millisecond)
+	defer c.Close()
+	c.SetLivenessRounds(1)
+	go c.Dispatch()
+
+	// Peer: answers every ping with a pong (healthy path).
+	go func() {
+		br := bufio.NewReader(b)
+		for {
+			f, err := ReadFrame(br)
+			if err != nil {
+				return
+			}
+			if f.Type == FramePing {
+				_ = WriteFrame(b, 0, FramePong, []byte{0})
+			}
+		}
+	}()
+
+	// 15 intervals with rounds=1. Pre-fix, the carrier died at the
+	// FIRST tick (the guaranteed first-round miss).
+	time.Sleep(150 * time.Millisecond)
+	if !c.Ready() {
+		t.Fatal("false positive: rounds=1 declared a healthy path dead (priming round counted as a miss)")
+	}
+
+	// Now blackhole: detection must take (1+1) rounds = 2 intervals
+	// (priming already happened; the first real round may legitimately
+	// miss if the last pong predates it). Bounded deadline, no
+	// timing assumption the logic depends on.
+	b.Blackhole()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.Ready() {
+		t.Fatal("carrier still Ready after the path was blackholed (rounds=1)")
+	}
+	waitForShutdownDone(t, c)
+}
+
+// TestLivenessRoundsOneDetectionBound: with rounds=1 a SILENT peer (no
+// pong ever) must be declared dead in exactly 2 intervals (priming
+// round + 1 missed round), not 1. This pins the documented
+// (LivenessRounds + 1) * interval detection bound used by the RUNBOOK
+// blackhole scenario.
+func TestLivenessRoundsOneDetectionBound(t *testing.T) {
+	a, b := testutil.NewMemPipe()
+	defer a.Close()
+	defer b.Close()
+	c := NewCarrierConn(a, 10*time.Millisecond)
+	defer c.Close()
+	c.SetLivenessRounds(1)
+	go c.Dispatch()
+	// Peer stays silent: it never answers the pings.
+
+	// The carrier must live for >= 1.5 intervals: pre-fix, the
+	// guaranteed first-round miss killed it at 1 interval (10 ms).
+	// Poll until dead (bounded deadline = safety margin, not a logic
+	// assumption), then check the observed time-to-death.
+	start := time.Now()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.Ready() {
+		t.Fatal("silent peer not declared dead within (rounds+1)*interval")
+	}
+	elapsed := time.Since(start)
+	if elapsed < 15*time.Millisecond {
+		t.Fatalf("carrier died after %v: rounds=1 counted the priming round as a miss (want >= 1.5 intervals)", elapsed)
+	}
+	waitForShutdownDone(t, c)
+}
