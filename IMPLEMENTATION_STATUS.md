@@ -91,10 +91,16 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
     (required/optional/test-only dependency table, per-host OS/ports/
     firewall/config), the CDN-stand-in decision (direct TLS origin is
     sufficient; real CDN optional), and the mandatory results-record
-    format. **STATUS: AWAITING STAGING INFRASTRUCTURE** — the issue
-    stays open until the matrix has actually been executed on two real
-    endpoints (twice, once with race builds) and recorded here. This is
-    the explicit human-only dependency.
+    format. **STATUS: L5 RUN A EXECUTED 2026-09-06/07 on two real
+    staging endpoints (37.32.7.124 ↔ 91.107.159.51) — VERDICT BLOCKED**
+    (see "Integration test record" below): the required transports
+    (CDN/TLS up, VLESS+Reality down) were missing, the path itself
+    blackholes established TCP flows (~90 s / ~120 s carrier lifetimes,
+    proven product-free), and two product findings (F2 stranded-session
+    hang, F3 S16 0x06-vs-0x00) are open. The L5-1 liveness priming
+    fix is in (`aa326bc`) and verified. The issue stays open until the
+    full matrix (twice, once with race builds) passes on the required
+    transports over a healthy path.
 - **Issue #8 — configuration / installer / systemd / README / Xray-example
   consistency (branch `fix/issue-8-config-consistency`)**: audit +
   reconciliation pass over `internal/config` ↔ `install.sh` ↔
@@ -325,6 +331,174 @@ items, in priority order:
   that long per attempt before the connection is closed (before this
   follow-up, the Germany-side dial path could block indefinitely on a
   silent peer because `wsConn` has no `SetDeadline`).
+
+## Integration test record
+
+### L5 run A — 2026-09-06/07 (UTC) — commit `aa326bc`
+
+- **Hosts:** Iran 37.32.7.124 (Ubuntu 24.04.4 LTS, kernel 6.8.0-138-generic),
+  Germany 91.107.159.51 (Ubuntu 24.04.4 LTS, kernel 6.8.0-138-generic).
+  Client = the Iran host. Both staging-only; production untouched.
+- **Build:** Go 1.27.1 (linux/amd64), built on the Germany host from
+  `aa326bc` (l5-harness). SHA256 (normal): iran-splitter
+  `616cae02…5e71`, germany-splitter `a1bfe2b1…032f`, l5cli
+  `00c20808…7369`; (race): iran-splitter-race `5f503fa9…1879`,
+  germany-splitter-race `461dd238…11ecc`. Iran binaries pulled over the
+  carrier path (h2h) and SHA-verified before install. Old Germany binary
+  preserved as `germany-splitter.bak-old-liveness`.
+- **Topology (STAGING DEVIATION — required transports missing):**
+  up = `ws://37.32.7.124:9001/upload` **direct, no CDN, no TLS**;
+  down = **plain TCP** `91.107.159.51:9002` **without VLESS+Reality**
+  (RUNBOOK §2.1 lists the public up-carrier domain and VLESS+Reality as
+  REQUIRED for L5). No Xray on either host. `keepalive=30s`,
+  `liveness=1` (staging value), `grace=5s`. Fresh per-run `SPLIT_SECRET`
+  (in env files only; never in repo/logs/issues).
+- **Matrix: NOT executable in full (0/20) — infrastructure gate failed.**
+  Per RUNBOOK §2.1 the two required transports are absent, and the real
+  path itself is degraded (Finding F1 below) such that even the
+  bare-transport baseline fails. Partial execution:
+  - L5-1 (finding) — liveness false-positive at `rounds=1` — **fixed in
+    this commit** (`aa326bc`), verified on both hosts (see below).
+  - S1/S4/S5/S6 (basic SOCKS5) — passed intermittently in earlier rounds
+    (1 KiB up, sha256 match, ~100 ms); most attempts now hit path
+    blackholes (F1) and only survive when the transfer finishes within a
+    carrier's lifetime (~90 s up / ~120 s down).
+  - S16 (closed port) — observed `0x00` then bounded tunnel termination
+    (83 ms), **not** the RUNBOOK-expected 0x06 (Finding F3, issue #21).
+  - Rebind under live flap — **works**: a live session survived 125+
+    carrier cycles over 106 min, every loss re-attached in 2–4 s,
+    `sessions_lost_after_carrier_failure` stayed 0.
+  - Scenario 11 (blackhole detection) — the liveness mechanism fires
+    correctly (see F1 for the natural blackhole it detected); the
+    *controlled* iptables variant was not run against a healthy path.
+  - Scenario 19/20 (graceful shutdown/restart) — not run (would disrupt
+    the still-deployed staging services; deferred to the full run).
+- **Verdict: BLOCKED — not ACCEPT, not REJECT.** The acceptance gate
+  (20/20 matrix, twice, once with race builds) cannot be executed:
+  (a) required staging infrastructure is missing (CDN/TLS up-carrier
+  domain, VLESS+Reality down-carrier, Xray consumer), (b) the Iran→Germany
+  path itself intermittently blackholes established TCP flows (F1), (c)
+  open product finding F2 (unbounded client hang, issue #20) and the S16
+  0x06-vs-0x00 discrepancy (F3, issue #21) must be resolved/re-run.
+  **Issue #9 stays open; no PR.** Staging-infra gap: issue #19.
+
+#### Findings
+
+- **F1 (ENVIRONMENTAL, high-confidence) — the staging path blackholes
+  established TCP flows, deterministically.** Both carriers flap on a
+  fixed cycle (up-carrier lifetime ≈ 90 s, down-carrier ≈ 120 s) even on
+  the liveness-fixed binary, while ICMP stays 84 ms / 0% loss. The
+  decisive evidence is product-free: a bare Python TCP echo probe
+  (no splitter, no WS, no frames) exchanging 1 byte/2 s, run in BOTH
+  directions over 11098/11099 **and** 443, dies in both directions at
+  10–23 s (10.2 s for a continuous full-duplex flow too), after healthy
+  ~87 ms RTTs. Kernel `ss -ti` on the dead carrier flows shows the
+  signature: a single small segment (14–16 B) retransmitted with RTO
+  backoff 6–8 (`rto` up to 77 s), `lost:1`, FIN never acked, while
+  freshly established flows show normal `rto:287–297`. Losses are
+  per-flow and direction-dependent (pings I→G on the up-carrier, pongs
+  G→I on the down-carrier — both directions observed). No local firewall
+  (iptables default-ACCEPT on both hosts, no nft rules, no conntrack
+  table). New flows always work; only ESTABLISHED flows degrade with
+  age. This is consistent with an upstream middlebox/NAT that silently
+  expires or blackholes idle-ish TCP flows on this particular
+  Iran→Germany route — an infrastructure condition, not a product
+  condition. The product's liveness is *correctly* detecting these real
+  blackholes; the flapping is the path, not the code.
+- **F2 (PRODUCT, MEDIUM) — a session can be stranded with an unbounded
+  client hang when its peer-side incarnation never exists.** Observed
+  end-to-end: Iran created session `a9c49df6` (upstream FrameHeader
+  in flight); the up-carrier died 28 s later and was torn down,
+  discarding the unacked header frame; Germany therefore never created
+  the session and permanently refused every rebind
+  ("rebind refused: stream 1: no active session for stream", 26+
+  `carrier_rebind_failures`). Iran kept re-attaching the session to
+  fresh carriers for 106 minutes (gens 504→629) and its client socket
+  stayed open, blocked in the response read with no deadline — the
+  process held exactly one bounded 1 KiB session; no crash, no growth
+  (fd 10, RSS 8 MiB, 7 threads). The session was cleaned correctly when
+  the client died (`closed: client EOF`; gauges → 0). Two distinct gaps:
+  (a) Iran cannot learn that Germany dropped the session (no
+  peer-side tombstone/negative ack for a refused rebind), and (b) the
+  *client* side (l5cli) has no response-read deadline, so the hang is
+  unbounded even though the relay is bounded. Both need a scoped fix +
+  test before the full matrix; filed as issue #20 (not fixed in this
+  commit, per scope: this commit is the l5-harness record).
+- **F3 (PRODUCT, MEDIUM) — S16 discrepancy: closed-port target returns
+  0x00 + bounded termination, not 0x06.** `l5cli -mode closed` (dest
+  127.0.0.1:11099 on Germany, no listener) returned
+  `{"socksReply":0,"detail":"reply 0x00 then tunnel terminated
+  (bounded)"}` in 83 ms. The RUNBOOK asserts 0x06 "never 0x00" for
+  target-dial failure. The relay's *relay* path maps dial failures to
+  bounded session end on the Germany side (the client sees the CONNECT
+  answer already sent, then EOF) — the SOCKS 0x06 is only produced on
+  the *bootstrap* failure path (carrier-not-ready → 0x06, observed
+  earlier: "carriers not ready within bootstrap wait"). Needs a
+  code-level decision (map target-dial failure to 0x06 in the CONNECT
+  reply where the answer is still writable, or amend the RUNBOOK
+  assertion) plus a regression test.
+- **L5-1 (PRODUCT, FIXED in `aa326bc`) — liveness priming round.**
+  `CarrierConn.liveness`'s first tick used to count a miss for a ping
+  whose pong cannot have been latched yet (pong is ≥ 1 RTT away), so
+  `SPLIT_LIVENESS_ROUNDS=1` declared every freshly established carrier
+  dead exactly one interval after the handshake (deterministic 30 s
+  flapping, 233 mirrored loss events on both hosts). Fixed with a
+  priming round (first tick sends the ping but never counts) + two
+  regression tests (`TestLivenessRoundsOneNoFalsePositive`,
+  `TestLivenessPrimingRoundNeverCountsMiss`); RUNBOOK scenario 11
+  updated to the priming semantics. Post-fix, the deterministic 30 s
+  death is gone; the remaining flapping is F1 (the path).
+- **F4 (DOC, LOW) — "45 s at defaults" math.** The carrier-liveness
+  note in the current-state section says ~45 s at the 30 s ping period
+  and default rounds 3; 3 unanswered *consecutive* pings at 30 s
+  interval is 90 s (plus priming, 120 s). The 45 s figure matches a
+  15 s period. Cosmetic; will be corrected with the F3/RUNBOOK pass.
+
+#### Evidence (key commands, reproducible)
+
+- Carrier cycle (Germany): `journalctl -u germany-splitter | grep
+  'carrier (up|down) (ready|lost)'` → up: 16:23:27→16:24:57 (90 s),
+  16:24:58→16:26:28 (90 s), 16:26:30→16:28:00 (90 s),
+  16:28:01→16:29:31 (90 s), 16:29:34→16:31:04 (90 s); down:
+  16:19:03→16:25:07 (124 s), 16:25:08→16:27:08 (120 s),
+  16:27:10→16:29:10 (120 s), … steady for 4.5 h (435 loss events,
+  0 sessions lost).
+- Product-free path test (both hosts, both directions):
+  `python3 age_probe.py <peer> <port> <dur>` (1 B/2 s over one bare
+  conn) → healthy ~87 ms, then `TimeoutError` at +22.7 s (i2g, 11099)
+  / +22.6 s (g2i, 11098) / +10.2 s on 443; `python3 cont_flow.py`
+  (continuous full-duplex 4 KiB chunks) → `SEND/RECV ERROR at +10.2s`
+  in both directions, 0 bytes delivered. Ping baseline: 20/20, 84 ms
+  avg, 0% loss.
+- Kernel signature: `ss -tinp | grep -A4 ':9001'` on dead flows →
+  `FIN-WAIT-1 … Send-Q 14`, `rto:18048 backoff:6`, `rto:77312
+  backoff:8`, `lost:1 retrans:1/7..9`, `lastrcv` frozen minutes old;
+  live flows: `ESTAB`, `rto:287–297`, Send-Q 0.
+- Split-brain (F2): Iran `session a9c49df6: up reattached to carrier
+  gen 504..629` (125 cycles) while Germany logged `rebind refused:
+  stream 1 (up|down): no active session for stream` at every loss;
+  `errors 0`, `carrier_rebind_failures 26`; session closed cleanly on
+  client death (`closed: client EOF`), all gauges back to 0.
+- S16: `l5cli client -mode closed` → `{"ok":true,"mode":"closed",
+  "socksReply":0,…,"detail":"reply 0x00 then tunnel terminated
+  (bounded)…","elapsedMs":83.7}`.
+- Resources over 6.5 h of flapping: Iran RSS 8.2 MiB / 10 fds / 7
+  threads; Germany RSS 8.6 MiB / 9 fds / 8 threads — flat (no leak).
+
+#### What is needed to complete L5 (for the next run)
+
+1. Required staging transports per RUNBOOK §2.1: public up-carrier
+   domain with CDN or direct TLS origin (`wss://<domain>/upload`), and
+   VLESS+Reality down-carrier (Xray/3x-ui inbound → `:9002`).
+2. A healthy Iran↔Germany path (or an explicit note that the matrix
+   is being run over a path with known flow blackholes, with scenario
+   timeouts adjusted to the measured ~90/120 s carrier lifetimes).
+3. Product fixes (or RUNBOOK amendments) for F2 (stranded session /
+   unbounded client read) and F3 (0x06 vs 0x00 on target-dial
+   failure), each with a regression test and a full matrix re-run.
+4. Then: full 20-scenario matrix ×2 (normal + race builds), resources
+   settling (scenario 18), graceful shutdown/restart (19/20), and the
+   two-run record per RUNBOOK §4.
 
 ## Historical phase records
 
