@@ -5,6 +5,41 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Self-contained deployment — T1 pairing exchange (merged, PR #22,
+  merge `6ae2850`)**: `internal/pairing` implements the cross-host
+  pairing of the new deployment architecture (design doc:
+  `docs/self-contained-deployment-architecture.md`, §6.1): two versioned
+  blobs — **A** (Iran → Germany: tunnel secret + public upload-domain)
+  and **B** (Germany → Iran: Reality/VLESS PUBLIC parameters — X25519
+  public key (base64, 32-byte check), 16-hex shortId, RFC-4122-v4 UUID —
+  plus the down-carrier host:port). Wire form
+  `splat-v1.<b64url(payload)>.<b64url(sha256(payload))>` over
+  deterministic JSON; strict decode (unknown fields rejected — a
+  `privateKey` smuggled into blob B is structurally impossible); constant
+  time checksum compare; version + role gates. Secret-safety contract
+  (§8): generators on `crypto/rand` (secret 64-hex checked by the
+  Phase-6 `mux.ValidateSecretMaterial` — reused, not re-implemented;
+  shortId; UUID v4); `String()`/`Summary()` redacted, only `Encode()`
+  yields the transmittable form; error messages never echo blob contents
+  (Go JSON errors sanitized — value-embedding paths collapsed to a
+  generic sentinel; only unknown-field names surfaced); `Redact()` masks
+  32+-hex runs for deploy log lines. New `internal/archtest` package:
+  AST gate enforcing the §2.2 invariant "pkg/* never imports
+  internal/*" (pre-existing `internal/testutil` test helper allowlisted;
+  any new violation fails CI). 19 focused tests: round trips,
+  determinism, empty/garbage/truncated, checksum tamper, wrong version,
+  role mismatch, field validation, unknown-field rejection, repeated-
+  pairing idempotence (re-encode convergence, stateless generation),
+  secret-leak assertions, Redact behavior, generator boundaries. Linux
+  gate (real run on linux/amd64, Go 1.27.1, 2026-09-07): `go build`,
+  `go vet`, `go test ./...`, `go test -race ./...` — all green
+  (12 packages). NEXT: T2 (Xray installer), T3 (Reality keygen + Germany
+  Xray config generation), T4 (deployment CLI) — separate PRs.
+  **Operator note:** the 3 local `l5-harness` commits (`2b37e4e`,
+  `aa326bc`, `df81f21`) are NOT in `main` yet; `docs/` (incl. the
+  architecture doc) and `dist/` remain untracked — disposition
+  outstanding.
+
 - **Issue #9 — real two-server integration / production acceptance
   (branch `feat/issue-9-two-server-acceptance`)**: the harness for the
   acceptance gate is built. Two levels, per the re-baselined test strategy:
