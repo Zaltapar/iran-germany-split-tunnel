@@ -34,3 +34,8 @@ log/
 tmp-*
 $null
 *.exe~
+
+# Generated deployment artifacts (binaries, transfer chunks, staging keys).
+# NEVER commit: dist/keys/* contains private key material (host-to-host
+# staging key). Rebuild via `go build`; regenerate keys per L5 runbook.
+dist/
