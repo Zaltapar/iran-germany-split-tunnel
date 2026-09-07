@@ -30,6 +30,7 @@ type topo struct {
 	iran   *node.Node
 	de     *node.Node
 	secret []byte
+	grace  time.Duration // the node Config.Grace this topo was built with
 
 	upIr, upDe     *testutil.MemConn
 	downIr, downDe *testutil.MemConn
@@ -53,7 +54,7 @@ func newTopoBuf(t *testing.T, grace time.Duration, bufBytes int) *topo {
 	}
 	logger := log.New(baseLog.Writer(), "IRAN ", baseLog.Flags())
 	deLog := log.New(baseLog.Writer(), "DE   ", baseLog.Flags())
-	tp := &topo{t: t, secret: secret}
+	tp := &topo{t: t, secret: secret, grace: grace}
 
 	iranCfg := node.Config{
 		Role: node.RoleIran, Grace: grace,
@@ -221,25 +222,42 @@ func (tp *topo) write(c *testutil.MemConn, s string) {
 	}
 }
 
-// readDeadline bounds a read of n bytes. The 10 s base covers a fast
-// machine; the per-byte margin keeps the bound PROPORTIONAL TO THE
-// AMOUNT OF WORK when the suite runs under the race detector (5–20x
-// slower), so the 200-session stress test's per-session 32 KiB drain
-// does not time out for a scheduling artifact (observed under CI
-// `go test -race`: budget drain just past the flat 10 s). The bound
-// stays finite — a stuck relay still fails the test, so this is a
-// corrected bound, not a mask.
-func readDeadline(n int) time.Duration {
-	d := 10*time.Second + time.Duration(n)*time.Millisecond
-	if d < 10*time.Second {
-		d = 10 * time.Second
+// readDeadline bounds a read of n bytes on a topo with the given grace
+// window. The bound must respect TWO independent work dimensions:
+//
+//  1. The AMOUNT OF WORK (n bytes through the relay, which is 5–20x
+//     slower under the race detector). A per-byte margin keeps the
+//     bound proportional to the drain, so a 32 KiB stress-test drain
+//     does not time out for a scheduling artifact.
+//
+//  2. The GRACE WINDOW the test itself chose for the node. A read that
+//     crosses a carrier rebind must wait for the rebind sweep to
+//     complete, and that sweep is bounded by Config.Grace — NOT by the
+//     read deadline. If the read deadline is shorter than the grace the
+//     test deliberately set, a slow CI runner (2 shared vCPUs, much
+//     slower per-op than a dev box) can make the sweep exceed the
+//     deadline even though the session would have re-attached fine
+//     within its own grace. That is a test-boundary bug, not a relay
+//     bug: the test would have passed had it waited the grace it
+//     already asked for.
+//
+// So the bound is max(10s base, 1.5x the test's grace + 5s) plus the
+// per-byte margin. For small-grace tests (2s) this is the same 10s as
+// before; for the 120-session stress test (20s grace) it becomes 35s,
+// which is the grace the test explicitly opted into, scaled for
+// scheduling headroom. The bound stays finite — a genuinely stuck
+// relay still fails the test, so this is a corrected bound, not a mask.
+func readDeadline(grace time.Duration, n int) time.Duration {
+	d := 10 * time.Second
+	if g := grace*3/2 + 5*time.Second; g > d {
+		d = g
 	}
-	return d
+	return d + time.Duration(n)*time.Millisecond
 }
 
 func (tp *topo) readN(c *testutil.MemConn, n int, what string) string {
 	tp.t.Helper()
-	c.SetReadDeadline(time.Now().Add(readDeadline(n)))
+	c.SetReadDeadline(time.Now().Add(readDeadline(tp.grace, n)))
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(c, buf); err != nil {
 		tp.t.Fatalf("reading %s: %v", what, err)
