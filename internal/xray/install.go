@@ -1,8 +1,6 @@
 package xray
 
 import (
-	"archive/zip"
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -23,14 +21,6 @@ var (
 	ErrConfigGate     = errors.New("xray: 'xray run -test' rejected the generated config (install aborted before any service change)")
 	ErrInstallAborted = errors.New("xray: install aborted; no service was started and the previous version (if any) is untouched")
 )
-
-// maxExtractedBytes caps the total extracted size (a real Xray release
-// is < 250 MiB with geodata; this bounds zip-bomb style abuse while
-// leaving generous headroom).
-const maxExtractedBytes = 250 << 20
-
-// maxSingleEntryBytes caps a single zip entry.
-const maxSingleEntryBytes = 100 << 20
 
 // Downloader fetches a release asset. It is a type so tests substitute a
 // local server or static bytes — the install logic itself is network-
@@ -148,6 +138,9 @@ type Installed struct {
 // failed install never leaves a half version on disk, and a previously
 // active version is untouched (rollback = keep the old dir, which is
 // what this guarantees).
+//
+// Filesystem helpers: extractZip/safeJoin/copyTree live in extract.go,
+// fetchDigest/readBounded in fetch.go, excerpt in output.go.
 func (in *Installer) Install(version string, arch Arch, testConfig string) (*Installed, error) {
 	if in.Prefix == "" {
 		return nil, fmt.Errorf("xray: empty prefix")
@@ -173,25 +166,8 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 		return nil, err
 	}
 
-	// Steps 1-3: fetch both assets.
-	zipBody, err := in.DL.Fetch(zipURL)
-	if err != nil {
-		return nil, err
-	}
-	defer zipBody.Close()
-	dgstBody, err := in.DL.Fetch(dgstURL)
-	if err != nil {
-		return nil, err
-	}
-	defer dgstBody.Close()
-	dgstData, err := io.ReadAll(io.LimitReader(dgstBody, maxDgstBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("%w: digest", ErrDownload)
-	}
-	if int64(len(dgstData)) > maxDgstBytes {
-		return nil, fmt.Errorf("%w: sidecar is larger than %d bytes", ErrDgstTooLarge, maxDgstBytes)
-	}
-	sha256Hex, err := ParseDigest(dgstData)
+	// Step 2-3: fetch the .dgst sidecar and parse its SHA-256.
+	sha256Hex, err := fetchDigest(in.DL, dgstURL)
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +175,11 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	// Step 4: buffer the zip (bounded by the entry caps via the
 	// extraction guard) and verify in constant time. Buffering keeps
 	// the verify→extract order clean and re-reads the same bytes.
+	zipBody, err := in.DL.Fetch(zipURL)
+	if err != nil {
+		return nil, err
+	}
+	defer zipBody.Close()
 	zipBytes, err := readBounded(zipBody, maxExtractedBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: zip", ErrDownload)
@@ -211,21 +192,9 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	// same-filesystem rename on Linux (a /tmp → /opt rename would be
 	// cross-device and fall back to a non-atomic copy). Stale stage
 	// dirs from a crashed install are swept first (prefix-scoped only).
-	if err := os.MkdirAll(in.Prefix, 0o755); err != nil {
-		return nil, fmt.Errorf("xray: prefix: %w", err)
-	}
-	entries, err := os.ReadDir(in.Prefix)
+	stage, err := prepareStageDir(in.Prefix)
 	if err != nil {
-		return nil, fmt.Errorf("xray: prefix: %w", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), ".xray-stage-") {
-			_ = os.RemoveAll(filepath.Join(in.Prefix, e.Name()))
-		}
-	}
-	stage, err := os.MkdirTemp(in.Prefix, ".xray-stage-*")
-	if err != nil {
-		return nil, fmt.Errorf("xray: staging: %w", err)
+		return nil, err
 	}
 	defer os.RemoveAll(stage)
 	if err := extractZip(zipBytes, stage, in.WithGeodata); err != nil {
@@ -295,6 +264,29 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	}, nil
 }
 
+// prepareStageDir creates the staging directory inside the prefix (so
+// the final move is an atomic same-filesystem rename), sweeping stale
+// stage dirs from a previously crashed install first.
+func prepareStageDir(prefix string) (string, error) {
+	if err := os.MkdirAll(prefix, 0o755); err != nil {
+		return "", fmt.Errorf("xray: prefix: %w", err)
+	}
+	entries, err := os.ReadDir(prefix)
+	if err != nil {
+		return "", fmt.Errorf("xray: prefix: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), ".xray-stage-") {
+			_ = os.RemoveAll(filepath.Join(prefix, e.Name()))
+		}
+	}
+	stage, err := os.MkdirTemp(prefix, ".xray-stage-*")
+	if err != nil {
+		return "", fmt.Errorf("xray: staging: %w", err)
+	}
+	return stage, nil
+}
+
 // RemoveVersion deletes a version dir (cleanup --older-than support).
 // It refuses to delete outside the prefix.
 func (in *Installer) RemoveVersion(version string) error {
@@ -320,156 +312,3 @@ func (in *Installer) RemoveVersion(version string) error {
 // here is logged by the caller via the returned error chain (it only
 // happens when the dir could not be created in the first place).
 func cleanupVersionDir(dir string) { _ = os.RemoveAll(dir) }
-
-// readBounded reads at most max bytes from r, failing if r has more.
-func readBounded(r io.Reader, max int64) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, max+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > max {
-		return nil, fmt.Errorf("xray: download exceeds %d bytes", max)
-	}
-	return data, nil
-}
-
-// excerptMax bounds the xray output embedded in a gate error.
-const excerptMax = 2000
-
-// excerpt returns a bounded, trimmed form of xray output for error
-// display. The generated config carries only public parameters (public
-// key, UUID, SNI, dest) — the tunnel secret and the Reality private key
-// never reach xray — so a bounded echo is not a secret leak.
-func excerpt(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "(no output)"
-	}
-	if len(s) > excerptMax {
-		return s[:excerptMax] + " ... (truncated)"
-	}
-	return s
-}
-
-// extractZip unpacks the (already verified) zip into dst with
-// zip-slip protection, per-entry and total size caps, and optional
-// geodata filtering. The official release layout is flat (xray,
-// geoip.dat, geosite.dat, LICENSE, README.md) but the guard is general.
-func extractZip(data []byte, dst string, withGeodata bool) error {
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return fmt.Errorf("%w: not a zip archive", ErrExtract)
-	}
-	absDst, err := filepath.Abs(dst)
-	if err != nil {
-		return err
-	}
-	var total int64
-	for _, f := range zr.File {
-		if !withGeodata && isGeoData(f.Name) {
-			continue
-		}
-		target, err := safeJoin(absDst, f.Name)
-		if err != nil {
-			return fmt.Errorf("%w: %v", ErrZipEntry, err)
-		}
-		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return fmt.Errorf("%w: %v", ErrExtract, err)
-			}
-			continue
-		}
-		if f.UncompressedSize64 > maxSingleEntryBytes {
-			return fmt.Errorf("%w: %s (%d bytes)", ErrZipEntry, f.Name, f.UncompressedSize64)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("%w: %v", ErrExtract, err)
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return fmt.Errorf("%w: %v", ErrExtract, err)
-		}
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode().Perm()|0o100)
-		if err != nil {
-			rc.Close()
-			return fmt.Errorf("%w: %v", ErrExtract, err)
-		}
-		// Cap the ACTUAL bytes written, not just the declared size
-		// (a hostile zip can under-declare UncompressedSize64).
-		n, cerr := io.Copy(out, io.LimitReader(rc, maxSingleEntryBytes))
-		rc.Close()
-		out.Close()
-		if cerr != nil {
-			return fmt.Errorf("%w: %v", ErrExtract, cerr)
-		}
-		total += n
-		if n > maxSingleEntryBytes || total > maxExtractedBytes {
-			return fmt.Errorf("%w: entry or total extracted size", ErrZipEntry)
-		}
-	}
-	// The release must contain the binary itself.
-	if _, err := os.Stat(filepath.Join(absDst, "xray")); err != nil {
-		return fmt.Errorf("%w: no 'xray' binary in archive", ErrExtract)
-	}
-	return nil
-}
-
-func isGeoData(name string) bool {
-	base := filepath.Base(name)
-	return base == "geoip.dat" || base == "geosite.dat"
-}
-
-// safeJoin joins base and a (possibly nested) zip entry path, refusing
-// absolute paths, empty names, and any ".." segment. Traversal is
-// rejected on the RAW name (before cleaning — filepath.Clean would
-// silently fold "/../x" into "/x", which is exactly the confusion a
-// zip-slip guard must not make). Entry names are attacker-controlled,
-// so errors do not echo them.
-func safeJoin(base, name string) (string, error) {
-	name = strings.ReplaceAll(name, "\\", "/")
-	if name == "" {
-		return "", fmt.Errorf("zip entry with empty name")
-	}
-	if strings.HasPrefix(name, "/") {
-		return "", fmt.Errorf("zip entry with absolute path")
-	}
-	for _, seg := range strings.Split(name, "/") {
-		if seg == ".." {
-			return "", fmt.Errorf("zip entry attempts directory traversal")
-		}
-	}
-	target := filepath.Join(base, filepath.FromSlash(name))
-	rel, err := filepath.Rel(base, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", fmt.Errorf("zip entry escapes target dir")
-	}
-	return target, nil
-}
-
-func copyTree(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, info.Mode())
-		}
-		rc, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer rc.Close()
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-		_, err = io.Copy(out, rc)
-		return err
-	})
-}
