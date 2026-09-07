@@ -5,6 +5,56 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Self-contained deployment — T2 Xray-core installer (merged, PR #24,
+  merge `ffb6028`)**: `internal/xray` is the managed-transport adapter for
+  the down-carrier protocol engine (design doc §4 — the doc itself merged in
+  the same PR as T0, v0.2, review gate PASSED: CRITICAL=0 HIGH=0). One pinned
+  release `v26.3.27` (stable-only tag regex, never "latest";
+  `pin_test.go` is the L2 pin floor — resolves the tag via the GitHub API,
+  skips without network, FAILS if the pin points at nothing), the
+  upstream-published `.dgst` sidecar parsed fail-closed (empty / no SHA2-256
+  line → release rejected), the zip's SHA-256 verified in CONSTANT TIME,
+  extraction with zip-slip protection (traversal rejected on the RAW entry
+  name before any Clean; size caps on ACTUAL copied bytes, not the
+  under-declarable `UncompressedSize64`; symlink entries flattened to text;
+  the archive must contain the `xray` binary), staging INSIDE the prefix
+  (`.xray-stage-*`, stale swept) for an atomic same-filesystem rename into
+  the versioned layout `<prefix>/<version>/xray` (copyTree fallback for
+  cross-device), `xray version` smoke check, `xray run -test` config gate,
+  and failure containment (any failure after verify removes the
+  staged/version dir; a previously installed version is untouched — that is
+  the rollback guarantee). The ARCHITECT review
+  (`docs/reviews/t2-xray-installer-review.md`) returned CRITICAL=0 HIGH=0,
+  2 MEDIUM + 2 LOW, all remediated in-tree in the same PR: **M1** a chmod
+  failure now removes the version dir (previously a poisoned
+  non-executable dir stuck the prefix without Force); **M2** the -test/
+  smoke-gate errors now embed a bounded (2 KiB) xray output excerpt so a
+  rejected generated config is diagnosable (§19.7 — safe: the generated
+  config carries only PUBLIC Reality parameters, never the tunnel secret or
+  the Reality private key); **L1** the `.dgst` read is bounded to 1 MiB.
+  23 network-free tests (static DL + fake Executor + `httptest`: happy
+  path, geodata toggle, failure containment, checksum mismatch, missing
+  dgst, smoke failure, existing-version refusal/Force, `RemoveVersion`
+  prefix guard, 4 zip-slip shapes, oversized zip-bomb entry, HTTP wiring,
+  plus the remediation tests). Linux gate (REAL run on linux/amd64,
+  Go 1.27.1, 2026-09-07, germany-node): `gofmt`, `go vet`, `go test
+  ./...`, `go test -race ./...` — all green (14 packages). Boundary:
+  stdlib-only imports, zero new Go deps, `pkg/*` never imported (archtest).
+  Also in the PR: `.gitignore` `dist/` rule (generated artifacts; private
+  keys must never be committed). **Post-merge CI incident (fixed in
+  PR #25, merge `4cc0edf`):** runs #40/#41 failed at `go test` with
+  `TestHundredSessionStress` (120 sessions, 20 s grace) hitting the
+  test's flat 10 s read deadline on GitHub's 2 shared-vCPU runner —
+  a boundary mismatch (the read deadline was shorter than the grace
+  the test itself chose), not a relay bug: the test passes in 3.5 s
+  under `GOMAXPROCS=2` on linux/amd64. `readDeadline` is now
+  `max(10 s, 1.5 x grace + 5 s) + n*1 ms` (the stress test becomes
+  35 s; every other test keeps its 10 s bound) — still finite, so a
+  stuck relay still fails. The same PR also split `install.go`
+  476 -> 315 lines (`extract.go` / `fetch.go` / `output.go` — pure
+  file split, zero behavior change). NEXT: T3 (Reality keygen +
+  Germany Xray config generation + `-test` gate), T4 (origin/Caddy
+  provider) — separate PRs.
 - **Self-contained deployment — T1 pairing exchange (merged, PR #22,
   merge `6ae2850`)**: `internal/pairing` implements the cross-host
   pairing of the new deployment architecture (design doc:
@@ -33,12 +83,14 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
   secret-leak assertions, Redact behavior, generator boundaries. Linux
   gate (real run on linux/amd64, Go 1.27.1, 2026-09-07): `go build`,
   `go vet`, `go test ./...`, `go test -race ./...` — all green
-  (12 packages). NEXT: T2 (Xray installer), T3 (Reality keygen + Germany
-  Xray config generation), T4 (deployment CLI) — separate PRs.
+  (12 packages). NEXT: T2 (Xray installer) — now merged as PR #24 (entry
+  above); T3 (Reality keygen + Germany Xray config generation) is next —
+  separate PRs.
   **Operator note:** the 3 local `l5-harness` commits (`2b37e4e`,
-  `aa326bc`, `df81f21`) are NOT in `main` yet; `docs/` (incl. the
-  architecture doc) and `dist/` remain untracked — disposition
-  outstanding.
+  `aa326bc`, `df81f21`) are NOT in `main` yet. (Disposition resolved by
+  PR #24: `docs/` incl. the architecture doc is now tracked; `dist/` is
+  git-ignored since `0d9bace` — it holds generated artifacts and must
+  never be committed.)
 
 - **Issue #9 — real two-server integration / production acceptance
   (branch `feat/issue-9-two-server-acceptance`)**: the harness for the
