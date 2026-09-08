@@ -200,6 +200,14 @@ func fieldErr(problems []string) error {
 // ValidSNI reports whether s is an acceptable Reality SNI (see validSNI).
 func ValidSNI(s string) bool { return validSNI(s) }
 
+// ValidUploadDomain reports whether d is an acceptable public upload
+// domain (see validUploadDomain). The Iran-side origin provider
+// (internal/origin, task T4) validates the same operator value as blob
+// A's uploadDomain and must call this wrapper instead of
+// re-implementing the rule (project rule: do not duplicate validation
+// rules unnecessarily).
+func ValidUploadDomain(d string) bool { return validUploadDomain(d) }
+
 // ValidUUID reports whether u is a lowercase RFC 4122 version-4 UUID — the
 // same rule blob B applies to public.uuid.
 func ValidUUID(u string) bool { return uuidV4Re.MatchString(u) }

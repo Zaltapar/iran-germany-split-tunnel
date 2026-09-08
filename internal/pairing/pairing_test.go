@@ -437,3 +437,28 @@ func isHex(s string) bool {
 	}
 	return true
 }
+
+// TestValidUploadDomainAgreesWithNewBlobA (T4): the exported
+// ValidUploadDomain wrapper (used by internal/origin) must apply the
+// SAME rule as NewBlobA's uploadDomain validation — one rule, two
+// entry points, no drift.
+func TestValidUploadDomainAgreesWithNewBlobA(t *testing.T) {
+	valid := "upload.example.com"
+	if _, err := NewBlobA(makeSecret(), valid); err != nil {
+		t.Fatalf("NewBlobA(valid): %v", err)
+	}
+	if !ValidUploadDomain(valid) {
+		t.Errorf("ValidUploadDomain(%q) = false, want true", valid)
+	}
+	for _, invalid := range []string{
+		"", "single", "has space.com", "under_score.com", "with:port.com",
+		"//scheme.com", "-lead.com", "trail-.com",
+	} {
+		if _, err := NewBlobA(makeSecret(), invalid); err == nil {
+			t.Errorf("NewBlobA(%q) accepted, want reject", invalid)
+		}
+		if ValidUploadDomain(invalid) {
+			t.Errorf("ValidUploadDomain(%q) = true, want false", invalid)
+		}
+	}
+}
