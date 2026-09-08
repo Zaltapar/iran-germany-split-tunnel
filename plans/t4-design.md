@@ -314,9 +314,12 @@ shims are needed. The only cross-package edit is the additive exported wrapper
   validate --config <golden>` MUST exit 0. (CI runner is non-root; `caddy validate` needs
   no root — no /var/log path in the Caddyfile, unlike the Xray error log.)
 - Determinism: every render + instruction function run twice → byte-identical.
-- Concurrency: activate is O_EXCL on the fixed tmp name → two concurrent activations
-  cannot clobber (second fails). (No goroutines in T4; the rule is satisfied trivially.)
-
+- Concurrency: T4 has NO goroutines and activations are serial in
+  production (single deploy user, T3/xray model). The fixed tmp name is
+  created O_EXCL and a stale REGULAR tmp is treated as crash residue
+  (cleaned up) while a SYMLINK tmp is refused — tested deterministically
+  (TestActivateStaleTmpCrashRecovery). A genuinely concurrent 2-writer
+  race is out-of-model (same as T3) and deliberately not asserted.
 ## 6. Verification plan (before PR)
 1. Local: `gofmt -l` clean, `go vet ./...`, `go test ./...`, `go test -race ./...`,
    `go build ./...` (Windows dev box).

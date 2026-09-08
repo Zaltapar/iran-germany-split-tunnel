@@ -143,6 +143,6 @@ func reverseProxyBlock(upstream string) string {
 	b.WriteString("\t\t\tread_timeout " + wsIdleTimeout + "\n")
 	b.WriteString("\t\t\twrite_timeout " + wsIdleTimeout + "\n")
 	b.WriteString("\t\t}\n")
-	b.WriteString("\t}\n")
+	b.WriteString("\t}")
 	return b.String()
 }

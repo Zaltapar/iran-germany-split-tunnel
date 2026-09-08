@@ -7,5 +7,4 @@ upload.example.com:8443 {
 			write_timeout 3600s
 		}
 	}
-
 }

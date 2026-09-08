@@ -11,5 +11,4 @@ upload.example.com {
 			write_timeout 3600s
 		}
 	}
-
 }

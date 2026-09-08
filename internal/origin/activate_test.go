@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -184,40 +183,33 @@ func TestActivateDirGuard(t *testing.T) {
 	}
 }
 
-// Two concurrent activations on the same target cannot clobber: the
-// fixed tmp name is created O_EXCL, so exactly one wins.
-func TestActivateConcurrentNoClobber(t *testing.T) {
+// Crash recovery (the in-model case, single-writer deploy user): a
+// stale REGULAR tmp left by a crashed activation is cleaned up and the
+// activation proceeds. A pre-planted SYMLINK tmp is refused (covered by
+// TestActivateRefusesSymlinkTmp). T4 has no goroutines; activations are
+// serial in production, so the guarantee tested here is deterministic
+// (no racy multi-goroutine assertion — that is out-of-model, same as T3).
+func TestActivateStaleTmpCrashRecovery(t *testing.T) {
 	fe := &fakeExec{}
 	dir, _ := activateFixture(t, fe)
-	const n = 8
-	var wg sync.WaitGroup
-	errs := make([]error, n)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			_, errs[i] = ActivateCaddyfile(ActivateParams{Plan: testPlan(), Dir: dir, Bin: "/fake/caddy", Exec: fe})
-		}(i)
+	tmp := filepath.Join(dir, "Caddyfile.tmp")
+	if err := os.WriteFile(tmp, []byte("stale leftover from a crashed run"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	wg.Wait()
-	ok, fail := 0, 0
-	for _, e := range errs {
-		if e == nil {
-			ok++
-		} else {
-			fail++
-		}
-	}
-	if ok != 1 {
-		t.Errorf("expected exactly one winner, got %d ok / %d fail", ok, fail)
-	}
-	b, err := os.ReadFile(filepath.Join(dir, "Caddyfile"))
+	live, err := ActivateCaddyfile(ActivateParams{Plan: testPlan(), Dir: dir, Bin: "/fake/caddy", Exec: fe})
 	if err != nil {
-		t.Fatalf("live missing after concurrent activation: %v", err)
+		t.Fatalf("activate with a stale regular tmp: %v", err)
 	}
 	want, _ := RenderCaddyfile(testPlan())
+	b, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatalf("live missing: %v", err)
+	}
 	if !bytes.Equal(b, want) {
-		t.Errorf("live bytes corrupted by concurrent activation")
+		t.Error("live != rendered bytes")
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Error("stale tmp not cleaned up")
 	}
 }
 
