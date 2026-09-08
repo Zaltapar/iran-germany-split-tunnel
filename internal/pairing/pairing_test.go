@@ -39,7 +39,7 @@ func fixtureBlobA(t *testing.T) (*BlobA, string) {
 func fixtureBlobB(t *testing.T) (*BlobB, string) {
 	t.Helper()
 	pub := base64.StdEncoding.EncodeToString(make([]byte, 32))
-	b, err := NewBlobB(PublicParams{RealityPublicKey: pub, ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000"}, DownTarget{Host: "203.0.113.10", Port: 443})
+	b, err := NewBlobB(PublicParams{RealityPublicKey: pub, ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}, DownTarget{Host: "203.0.113.10", Port: 443})
 	if err != nil {
 		t.Fatalf("NewBlobB: %v", err)
 	}
@@ -86,6 +86,7 @@ func TestBlobBRoundTrip(t *testing.T) {
 	}
 	if got.Public.UUID != "123e4567-e89b-42d3-a456-426614174000" ||
 		got.Public.ShortID != "0123456789abcdef" ||
+		got.Public.SNI != "www.lovelive123.com" ||
 		got.Germany.Host != "203.0.113.10" || got.Germany.Port != 443 {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
@@ -212,19 +213,30 @@ func TestBlobAInvalidFields(t *testing.T) {
 
 func TestBlobBInvalidFields(t *testing.T) {
 	valid := func() PublicParams {
-		return PublicParams{RealityPublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)), ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000"}
+		return PublicParams{RealityPublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)), ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}
 	}
 	cases := map[string]func(*PublicParams){
-		"pubkey 31 bytes":  func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 31)) },
-		"pubkey 33 bytes":  func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 33)) },
-		"pubkey not b64":   func(p *PublicParams) { p.RealityPublicKey = "not-base64!!!" },
-		"pubkey empty":     func(p *PublicParams) { p.RealityPublicKey = "" },
-		"shortid 15 hex":   func(p *PublicParams) { p.ShortID = "0123456789abcde" },
-		"shortid upper":    func(p *PublicParams) { p.ShortID = "0123456789ABCDEF" },
-		"shortid bad char": func(p *PublicParams) { p.ShortID = "0123456789abcdeg" },
-		"uuid wrong ver":   func(p *PublicParams) { p.UUID = "123e4567-e89b-12d3-a456-426614174000" },
-		"uuid upper":       func(p *PublicParams) { p.UUID = "123E4567-E89B-42D3-A456-426614174000" },
-		"uuid short":       func(p *PublicParams) { p.UUID = "123e4567-e89b-42d3" },
+		"pubkey 31 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 31)) },
+		"pubkey 33 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 33)) },
+		"pubkey not b64":      func(p *PublicParams) { p.RealityPublicKey = "not-base64!!!" },
+		"pubkey empty":        func(p *PublicParams) { p.RealityPublicKey = "" },
+		"shortid 15 hex":      func(p *PublicParams) { p.ShortID = "0123456789abcde" },
+		"shortid upper":       func(p *PublicParams) { p.ShortID = "0123456789ABCDEF" },
+		"shortid bad char":    func(p *PublicParams) { p.ShortID = "0123456789abcdeg" },
+		"uuid wrong ver":      func(p *PublicParams) { p.UUID = "123e4567-e89b-12d3-a456-426614174000" },
+		"uuid upper":          func(p *PublicParams) { p.UUID = "123E4567-E89B-42D3-A456-426614174000" },
+		"uuid short":          func(p *PublicParams) { p.UUID = "123e4567-e89b-42d3" },
+		"sni empty":           func(p *PublicParams) { p.SNI = "" },
+		"sni uppercase":       func(p *PublicParams) { p.SNI = "WWW.Lovelive123.com" },
+		"sni ip literal":      func(p *PublicParams) { p.SNI = "203.0.113.10" },
+		"sni with port":       func(p *PublicParams) { p.SNI = "www.lovelive123.com:443" },
+		"sni single label":    func(p *PublicParams) { p.SNI = "lovelive123" },
+		"sni scheme":          func(p *PublicParams) { p.SNI = "https://www.lovelive123.com" },
+		"sni underscore":      func(p *PublicParams) { p.SNI = "www_lovelive123.com" },
+		"sni whitespace":      func(p *PublicParams) { p.SNI = "www.lo velive123.com" },
+		"sni leading hyphen":  func(p *PublicParams) { p.SNI = "www.-lovelive123.com" },
+		"sni trailing hyphen": func(p *PublicParams) { p.SNI = "www.lovelive123-.com" },
+		"sni too long":        func(p *PublicParams) { p.SNI = strings.Repeat("a", 100) + "." + strings.Repeat("b", 154) },
 	}
 	for name, mutate := range cases {
 		p := valid()
@@ -257,7 +269,7 @@ func TestUnknownFieldRejected(t *testing.T) {
 	if _, err := ParseBlobA(withPayload(t, []byte(payloadA))); err == nil {
 		t.Error("unknown field accepted in blob A")
 	}
-	payloadB := `{"v":1,"role":"b","public":{"realityPublicKey":"` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `","shortId":"0123456789abcdef","uuid":"123e4567-e89b-42d3-a456-426614174000"},"germany":{"host":"203.0.113.10","port":443},"privateKey":"MUST-REJECT"}`
+	payloadB := `{"v":1,"role":"b","public":{"realityPublicKey":"` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `","shortId":"0123456789abcdef","uuid":"123e4567-e89b-42d3-a456-426614174000","sni":"www.lovelive123.com"},"germany":{"host":"203.0.113.10","port":443},"privateKey":"MUST-REJECT"}`
 	if _, err := ParseBlobB(withPayload(t, []byte(payloadB))); err == nil {
 		t.Error("unknown field (privateKey) accepted in blob B — key material boundary broken")
 	}
@@ -283,7 +295,7 @@ func TestTypeMismatchDoesNotLeakValue(t *testing.T) {
 	// Numeric overflow into an int field is the path where Go's json error
 	// text embeds the offending value verbatim; it must be sanitized too.
 	big := "123456789012345678901234567890"
-	payloadB2 := `{"v":1,"role":"b","public":{"realityPublicKey":"` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `","shortId":"0123456789abcdef","uuid":"123e4567-e89b-42d3-a456-426614174000"},"germany":{"host":"203.0.113.10","port":` + big + `}}`
+	payloadB2 := `{"v":1,"role":"b","public":{"realityPublicKey":"` + base64.StdEncoding.EncodeToString(make([]byte, 32)) + `","shortId":"0123456789abcdef","uuid":"123e4567-e89b-42d3-a456-426614174000","sni":"www.lovelive123.com"},"germany":{"host":"203.0.113.10","port":` + big + `}}`
 	_, err2 := ParseBlobB(withPayload(t, []byte(payloadB2)))
 	if err2 == nil {
 		t.Fatal("expected error for overflowing port")

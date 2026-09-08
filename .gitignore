@@ -39,3 +39,7 @@ $null
 # NEVER commit: dist/keys/* contains private key material (host-to-host
 # staging key). Rebuild via `go build`; regenerate keys per L5 runbook.
 dist/
+
+# T3 Pinned-Xray gate: rendered fixed-vector config written at CI run time
+# (contains the documented non-production test vector; regenerate, never commit).
+internal/xray/testdata/e2e/

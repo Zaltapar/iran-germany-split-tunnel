@@ -60,7 +60,7 @@ func (f *fakeExec) RunTest(bin, config string) (string, error) {
 }
 func (f *fakeExec) Keypair(bin string) (string, error) {
 	f.calls = append(f.calls, "keypair:"+bin)
-	return "PrivateKey: pk\nPublicKey: uk\n", f.keyErr
+	return "PrivateKey: pk\nPassword (PublicKey): uk\nHash32: h32\n", f.keyErr
 }
 
 // ---------------------------------------------------------------------------

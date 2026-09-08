@@ -1,0 +1,55 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/split-tunnel/xray-germany.error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "split-down",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.lovelive123.com:443",
+          "serverNames": [
+            "www.lovelive123.com"
+          ],
+          "privateKey": "gAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHkA",
+          "shortIds": [
+            "0123456789abcdef"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "to-splitter",
+      "protocol": "freedom",
+      "settings": {
+        "redirect": "127.0.0.1:9002"
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "split-down"
+        ],
+        "outboundTag": "to-splitter"
+      }
+    ]
+  }
+}
