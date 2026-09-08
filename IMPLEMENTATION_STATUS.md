@@ -6,7 +6,7 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 ## Current state
 
 - **Self-contained deployment — T3 Reality keygen + Germany Xray config
-  (branch `feat/t3-reality-config`)**: `internal/xray` extends the T2
+  (merged, PR #26, merge `1b44347`)**: `internal/xray` extends the T2
   managed-transport adapter with the Germany-side Reality pipeline
   (design `plans/t3-design.md`; architecture doc §4.4/§4.5):
   - **Keygen** (`keygen.go`): runs the pinned binary's own `xray x25519`
