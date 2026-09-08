@@ -13,7 +13,7 @@ cmd/germany-splitter/main.go runDownCarrier, pkg/mux CarrierAuth):
     Internet → [Germany Xray-core v26.3.27]
                 inbound "split-down": VLESS + Reality, 0.0.0.0:443
                 routing: inboundTag split-down → outbound "to-splitter"
-                outbound "to-splitter": dokodemo-door → 127.0.0.1:9002
+                outbound "to-splitter": freedom (redirect 127.0.0.1:9002)
              → [germany-splitter] SPLIT_DOWN_LISTEN (default ":9002", internal/config/config.go)
              → mux.CarrierAuth(FrameAuth, RoleDownload, tunnel secret) → node.InstallDown
 
@@ -23,7 +23,15 @@ WS up-carrier to Germany wss endpoint (Caddy, T4). Iran-side Xray inbound (dokod
 
 Two auth layers by design (doc §4.5 Q7): Reality authenticates/stealths the transport;
 the tunnel secret (mux.FrameAuth) authenticates the peer. Xray hands the splitter a raw
-opaque TCP stream — so the Germany outbound MUST be dokodemo-door (not a proxy protocol).
+opaque TCP stream — so the Germany outbound must be a passthrough construct (not a proxy
+protocol). CORRECTION (round 3, real-binary gate): the original design said
+"MUST be dokodemo-door", but at the pinned v26.3.27 tag dokodemo-door is registered
+inbound-ONLY (infra/conf/xray.go inboundConfigLoader; absent from
+outboundConfigLoader), so a dokodemo-door outbound fails `xray run -test` with
+`unknown config id: dokodemo-door`. The implemented outbound is `freedom` with
+`settings.redirect = "127.0.0.1:9002"` — its DestinationOverride (infra/conf/freedom.go,
+proxy/freedom/freedom.go) forces every dial target to the fixed endpoint, giving the
+same opaque-TCP hand-off.
 
 ## 2. Pinned-version (v26.3.27) ground truth — verified against the tag
 
@@ -59,7 +67,16 @@ Verified via raw.githubusercontent.com / api.github.com git-trees at ref v26.3.2
      StdEncoding base64 (with padding) is NOT accepted.
    - shortIds are hex strings in JSON (adapter hex-decodes to [8]byte).
    - DokodemoConfig: `address`, `port`, `followRedirect`, ... (dokodemo.go confirmed).
+     CORRECTION (round 3, real-binary gate): at this tag dokodemo-door is
+     registered INBOUND-only (infra/conf/xray.go inboundConfigLoader, line 27);
+     the outboundConfigLoader (line 40) has no dokodemo entry →
+     "unknown config id: dokodemo-door" on `xray run -test`. The Germany
+     outbound is therefore freedom + settings.redirect (FreedomConfig.Redirect
+     → DestinationOverride, freedom.go:143+; runtime override
+     proxy/freedom/freedom.go:97-110).
    - VLESS inbound settings: `clients` [{id, flow?}], `decryption` (inbound/config.proto).
+   - FreedomConfig (outbound): `redirect` "host:port" → DestinationOverride
+     (infra/conf/freedom.go:143); forces the dial target at runtime.
    - core/config.proto (proto layer) uses singular `inbound`/`outbound` — irrelevant to
      JSON output; the adapter is authoritative.
 
@@ -81,7 +98,7 @@ Verified via raw.githubusercontent.com / api.github.com git-trees at ref v26.3.2
 |---|---|
 | internal/xray/keygen.go (new) | `GenerateRealityKeypair(ctx, bin string) (*Keypair, error)`; `Keypair{PrivateRaw, PublicRaw, PrivateStd, PublicStd}` (Private* fields unexported-in-spirit: the type is internal, no public API prints them). Runs `xray x25519` via the existing structured `runCombined` (exec.Command args, no shell). Parses the 3 labeled lines; strict: exactly 3 lines, exact prefixes, RawURL decode == 32 bytes, public re-derivation NOT required (binary does ECDH); errors are sentinels, never echo key material. |
 | internal/xray/keygen_test.go (new) | Fake-exec table tests: happy path, missing line, wrong line count, non-b64, wrong length, uppercase hex shortId not here (config), error string contains no key bytes. |
-| internal/xray/realityconfig.go (new) | `RealityParams` (operator-validated input struct, see §3.4); `RenderGermanyConfig(p RealityParams, keypair) ([]byte, error)` — deterministic JSON, fixed key order (hand-built via ordered writer or fixed struct set with explicit field order), 2-space indent, trailing newline. Output = doc §4.5 shape verbatim: log{loglevel, error?}, inbounds[0]=split-down vless+reality (clients[{id}], decryption none, dest "<SNI>:443", serverNames [SNI], privateKey RawURL, shortIds [16hex]), outbounds[0]=to-splitter dokodemo-door 127.0.0.1:9002, routing rule split-down→to-splitter. NO flow (server side), NO sniffing (opaque TCP must not be sniffed/overridden), NO extra outbounds. |
+| internal/xray/realityconfig.go (new) | `RealityParams` (operator-validated input struct, see §3.4); `RenderGermanyConfig(p RealityParams, keypair) ([]byte, error)` — deterministic JSON, fixed key order (hand-built via ordered writer or fixed struct set with explicit field order), 2-space indent, trailing newline. Output = doc §4.5 shape verbatim: log{loglevel, error?}, inbounds[0]=split-down vless+reality (clients[{id}], decryption none, dest "<SNI>:443", serverNames [SNI], privateKey RawURL, shortIds [16hex]), outbounds[0]=to-splitter freedom redirect 127.0.0.1:9002 (see round-3 correction in §1 — dokodemo-door is inbound-only at this tag), routing rule split-down→to-splitter. NO flow (server side), NO sniffing (opaque TCP must not be sniffed/overridden), NO extra outbounds. |
 | internal/xray/realityconfig_test.go (new) | Golden files: internal/xray/testdata/golden/germany-config.golden.json + fixed-vector input. Same logical input → byte-identical output (run twice, compare). Every golden case from the spec (§5). |
 | internal/xray/activate.go (new) | `ActivateGermanyConfig(Activate{Dir, FileName, Bin, Executor, Log})`: (1) render; (2) write 0600 to `xray-germany.json.tmp` in same dir; fsync; (3) `Executor.RunTest(bin, tmp)` gate — on failure: remove tmp, return ErrConfigGate-equivalent (new sentinel), NOTHING changed; (4) if live file exists: copy to `<name>.prev` (0600) [rollback artifact]; (5) rename tmp → live (atomic same-fs); (6) chown-free, owner = deploy user. No service restart here (T5+ job). Symlink safety: `os.Lstat` the target first, refuse if symlink (OpenFile O_NOFOLLOW on write, create-only flags). |
 | internal/xray/activate_test.go (new) | Fake executor: gate-fail leaves dir byte-identical (incl. no .tmp, no .prev change); gate-pass creates .prev of old content + new live; permissions asserted 0600 (os.Stat); symlink target refused; dir-not-writable fails clean. |
@@ -195,9 +212,10 @@ Nothing in pkg/*, nothing in internal/config, pkg/node untouched (arch test stay
    injected into JSON → strict decode rejects (unknown field).
 9. activate: gate-fail → dir unchanged (byte-compare pre/post, incl. mtime-free compare
    of contents); gate-pass → old content preserved byte-identical in .prev; perms 0600.
-10. :9002 only appears as dokodemo target 127.0.0.1:9002 (grep golden); 443 is the only
-    listen port; no other public listeners in the config (structural assert on parsed
-    JSON in the test).
+10. :9002 and 127.0.0.1 appear ONLY inside the freedom outbound's
+    settings.redirect "127.0.0.1:9002" (grep golden); 443 is the only numeric
+    port field and 0.0.0.0 the only listen; no other public listeners (structural
+    assert on parsed JSON in the test).
 11. error strings never contain the private key bytes (table over all failure modes).
 12. determinism: 100 renders → 1 distinct byte string (checksum).
 

@@ -163,7 +163,8 @@ func TestHandBuiltKeypairAccepted(t *testing.T) {
 
 // 10. structural exposure audit of the rendered config:
 //   - the only public listener is the Reality inbound 0.0.0.0:443;
-//   - 9002 appears ONLY as the loopback dokodemo-door target 127.0.0.1:9002;
+//   - 9002 and 127.0.0.1 appear ONLY inside the freedom outbound's
+//     settings.redirect ("127.0.0.1:9002") — nowhere else in the document;
 //   - there is exactly one inbound and one outbound, no extra listeners.
 func TestStructuralExposureAudit(t *testing.T) {
 	out := renderGolden(t)
@@ -173,11 +174,12 @@ func TestStructuralExposureAudit(t *testing.T) {
 		t.Fatalf("config is not valid JSON: %v", err)
 	}
 
-	// Collect every port and every listen/address value in the whole
+	// Collect every port, listen/address, and redirect value in the whole
 	// document (the exposure surface), regardless of nesting.
 	var walk func(any)
-	ports := map[int]int{}      // port value -> occurrences
-	listens := map[string]int{} // listen/address value -> occurrences
+	ports := map[int]int{}        // port value -> occurrences
+	listens := map[string]int{}   // listen/address value -> occurrences
+	redirects := map[string]int{} // redirect value -> occurrences
 	walk = func(v any) {
 		switch x := v.(type) {
 		case map[string]any:
@@ -191,6 +193,10 @@ func TestStructuralExposureAudit(t *testing.T) {
 					if s, ok := val.(string); ok {
 						listens[s]++
 					}
+				case "redirect":
+					if s, ok := val.(string); ok {
+						redirects[s]++
+					}
 				}
 				walk(val)
 			}
@@ -202,25 +208,32 @@ func TestStructuralExposureAudit(t *testing.T) {
 	}
 	walk(doc)
 
-	// Exactly two ports in the whole document: 443 (inbound) and 9002
-	// (loopback target). Nothing else.
-	if len(ports) != 2 {
-		t.Errorf("expected exactly 2 distinct ports (443, 9002), got %v", ports)
+	// The only numeric port in the document is 443 (the inbound listener).
+	// 9002 must NOT appear as a port field — it exists only inside the
+	// redirect string.
+	if len(ports) != 1 {
+		t.Errorf("expected exactly 1 distinct port field (443), got %v", ports)
 	}
 	if ports[443] != 1 {
 		t.Errorf("port 443 must appear exactly once, got %d", ports[443])
 	}
-	if ports[9002] != 1 {
-		t.Errorf("port 9002 must appear exactly once (the loopback target), got %d", ports[9002])
+
+	// The only listen address is 0.0.0.0 (the one public inbound). The
+	// loopback address 127.0.0.1 must NOT appear as a listen/address field.
+	if len(listens) != 1 {
+		t.Errorf("expected exactly 1 listen/address value (0.0.0.0), got %v", listens)
+	}
+	if listens["0.0.0.0"] != 1 {
+		t.Errorf("listen 0.0.0.0 must appear exactly once, got %v", listens)
 	}
 
-	// Listeners/addresses: 0.0.0.0 (the one public inbound) and 127.0.0.1
-	// (the dokodemo target) — and nothing else.
-	if len(listens) != 2 {
-		t.Errorf("expected exactly 2 listen/address values (0.0.0.0, 127.0.0.1), got %v", listens)
+	// 9002 and 127.0.0.1 live ONLY in the freedom outbound redirect,
+	// exactly once each, bound to the fixed splitter endpoint.
+	if len(redirects) != 1 {
+		t.Fatalf("expected exactly 1 redirect value, got %v", redirects)
 	}
-	if listens["0.0.0.0"] != 1 || listens["127.0.0.1"] != 1 {
-		t.Errorf("unexpected listen/address distribution: %v", listens)
+	if redirects["127.0.0.1:9002"] != 1 {
+		t.Errorf("redirect must be exactly 127.0.0.1:9002, got %v", redirects)
 	}
 
 	// Exactly one inbound (split-down) and one outbound (to-splitter).
@@ -240,8 +253,8 @@ func TestStructuralExposureAudit(t *testing.T) {
 	if ob["tag"] != "to-splitter" {
 		t.Errorf("outbound tag = %v, want to-splitter", ob["tag"])
 	}
-	if ob["protocol"] != "dokodemo-door" {
-		t.Errorf("outbound protocol = %v, want dokodemo-door", ob["protocol"])
+	if ob["protocol"] != "freedom" {
+		t.Errorf("outbound protocol = %v, want freedom", ob["protocol"])
 	}
 
 	// The routing rule must bind split-down -> to-splitter.

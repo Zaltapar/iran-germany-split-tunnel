@@ -6,7 +6,7 @@
 - **Scope**: `internal/xray/keygen.go`, `internal/xray/realityconfig.go`, `internal/xray/activate.go`, `internal/pairing/pairing.go` (SNI), and their tests.
 - **Standard**: CRITICAL = 0 and HIGH = 0 required before merge (per T3 spec mandatory loop).
 
-## Verdict (Round 2 — FINAL)
+## Verdict (Round 3 — FINAL)
 
 | Severity | Count |
 |----------|-------|
@@ -15,7 +15,62 @@
 | MEDIUM   | 0 |
 | LOW      | 0 |
 
-**Result: PASS** — CRITICAL-1, LOW-1, LOW-2 all remediated and verified. T3-K complete.
+**Result: PASS** — CRITICAL-2 (real-binary gate) remediated and verified against the
+pinned v26.3.27 binary on Linux. Round 2's PASS (code review) is superseded by this
+gate-driven round.
+
+### Round 3 — CRITICAL-2: `dokodemo-door` is not a valid OUTBOUND protocol
+
+Found by the **real-binary Linux gate** on germany-node (commit 8d9849d):
+`xray run -test` against the rendered golden config failed with
+
+```
+failed to load outbound detour config for protocol dokodemo-door
+> infra/conf: unknown config id: dokodemo-door
+```
+
+Root cause (verified at the pinned tag, commit d2758a0 == the binary's build hash):
+`infra/conf/xray.go` registers `dokodemo-door` in the **inbound** loader
+(line 27) but NOT in the **outbound** loader (line 40). The doc §4.5 / design doc
+assumed a dokodemo-door *outbound*; the hermetic fake-Executor suite never runs the
+real binary, so it could not catch this.
+
+Fix: outbound `freedom` + `settings.redirect = "127.0.0.1:9002"`.
+Verified: (a) the pinned binary accepts the rendered config (`Configuration OK.`,
+exit 0); (b) the runtime override is semantically correct —
+`infra/conf/freedom.go:143` builds a `DestinationOverride` from `redirect`, and
+`proxy/freedom/freedom.go:97-110` replaces the dial target's address and port with
+the fixed endpoint for every connection (TCP and UDP).
+
+### Round 3 verification (evidence)
+
+- [`realityconfig.go`](internal/xray/realityconfig.go) outbound is now
+  `Protocol: "freedom"`, `freedomSettings{Redirect: "127.0.0.1:9002"}`; doc comment
+  records why dokodemo-door is unusable as an outbound at the pinned tag.
+- Golden regenerated: `"protocol": "freedom"`, `"settings": { "redirect":
+  "127.0.0.1:9002" }`; `TestGoldenMatchesCommittedFile` + 100× determinism green.
+- [`realityconfig_test.go`](internal/xray/realityconfig_test.go) structural audit
+  reworked: 443 is the ONLY numeric port field, 0.0.0.0 the ONLY listen, and
+  9002/127.0.0.1 appear ONLY inside the redirect string (exactly once).
+- germany-node (Go 1.27.1, Ubuntu 24.04.4) full gate at the fix commit:
+  `gofmt -l` clean, `go vet`, `go test ./...`, `go test -race ./...`, `go build`,
+  then real pinned binary: sha256 vs `.dgst` OK, `xray version` OK, `x25519`
+  3-line shape OK, `xray run -test -config <rendered>` → `Configuration OK.`
+- Docs corrected in lockstep: architecture doc §3.2/§4.5 + JSON example + Q7,
+  plans/t3-design.md §1/§2/§3.1/§5, IMPLEMENTATION_STATUS.md T3 bullet.
+
+## Verdict (Round 2 — code review, superseded by Round 3 gate)
+
+| Severity | Count |
+|----------|-------|
+| CRITICAL | 0 |
+| HIGH     | 0 |
+| MEDIUM   | 0 |
+| LOW      | 0 |
+
+**Result: PASS** — CRITICAL-1, LOW-1, LOW-2 all remediated and verified. T3-K
+(code review) complete; the real-binary gate (Round 3) found and fixed one further
+CRITICAL (CRITICAL-2).
 
 ### Round 2 verification (evidence)
 

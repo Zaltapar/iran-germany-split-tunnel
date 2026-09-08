@@ -36,10 +36,9 @@
   "outbounds": [
     {
       "tag": "to-splitter",
-      "protocol": "dokodemo-door",
+      "protocol": "freedom",
       "settings": {
-        "address": "127.0.0.1",
-        "port": 9002
+        "redirect": "127.0.0.1:9002"
       }
     }
   ],

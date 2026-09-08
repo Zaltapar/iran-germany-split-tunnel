@@ -22,10 +22,17 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
     byte-pinned by `internal/xray/testdata/golden/germany-config.golden.json`)
     producing the doc §4.5 Germany config: VLESS+Reality inbound
     `split-down` on 0.0.0.0:443 (`dest` derived as `<SNI>:443`, never
-    operator input) + routing → dokodemo-door outbound `to-splitter`
-    127.0.0.1:9002; no flow, no sniffing, no extra outbounds. Operator
-    inputs (SNI/shortId/UUID) are validated against the single source of
-    truth in `internal/pairing`; errors name fields, never values.
+    operator input) + routing → freedom outbound `to-splitter` with
+    `settings.redirect = "127.0.0.1:9002"` (opaque-TCP hand-off); no flow,
+    no sniffing, no extra outbounds. The outbound is `freedom` rather than
+    `dokodemo-door` because at the pinned v26.3.27 tag dokodemo-door is
+    registered as an INBOUND protocol only (the real-binary gate caught this:
+    a dokodemo-door outbound fails `xray run -test` with
+    `unknown config id: dokodemo-door`); freedom's `redirect` sets a
+    `DestinationOverride` that forces every dial target to the fixed
+    splitter endpoint. Operator inputs (SNI/shortId/UUID) are validated
+    against the single source of truth in `internal/pairing`; errors name
+    fields, never values.
   - **Activation** (`activate.go`): transactional, fail-closed — render →
     write candidate 0600 (O_EXCL, fsync) → gate on the pinned binary's own
     `xray run -test` (on gate failure: tmp removed, directory left
@@ -55,10 +62,20 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
     produces — plus 2 LOW (Std-encoding mask, comment precision); all
     remediated with a positive regression pin (a key with bit 3 of byte 0
     set and bit 5 of byte 31 clear must be ACCEPTED). Round 2 PASS:
-    CRITICAL=0 HIGH=0.
+    CRITICAL=0 HIGH=0. Round 3 (post-merge of the code, on the real
+    binary): the germany-node Linux gate caught CRITICAL-2 — the renderer
+    emitted a `dokodemo-door` **outbound**, but at the pinned tag that
+    protocol is registered inbound-only (`infra/conf/xray.go`
+    `inboundConfigLoader`), so `xray run -test` failed with
+    `unknown config id: dokodemo-door`. Remediated to `freedom` +
+    `settings.redirect = "127.0.0.1:9002"` (verified: real binary accepts
+    the config, and the runtime `DestinationOverride` forces the dial
+    target to the fixed endpoint). The hermetic fake-Executor suite could
+    never catch this — it is exactly why the pinned-binary gate exists.
   - **Verification**: full `go test ./... -count=1` + `go vet` green
     (Windows dev host, Go 1.27.0); Linux gate on germany-node (Go 1.27.1)
-    recorded in this PR's CI.
+    green at the fix commit (gofmt/vet/test/race/build + pinned-binary
+    `xray run -test`), and mirrored in this PR's CI ("Pinned Xray gate").
   - **Out of scope (explicit)**: systemd units / `splitterctl` / TLS
     preflight (T5), Iran-side config (T10), Caddy/origin (T4).
   NEXT: T4 (origin/Caddy provider + preflight).

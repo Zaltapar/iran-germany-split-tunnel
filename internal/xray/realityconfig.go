@@ -21,14 +21,15 @@ package xray
 //   - the Reality PRIVATE key is written into the config (0600 at
 //     activation, doc §4.4) but never into any pairing blob, log line, or
 //     error;
-//   - 9002 appears ONLY as the loopback dokodemo-door target
-//     127.0.0.1:9002; the only public listener in the generated config is
-//     the Reality inbound 0.0.0.0:443.
+//   - 9002 appears ONLY as the loopback target 127.0.0.1:9002 (the freedom
+//     outbound's settings.redirect); the only public listener in the
+//     generated config is the Reality inbound 0.0.0.0:443.
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
@@ -161,14 +162,16 @@ type germanyRealitySettings struct {
 }
 
 type germanyOutbound struct {
-	Tag      string           `json:"tag"`
-	Protocol string           `json:"protocol"`
-	Settings dokodemoSettings `json:"settings"`
+	Tag      string          `json:"tag"`
+	Protocol string          `json:"protocol"`
+	Settings freedomSettings `json:"settings"`
 }
 
-type dokodemoSettings struct {
-	Address string `json:"address"`
-	Port    int    `json:"port"`
+// freedomSettings mirrors xray-core v26.3.27 infra/conf/freedom.go FreedomConfig
+// (only the fields this config uses; unknown fields are ignored by the
+// binary, but we emit only the redirect).
+type freedomSettings struct {
+	Redirect string `json:"redirect"`
 }
 
 type germanyRouting struct {
@@ -185,11 +188,20 @@ type germanyRoutingRule struct {
 //
 //	inbound  "split-down"  vless + reality   0.0.0.0:443
 //	routing  split-down    → to-splitter
-//	outbound "to-splitter" dokodemo-door     127.0.0.1:9002
+//	outbound "to-splitter" freedom redirect  127.0.0.1:9002
 //
 // Deliberate omissions (doc §4.5): no flow (server side), no sniffing
 // (opaque TCP must not be sniffed or have its dest overridden), no extra
 // outbounds. The output ends with a single trailing newline.
+//
+// The outbound is freedom-with-redirect, NOT dokodemo-door: at the pinned
+// Xray v26.3.27 tag, dokodemo-door is registered as an INBOUND protocol
+// only (infra/conf/xray.go inboundConfigLoader); it is absent from the
+// outbound loader, so "unknown config id: dokodemo-door" fails
+// xray run -test. freedom's settings.redirect sets a DestinationOverride
+// that forces every connection's dial target to the fixed endpoint
+// (proxy/freedom/freedom.go), which is exactly the opaque-TCP hand-off to
+// the splitter down-carrier that dokodemo-door would have provided.
 func RenderGermanyConfig(p RealityParams, kp *Keypair) ([]byte, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
@@ -227,10 +239,13 @@ func RenderGermanyConfig(p RealityParams, kp *Keypair) ([]byte, error) {
 		}},
 		Outbounds: []germanyOutbound{{
 			Tag:      tagToSplitter,
-			Protocol: "dokodemo-door",
-			Settings: dokodemoSettings{
-				Address: splitterAddress,
-				Port:    splitterPort,
+			Protocol: "freedom",
+			Settings: freedomSettings{
+				// redirect forces the freedom outbound's dial target to
+				// the fixed splitter down-carrier endpoint (opaque TCP
+				// hand-off); see the function doc for why dokodemo-door
+				// is not usable as an outbound at the pinned tag.
+				Redirect: splitterAddress + ":" + strconv.Itoa(splitterPort),
 			},
 		}},
 		Routing: germanyRouting{
