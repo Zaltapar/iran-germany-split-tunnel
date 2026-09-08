@@ -123,6 +123,48 @@ func validUploadDomain(d string) bool {
 	return validHost(d)
 }
 
+// validSNI validates the Reality SNI carried in blob B: the TLS ServerName
+// Iran's outbound presents and the Germany inbound's serverNames must
+// contain. Unlike a generic host it MUST be a DNS name (an IP literal is
+// not a usable SNI) and MUST be lowercase: the SNI is matched against the
+// impersonation target's certificate at handshake time, so case drift
+// would surface as a runtime TLS failure, not a validation error.
+//
+// Rules: 1..253 chars, no IP literal, no port/scheme/whitespace/underscore,
+// at least two labels, each 1..63 chars, alnum + '-' only, no leading or
+// trailing hyphen per label.
+func validSNI(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	if net.ParseIP(s) != nil {
+		return false
+	}
+	if strings.ContainsAny(s, " \t\n:/_") {
+		return false
+	}
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, l := range labels {
+		if len(l) == 0 || len(l) > 63 {
+			return false
+		}
+		if l[0] == '-' || l[len(l)-1] == '-' {
+			return false
+		}
+		for _, r := range l {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			default:
+				return false // uppercase and all other characters are rejected
+			}
+		}
+	}
+	return true
+}
+
 // validRealityPublicKey validates a base64 (StdEncoding) X25519 public key:
 // exactly 32 bytes when decoded.
 func validRealityPublicKey(s string) bool {
@@ -145,6 +187,26 @@ func fieldErr(problems []string) error {
 	}
 	return fmt.Errorf("%w: %s", ErrFields, strings.Join(problems, "; "))
 }
+
+// ---------------------------------------------------------------------------
+// Exported validators — single source of truth for shared operator input
+// ---------------------------------------------------------------------------
+//
+// The Germany Xray config generator (internal/xray, task T3) validates the
+// same operator values (SNI, UUID, shortId) as blob B does. It must call
+// these wrappers instead of re-implementing the rules (project rule: do
+// not duplicate validation rules unnecessarily).
+
+// ValidSNI reports whether s is an acceptable Reality SNI (see validSNI).
+func ValidSNI(s string) bool { return validSNI(s) }
+
+// ValidUUID reports whether u is a lowercase RFC 4122 version-4 UUID — the
+// same rule blob B applies to public.uuid.
+func ValidUUID(u string) bool { return uuidV4Re.MatchString(u) }
+
+// ValidShortID reports whether s is a 16-char lowercase hex Reality shortId
+// — the same rule blob B applies to public.shortId.
+func ValidShortID(s string) bool { return shortIDRe.MatchString(s) }
 
 // ---------------------------------------------------------------------------
 // Secret generation
@@ -270,6 +332,7 @@ type PublicParams struct {
 	RealityPublicKey string `json:"realityPublicKey"` // base64 StdEncoding, 32 bytes decoded
 	ShortID          string `json:"shortId"`          // 16 hex chars
 	UUID             string `json:"uuid"`             // RFC 4122 v4, lowercase
+	SNI              string `json:"sni"`              // Reality SNI / TLS ServerName (lowercase RFC 1123 hostname)
 }
 
 // DownTarget is Germany's public down-carrier endpoint (the Reality
@@ -316,6 +379,9 @@ func (b *BlobB) validate() error {
 	if !uuidV4Re.MatchString(b.Public.UUID) {
 		problems = append(problems, "public.uuid: must be an RFC 4122 version-4 UUID (lowercase)")
 	}
+	if !validSNI(b.Public.SNI) {
+		problems = append(problems, "public.sni: must be a lowercase RFC 1123 hostname (no IP literal, no port, no scheme)")
+	}
 	if !validHost(b.Germany.Host) {
 		problems = append(problems, "germany.host: invalid public host")
 	}
@@ -342,8 +408,8 @@ func ParseBlobB(s string) (*BlobB, error) {
 // by definition, but the summary never includes the tunnel secret (it is
 // not in this blob).
 func (b *BlobB) Summary() string {
-	return fmt.Sprintf("blobB{version=%d, uuid=%s, shortId=%s, down=%s:%d}",
-		b.V, b.Public.UUID, b.Public.ShortID, b.Germany.Host, b.Germany.Port)
+	return fmt.Sprintf("blobB{version=%d, sni=%s, uuid=%s, shortId=%s, down=%s:%d}",
+		b.V, b.Public.SNI, b.Public.UUID, b.Public.ShortID, b.Germany.Host, b.Germany.Port)
 }
 
 func (b *BlobB) String() string { return b.Summary() }

@@ -58,9 +58,17 @@ type Executor interface {
 	// combined output. Non-nil error or non-zero exit = the gate
 	// failed and NOTHING may be (re)started.
 	RunTest(bin, config string) (string, error)
-	// Keypair runs "<bin> x2025 reality keypair" and returns its
-	// output (the private key line — handled by T3; the installer
-	// only needs the call to succeed).
+	// Keypair runs "<bin> x25519" and returns its combined output.
+	// The pinned Xray (v26.3.27) has no "x2025" subcommand; the
+	// Reality keypair command is "x25519" (flags: -i, --std-encoding).
+	// Output is exactly three lines (default RawURL base64, unpadded):
+	//
+	//	PrivateKey: <32-byte clamped secret>
+	//	Password (PublicKey): <32-byte public key>
+	//	Hash32: <blake3-256 of the public key>
+	//
+	// Callers parse it via ParseX25519Output; the output contains the
+	// PRIVATE key and must never be logged.
 	Keypair(bin string) (string, error)
 }
 
@@ -79,7 +87,7 @@ func (OSExecutor) RunTest(bin, config string) (string, error) {
 
 // Keypair implements Executor.
 func (OSExecutor) Keypair(bin string) (string, error) {
-	return runCombined(bin, "x2025", "reality", "keypair")
+	return runCombined(bin, "x25519")
 }
 
 func runCombined(name string, args ...string) (string, error) {
