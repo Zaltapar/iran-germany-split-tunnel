@@ -91,8 +91,12 @@ jobs:
 
           # 5) The real binary must accept the generated config. The config's
           #    error log path is the production location (doc §4.5); create
-          #    the directory in CI as T5 will on the real node.
-          mkdir -p /var/log/split-tunnel
+          #    the directory in CI as T5 will on the real node. The runner
+          #    user is non-root, so the system dir needs sudo, and xray
+          #    (running as the runner user) needs to be able to open the
+          #    error log file inside it.
+          sudo mkdir -p /var/log/split-tunnel
+          sudo chown "$(id -un):$(id -gn)" /var/log/split-tunnel
           "$XRAY" run -test -config "$CFG"
 
       - name: go build (host)
