@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha512"
 	"encoding/json"
 	"errors"
@@ -23,15 +24,21 @@ import (
 // ---------------------------------------------------------------------------
 
 // staticDL serves fixed bytes per URL; keeps the install logic
-// network-independent.
+// network-independent. blockOnCtx makes Fetch wait for the caller's ctx
+// (cancellation-injection tests).
 type staticDL struct {
-	files map[string][]byte
-	err   error
+	files      map[string][]byte
+	err        error
+	blockOnCtx bool
 }
 
-func (s staticDL) Fetch(url string) (io.ReadCloser, error) {
+func (s staticDL) Fetch(ctx context.Context, url string) (io.ReadCloser, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if s.blockOnCtx {
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	b, ok := s.files[url]
 	if !ok {
@@ -40,21 +47,31 @@ func (s staticDL) Fetch(url string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-// fakeExec records calls and returns canned results.
+// fakeExec records calls and returns canned results. blockOnCtx makes
+// VersionOutput/Validate wait for the caller's ctx.
 type fakeExec struct {
 	versionOut  string
 	versionErr  error
 	validateOut string
 	validateErr error
 	calls       []string
+	blockOnCtx  bool
 }
 
-func (f *fakeExec) VersionOutput(bin string) (string, error) {
+func (f *fakeExec) VersionOutput(ctx context.Context, bin string) (string, error) {
 	f.calls = append(f.calls, "version:"+bin)
+	if f.blockOnCtx {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	return f.versionOut, f.versionErr
 }
-func (f *fakeExec) Validate(bin, config string) (string, error) {
+func (f *fakeExec) Validate(ctx context.Context, bin, config string) (string, error) {
 	f.calls = append(f.calls, "validate:"+bin+":"+config)
+	if f.blockOnCtx {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	return f.validateOut, f.validateErr
 }
 
@@ -128,7 +145,7 @@ func TestInstallHappyPath(t *testing.T) {
 	tarBytes := makeTarGz(t)
 	in, fe, prefix := installFixture(t, tarBytes)
 
-	got, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	got, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -189,7 +206,7 @@ func TestInstallFailureLeavesNoPartialState(t *testing.T) {
 		oldCA: checksumsFile(fmt.Sprintf("%s  %s", sha512For(t, oldTar), oldName)),
 	}}
 	oldIn := &Installer{Prefix: prefix, DL: oldDL, Exec: &fakeExec{versionOut: "v9.9.9 h1:old"}}
-	if _, err := oldIn.Install("v9.9.9", CaddyArchLinuxAMD64, ""); err != nil {
+	if _, err := oldIn.Install(context.Background(), "v9.9.9", CaddyArchLinuxAMD64, ""); err != nil {
 		t.Fatalf("old install: %v", err)
 	}
 	oldDir, _ := VersionDir(prefix, "v9.9.9")
@@ -199,7 +216,7 @@ func TestInstallFailureLeavesNoPartialState(t *testing.T) {
 
 	// Now a NEW install that fails the config gate.
 	fe.validateErr = errors.New("config rejected")
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "/etc/split-tunnel/Caddyfile")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "/etc/split-tunnel/Caddyfile")
 	if err == nil {
 		t.Fatal("expected config-gate failure")
 	}
@@ -227,7 +244,7 @@ func TestInstallChecksumMismatchAborts(t *testing.T) {
 		ca: checksumsFile(fmt.Sprintf("%s  %s", strings.Repeat("ab", sha512.Size), name)), // wrong checksum
 	}}
 	in := &Installer{Prefix: prefix, DL: dl, Exec: &fakeExec{versionOut: PinnedVersion + " h1:x"}}
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err == nil {
 		t.Fatal("expected mismatch")
 	}
@@ -249,7 +266,7 @@ func TestInstallMissingChecksumRejected(t *testing.T) {
 		ca: []byte("# no entries\n"), // no line for the tar
 	}}
 	in := &Installer{Prefix: prefix, DL: dl, Exec: &fakeExec{versionOut: PinnedVersion + " h1:x"}}
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err == nil {
 		t.Fatal("expected rejection of release without a checksum entry")
 	}
@@ -262,7 +279,7 @@ func TestInstallSmokeCheckFailureCleansUp(t *testing.T) {
 	tarBytes := makeTarGz(t)
 	in, fe, prefix := installFixture(t, tarBytes)
 	fe.versionOut = "not the pinned version" // smoke: first field != version
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err == nil {
 		t.Fatal("expected smoke failure")
 	}
@@ -278,14 +295,14 @@ func TestInstallSmokeCheckFailureCleansUp(t *testing.T) {
 func TestInstallExistingVersionRefusedWithoutForce(t *testing.T) {
 	tarBytes := makeTarGz(t)
 	in, _, _ := installFixture(t, tarBytes)
-	if _, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, ""); err != nil {
+	if _, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, ""); err != nil {
 		t.Fatalf("first install: %v", err)
 	}
-	if _, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, ""); err == nil {
+	if _, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, ""); err == nil {
 		t.Fatal("second install should be refused")
 	}
 	in.Force = true
-	if _, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, ""); err != nil {
+	if _, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, ""); err != nil {
 		t.Fatalf("forced reinstall: %v", err)
 	}
 }
@@ -361,7 +378,7 @@ func TestTarSlipRejected(t *testing.T) {
 		name, _ := TarName(PinnedVersion, CaddyArchLinuxAMD64)
 		dl := staticDL{files: map[string][]byte{ta: tarBytes, ca: checksumsFile(fmt.Sprintf("%s  %s", sha512For(t, tarBytes), name))}}
 		in := &Installer{Prefix: prefix, DL: dl, Exec: &fakeExec{versionOut: PinnedVersion + " h1:x"}}
-		_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+		_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 		if err == nil {
 			t.Errorf("tar-slip entry %q accepted", evil)
 			continue
@@ -398,7 +415,7 @@ func TestTarSymlinkEntryRejected(t *testing.T) {
 	name, _ := TarName(PinnedVersion, CaddyArchLinuxAMD64)
 	dl := staticDL{files: map[string][]byte{ta: gz.Bytes(), ca: checksumsFile(fmt.Sprintf("%s  %s", sha512For(t, gz.Bytes()), name))}}
 	in := &Installer{Prefix: prefix, DL: dl, Exec: &fakeExec{versionOut: PinnedVersion + " h1:x"}}
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err == nil {
 		t.Fatal("symlink entry accepted")
 	}
@@ -415,7 +432,7 @@ func TestInstallOversizedChecksumsRejected(t *testing.T) {
 		ca: bytes.Repeat([]byte("x"), maxChecksumBytes+1),
 	}}
 	in := &Installer{Prefix: prefix, DL: dl, Exec: &fakeExec{versionOut: PinnedVersion + " h1:x"}}
-	_, err := in.Install(PinnedVersion, CaddyArchLinuxAMD64, "")
+	_, err := in.Install(context.Background(), PinnedVersion, CaddyArchLinuxAMD64, "")
 	if err == nil {
 		t.Fatal("expected rejection of oversized checksums file")
 	}
@@ -437,7 +454,7 @@ func TestHTTPDownloaderAgainstLocalServer(t *testing.T) {
 	defer srv.Close()
 
 	dl := HTTPDownloader{}
-	rc, err := dl.Fetch(srv.URL + "/tar")
+	rc, err := dl.Fetch(context.Background(), srv.URL+"/tar")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +463,7 @@ func TestHTTPDownloaderAgainstLocalServer(t *testing.T) {
 	if !bytes.Equal(body, tarBytes) {
 		t.Error("downloaded body mismatch")
 	}
-	if _, err := dl.Fetch(srv.URL + "/404"); err == nil {
+	if _, err := dl.Fetch(context.Background(), srv.URL+"/404"); err == nil {
 		t.Error("404 accepted")
 	}
 }

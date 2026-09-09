@@ -100,7 +100,8 @@ func TestProbeTLS13NoTLS13(t *testing.T) {
 	}
 }
 
-// An unreachable destination (closed port) → dial error, not ErrNoTLS13.
+// An unreachable destination (closed port) → ErrProbeUnreachable, not
+// ErrNoTLS13 (the diagnosis is honest about the class).
 func TestProbeUnreachable(t *testing.T) {
 	// Bind then close a port to get a guaranteed-closed local port.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -109,15 +110,18 @@ func TestProbeUnreachable(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	ln.Close()
-	res, err := ProbeTLS13(context.Background(), addr, "x")
+	res, err := ProbeTLS13(context.Background(), addr, "x.example.com")
 	if err == nil {
 		t.Fatal("expected dial error for a closed port")
+	}
+	if !errors.Is(err, ErrProbeUnreachable) {
+		t.Errorf("want ErrProbeUnreachable, got %v", err)
 	}
 	if errors.Is(err, ErrNoTLS13) {
 		t.Error("closed port must be a dial error, not ErrNoTLS13")
 	}
-	if res.Reachable {
-		t.Error("closed port reported reachable")
+	if res == nil || res.Reachable {
+		t.Errorf("closed port must report Reachable=false: %+v", res)
 	}
 }
 
@@ -131,7 +135,7 @@ func TestProbeHonorsContext(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	addr := ln.Addr().String()
 	ln.Close()
-	if _, err := ProbeTLS13(ctx, addr, "x"); err == nil {
+	if _, err := ProbeTLS13(ctx, addr, "x.example.com"); err == nil {
 		t.Fatal("expected an error under a short ctx")
 	}
 }

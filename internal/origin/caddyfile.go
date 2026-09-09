@@ -49,18 +49,30 @@ const wsIdleTimeout = "3600s"
 //
 // The render is pure (no I/O) and deterministic: the same Plan always
 // yields the same bytes.
+//
+// Injection safety (review CRITICAL-1): the ONLY operator-controlled
+// strings that reach the output are
+//   - Domain   — validated by pairing.ValidUploadDomain (no whitespace,
+//     colon, brace, or comment byte can survive that rule);
+//   - the ACME email  — RE-CHECKED here by canonicalACMEEmail (no
+//     whitespace/control/Caddyfile-significant byte anywhere);
+//   - the upstream — RE-DERIVED here by canonicalUpstream from the
+//     parsed loopback IP + decimal port; the raw input string is never
+//     rendered.
+//
+// Everything else is a fixed template fragment.
 func RenderCaddyfile(plan Plan) ([]byte, error) {
 	if err := plan.validate(); err != nil {
 		return nil, err
 	}
 	switch plan.Mode {
 	case ModeCaddy:
-		return renderCaddy(plan), nil
+		return renderCaddy(plan)
 	case ModeCDN:
 		if plan.CDNSecurity != CDNTLSOrigin {
 			return nil, fmt.Errorf("%w: cdn plainOrigin (mode B) needs no Caddy", ErrNoCaddyfile)
 		}
-		return renderCDNInternal(plan), nil
+		return renderCDNInternal(plan)
 	default: // ModeNone
 		return nil, fmt.Errorf("%w: none mode needs no Caddy", ErrNoCaddyfile)
 	}
@@ -83,33 +95,41 @@ func RenderCaddyfile(plan Plan) ([]byte, error) {
 //
 // All shapes were validated with the pinned binary (design §2.3,
 // T4-C1 email probes).
-func renderCaddy(plan Plan) []byte {
+func renderCaddy(plan Plan) ([]byte, error) {
+	upstream, err := canonicalUpstream(plan.UpstreamAddr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: upstreamAddr: %v", ErrInvalidPlan, err)
+	}
+	email, err := canonicalACMEEmail(plan.ACMEEmail)
+	if err != nil {
+		return nil, err
+	}
 	var b strings.Builder
 	b.WriteString(managedMarker + "\n")
 	b.WriteString(plan.Domain + " {\n")
 	switch plan.ACMEChallenge {
 	case "", ACMEHTTP01:
-		if plan.ACMEEmail != "" {
-			b.WriteString("\ttls " + plan.ACMEEmail + "\n")
+		if email != "" {
+			b.WriteString("\ttls " + email + "\n")
 		}
 		// No tls directive = Caddy's default: public ACME via
 		// HTTP-01 (verified: apps.tls={} + listen [":443"]).
 	case ACMETLSALPN01:
 		b.WriteString("\ttls {\n")
 		b.WriteString("\t\tissuer acme {\n")
-		if plan.ACMEEmail != "" {
-			b.WriteString("\t\t\temail " + plan.ACMEEmail + "\n")
+		if email != "" {
+			b.WriteString("\t\t\temail " + email + "\n")
 		}
 		b.WriteString("\t\t\tdisable_http_challenge\n")
 		b.WriteString("\t\t}\n")
 		b.WriteString("\t}\n")
 	default:
 		// Unreachable: validate() rejects unknown challenges.
-		b.WriteString("\ttls {\n\t\tissuer acme {\n\t\t\tdisable_http_challenge\n\t\t}\n\t}\n")
+		return nil, fmt.Errorf("%w: acmeChallenge", ErrInvalidPlan)
 	}
-	b.WriteString("\t" + reverseProxyBlock(plan.UpstreamAddr) + "\n")
+	b.WriteString("\t" + reverseProxyBlock(upstream) + "\n")
 	b.WriteString("}\n")
-	return []byte(b.String())
+	return []byte(b.String()), nil
 }
 
 // renderCDNInternal renders the CDN TLS-origin (mode A) site block:
@@ -118,7 +138,11 @@ func renderCaddy(plan Plan) []byte {
 // private issuer — no public CA, the CDN supplies the public cert;
 // verified: listens ONLY on the origin port, host matcher is the bare
 // domain so a CDN sending Host: <domain> matches).
-func renderCDNInternal(plan Plan) []byte {
+func renderCDNInternal(plan Plan) ([]byte, error) {
+	upstream, err := canonicalUpstream(plan.UpstreamAddr)
+	if err != nil {
+		return nil, fmt.Errorf("%w: upstreamAddr: %v", ErrInvalidPlan, err)
+	}
 	port := plan.OriginPort
 	if port == 0 {
 		port = 443
@@ -127,9 +151,9 @@ func renderCDNInternal(plan Plan) []byte {
 	b.WriteString(managedMarker + "\n")
 	b.WriteString(plan.Domain + ":" + strconv.Itoa(port) + " {\n")
 	b.WriteString("\ttls internal\n")
-	b.WriteString("\t" + reverseProxyBlock(plan.UpstreamAddr) + "\n")
+	b.WriteString("\t" + reverseProxyBlock(upstream) + "\n")
 	b.WriteString("}\n")
-	return []byte(b.String())
+	return []byte(b.String()), nil
 }
 
 // reverseProxyBlock is the shared proxy body (tab-prefixed for site

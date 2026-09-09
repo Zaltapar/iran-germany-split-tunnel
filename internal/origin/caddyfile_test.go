@@ -36,11 +36,12 @@ func goldenPlanALPN() Plan {
 
 func goldenPlanCDN() Plan {
 	return Plan{
-		Mode:         ModeCDN,
-		Domain:       "upload.example.com",
-		UpstreamAddr: "127.0.0.1:9001",
-		OriginPort:   8443,
-		CDNSecurity:  CDNTLSOrigin,
+		Mode:           ModeCDN,
+		Domain:         "upload.example.com",
+		UpstreamAddr:   "127.0.0.1:9001",
+		OriginPort:     8443,
+		CDNSecurity:    CDNTLSOrigin,
+		CDNOriginTrust: CDNOriginTrustPullCA, // D9: declared, fail-closed
 	}
 }
 

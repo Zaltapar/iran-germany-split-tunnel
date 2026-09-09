@@ -28,7 +28,9 @@ func (p *NoneProvider) Configure(ctx context.Context, plan Plan) error {
 }
 
 // DirectWSURL is the ws:// URL the carrier dials in none mode:
-// ws://<upstream>/upload (the loopback listener, no TLS).
+// ws://<upstream>/upload (the loopback listener, no TLS). The upstream
+// is re-derived from the parsed loopback IP + decimal port (the raw
+// operator string is never interpolated).
 func (p *NoneProvider) DirectWSURL(plan Plan) (string, error) {
 	if plan.Mode != ModeNone {
 		return "", fmt.Errorf("%w: DirectWSURL requires mode none, got %q", ErrInvalidPlan, plan.Mode)
@@ -36,7 +38,11 @@ func (p *NoneProvider) DirectWSURL(plan Plan) (string, error) {
 	if err := plan.validate(); err != nil {
 		return "", err
 	}
-	return "ws://" + plan.UpstreamAddr + UpstreamPath, nil
+	upstream, err := canonicalUpstream(plan.UpstreamAddr)
+	if err != nil {
+		return "", fmt.Errorf("%w: upstreamAddr", ErrInvalidPlan)
+	}
+	return "ws://" + upstream + UpstreamPath, nil
 }
 
 // Status implements OriginProvider: reports "no origin" (direct WS,

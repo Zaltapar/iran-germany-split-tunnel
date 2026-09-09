@@ -360,3 +360,28 @@ shims are needed. The only cross-package edit is the additive exported wrapper
   (binary present at the versioned path, Caddyfile present + `caddy validate` passes,
   binary version == pinned). It does NOT probe systemd (T5) and does NOT open sockets —
   so it is safe to call pre-service-start and in tests without root.
+- D9 (Round-1 review HIGH-4 — CDN origin-certificate trust): `cdn` mode A
+  (`tls internal`) generates a certificate rooted in Caddy's PRIVATE (local) CA,
+  which a generic CDN does NOT trust automatically. Mode A therefore FAILS CLOSED
+  unless the Plan declares the trust contract via `CDNOriginTrust`:
+  `pullCA` = the operator exports the Caddy local ROOT CA CERTIFICATE (public half
+  only; the CA private key never leaves the host and this package never reads it) and
+  installs it into the CDN's custom-trust / authenticated-origin config (the CDN
+  AUTHENTICATES the origin cert); `unauthenticatedTLS` = the CDN origin pull accepts
+  any certificate (encrypted against passive observers, NOT authenticated — an active
+  MITM is possible), explicitly acknowledged. A provider-issued Origin CA certificate
+  is a third contract requiring a provider-specific adapter; it is NOT labeled generic
+  and is out of v1. The operator-facing instructions name the declared contract and
+  never imply a Caddy-internal certificate is automatically provider-trusted. Tests
+  pin both contracts and the fail-closed behavior on an undeclared/unknown capability.
+- D10 (Round-1 review HIGH-5 — CDN sub-mode convergence): the desired CDN sub-mode is
+  EXPLICIT state (a project-owned `cdn-origin.state` record in the config dir, 0600),
+  not inferred from whether a Caddyfile exists. A → B deactivates ONLY a Caddyfile
+  carrying the exact project-managed marker (transactional move-aside into a
+  `.cdn-deactivate-<n>/` dir as rollback metadata; an operator-owned or symlinked file
+  is refused, never deleted). B → A re-installs + re-activates through the shared
+  caddyCore. The state record is a MINIMAL coordination point, not a second manifest:
+  the authoritative deployment manifest is internal/deploy (T7), which can consume the
+  field. Status reports the SELECTED sub-mode (A → file-level Caddy health; B → the
+  converged plainOrigin resting state) and falls back to a file-presence hint only for
+  a legacy deployment with no state record.

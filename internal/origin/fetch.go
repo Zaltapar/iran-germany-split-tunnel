@@ -1,6 +1,7 @@
 package origin
 
 import (
+	"context"
 	"fmt"
 	"io"
 )
@@ -8,9 +9,10 @@ import (
 // fetchChecksums downloads the upstream checksums file, bounds its
 // size, and returns the raw bytes (parsed by ParseChecksumFile). Fail
 // closed: an oversized, unreadable, or empty sidecar aborts the
-// install.
-func fetchChecksums(dl Downloader, url string) ([]byte, error) {
-	body, err := dl.Fetch(url)
+// install. The ctx is authoritative (HIGH-2): a canceled ctx aborts
+// the fetch.
+func fetchChecksums(ctx context.Context, dl Downloader, url string) ([]byte, error) {
+	body, err := dl.Fetch(ctx, url)
 	if err != nil {
 		return nil, err
 	}

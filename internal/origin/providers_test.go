@@ -213,13 +213,19 @@ func TestCDNModeBNoCaddy(t *testing.T) {
 	if env != "SPLIT_WS_LISTEN=0.0.0.0:8443" {
 		t.Errorf("SplitterEnv = %q", env)
 	}
-	// Status reports the mode B resting state (no Caddy expected).
+	// Status reports the SELECTED sub-mode honestly (MEDIUM-R2-2): mode B
+	// is the desired converged state, so it names plainOrigin, but it does
+	// NOT claim liveness (no listener/service/CDN was probed — D8 file-level
+	// health only, and mode B has no origin file to check).
 	h, err := p.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if h.Live {
-		t.Errorf("mode B Status should be not-live (no Caddy): %+v", h)
+		t.Errorf("mode B Status must not claim liveness without probing: %+v", h)
+	}
+	if !strings.Contains(h.Detail, "plainOrigin") || !strings.Contains(h.Detail, "SELECTED") {
+		t.Errorf("mode B Status detail should name the selected plainOrigin sub-mode: %+v", h)
 	}
 }
 
