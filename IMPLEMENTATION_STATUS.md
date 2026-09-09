@@ -5,6 +5,89 @@ Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
 
 ## Current state
 
+- **Self-contained deployment — T4 origin/Caddy provider (branch
+  `feat/t4-origin`, review gate PASSED — pending PR + Linux CI merge)**:
+  `internal/origin` is the managed TLS-origin provider for the Iran node
+  (design `plans/t4-design.md`; architecture doc §5). Three providers behind
+  the `OriginProvider` interface: **caddy** (pinned Caddy serves the public
+  ACME cert), **cdn** (operator CDN fronts the origin; sub-mode A
+  `tlsOrigin` with the D9 explicitly-declared origin-trust contract —
+  `pullCA` / `unauthenticatedTLS`, fail-closed when undeclared — and sub-mode
+  B `plainOrigin` with NO Caddy), **none** (testing only).
+  - **Pinned supply chain** (`version.go`, `fetch.go`, `checksum.go`,
+    `extract.go`): one pinned release `v2.11.4` (tag-regex validated, never
+    "latest"); the tar's SHA-512 is parsed from the upstream
+    `caddy_2.11.4_checksums.txt` (two-space GPG format, `*` marker tolerated,
+    fail-closed on empty/missing) and verified in CONSTANT TIME; extraction
+    with tar-slip protection (traversal rejected on the RAW entry name;
+    per-entry + total size caps on ACTUAL bytes; link entries refused; the
+    flat release must contain the `caddy` binary).
+  - **Install + force exchange** (`install.go`): staging INSIDE the prefix
+    (`.caddy-stage-*`, stale swept) for an atomic same-filesystem exchange
+    into the versioned layout `<prefix>/caddy/v2.11.4/`; the forced
+    reinstall is candidate-first (`<version>.new`, validated by `caddy
+    version` smoke + `caddy validate --config` gate BEFORE any swap) and
+    two-phase (live→`.old`, candidate→live) with restore-on-failure — the
+    known-good pinned version survives every injected failure. **Crash-state
+    reconciliation** (review HIGH-R2-1): a Step-0 pass in `Install` runs
+    BEFORE existing-version detection and recovers a crashed exchange — a
+    lone `.old` (no live peer) is the only copy of the previously working
+    version and is restored; live+`.old` is ambiguous and refused fail-closed;
+    `.new` is removed only after Lstat proves a regular directory; symlinks
+    at transaction names are never followed.
+  - **Caddyfile renderer** (`caddyfile.go`): pure, deterministic,
+    byte-pinned by committed goldens; injection-safe (the ACME email is
+    re-validated and the upstream re-derived from parsed loopback-IP +
+    decimal port at the render site — raw operator strings never reach the
+    output); WS forwarding is native `reverse_proxy /upload`; the only
+    transport tuning is the per-operation 3600s read/write timeout (a total
+    `stream_timeout` is deliberately NEVER emitted — it would kill
+    long-lived carriers).
+  - **CDN provider** (`cdn.go`): desired sub-mode persisted in a
+    project-owned 0600 state record (Status reports the SELECTION, not file
+    existence); A→B deactivation is marker-owned (exact managed-marker
+    first line; operator-owned files refused via `ErrUnmanagedState`),
+    transactional with rollback metadata moved aside into `.cdn-deactivate-<n>`
+    dirs allocated by Lstat-checked retry (restart-safe: non-empty preserved
+    dirs are skipped, empty crash-residue reclaimed); mode B `Status` reports
+    `Live=false` with an explicit "selected, liveness unverified by this
+    provider (T7 doctor owns runtime checks)" detail — this package performs
+    D8 FILE-level health only; corrupt state records fail closed (never
+    merged into the no-record hint). Instructions for both sub-modes are
+    deterministic, name every CDN field, and state explicitly that a
+    Caddy-internal certificate is NOT automatically trusted by a generic CDN.
+  - **Review** (`docs/reviews/t4-origin-review.md`): round 1 found
+    CRITICAL-1 (Caddyfile injection via email/upstream) + 5 HIGH (exchange
+    failure containment, ctx propagation, D9 fail-closed, marker ownership,
+    ... ) + 2 MEDIUM — all remediated in-tree. Round 2 (independent
+    falsification) found 2 HIGH (crash-state sweep destroyed the only
+    known-good version; missing Pinned-Caddy CI gate) + 3 MEDIUM (aside-name
+    EEXIST after restart; mode-B liveness claim + canceled ctx; corrupt
+    state misreported) + 3 LOW — all HIGH/MEDIUM remediated with
+    deterministic regression tests (crash-state suite, restart-collision
+    suite, corrupt-state tests, honest-mode-B assertions). Round 3
+    re-review: **PASS — CRITICAL=0 / HIGH=0 / MEDIUM=0**; LOWs tracked
+    (aside retention → T7; activation prev-aside journal → T7;
+    started-child cancellation proof → Linux CI).
+  - **CI gate** (`.github/workflows/go.yml`, "Pinned Caddy gate"): the REAL
+    pinned v2.11.4 linux-amd64 tar (SHA-512-verified against the upstream
+    checksums file with the same parse semantics as
+    `ParseChecksumFile` — mawk-safe) runs `caddy version` (first field ==
+    `v2.11.4`) and `caddy validate --config` on all three fixed-vector
+    variants (ACME http01, tlsalpn01, `tls internal` on the origin port);
+    the rendered files come from the `caddye2e`-tagged harness into a
+    gitignored stable path. Internet dependency is intentional and isolated
+    to this step; the hermetic suite never touches the network.
+  - **Verification (local)**: `gofmt` clean (origin package), `go vet`,
+    full `go test ./...` green on the dev host (Windows; symlink tests
+    skip unprivileged). Authoritative verification pending this branch's
+    Linux CI: `go test -race ./...` (the Windows 0xc0000139 toolchain
+    limitation) + both pinned-binary gates.
+  - **Out of scope (explicit)**: systemd units / `splitterctl` (T5),
+    production CDN/Reality operator inputs (never requested), deactivation
+    aside retention + activation crash-window journal + runtime liveness
+    probe (T7 doctor/manifest ownership).
+  NEXT: T5 (systemd service management).
 - **Self-contained deployment — T3 Reality keygen + Germany Xray config
   (merged, PR #26, merge `1b44347`)**: `internal/xray` extends the T2
   managed-transport adapter with the Germany-side Reality pipeline

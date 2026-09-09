@@ -1,0 +1,14 @@
+# Managed by split-tunnel installer - do not edit by hand
+upload.example.com {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	reverse_proxy /upload 127.0.0.1:9001 {
+		transport http {
+			read_timeout 3600s
+			write_timeout 3600s
+		}
+	}
+}

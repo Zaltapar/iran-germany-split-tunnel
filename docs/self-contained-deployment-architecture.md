@@ -494,11 +494,31 @@ Behind a **provider abstraction** (`internal/origin`, interface
    at Iran's origin (CNAME to the CDN, or A/AAAA per the CDN's requirement).
    No **ACME** in this mode (the domain resolves to the CDN, so an origin
    challenge cannot complete without a DNS-01 API — explicitly out of v1
-   scope). Two origin options, both operator-config-free:
-   - **A (default): TLS origin.** The project installs Caddy on the origin
-     port with a **self-signed (internal CA) certificate**; the CDN's origin
-     pull is TLS to that certificate (origin-verification / "Origin CA" style
-     per the CDN). TLS end-to-end from the user to the origin.
+   scope). Two origin options:
+   - **A: TLS origin.** The project installs Caddy on the origin port with a
+     certificate rooted in **Caddy's private (local) CA** (`tls internal`).
+     A Caddy-internal certificate is **NOT** automatically trusted by a
+     generic CDN — so mode A **fails closed** unless the operator declares
+     how the CDN authenticates the origin certificate (the `cdnOriginTrust`
+     plan field, decision D9 in plans/t4-design.md):
+     - **`pullCA` (authenticated private-CA origin TLS)** — the operator
+       exports the Caddy local **root CA certificate** (public half only;
+       the CA private key never leaves the host) and installs it into the
+       CDN's custom-trust / authenticated-origin configuration (e.g.
+       Cloudflare "Authenticated Origin Pulls" with an uploaded CA, or the
+       provider's equivalent). The CDN **authenticates** the origin
+       certificate against that CA. Required CDN capability: custom origin
+       CA trust. If the CDN lacks it, mode A cannot use this contract.
+     - **`unauthenticatedTLS` (encrypted but NON-authenticated origin TLS)** —
+       the CDN's origin pull is set to a mode that accepts any certificate
+       ("TLS, no origin verification" / "Full (not strict)"). The CDN→origin
+       leg is encrypted against **passive** observers, but an **active**
+       MITM between the CDN and the origin can present its own certificate
+       (the CDN does not authenticate the origin cert). This is an explicit
+       operator-acknowledged trade-off, not a silent default.
+     A "provider-issued Origin CA certificate" is a THIRD contract that
+     requires a provider-specific adapter and is **not** labeled generic;
+     it is out of v1 (the interface isolates future adapters).
    - **B: plain origin.** No Caddy; the splitter's own WS listener serves the
      origin (`SPLIT_WS_LISTEN=0.0.0.0:<origin-port>` — the WS upgrade, the
      `/upload` path restriction, and the handshake limit are native to the
@@ -1019,9 +1039,14 @@ panel, product/deployment separation).
 - **H3 — CDN-mode origin TLS was unspecified.** v0.1 said "CDN back-to-origin"
   without saying what serves TLS at the origin when the domain resolves to
   the CDN (ACME impossible there). Fixed: two explicit options — (A) Caddy
-  with a self-signed/internal-CA cert + CDN origin verification (TLS
-  end-to-end, default), (B) plain origin served by the splitter's own WS
-  listener with an explicit security note (no ACME, no extra process).
+  with a private-CA (`tls internal`) cert + an explicit origin-certificate
+  trust declaration (`pullCA`: the CDN authenticates the exported Caddy
+  root CA; `unauthenticatedTLS`: the operator acknowledges an unauthenticated
+  origin leg), and (B) plain origin served by the splitter's own WS
+  listener with an explicit security note (no ACME, no extra process). The
+  v0.2 wording "CDN origin verification per the CDN" was itself still
+  ambiguous about WHO trusts the private CA; the T4 Round-1 review (HIGH-4)
+  closed that: mode A now fails closed on an undeclared trust capability.
 
 **MEDIUM — resolved in v0.2 (inline) or tracked to tasks:**
 

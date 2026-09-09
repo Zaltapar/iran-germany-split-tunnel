@@ -43,3 +43,8 @@ dist/
 # T3 Pinned-Xray gate: rendered fixed-vector config written at CI run time
 # (contains the documented non-production test vector; regenerate, never commit).
 internal/xray/testdata/e2e/
+
+# T4 Pinned-Caddy gate: rendered fixed-vector Caddyfiles written at CI run
+# time (contains the documented non-production test vectors; regenerate,
+# never commit).
+internal/origin/testdata/e2e/

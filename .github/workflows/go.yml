@@ -99,6 +99,79 @@ jobs:
           sudo chown "$(id -un):$(id -gn)" /var/log/split-tunnel
           "$XRAY" run -test -config "$CFG"
 
+      # T4 Pinned-Caddy gate: the REAL pinned Caddy binary (v2.11.4,
+      # SHA-512-verified against the upstream-published
+      # caddy_2.11.4_checksums.txt) validates every generated Caddyfile
+      # variant (design doc plans/t4-design.md §6, review HIGH-R2-2).
+      # The pinned release is the authority on the generated config,
+      # exactly like the Xray gate is for the Germany config. Internet
+      # dependency is intentional and isolated to this step only; the
+      # hermetic unit suite above never touches the network.
+      - name: Pinned Caddy gate
+        run: |
+          set -euo pipefail
+          # 1) Render the fixed-vector Caddyfiles; capture their stable
+          #    paths (the e2e helper prints one marker per variant).
+          OUT=$(go test -v -tags caddye2e -run TestE2ERenderGoldens ./internal/origin/)
+          MARKERS=$(printf '%s\n' "$OUT" | grep -oE 'E2E_CADDYFILE_PATH=[^ ]+')
+          CF_DEFAULT=$(printf '%s\n' "$MARKERS" | awk -F= '$2=="caddy-default"{print $3}')
+          CF_ALPN=$(printf '%s\n' "$MARKERS" | awk -F= '$2=="caddy-alpn01"{print $3}')
+          CF_CDN=$(printf '%s\n' "$MARKERS" | awk -F= '$2=="cdn-tls-internal"{print $3}')
+          test -n "$CF_DEFAULT" && test -f "$CF_DEFAULT"
+          test -n "$CF_ALPN" && test -f "$CF_ALPN"
+          test -n "$CF_CDN" && test -f "$CF_CDN"
+
+          # 2) Download the pinned release + checksums (URLs match the
+          #    internal/origin/version.go constants for v2.11.4
+          #    linux-amd64; the asset name drops the leading "v").
+          VER=v2.11.4
+          TAR=caddy_2.11.4_linux_amd64.tar.gz
+          CKS=caddy_2.11.4_checksums.txt
+          cd "$(mktemp -d)"
+          curl -fsSL -o "$TAR" "https://github.com/caddyserver/caddy/releases/download/${VER}/${TAR}"
+          curl -fsSL -o "$CKS" "https://github.com/caddyserver/caddy/releases/download/${VER}/${CKS}"
+
+          # 3) Verify SHA-512 against the upstream checksums file. The
+          #    parse mirrors internal/origin/checksum.go ParseChecksumFile:
+          #    "<128-hex><two spaces><name>" (a leading '*' marker
+          #    tolerated), the name field must match the asset EXACTLY.
+          #    (No {n} regex intervals: the runner awk is mawk, which
+          #    does not support them — index()/length() instead.)
+          EXPECTED=$(awk -v t="$TAR" '
+            {
+              line=$0
+              sub(/^[ \t]*/, "", line)
+              if (line ~ /^#/) next
+              if (substr(line, 1, 1) == "*") line = substr(line, 2)
+              p = index(line, "  ")
+              if (p == 0) next
+              hex = substr(line, 1, p - 1)
+              name = substr(line, p + 2)
+              gsub(/^[ \t]+/, "", hex); gsub(/[ \t]+$/, "", hex)
+              gsub(/^[ \t]+/, "", name); gsub(/[ \t]+$/, "", name)
+              if (length(hex) != 128) next
+              if (hex !~ /^[0-9A-Fa-f]+$/) next
+              if (name == t) { print hex; exit }
+            }' "$CKS")
+          test -n "$EXPECTED"
+          EXPECTED=$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')
+          ACTUAL=$(sha512sum "$TAR" | awk '{print $1}')
+          test "$EXPECTED" = "$ACTUAL"
+          tar -xzf "$TAR"
+          CADDY=./caddy
+          test -x "$CADDY"
+
+          # 4) Smoke: the binary reports the pinned version (the
+          #    installer's gate checks its FIRST field == v2.11.4).
+          test "$("$CADDY" version | awk '{print $1}')" = "$VER"
+
+          # 5) The real binary must accept every generated Caddyfile
+          #    variant (ACME http01 default, tlsalpn01, tls internal).
+          for CFG in "$CF_DEFAULT" "$CF_ALPN" "$CF_CDN"; do
+            echo "Validating config: $CFG"
+            "$CADDY" validate --config "$CFG"
+          done
+
       - name: go build (host)
         run: go build ./...
       # The L4 two-process gate (Issue #9): only on manual dispatch.
