@@ -1,0 +1,14 @@
+# Scoped byte-stability for byte-pinned assets (T5, design §4.13).
+# These files are compared byte-for-byte by tests and rendered deterministically
+# with LF line endings. eol=lf forces checkout with LF on every platform so a
+# Windows/OneDrive host cannot drift a golden to CRLF (the failure mode found
+# in the T5 recovery audit: content-identical "modified" golden in the worktree).
+#
+# Deliberately scoped: only the assets whose bytes are part of the contract.
+# Everything else keeps git's default behavior.
+
+*.service                 eol=lf
+*.golden.*                eol=lf
+internal/systemd/testdata/ eol=lf
+internal/xray/testdata/    eol=lf
+internal/origin/testdata/  eol=lf
