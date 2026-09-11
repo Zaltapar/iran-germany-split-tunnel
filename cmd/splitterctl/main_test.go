@@ -30,6 +30,42 @@ func TestRunUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestRunMutationParsersRejectMalformedArguments(t *testing.T) {
+	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
+	cases := [][]string{
+		{"install"}, {"install", "france"},
+		{"pair"}, {"pair", "exchange"},
+		{"upgrade", "--unknown"}, {"upgrade", "--xray", "--origin"},
+		{"rollback"}, {"rollback", "--to"}, {"rollback", "--to", "../escape"},
+		{"uninstall", "--force"}, {"config"}, {"config", "delete"},
+	}
+	for _, args := range cases {
+		var out bytes.Buffer
+		err := run(context.Background(), args, &out, &out)
+		if !errors.Is(err, errUsage) {
+			t.Errorf("%v: error = %v, want usage error", args, err)
+		}
+	}
+}
+
+func TestRunMutationParsersAcceptValidShapesBeforeWiring(t *testing.T) {
+	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
+	cases := [][]string{
+		{"install", "iran"}, {"install", "germany"},
+		{"pair", "generate"}, {"pair", "apply"}, {"pair", "finalize"},
+		{"upgrade"}, {"upgrade", "--xray"},
+		{"rollback", "--to", "state-1"}, {"uninstall"}, {"uninstall", "--purge"},
+		{"config", "set"},
+	}
+	for _, args := range cases {
+		var out bytes.Buffer
+		err := run(context.Background(), args, &out, &out)
+		if !errors.Is(err, errNotWired) {
+			t.Errorf("%v: error = %v, want not-wired error", args, err)
+		}
+	}
+}
+
 func TestRunReadOnlyCommandsRejectArguments(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
 	for _, args := range [][]string{{"status", "extra"}, {"doctor", "--verbose"}} {
@@ -168,7 +204,7 @@ func TestDoctorFailsClosedOnTamperedState(t *testing.T) {
 
 func TestMutatingCommandsReportNotWired(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
-	for _, args := range [][]string{{"install", "iran"}, {"pair", "generate"}, {"upgrade"}, {"rollback"}, {"uninstall"}, {"config", "set"}} {
+	for _, args := range [][]string{{"install", "iran"}, {"pair", "generate"}, {"upgrade"}, {"rollback", "--to", "state-1"}, {"uninstall"}, {"config", "set"}} {
 		var out bytes.Buffer
 		err := run(context.Background(), args, &out, &out)
 		if !errors.Is(err, errNotWired) {

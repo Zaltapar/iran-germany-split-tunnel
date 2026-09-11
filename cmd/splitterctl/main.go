@@ -41,7 +41,6 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	if err != nil {
 		return err
 	}
-
 	switch args[0] {
 	case "status":
 		if len(args) != 1 {
@@ -57,11 +56,50 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if len(args) == 2 && args[1] == "show" {
 			return configShow(ctx, store, out)
 		}
-		return fmt.Errorf("%w: config supports only 'show' until config mutation is wired", errNotWired)
-	case "install", "upgrade", "rollback", "uninstall", "pair":
-		return fmt.Errorf("%w: %s", errNotWired, strings.Join(args, " "))
+		if len(args) < 2 || args[1] != "set" {
+			return fmt.Errorf("%w: config supports show or set", errUsage)
+		}
+		return notWired(args)
+	case "install":
+		if len(args) != 2 || (args[1] != deploy.RoleIran && args[1] != deploy.RoleGermany) {
+			return fmt.Errorf("%w: install requires exactly iran or germany", errUsage)
+		}
+		return notWired(args)
+	case "pair":
+		if len(args) != 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
+			return fmt.Errorf("%w: pair requires generate, apply, or finalize", errUsage)
+		}
+		return notWired(args)
+	case "upgrade":
+		if len(args) > 2 || (len(args) == 2 && !isUpgradeTarget(args[1])) {
+			return fmt.Errorf("%w: upgrade accepts at most one of --xray, --origin, or --splitter", errUsage)
+		}
+		return notWired(args)
+	case "rollback":
+		if len(args) != 3 || args[1] != "--to" || args[2] == "" || strings.ContainsAny(args[2], `/\\`) {
+			return fmt.Errorf("%w: rollback requires --to state-id", errUsage)
+		}
+		return notWired(args)
+	case "uninstall":
+		if len(args) > 2 || (len(args) == 2 && args[1] != "--purge") {
+			return fmt.Errorf("%w: uninstall accepts only --purge", errUsage)
+		}
+		return notWired(args)
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, args[0])
+	}
+}
+
+func notWired(args []string) error {
+	return fmt.Errorf("%w: %s", errNotWired, strings.Join(args, " "))
+}
+
+func isUpgradeTarget(arg string) bool {
+	switch arg {
+	case "--xray", "--origin", "--splitter":
+		return true
+	default:
+		return false
 	}
 }
 

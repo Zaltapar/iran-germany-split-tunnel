@@ -1,9 +1,15 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 request-input checkpoint (full local tests pending)
+Latest recorded commit: pending T8 strict-CLI checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 strict CLI command boundary (implemented locally; mutation adapters still
+  pending):** `cmd/splitterctl` validates exact subcommand shapes for install,
+  pair, upgrade, rollback, uninstall, and config set before returning explicit
+  not-wired errors. Read-only status/doctor/config-show behavior remains
+  unchanged. Tests cover malformed and valid-but-unwired command shapes.
 
 - **T8 typed request input boundary (implemented locally; production role
   adapters still pending):** `internal/deploy.InstallRequest` validates
