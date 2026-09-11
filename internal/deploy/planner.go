@@ -24,8 +24,13 @@ func PlanDesired(current *Manifest, desired DesiredState) (Plan, error) {
 			}
 		}
 		compare("components.splitter.version", current.Components.Splitter.Version, desired.Components.Splitter.Version, false)
+		compare("components.splitter.path", current.Components.Splitter.Path, desired.Components.Splitter.Path, true)
+		compare("components.splitter.sha256", current.Components.Splitter.SHA256, desired.Components.Splitter.SHA256, true)
 		compare("components.xray.version", current.Components.Xray.Version, desired.Components.Xray.Version, false)
+		compare("components.xray.path", current.Components.Xray.Path, desired.Components.Xray.Path, true)
+		compare("components.xray.sha256", current.Components.Xray.SHA256, desired.Components.Xray.SHA256, true)
 		compare("components.origin.mode", current.Components.Origin.Mode, desired.Components.Origin.Mode, true)
+		compare("components.origin.version", current.Components.Origin.Version, desired.Components.Origin.Version, false)
 		compare("components.origin.domain", current.Components.Origin.Domain, desired.Components.Origin.Domain, true)
 		compare("paths.env", current.Paths.Env, desired.Paths.Env, true)
 		compare("paths.config", current.Paths.Config, desired.Paths.Config, true)

@@ -76,6 +76,10 @@ const (
 	xrayErrorLog    = "/var/log/split-tunnel/xray-germany.error.log"
 )
 
+// ValidateRealityParams exposes pure Reality input validation to deployment
+// orchestration. It performs no filesystem, process, or network operations.
+func ValidateRealityParams(p RealityParams) error { return p.validate() }
+
 // validate reports the first aggregated problem set (field names + rule
 // text only, never values).
 func (p RealityParams) validate() error {

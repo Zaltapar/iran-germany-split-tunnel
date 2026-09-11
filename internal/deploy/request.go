@@ -35,6 +35,8 @@ type InstallRequest struct {
 	OriginVersion   string
 	OriginPath      string
 
+	Reality xray.RealityParams
+
 	Firewall firewall.Plan
 }
 
@@ -59,6 +61,11 @@ func (r InstallRequest) Validate() error {
 	}
 	if r.Role == RoleGermany && (r.XrayVersion == "" || r.XrayPath == "" || !filepath.IsAbs(r.XrayPath)) {
 		return fmt.Errorf("deploy: Germany Xray artifact metadata is incomplete or unsafe")
+	}
+	if r.Role == RoleGermany {
+		if err := xray.ValidateRealityParams(r.Reality); err != nil {
+			return fmt.Errorf("deploy: invalid Germany Reality parameters: %w", err)
+		}
 	}
 	if r.XrayVersion != "" && !xray.ValidVersion(r.XrayVersion) {
 		return fmt.Errorf("deploy: invalid Xray version")
@@ -151,6 +158,11 @@ func within(root, path string) bool {
 	return len(rel) < len(prefix) || rel[:len(prefix)] != prefix
 }
 
+func realityFingerprint(params xray.RealityParams) string {
+	sum := sha256.Sum256([]byte(params.SNI + "\n" + params.ShortID + "\n" + params.UUID))
+	return hex.EncodeToString(sum[:])
+}
+
 func firewallFingerprint(plan firewall.Plan) string {
 	parts := make([]string, 0, len(plan.Allow)+len(plan.Deny)+len(plan.CDNEgress)+2)
 	parts = append(parts, string(plan.Backend), plan.Role)
@@ -179,7 +191,7 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 		Role: r.Role,
 		Components: Components{
 			Splitter: ComponentState{Version: r.SplitterVersion, Path: r.SplitterPath},
-			Xray:     ComponentState{Version: r.XrayVersion, Path: r.XrayPath},
+			Xray:     ComponentState{Version: r.XrayVersion, Path: r.XrayPath, SHA256: realityFingerprint(r.Reality)},
 			Origin:   OriginState{Mode: string(r.Origin.Mode), Domain: r.Origin.Domain, Version: r.OriginVersion},
 		},
 		Paths:    Paths{StateRoot: r.StateRoot, Env: r.EnvPath, Config: r.ConfigPath},

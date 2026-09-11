@@ -1,9 +1,17 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B desired-state checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B Reality/planner checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B Reality input and complete planner drift (implemented locally;
+  concrete Linux adapters still pending):** Germany requests now carry only
+  public `xray.RealityParams`, validated through the authoritative Xray seam;
+  desired state stores a public-parameter fingerprint and never private key
+  material. Planner drift coverage now includes component paths/hashes,
+  Reality fingerprint, origin version, services, firewall ownership/rules,
+  pairing, and managed paths.
 
 - **T8-B complete desired-state projection (implemented locally; concrete Linux
   adapters still pending):** `InstallRequest.Desired` now deterministically

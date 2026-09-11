@@ -8,6 +8,7 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
 func absoluteTestPath(name string) string {
@@ -55,6 +56,7 @@ func validGermanyRequest() InstallRequest {
 		SplitterPath:    absoluteTestPath("germany-splitter"),
 		XrayVersion:     "v26.3.27",
 		XrayPath:        absoluteTestPath("xray"),
+		Reality:         xray.RealityParams{SNI: "www.example.com", ShortID: "0123456789abcdef", UUID: "550e8400-e29b-41d4-a716-446655440000"},
 		Firewall:        firewall.Plan{Backend: firewall.BackendNone, Role: RoleGermany},
 	}
 }

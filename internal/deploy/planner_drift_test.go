@@ -22,6 +22,7 @@ func TestPlanDesiredDetectsCompleteStateDrift(t *testing.T) {
 		{"firewall", func(d *DesiredState) { d.Firewall.RulesHash = "new" }, "firewall.rulesHash"},
 		{"pairing", func(d *DesiredState) { d.Pairing.State = "finalized" }, "pairing.state"},
 		{"component", func(d *DesiredState) { d.Components.Xray.Version = "v26.3.28" }, "components.xray.version"},
+		{"reality", func(d *DesiredState) { d.Components.Xray.SHA256 = "different-public-reality-fingerprint" }, "components.xray.sha256"},
 		{"path", func(d *DesiredState) { d.Paths.Config = "/tmp/state/other.json" }, "paths.config"},
 	}
 	for _, tc := range cases {
