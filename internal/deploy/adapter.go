@@ -13,7 +13,11 @@ type Adapter interface {
 	Activate(context.Context, DesiredState) error
 	Transition(context.Context, DesiredState) error
 	Health(context.Context, DesiredState) error
+	// Restore is used only when a committed previous manifest exists.
 	Restore(context.Context, Manifest) error
+	// CleanupFresh removes only artifacts recorded as created by this
+	// transaction when a fresh install has no previous manifest to restore.
+	CleanupFresh(context.Context, DesiredState) error
 	Uninstall(context.Context, Manifest) error
 }
 
@@ -29,6 +33,9 @@ func ApplyDesired(ctx context.Context, store *Store, previous Manifest, desired 
 		Previous: previous,
 		Desired:  desired,
 		Recover: func(recoveryCtx context.Context, old Manifest) error {
+			if old.Generation == "" {
+				return adapter.CleanupFresh(recoveryCtx, desired)
+			}
 			return adapter.Restore(recoveryCtx, old)
 		},
 		Steps: []Step{

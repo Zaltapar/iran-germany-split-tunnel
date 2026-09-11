@@ -1,9 +1,16 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 systemd-plan checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B fresh-recovery checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B fresh-install recovery semantics (implemented locally; concrete Linux
+  adapters still pending):** the typed adapter contract now distinguishes
+  committed-state restoration from fresh-install cleanup. Fresh failures call
+  `CleanupFresh(desired)` rather than `Restore(emptyManifest)`, successful
+  cleanup returns a recovered transaction error, cleanup failure is surfaced as
+  fatal unrecovered state, and dedicated tests cover both paths.
 
 - **T8 T5 handoff planning (implemented locally; Linux execution still
   pending):** `internal/deploy.BuildSystemdPlan` produces the protected env

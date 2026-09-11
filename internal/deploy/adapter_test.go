@@ -8,8 +8,9 @@ import (
 )
 
 type adapterFake struct {
-	calls []string
-	errAt string
+	calls      []string
+	errAt      string
+	cleanupErr bool
 }
 
 func (f *adapterFake) call(name string) error {
@@ -28,7 +29,14 @@ func (f *adapterFake) Transition(context.Context, DesiredState) error {
 }
 func (f *adapterFake) Health(context.Context, DesiredState) error { return f.call("health") }
 func (f *adapterFake) Restore(context.Context, Manifest) error    { return f.call("restore") }
-func (f *adapterFake) Uninstall(context.Context, Manifest) error  { return f.call("uninstall") }
+func (f *adapterFake) CleanupFresh(context.Context, DesiredState) error {
+	f.calls = append(f.calls, "cleanup-fresh")
+	if f.cleanupErr {
+		return errors.New("cleanup-fresh failed")
+	}
+	return nil
+}
+func (f *adapterFake) Uninstall(context.Context, Manifest) error { return f.call("uninstall") }
 
 func TestApplyDesiredMapsAdapterPhases(t *testing.T) {
 	store, err := NewStore(t.TempDir())
@@ -67,6 +75,39 @@ func TestApplyDesiredRecoversOnAdapterFailure(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fake.calls, []string{"prepare", "validate", "backup", "activate", "restore"}) {
 		t.Fatalf("calls = %#v", fake.calls)
+	}
+}
+
+func TestApplyDesiredFreshFailureUsesExplicitCleanup(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &adapterFake{errAt: "activate"}
+	_, err = ApplyDesired(context.Background(), store, Manifest{}, DesiredState{
+		Role:  RoleIran,
+		Paths: Paths{StateRoot: store.Root},
+	}, fake)
+	if !errors.Is(err, ErrRecovered) {
+		t.Fatalf("error = %v, want ErrRecovered", err)
+	}
+	if !reflect.DeepEqual(fake.calls, []string{"prepare", "validate", "backup", "activate", "cleanup-fresh"}) {
+		t.Fatalf("fresh failure calls = %#v", fake.calls)
+	}
+}
+
+func TestApplyDesiredFreshCleanupFailureIsFatal(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &adapterFake{errAt: "activate", cleanupErr: true}
+	_, err = ApplyDesired(context.Background(), store, Manifest{}, DesiredState{
+		Role:  RoleIran,
+		Paths: Paths{StateRoot: store.Root},
+	}, fake)
+	if !errors.Is(err, ErrTransaction) || errors.Is(err, ErrRecovered) {
+		t.Fatalf("error = %v, want fatal unrecovered transaction error", err)
 	}
 }
 
