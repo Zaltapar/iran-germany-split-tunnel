@@ -1,9 +1,15 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: `2b88b42` (aggregate budget waiter starvation fix; CI Go #58 green)
+Latest recorded commit: pending CLI checkpoint (full local tests green)
 
 ## Current state
+
+- **T8 thin CLI scaffold (implemented locally; host adapters still pending):**
+  `cmd/splitterctl` now provides safe `status` and `doctor` commands backed by
+  `internal/deploy`, explicit help/usage handling, and clear not-wired errors
+  for mutating commands until the systemd/Xray/origin/firewall adapters are
+  composed. Focused CLI tests and the full local `go test ./...` suite pass.
 
 - **T8/T7 transaction, diagnostics, and pairing orchestration (implemented
   locally, pending CLI/integration):** `internal/deploy` now has explicit
