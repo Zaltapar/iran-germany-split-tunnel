@@ -1,9 +1,18 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 controller-request checkpoint (full local tests pending)
+Latest recorded commit: pending T8 systemd-plan checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 T5 handoff planning (implemented locally; Linux execution still
+  pending):** `internal/deploy.BuildSystemdPlan` produces the protected env
+  projection and canonical T5 unit specs for Iran and Germany, including
+  Xray/origin dependency metadata. It is pure and delegates unit rendering and
+  mutation to `internal/systemd`; tests cover both roles and secret absence.
+  The remaining integration blocker is execution on a provisioned Linux host:
+  T5 mutation APIs are root-gated and canonical-path based, so T8 does not
+  bypass them or claim installer/L5 completion from Windows tests.
 
 - **T8 controller request bridge (implemented locally; production adapters still
   pending):** `Controller.ApplyRequest` validates a complete

@@ -28,6 +28,7 @@ type InstallRequest struct {
 	XrayVersion     string
 	XrayPath        string
 	OriginVersion   string
+	OriginPath      string
 }
 
 // Validate checks all operator-controlled fields before an adapter can mutate
@@ -54,6 +55,9 @@ func (r InstallRequest) Validate() error {
 	}
 	if r.OriginVersion != "" && !origin.ValidVersion(r.OriginVersion) {
 		return fmt.Errorf("deploy: invalid origin version")
+	}
+	if r.Role == RoleIran && r.Origin.Mode != origin.ModeNone && (r.OriginVersion == "" || r.OriginPath == "" || !filepath.IsAbs(r.OriginPath)) {
+		return fmt.Errorf("deploy: Iran origin artifact metadata is incomplete or unsafe")
 	}
 	if r.StateRoot == "" || !filepath.IsAbs(r.StateRoot) {
 		return fmt.Errorf("deploy: state root must be absolute")

@@ -33,6 +33,7 @@ func validIranRequest() InstallRequest {
 		SplitterVersion: "v1.0.0",
 		SplitterPath:    absoluteTestPath("iran-splitter"),
 		OriginVersion:   "v2.11.4",
+		OriginPath:      absoluteTestPath("caddy"),
 	}
 }
 
