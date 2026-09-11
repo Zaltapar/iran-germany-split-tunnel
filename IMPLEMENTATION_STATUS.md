@@ -5,6 +5,13 @@ Latest recorded commit: `2b88b42` (aggregate budget waiter starvation fix; CI Go
 
 ## Current state
 
+- **T8/T6 firewall boundary (implemented locally, pending integration):**
+  `internal/firewall` provides typed role/port plans, UFW/nftables/none
+  backends, stable `split-tunnel` ownership markers, structured argv execution,
+  conservative owned-rule parsing, idempotent apply, and reverse-order rollback
+  on partial failure. Fake-backed tests cover idempotence, argv separation,
+  unmanaged-rule preservation, validation, rollback, and none mode.
+
 - **CI blocker — aggregate session-buffer admission starvation (RESOLVED):**
   GitHub Actions Go #56 (`e922907`) failed during ordinary `go test ./...` in
   `pkg/node` at `TestAggregateBudgetStress200SessionsCarrierCycling`:
