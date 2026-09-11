@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +25,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, out, errOut interface{ Write([]byte) (int, error) }) error {
+func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
 		printUsage(out)
 		if len(args) == 0 {
@@ -43,17 +44,28 @@ func run(ctx context.Context, args []string, out, errOut interface{ Write([]byte
 
 	switch args[0] {
 	case "status":
+		if len(args) != 1 {
+			return fmt.Errorf("%w: status takes no arguments", errUsage)
+		}
 		return status(ctx, store, out)
 	case "doctor":
+		if len(args) != 1 {
+			return fmt.Errorf("%w: doctor takes no arguments", errUsage)
+		}
 		return doctor(ctx, store, out)
-	case "install", "upgrade", "rollback", "uninstall", "config", "pair":
+	case "config":
+		if len(args) == 2 && args[1] == "show" {
+			return configShow(ctx, store, out)
+		}
+		return fmt.Errorf("%w: config supports only 'show' until config mutation is wired", errNotWired)
+	case "install", "upgrade", "rollback", "uninstall", "pair":
 		return fmt.Errorf("%w: %s", errNotWired, strings.Join(args, " "))
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, args[0])
 	}
 }
 
-func status(_ context.Context, store *deploy.Store, out interface{ Write([]byte) (int, error) }) error {
+func status(_ context.Context, store *deploy.Store, out io.Writer) error {
 	m, err := store.Load()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -67,7 +79,7 @@ func status(_ context.Context, store *deploy.Store, out interface{ Write([]byte)
 	return nil
 }
 
-func doctor(ctx context.Context, store *deploy.Store, out interface{ Write([]byte) (int, error) }) error {
+func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
 	findings := (deploy.Diagnostics{Store: store}).Run(ctx)
 	for _, f := range findings {
 		_, _ = fmt.Fprintf(out, "%s [%s] %s", f.ID, f.Severity, f.Summary)
@@ -82,7 +94,27 @@ func doctor(ctx context.Context, store *deploy.Store, out interface{ Write([]byt
 	return nil
 }
 
-func printUsage(out interface{ Write([]byte) (int, error) }) {
+func configShow(_ context.Context, store *deploy.Store, out io.Writer) error {
+	m, err := store.Load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("config: not installed")
+		}
+		return err
+	}
+	// Deliberately omit pairing fingerprints, paths, and component hashes: this
+	// command is operator-readable and must not become a secret or topology dump.
+	_, _ = fmt.Fprintf(out, "role: %s\n", m.Role)
+	_, _ = fmt.Fprintf(out, "splitter.version: %s\n", m.Components.Splitter.Version)
+	_, _ = fmt.Fprintf(out, "xray.version: %s\n", m.Components.Xray.Version)
+	_, _ = fmt.Fprintf(out, "origin.mode: %s\n", m.Components.Origin.Mode)
+	_, _ = fmt.Fprintf(out, "origin.domain: %s\n", m.Components.Origin.Domain)
+	_, _ = fmt.Fprintf(out, "firewall.backend: %s\n", m.Firewall.Backend)
+	_, _ = fmt.Fprintf(out, "pairing.state: %s\n", m.Pairing.State)
+	return nil
+}
+
+func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "usage: splitterctl <install|pair|status|doctor|upgrade|rollback|uninstall|config>")
 	fmt.Fprintln(out, "  status                         show persisted deployment state")
 	fmt.Fprintln(out, "  doctor                         run read-only deployment checks")

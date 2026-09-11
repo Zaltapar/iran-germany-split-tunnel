@@ -1,15 +1,15 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending CLI checkpoint (full local tests green)
+Latest recorded commit: pending T8 CLI/config checkpoint (full local tests pending)
 
 ## Current state
 
-- **T8 thin CLI scaffold (implemented locally; host adapters still pending):**
-  `cmd/splitterctl` now provides safe `status` and `doctor` commands backed by
-  `internal/deploy`, explicit help/usage handling, and clear not-wired errors
-  for mutating commands until the systemd/Xray/origin/firewall adapters are
-  composed. Focused CLI tests and the full local `go test ./...` suite pass.
+- **T8 read-only CLI/config slice (implemented locally; host adapters still
+  pending):** `cmd/splitterctl` provides strict `status` and `doctor` commands,
+  redacted `config show`, explicit help/usage handling, and clear not-wired
+  errors for mutating commands until the systemd/Xray/origin/firewall adapters
+  are composed. Focused CLI tests pass; the full suite is the next gate.
 
 - **T8/T7 transaction, diagnostics, and pairing orchestration (implemented
   locally, pending CLI/integration):** `internal/deploy` now has explicit

@@ -21,13 +21,23 @@ func TestRunHelp(t *testing.T) {
 		t.Fatalf("help output = %q", out.String())
 	}
 }
-
 func TestRunUnknownCommand(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
 	var out bytes.Buffer
 	err := run(context.Background(), []string{"nope"}, &out, &out)
 	if !errors.Is(err, errUsage) {
 		t.Fatalf("error = %v, want usage error", err)
+	}
+}
+
+func TestRunReadOnlyCommandsRejectArguments(t *testing.T) {
+	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
+	for _, args := range [][]string{{"status", "extra"}, {"doctor", "--verbose"}} {
+		var out bytes.Buffer
+		err := run(context.Background(), args, &out, &out)
+		if !errors.Is(err, errUsage) {
+			t.Errorf("%v: error = %v, want usage error", args, err)
+		}
 	}
 }
 
@@ -79,6 +89,48 @@ func TestStatusAndDoctorValidState(t *testing.T) {
 	}
 }
 
+func TestConfigShowIsRedacted(t *testing.T) {
+	root := t.TempDir()
+	store, err := deploy.NewStore(filepath.Join(root, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Commit(deploy.Manifest{
+		Role:       deploy.RoleIran,
+		Generation: "i-config",
+		Paths: deploy.Paths{
+			StateRoot: store.Root,
+			Env:       "/etc/split-tunnel/iran.env",
+			Config:    "/etc/split-tunnel/secret-config.json",
+		},
+		Components: deploy.Components{
+			Splitter: deploy.ComponentState{Version: "v1", Path: "/opt/split-tunnel/splitter", SHA256: "splitter-hash"},
+			Origin:   deploy.OriginState{Mode: "caddy", Domain: "upload.example.com"},
+		},
+		Pairing:  deploy.PairingState{State: "finalized", Fingerprints: []string{"secret-fingerprint"}},
+		Firewall: deploy.FirewallState{Backend: "ufw", RulesHash: "rules-hash"},
+	}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_STATE_ROOT", store.Root)
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"config", "show"}, &out, &out); err != nil {
+		t.Fatalf("config show: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"role: iran", "origin.mode: caddy", "origin.domain: upload.example.com", "pairing.state: finalized"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("config output %q does not contain %q", got, want)
+		}
+	}
+	for _, forbidden := range []string{"secret-fingerprint", "secret-config.json", "splitter-hash", "rules-hash", "stateRoot", "manifestHash"} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("config output leaked %q: %q", forbidden, got)
+		}
+	}
+}
+
 func TestDoctorFailsClosedOnTamperedState(t *testing.T) {
 	root := t.TempDir()
 	store, err := deploy.NewStore(filepath.Join(root, "state"))
@@ -116,7 +168,7 @@ func TestDoctorFailsClosedOnTamperedState(t *testing.T) {
 
 func TestMutatingCommandsReportNotWired(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
-	for _, args := range [][]string{{"install", "iran"}, {"pair", "generate"}, {"upgrade"}, {"rollback"}, {"uninstall"}, {"config", "show"}} {
+	for _, args := range [][]string{{"install", "iran"}, {"pair", "generate"}, {"upgrade"}, {"rollback"}, {"uninstall"}, {"config", "set"}} {
 		var out bytes.Buffer
 		err := run(context.Background(), args, &out, &out)
 		if !errors.Is(err, errNotWired) {
