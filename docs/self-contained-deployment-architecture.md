@@ -1,8 +1,15 @@
 # Self-Contained Deployment Architecture — Design Report (v0.2)
 
-Status: **DESIGN ONLY — no implementation yet.** This is the AUDIT → ARCHITECT →
-DESIGN → REUSE RESEARCH → PLAN deliverable for the "self-contained deployment"
-direction change.
+Status: **IMPLEMENTED — T0–T5 merged into `main` @ `457823e`.** This was the
+AUDIT → ARCHITECT → DESIGN → REUSE RESEARCH → PLAN deliverable for the
+"self-contained deployment" direction change, and it remains the design
+baseline for the implementation. Implemented against this document:
+T0 baseline, T1 pairing (`internal/pairing`), T2 Xray installer
+(`internal/xray` install pipeline), T3 Reality config
+(`internal/xray` render/activate), T4 origin provider (`internal/origin`),
+T5 systemd management (`internal/systemd`). Remaining: T6 firewall
+(`internal/firewall`), T7 deploy orchestration + state (`internal/deploy`),
+T8 CLI (`cmd/splitterctl`) — see §17 for the task breakdown.
 
 **Review gate (see §21): PASSED — CRITICAL = 0, HIGH = 0.** v0.1 was reviewed
 independently in ARCHITECT mode; 3 HIGH findings were fixed in v0.2 (H1 Iran
@@ -10,13 +17,20 @@ Xray config spec, H2 ACME port-80 firewall gap, H3 CDN-mode origin TLS
 ambiguity) plus 6 MEDIUM clarifications. MEDIUM/LOW items are tracked in §21
 and must be closed by the implementation tasks that own them (noted inline).
 
-Repository state this was written against (verified from GitHub, not from memory):
+Repository state this was written against (historical baseline, verified from
+GitHub at the time of writing — retained for traceability, not current):
 
 - `main` @ `2dcf14d` — L4 two-process gate fully green on Linux (S1–S11).
 - `l5-harness` @ `2b37e4e` — L5 run A recorded; **VERDICT BLOCKED** (required
   transports absent: CDN/TLS up, VLESS+Reality down; path blackholes established
   TCP). Issue #9 open. Findings #19 (infra gap + path), #20 (stranded session),
   #21 (S16 0x00-vs-0x06) open.
+
+Current state (verified, `main` @ `457823e`): the design is implemented for
+T0–T5 (milestone records in `IMPLEMENTATION_STATUS.md`; CI green on the T5
+merge). Issue #9 remains open: L4 green on Linux, L5 awaiting staging
+infrastructure. Findings #19/#20/#21 remain open and are preserved by the
+deployment work (T6–T8) — deployment completion does not close them.
 
 ## 0. The direction change, precisely
 
