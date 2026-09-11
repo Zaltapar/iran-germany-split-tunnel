@@ -1,9 +1,16 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 adapter-boundary checkpoint (full local tests pending)
+Latest recorded commit: pending T8 controller checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 controller boundary (implemented locally; production role adapters
+  still pending):** `internal/deploy.Controller` owns current-state loading,
+  fresh-install versus tampered-state classification, apply/upgrade
+  convergence, rollback delegation, and uninstall delegation. Tests verify
+  fresh install, tamper blocking before adapter calls, rollback delegation,
+  and uninstall delegation.
 
 - **T8 adapter composition boundary (implemented locally; production role
   adapters still pending):** `internal/deploy.ApplyDesired` maps the typed
