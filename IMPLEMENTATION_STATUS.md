@@ -5,6 +5,14 @@ Latest recorded commit: `2b88b42` (aggregate budget waiter starvation fix; CI Go
 
 ## Current state
 
+- **T8/T7 transaction, diagnostics, and pairing orchestration (implemented
+  locally, pending CLI/integration):** `internal/deploy` now has explicit
+  preflight-to-commit steps with cancellation and bounded recovery, structured
+  redacted doctor findings, and pairing orchestration that delegates all blob
+  validation to T1 while persisting only fingerprints. The complete deploy
+  package suite passes; Windows skips symlink creation when the host privilege
+  is unavailable and Linux CI remains authoritative for that case.
+
 - **T8/T7 manifest and planner (implemented locally, pending orchestration):**
   `internal/deploy` now provides typed manifest/state models, canonical
   integrity hashing, atomic 0600 state/revision writes, ten-revision retention,
