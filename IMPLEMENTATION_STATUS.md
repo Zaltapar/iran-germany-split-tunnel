@@ -1,9 +1,17 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B pairing-CLI checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B artifact-journal checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B artifact journal foundation (implemented locally; journal persistence/
+  adapter restore and CLI rollback still pending):** `ArtifactJournal` records
+  only project-owned files, units, firewall ownership, and managed artifact
+  directories. Validation rejects invalid roles, traversal, unsafe units, and
+  paths outside the managed state root. This is the prerequisite for truthful
+  retained-revision restore and ownership-scoped uninstall; no state-only
+  rollback is exposed.
 
 - **T8-B real pairing CLI slice (implemented locally; install/upgrade/rollback/
   uninstall/config mutation still pending):** `splitterctl pair` now uses the
