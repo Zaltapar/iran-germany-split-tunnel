@@ -28,8 +28,8 @@ func validIranRequest() InstallRequest {
 		Config:          c,
 		Origin:          origin.Plan{Mode: origin.ModeCaddy, Domain: "upload.example.com", UpstreamAddr: "127.0.0.1:9001"},
 		StateRoot:       absoluteTestPath("state"),
-		EnvPath:         absoluteTestPath("iran.env"),
-		ConfigPath:      absoluteTestPath("iran.json"),
+		EnvPath:         absoluteTestPath(filepath.Join("state", "iran.env")),
+		ConfigPath:      absoluteTestPath(filepath.Join("state", "iran.json")),
 		SplitterVersion: "v1.0.0",
 		SplitterPath:    absoluteTestPath("iran-splitter"),
 		OriginVersion:   "v2.11.4",
@@ -46,8 +46,8 @@ func validGermanyRequest() InstallRequest {
 		Config:          c,
 		Origin:          origin.Plan{Mode: origin.ModeNone, UpstreamAddr: "127.0.0.1:9001"},
 		StateRoot:       absoluteTestPath("state"),
-		EnvPath:         absoluteTestPath("germany.env"),
-		ConfigPath:      absoluteTestPath("xray-germany.json"),
+		EnvPath:         absoluteTestPath(filepath.Join("state", "germany.env")),
+		ConfigPath:      absoluteTestPath(filepath.Join("state", "xray-germany.json")),
 		SplitterVersion: "v1.0.0",
 		SplitterPath:    absoluteTestPath("germany-splitter"),
 		XrayVersion:     "v26.3.27",
@@ -67,6 +67,32 @@ func TestInstallRequestDesiredValidRoles(t *testing.T) {
 		if desired.Pairing.State != "none" {
 			t.Fatalf("pairing state = %q", desired.Pairing.State)
 		}
+	}
+}
+
+func TestInstallRequestEnvProjectionKeepsSecretOutOfDesiredState(t *testing.T) {
+	r := validIranRequest()
+	env, err := r.Env()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env[config.EnvSecret] != r.Config.Secret {
+		t.Fatal("env projection omitted the secret")
+	}
+	desired, err := r.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join([]string{desired.Components.Splitter.Path, desired.Paths.Env, desired.Paths.Config}, "\n"), r.Config.Secret) {
+		t.Fatal("desired state contains the tunnel secret")
+	}
+}
+
+func TestInstallRequestRejectsPathEscape(t *testing.T) {
+	r := validIranRequest()
+	r.EnvPath = filepath.Join(filepath.Dir(r.StateRoot), "escape.env")
+	if err := r.Validate(); err == nil {
+		t.Fatal("path escape unexpectedly accepted")
 	}
 }
 

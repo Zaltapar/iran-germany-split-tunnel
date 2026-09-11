@@ -3,6 +3,7 @@ package deploy
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
@@ -42,11 +43,11 @@ func (r InstallRequest) Validate() error {
 	if err := origin.ValidatePlan(r.Origin); err != nil {
 		return fmt.Errorf("deploy: invalid origin plan: %w", err)
 	}
-	if r.SplitterVersion == "" || r.SplitterPath == "" {
-		return fmt.Errorf("deploy: splitter artifact metadata is incomplete")
+	if r.SplitterVersion == "" || r.SplitterPath == "" || !filepath.IsAbs(r.SplitterPath) {
+		return fmt.Errorf("deploy: splitter artifact metadata is incomplete or unsafe")
 	}
-	if r.Role == RoleGermany && (r.XrayVersion == "" || r.XrayPath == "") {
-		return fmt.Errorf("deploy: Germany Xray artifact metadata is incomplete")
+	if r.Role == RoleGermany && (r.XrayVersion == "" || r.XrayPath == "" || !filepath.IsAbs(r.XrayPath)) {
+		return fmt.Errorf("deploy: Germany Xray artifact metadata is incomplete or unsafe")
 	}
 	if r.XrayVersion != "" && !xray.ValidVersion(r.XrayVersion) {
 		return fmt.Errorf("deploy: invalid Xray version")
@@ -57,16 +58,83 @@ func (r InstallRequest) Validate() error {
 	if r.StateRoot == "" || !filepath.IsAbs(r.StateRoot) {
 		return fmt.Errorf("deploy: state root must be absolute")
 	}
-	if r.EnvPath == "" || !filepath.IsAbs(r.EnvPath) {
-		return fmt.Errorf("deploy: env path must be absolute")
+	if r.EnvPath == "" || !filepath.IsAbs(r.EnvPath) || !within(r.StateRoot, r.EnvPath) {
+		return fmt.Errorf("deploy: env path must be an absolute path below state root")
 	}
-	if r.ConfigPath != "" && !filepath.IsAbs(r.ConfigPath) {
-		return fmt.Errorf("deploy: config path must be absolute")
+	if r.ConfigPath != "" && (!filepath.IsAbs(r.ConfigPath) || !within(r.StateRoot, r.ConfigPath)) {
+		return fmt.Errorf("deploy: config path must be an absolute path below state root")
 	}
 	if r.Role == RoleIran && r.Origin.Mode == origin.ModeNone {
 		return fmt.Errorf("deploy: Iran public deployment cannot use none origin")
 	}
 	return nil
+}
+
+// Env returns the complete validated key/value projection consumed by T5's
+// protected env-file writer. The secret is intentionally returned only to the
+// caller performing the env-file mutation; Desired never includes it.
+func (r InstallRequest) Env() (map[string]string, error) {
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	c := r.Config
+	env := map[string]string{
+		config.EnvSecret: c.Secret,
+	}
+	if r.Role == RoleIran {
+		env[config.EnvSocksListen] = c.SocksListen
+		env[config.EnvWsListen] = c.WsListen
+		env[config.EnvDownCarrier] = c.DownCarrierAddr
+	} else {
+		env[config.EnvUpWsUrl] = c.UpWsUrl
+		env[config.EnvDownListen] = c.DownListen
+	}
+	if c.MetricsPort != 0 {
+		env[config.EnvMetricsPort] = strconv.Itoa(c.MetricsPort)
+	}
+	if c.AllowWeakSecret {
+		env[config.EnvAllowWeak] = strconv.FormatBool(c.AllowWeakSecret)
+	}
+	if c.RelayBufSize != 0 {
+		env[config.EnvRelayBuf] = strconv.Itoa(c.RelayBufSize)
+	}
+	if c.QueueBytesPerStream != 0 {
+		env[config.EnvQueueBytes] = strconv.Itoa(c.QueueBytesPerStream)
+	}
+	if c.QueueFramesPerStream != 0 {
+		env[config.EnvQueueFrames] = strconv.Itoa(c.QueueFramesPerStream)
+	}
+	if c.QueueBytesTotal != 0 {
+		env[config.EnvQueueTotal] = strconv.Itoa(c.QueueBytesTotal)
+	}
+	if c.OverflowWaitMs != 0 {
+		env[config.EnvOverflowMs] = strconv.Itoa(c.OverflowWaitMs)
+	}
+	if c.CarrierGraceMs != 0 {
+		env[config.EnvCarrierGrace] = strconv.Itoa(c.CarrierGraceMs)
+	}
+	if c.BootstrapWaitMs != 0 {
+		env[config.EnvBootstrapWait] = strconv.Itoa(c.BootstrapWaitMs)
+	}
+	if c.SessionBufBytes != 0 {
+		env[config.EnvSessionBuf] = strconv.Itoa(c.SessionBufBytes)
+	}
+	if c.SessionBufTotal != 0 {
+		env[config.EnvSessionBufTotal] = strconv.Itoa(c.SessionBufTotal)
+	}
+	if c.LivenessRounds != 0 {
+		env[config.EnvLivenessRounds] = strconv.Itoa(c.LivenessRounds)
+	}
+	return env, nil
+}
+
+func within(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	prefix := ".." + string(filepath.Separator)
+	return len(rel) < len(prefix) || rel[:len(prefix)] != prefix
 }
 
 // Desired converts a validated request into planner state. It does not read,

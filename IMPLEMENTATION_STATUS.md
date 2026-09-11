@@ -1,9 +1,17 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 strict-CLI checkpoint (full local tests pending)
+Latest recorded commit: pending T8 protected-input checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 protected input/env boundary (implemented locally; production adapters
+  still pending):** `InstallRequest.Env` produces the validated T5 env-file
+  projection with the secret available only to the env writer, while
+  `DesiredState` remains secret-free. Managed env/config paths must be beneath
+  the absolute state root; splitter/Xray artifact paths are absolute. Tests
+  cover secret separation and traversal rejection, and the full local suite is
+  green.
 
 - **T8 strict CLI command boundary (implemented locally; mutation adapters still
   pending):** `cmd/splitterctl` validates exact subcommand shapes for install,
