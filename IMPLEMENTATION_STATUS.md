@@ -1,11 +1,11 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: `77ee5cb` (T8 architecture design; pushed)
+Latest recorded commit: `2b88b42` (aggregate budget waiter starvation fix; CI Go #58 green)
 
 ## Current state
 
-- **CI blocker — aggregate session-buffer admission starvation (in progress):**
+- **CI blocker — aggregate session-buffer admission starvation (RESOLVED):**
   GitHub Actions Go #56 (`e922907`) failed during ordinary `go test ./...` in
   `pkg/node` at `TestAggregateBudgetStress200SessionsCarrierCycling`:
   the tail session timed out while draining after 322.42s. The failure was

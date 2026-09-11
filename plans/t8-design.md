@@ -1,6 +1,6 @@
 # T8 Design — Autonomous Deployment Orchestration / splitterctl
 
-Status: ARCHITECT design against `main` @ `e922907`.
+Status: ARCHITECT design against `main` @ `2b88b42` (Linux CI Go #58 green).
 
 ## 1. Scope and non-goals
 
@@ -20,7 +20,7 @@ The existing `install.sh` remains outside the T8 runtime path until T9. It must 
 
 ## 2. Hard prerequisite and release gate
 
-The reported Linux run is red in the pre-existing product-engine stress test `pkg/node/budget_integration_test.go:269`, `TestAggregateBudgetStress200SessionsCarrierCycling`. The failure occurs while draining a 32 KiB cycle payload after 200 sessions and consumes approximately 322 seconds before an I/O timeout. This is not an acceptable T8 CI result.
+The previously reported Linux run was red in the pre-existing product-engine stress test `pkg/node/budget_integration_test.go:269`, `TestAggregateBudgetStress200SessionsCarrierCycling`. The failure occurred while draining a 32 KiB cycle payload after 200 sessions and consumed approximately 322 seconds before an I/O timeout. The FIFO admission fix in `pkg/node/budget.go` resolved the starvation, and authoritative Linux Go #58 passed all workflow steps for `2b88b42`. This section remains a regression gate for future changes.
 
 Before T8 is called complete:
 
@@ -28,7 +28,7 @@ Before T8 is called complete:
 2. Determine whether the cause is an engine defect in aggregate-budget/rebind progress or an invalid/non-deterministic test bound.
 3. Add a deterministic regression test or correct the test synchronization/bound without using sleeps to hide a failure.
 4. Run focused `pkg/node` tests, then the complete Linux suite and race suite.
-5. Keep the result and disposition in `IMPLEMENTATION_STATUS.md`; do not weaken the existing gate or claim L4/L5 from a red run.
+5. Keep the result and disposition in `IMPLEMENTATION_STATUS.md`; do not weaken the existing gate or claim L4/L5 from a red run. **Completed for `2b88b42`:** the focused regression, full non-race suite, and authoritative Linux workflow (including race, pinned gates, and builds) passed.
 
 T8 code must not modify `pkg/node` as a convenience fix. If the investigation requires a product-engine change, it is an independently scoped prerequisite commit with its own review and tests.
 
@@ -264,20 +264,19 @@ The reported `pkg/node` failure is a separate prerequisite gate and must be gree
 
 ### 12.1 Authoritative CI checkpoint
 
-Browser verification of GitHub Actions run **Go #56** for commit `e922907` recorded:
+Browser verification of GitHub Actions run **Go #58** for commit `2b88b42` recorded:
 
 - Job: `Linux build & test`.
-- Result: **Failure**, total duration 5m57s.
-- Failed step: ordinary `go test ./...`, before race and pinned gates.
-- Failing package/test: `pkg/node`, `TestAggregateBudgetStress200SessionsCarrierCycling` at `pkg/node/budget_integration_test.go:314`.
-- Symptom: `reading cycle payload: i/o timeout` after 322.42s; package duration 334.040s.
-- Not reached: `go test -race`, Pinned Xray gate, Pinned Caddy gate, and build steps.
+- Result: **Success**, total duration 1m27s.
+- Ordinary `go test ./...` passed after the FIFO budget admission fix.
+- `go test -race`, pinned Xray/Caddy gates, host build, and linux/amd64 build completed successfully.
+- The prior Go #56 failure is retained as the regression history; it is resolved by `pkg/node/budget.go` FIFO waiter admission and covered by the deterministic budget regression test.
 
-This is a release blocker, not an architecture finding. T8 implementation and completion claims remain gated on a focused, deterministic disposition of this pre-existing product-engine failure and a subsequent green Linux CI run.
+The prerequisite release blocker is resolved. Future T8 changes must preserve this full Linux workflow gate.
 
 ## 13. Implementation sequence
 
-1. Resolve and record the red `pkg/node` stress-test gate.
+1. Preserve the resolved `pkg/node` stress-test gate in every subsequent CI run.
 2. Implement and test `internal/firewall` with fake executor and Linux command adapters.
 3. Implement manifest/state and planner with atomic writes, tamper detection, revisions, and crash journal.
 4. Implement transaction coordinator around T1–T5 APIs and fake seams.
