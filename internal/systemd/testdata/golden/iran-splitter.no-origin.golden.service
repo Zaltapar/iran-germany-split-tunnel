@@ -1,8 +1,8 @@
-# germany-splitter.service
+# iran-splitter.service
 [Unit]
-Description=germany-splitter (asymmetric split-tunnel)
-After=network-online.target xray-germany.service
-Wants=network-online.target xray-germany.service
+Description=iran-splitter (asymmetric split-tunnel)
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
@@ -10,8 +10,8 @@ StartLimitBurst=10
 Type=simple
 User=split-tunnel
 Group=split-tunnel
-ExecStart=/opt/split-tunnel/germany-splitter
-EnvironmentFile=/etc/split-tunnel/germany.env
+ExecStart=/opt/split-tunnel/iran-splitter
+EnvironmentFile=/etc/split-tunnel/iran.env
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -21,7 +21,7 @@ ProtectSystem=full
 ProtectHome=true
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=germany-splitter
+SyslogIdentifier=iran-splitter
 
 [Install]
 WantedBy=multi-user.target

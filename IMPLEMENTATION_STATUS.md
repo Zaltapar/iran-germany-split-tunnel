@@ -1,10 +1,26 @@
 # Implementation Status — Production Hardening
 
-Branch: `hardening/production-reliability`
-Base commit: `c85ed76` (main, "installer: rewrite install.sh ...")
+Branch: `feat/t5-systemd`
+Base commit: `dd0ba82` (T5 approved design + scoped `.gitattributes`)
 
 ## Current state
 
+- **T5 systemd/service management (branch `feat/t5-systemd`, implementation in progress):**
+  `internal/systemd` owns deterministic unit rendering, D4 `EnvironmentFile`
+  management, service-user/directory convergence, binary-pointer safety,
+  transactional ApplyUnit installation with rollback, bounded health checks,
+  and unit uninstall/rollback operations. Canonical unit goldens cover the
+  Germany splitter, Germany Xray, Iran splitter, Iran origin, and Iran
+  no-origin variants. The package includes cross-platform fake-based tests;
+  Linux-only ownership/chown and symlink cases are gated appropriately.
+  Local Windows verification currently passes `gofmt`, `go test ./internal/systemd/`,
+  `go build ./...`, and `go vet ./...`; authoritative Linux `-race` verification
+  remains pending.
+  - **Security contract:** splitter secrets are written only to 0600 env files;
+    shipped units contain `EnvironmentFile=` and no secret values. Managed paths
+    reject unsafe symlinks, unit names are allowlisted, and executor calls use
+    separated argv without a shell.
+  NEXT: Linux CI race verification, adversarial implementation review, and PR.
 - **Self-contained deployment — T4 origin/Caddy provider (branch
   `feat/t4-origin`, review gate PASSED — pending PR + Linux CI merge)**:
   `internal/origin` is the managed TLS-origin provider for the Iran node

@@ -7,6 +7,7 @@ package origin
 // (CI "Pinned Caddy gate" re-validates them on every run).
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"os"
@@ -72,6 +73,8 @@ func TestRenderMatchesGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read golden: %v", err)
 			}
+			got = bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
+			want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
 			if string(got) != string(want) {
 				t.Fatalf("render differs from golden\n--- got ---\n%s\n--- want ---\n%s", got, want)
 			}

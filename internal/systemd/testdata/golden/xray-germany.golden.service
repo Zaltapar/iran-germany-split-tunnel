@@ -1,0 +1,30 @@
+# xray-germany.service
+[Unit]
+Description=Xray core (Germany down-carrier, VLESS+Reality)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=split-tunnel
+Group=split-tunnel
+ExecStart=/opt/split-tunnel/xray/current/xray run -config /etc/split-tunnel/xray-germany.json
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=23
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=100000
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/log/split-tunnel
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xray-germany
+
+[Install]
+WantedBy=multi-user.target
