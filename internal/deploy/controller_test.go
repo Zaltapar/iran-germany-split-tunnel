@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +24,32 @@ func (f *controllerFake) Restore(ctx context.Context, m Manifest) error {
 func (f *controllerFake) Uninstall(ctx context.Context, m Manifest) error {
 	f.uninstalled = m
 	return f.call("uninstall")
+}
+
+func TestControllerApplyRequestKeepsSecretOutOfManifest(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validIranRequest()
+	request.StateRoot = store.Root
+	request.EnvPath = filepath.Join(store.Root, "iran.env")
+	request.ConfigPath = filepath.Join(store.Root, "iran.json")
+	fake := &controllerFake{}
+	result, err := (&Controller{Store: store, Adapter: fake}).ApplyRequest(context.Background(), request)
+	if err != nil {
+		t.Fatalf("ApplyRequest: %v", err)
+	}
+	if strings.Contains(result.Manifest.ManifestHash, request.Config.Secret) {
+		t.Fatal("manifest hash contains the tunnel secret")
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", loaded), request.Config.Secret) {
+		t.Fatal("persisted manifest contains the tunnel secret")
+	}
 }
 
 func TestControllerApplyTreatsMissingStateAsFreshInstall(t *testing.T) {

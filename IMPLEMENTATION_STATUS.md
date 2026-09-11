@@ -1,9 +1,15 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 protected-input checkpoint (full local tests pending)
+Latest recorded commit: pending T8 controller-request checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 controller request bridge (implemented locally; production adapters still
+  pending):** `Controller.ApplyRequest` validates a complete
+  `InstallRequest`, converts it to secret-free `DesiredState`, and then invokes
+  the typed adapter transaction. Tests prove valid requests reach the adapter
+  while the committed manifest remains free of the tunnel secret.
 
 - **T8 protected input/env boundary (implemented locally; production adapters
   still pending):** `InstallRequest.Env` produces the validated T5 env-file

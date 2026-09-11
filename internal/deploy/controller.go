@@ -15,6 +15,18 @@ type Controller struct {
 	Adapter Adapter
 }
 
+// ApplyRequest validates a complete operator request, converts it to
+// secret-free desired state, and converges the host through the injected
+// adapter. Request-specific secret handling remains the adapter's responsibility
+// through InstallRequest.Env; it is never serialized into deployment state.
+func (c *Controller) ApplyRequest(ctx context.Context, request InstallRequest) (Result, error) {
+	desired, err := request.Desired()
+	if err != nil {
+		return Result{}, err
+	}
+	return c.Apply(ctx, desired)
+}
+
 // Apply converges the host to desired state. An absent state file is treated
 // as a fresh install; an existing state must pass integrity validation before
 // any adapter method is called.
