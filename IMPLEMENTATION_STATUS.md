@@ -1,9 +1,24 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Last merge: `906c340` (Merge T5: transactional systemd service management)
+Latest recorded commit: `77ee5cb` (T8 architecture design; pushed)
 
 ## Current state
+
+- **CI blocker — aggregate session-buffer admission starvation (in progress):**
+  GitHub Actions Go #56 (`e922907`) failed during ordinary `go test ./...` in
+  `pkg/node` at `TestAggregateBudgetStress200SessionsCarrierCycling`:
+  the tail session timed out while draining after 322.42s. The failure was
+  reproduced locally on the fifth run of five, confirming a real progress bug,
+  not only Linux runner noise. Root cause was broadcast-only budget wake-up:
+  a newly woken/refunding relay could repeatedly race older parked relays.
+  `pkg/node/budget.go` now uses a FIFO waiter queue with cancellation removal
+  and fit-skipping to prevent starvation; `budget_test.go` adds a deterministic
+  older-waiter regression test. Verified locally: focused budget tests,
+  regression test `-count=20`, stress test `-count=5`, full `pkg/node`, and
+  full non-race `go test ./...` all pass. Windows `go test -race` could not
+  load (`0xc0000139`), so Linux race verification remains mandatory and is
+  not claimed here.
 
 - **T5 systemd/service management (MERGED to `main`, `906c340`):**
   `internal/systemd` owns deterministic unit rendering, D4 `EnvironmentFile`

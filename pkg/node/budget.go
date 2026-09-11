@@ -101,6 +101,13 @@ type bufKey struct {
 // sessionBufferBudget is the node-level aggregate byte budget for
 // shape-A reconnect buffers. See the package doc comment above for the
 // gauge semantics, the accounting invariants, and the refusal policy.
+type budgetWaiter struct {
+	key      bufKey
+	n        int
+	ready    chan struct{}
+	admitted bool
+}
+
 type sessionBufferBudget struct {
 	mu sync.Mutex
 	// limit <= 0: disabled (no aggregate budget).
@@ -112,13 +119,13 @@ type sessionBufferBudget struct {
 	// Close()'s force-reclaim, the clamped refunds, and the
 	// active-relay leak check.
 	active map[bufKey]int64
-	// wake: closed (and replaced) whenever space is freed, so every
-	// parked chargeWait re-checks. Plain channel lifecycle (no waiter
-	// count): close+replace is safe for any number of parkers — a
-	// parker always observes the close of the channel it parked on and
-	// re-loops.
-	wake   chan struct{}
-	closed bool
+	// waiters is a FIFO admission queue. A queue prevents a relay that
+	// just refunded bytes from repeatedly racing older parked relays.
+	// grantWaitersLocked scans in arrival order and may skip a request
+	// that does not currently fit, avoiding head-of-line blocking when
+	// request sizes differ.
+	waiters []*budgetWaiter
+	closed  bool
 }
 
 func newSessionBufferBudget(limit int) *sessionBufferBudget {
@@ -149,44 +156,76 @@ func (b *sessionBufferBudget) chargeWait(k bufKey, n int, ctx context.Context) b
 	if n <= 0 {
 		return true
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		b.mu.Lock()
-		if b.closed {
-			b.mu.Unlock()
-			return false
-		}
-		if b.limit <= 0 { // disabled
-			b.mu.Unlock()
-			return true
-		}
-		if _, ok := b.active[k]; !ok {
-			// Unknown relay (begun after Close, or a bug): refuse
-			// loudly instead of corrupting the accounting.
-			b.mu.Unlock()
-			return false
-		}
-		if b.accounted+int64(n) <= b.limit {
-			b.accounted += int64(n)
-			b.active[k] += int64(n)
-			b.mu.Unlock()
-			return true
-		}
-		// No room: park until space is freed (or ctx done).
-		if b.wake == nil {
-			b.wake = make(chan struct{})
-		}
-		w := b.wake
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
+	b.mu.Lock()
+	if b.closed {
 		b.mu.Unlock()
-		select {
-		case <-w:
-			// Space was freed somewhere: re-check.
-		case <-ctx.Done():
-			return false
+		return false
+	}
+	if b.limit <= 0 { // disabled
+		b.mu.Unlock()
+		return true
+	}
+	if _, ok := b.active[k]; !ok {
+		// Unknown relay (begun after Close, or a bug): refuse
+		// loudly instead of corrupting the accounting.
+		b.mu.Unlock()
+		return false
+	}
+
+	w := &budgetWaiter{key: k, n: n, ready: make(chan struct{})}
+	b.waiters = append(b.waiters, w)
+	b.grantWaitersLocked()
+	b.mu.Unlock()
+
+	select {
+	case <-w.ready:
+		return w.admitted
+	case <-ctx.Done():
+		b.mu.Lock()
+		if w.admitted {
+			b.mu.Unlock()
+			return true
+		}
+		b.removeWaiterLocked(w)
+		b.grantWaitersLocked()
+		b.mu.Unlock()
+		return false
+	}
+}
+
+// grantWaitersLocked admits queued requests in arrival order whenever they
+// fit. Requests larger than the currently available space are skipped so a
+// large request cannot block smaller fixed-size relay chunks behind it. Every
+// admitted waiter is signaled exactly once by closing its private channel.
+func (b *sessionBufferBudget) grantWaitersLocked() {
+	if b.closed || b.limit <= 0 {
+		return
+	}
+	for i := 0; i < len(b.waiters); {
+		w := b.waiters[i]
+		if b.accounted+int64(w.n) > b.limit {
+			i++
+			continue
+		}
+		b.accounted += int64(w.n)
+		b.active[w.key] += int64(w.n)
+		w.admitted = true
+		close(w.ready)
+		b.waiters = append(b.waiters[:i], b.waiters[i+1:]...)
+	}
+}
+
+func (b *sessionBufferBudget) removeWaiterLocked(want *budgetWaiter) {
+	for i, w := range b.waiters {
+		if w == want {
+			b.waiters = append(b.waiters[:i], b.waiters[i+1:]...)
+			return
 		}
 	}
 }
@@ -210,7 +249,7 @@ func (b *sessionBufferBudget) refund(k bufKey, n int) int64 {
 	}
 	b.accounted -= int64(n)
 	b.active[k] = cur - int64(n)
-	b.wakeLocked()
+	b.grantWaitersLocked()
 	return int64(n)
 }
 
@@ -230,18 +269,9 @@ func (b *sessionBufferBudget) end(k bufKey) int64 {
 	}
 	delete(b.active, k)
 	if cur > 0 {
-		b.wakeLocked()
+		b.grantWaitersLocked()
 	}
 	return cur
-}
-
-// wakeLocked signals every parked chargeWait that the budget state
-// changed (space freed). Caller must hold b.mu.
-func (b *sessionBufferBudget) wakeLocked() {
-	if b.wake != nil {
-		close(b.wake)
-		b.wake = make(chan struct{})
-	}
 }
 
 // AccountedBytes is the current aggregate usage — EXACTLY the sum of
@@ -279,6 +309,9 @@ func (b *sessionBufferBudget) Close() int64 {
 		}
 		delete(b.active, k)
 	}
-	b.wakeLocked()
+	for _, w := range b.waiters {
+		close(w.ready)
+	}
+	b.waiters = nil
 	return reclaimed
 }

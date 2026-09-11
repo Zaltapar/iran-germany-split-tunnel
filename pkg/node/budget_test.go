@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -141,6 +142,77 @@ func TestBudgetChargeRefusalParkingAndFree(t *testing.T) {
 	if got := b.AccountedBytes(); got != 0 {
 		t.Fatalf("after end accounted = %d, want 0", got)
 	}
+}
+
+func TestBudgetQueuedAdmissionDoesNotStarveOlderWaiter(t *testing.T) {
+	const limit = 100
+	b := newSessionBufferBudget(limit)
+	k1 := freshKey(&session.Session{})
+	k2 := freshKey(&session.Session{})
+	k3 := freshKey(&session.Session{})
+	b.begin(k1)
+	b.begin(k2)
+	b.begin(k3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !b.chargeWait(k1, limit, ctx) {
+		t.Fatal("initial charge must be admitted")
+	}
+
+	first := make(chan bool, 1)
+	second := make(chan bool, 1)
+	waitForQueued := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for {
+			b.mu.Lock()
+			queued := len(b.waiters)
+			b.mu.Unlock()
+			if queued == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("waiters registered = %d, want %d", queued, want)
+			}
+			runtime.Gosched()
+		}
+	}
+	go func() { first <- b.chargeWait(k2, 25, ctx) }()
+	waitForQueued(1)
+	go func() { second <- b.chargeWait(k3, 25, ctx) }()
+	waitForQueued(2)
+
+	if got := b.refund(k1, 25); got != 25 {
+		t.Fatalf("refund = %d, want 25", got)
+	}
+	select {
+	case ok := <-first:
+		if !ok {
+			t.Fatal("oldest waiter was refused")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("oldest waiter was not admitted")
+	}
+	select {
+	case ok := <-second:
+		t.Fatalf("newer waiter admitted before space was freed, result=%v", ok)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if got := b.refund(k2, 25); got != 25 {
+		t.Fatalf("second refund = %d, want 25", got)
+	}
+	select {
+	case ok := <-second:
+		if !ok {
+			t.Fatal("newer waiter was refused after space became available")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("newer waiter was not admitted")
+	}
+	b.end(k1)
+	b.end(k2)
+	b.end(k3)
 }
 
 func TestBudgetNeverDrivesNegative(t *testing.T) {
