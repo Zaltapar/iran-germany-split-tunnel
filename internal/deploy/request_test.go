@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
 )
 
@@ -34,6 +35,7 @@ func validIranRequest() InstallRequest {
 		SplitterPath:    absoluteTestPath("iran-splitter"),
 		OriginVersion:   "v2.11.4",
 		OriginPath:      absoluteTestPath("caddy"),
+		Firewall:        firewall.Plan{Backend: firewall.BackendNone, Role: RoleIran},
 	}
 }
 
@@ -53,6 +55,7 @@ func validGermanyRequest() InstallRequest {
 		SplitterPath:    absoluteTestPath("germany-splitter"),
 		XrayVersion:     "v26.3.27",
 		XrayPath:        absoluteTestPath("xray"),
+		Firewall:        firewall.Plan{Backend: firewall.BackendNone, Role: RoleGermany},
 	}
 }
 
@@ -67,6 +70,15 @@ func TestInstallRequestDesiredValidRoles(t *testing.T) {
 		}
 		if desired.Pairing.State != "none" {
 			t.Fatalf("pairing state = %q", desired.Pairing.State)
+		}
+		if desired.Firewall.Backend != string(firewall.BackendNone) || desired.Firewall.Ownership != firewall.Marker || desired.Firewall.RulesHash == "" {
+			t.Fatalf("firewall projection = %+v", desired.Firewall)
+		}
+		if request.Role == RoleGermany && len(desired.Services) != 2 {
+			t.Fatalf("Germany services = %+v", desired.Services)
+		}
+		if request.Role == RoleIran && len(desired.Services) != 2 {
+			t.Fatalf("Iran services = %+v", desired.Services)
 		}
 	}
 }

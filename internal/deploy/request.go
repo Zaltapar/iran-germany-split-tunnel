@@ -1,11 +1,16 @@
 package deploy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
@@ -29,6 +34,8 @@ type InstallRequest struct {
 	XrayPath        string
 	OriginVersion   string
 	OriginPath      string
+
+	Firewall firewall.Plan
 }
 
 // Validate checks all operator-controlled fields before an adapter can mutate
@@ -43,6 +50,9 @@ func (r InstallRequest) Validate() error {
 	}
 	if err := origin.ValidatePlan(r.Origin); err != nil {
 		return fmt.Errorf("deploy: invalid origin plan: %w", err)
+	}
+	if err := firewall.ValidatePlan(r.Firewall); err != nil {
+		return fmt.Errorf("deploy: invalid firewall plan: %w", err)
 	}
 	if r.SplitterVersion == "" || r.SplitterPath == "" || !filepath.IsAbs(r.SplitterPath) {
 		return fmt.Errorf("deploy: splitter artifact metadata is incomplete or unsafe")
@@ -141,11 +151,29 @@ func within(root, path string) bool {
 	return len(rel) < len(prefix) || rel[:len(prefix)] != prefix
 }
 
+func firewallFingerprint(plan firewall.Plan) string {
+	parts := make([]string, 0, len(plan.Allow)+len(plan.Deny)+len(plan.CDNEgress)+2)
+	parts = append(parts, string(plan.Backend), plan.Role)
+	for _, rule := range append(append([]firewall.Rule{}, plan.Allow...), plan.Deny...) {
+		parts = append(parts, fmt.Sprintf("%d/%s/%s/%s", rule.Port, rule.Protocol, rule.Action, rule.Comment))
+	}
+	parts = append(parts, plan.CDNEgress...)
+	sort.Strings(parts)
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
 // Desired converts a validated request into planner state. It does not read,
 // write, install, or start anything.
 func (r InstallRequest) Desired() (DesiredState, error) {
 	if err := r.Validate(); err != nil {
 		return DesiredState{}, err
+	}
+	services := []ServiceState{{Unit: r.Role + "-splitter.service", Component: "splitter"}}
+	if r.Role == RoleGermany {
+		services = append([]ServiceState{{Unit: "xray-germany.service", Component: "xray"}}, services...)
+	} else if r.Origin.Mode != origin.ModeNone {
+		services = append([]ServiceState{{Unit: "iran-origin.service", Component: "origin"}}, services...)
 	}
 	d := DesiredState{
 		Role: r.Role,
@@ -154,8 +182,10 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 			Xray:     ComponentState{Version: r.XrayVersion, Path: r.XrayPath},
 			Origin:   OriginState{Mode: string(r.Origin.Mode), Domain: r.Origin.Domain, Version: r.OriginVersion},
 		},
-		Paths:   Paths{StateRoot: r.StateRoot, Env: r.EnvPath, Config: r.ConfigPath},
-		Pairing: PairingState{State: "none"},
+		Paths:    Paths{StateRoot: r.StateRoot, Env: r.EnvPath, Config: r.ConfigPath},
+		Services: services,
+		Pairing:  PairingState{State: "none"},
+		Firewall: FirewallState{Backend: string(r.Firewall.Backend), Ownership: firewall.Marker, RulesHash: firewallFingerprint(r.Firewall)},
 	}
 	return d, nil
 }

@@ -1,9 +1,18 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B fresh-recovery checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B desired-state checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B complete desired-state projection (implemented locally; concrete Linux
+  adapters still pending):** `InstallRequest.Desired` now deterministically
+  projects role-specific services, pairing state, firewall backend/ownership/
+  rules fingerprint, managed paths, and component metadata without secrets.
+  Firewall plan validation is delegated to `internal/firewall`, and planner
+  drift tests cover services, firewall rules, pairing, component versions, and
+  paths. Existing planner firewall comparison was fixed to include ownership
+  and rules fingerprint.
 
 - **T8-B fresh-install recovery semantics (implemented locally; concrete Linux
   adapters still pending):** the typed adapter contract now distinguishes

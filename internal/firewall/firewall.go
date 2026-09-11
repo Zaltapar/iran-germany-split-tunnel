@@ -204,6 +204,10 @@ func (m *manager) backend(ctx context.Context, requested Backend) (Backend, erro
 	return m.Detect(ctx)
 }
 
+// ValidatePlan exposes pure firewall-plan validation to deployment
+// orchestration. It performs no command execution or host mutation.
+func ValidatePlan(p Plan) error { return validatePlan(p) }
+
 func validatePlan(p Plan) error {
 	if p.Role != "iran" && p.Role != "germany" {
 		return fmt.Errorf("%w: role must be iran or germany", ErrInvalidPlan)

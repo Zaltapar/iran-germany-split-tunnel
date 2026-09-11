@@ -30,6 +30,8 @@ func PlanDesired(current *Manifest, desired DesiredState) (Plan, error) {
 		compare("paths.env", current.Paths.Env, desired.Paths.Env, true)
 		compare("paths.config", current.Paths.Config, desired.Paths.Config, true)
 		compare("firewall.backend", current.Firewall.Backend, desired.Firewall.Backend, true)
+		compare("firewall.ownership", current.Firewall.Ownership, desired.Firewall.Ownership, true)
+		compare("firewall.rulesHash", current.Firewall.RulesHash, desired.Firewall.RulesHash, true)
 		compare("pairing.state", current.Pairing.State, desired.Pairing.State, true)
 		if !reflect.DeepEqual(current.Services, desired.Services) {
 			changes = append(changes, Change{Field: "services", Before: fmt.Sprintf("%d", len(current.Services)), After: fmt.Sprintf("%d", len(desired.Services)), Destructive: true})
