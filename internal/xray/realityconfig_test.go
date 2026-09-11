@@ -5,6 +5,7 @@ package xray
 // network, no real binary, fixed non-production test vectors.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -53,6 +54,8 @@ func TestGoldenMatchesCommittedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read golden: %v", err)
 	}
+	got = bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
+	want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
 	if string(got) != string(want) {
 		t.Fatalf("rendered config differs from golden\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}

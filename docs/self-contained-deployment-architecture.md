@@ -691,7 +691,7 @@ Two independent secrets, two different lifecycles:
 
 | Secret | Generated on | Travels? | Stored (value) | Used by |
 |---|---|---|---|---|
-| Tunnel secret (`SPLIT_SECRET`) | Iran (existing behavior) | yes — pairing blob A → Germany | 0600 file + systemd `Environment=` (root-only unit file, as today) | both splitters (auth v1) |
+| Tunnel secret (`SPLIT_SECRET`) | Iran (existing behavior) | yes — pairing blob A → Germany | 0600 role env file + systemd `EnvironmentFile=` | both splitters (auth v1) |
 | Reality private key | Germany | **never** | 0600 file + embedded in Xray config (0600) | xray-germany inbound |
 | Reality public key + SNI + shortId + UUID | Germany | yes — return blob B → Iran | Iran state (not secret-grade but paired) | iran-xray outbound |
 
@@ -707,11 +707,11 @@ Two independent secrets, two different lifecycles:
   `rotate-reality` (Reality) — both re-emit the cross-host blob, both
   require the peer to apply before the old value is discarded, both are
   documented two-step (no silent cross-host rotation).
-- Unit files: the tunnel secret stays in the systemd unit via
-  `Environment=SPLIT_SECRET=...` in a 0600 root-owned unit (existing,
-  proven) — or, cleaner, `EnvironmentFile=/etc/split-tunnel/env` (0600);
-  **Decision D4:** switch to `EnvironmentFile` so the unit file itself carries
-  no secret (easier `systemctl cat` hygiene, same security level).
+- **Unit files:** the tunnel secret is never embedded in a unit. **Decision D4:**
+  each splitter uses a root-owned 0600 role env file (`/etc/split-tunnel/iran.env`
+  or `/etc/split-tunnel/germany.env`) through `EnvironmentFile=`; the unit file
+  itself contains no secret (safer `systemctl cat` hygiene, same runtime
+  security level).
 
 ## 9. Upgrade / rollback design (Q17, Q21, Q22)
 
@@ -738,6 +738,17 @@ Two independent secrets, two different lifecycles:
   states).
 
 ## 10. Firewall / systemd design (Q12, Q13, Q15, Q16)
+
+### 10.0 Manual deployment contract (T5)
+
+The shipped units are canonical examples and must not be edited to insert
+secrets or operator endpoints. Manual deployment provisions the managed
+`split-tunnel` user and required directories, writes the role env file with
+mode `0600` and ownership `root:root`, installs the generated unit files, and
+runs `systemd-analyze verify` before `daemon-reload`, `enable`, and
+`start`/`restart`. Use `internal/systemd`/`splitterctl` as the deployment
+boundary; do not hand-write Xray, Caddy, Reality, or firewall configuration.
+
 
 ### 10.1 systemd ordering (Q13)
 
