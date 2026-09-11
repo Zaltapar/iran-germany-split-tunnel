@@ -1,9 +1,19 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B Reality/planner checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B Linux-adapter checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B concrete Linux composition root (implemented locally; CLI mutation
+  wiring and retained-artifact rollback still pending):** `internal/deploy`
+  now provides `LinuxAdapter`, which is Linux-only, canonical-T5-path guarded,
+  and delegates user/directories/env/units to `internal/systemd`, Germany Xray
+  install/keygen/config activation to `internal/xray`, Iran origin to
+  `internal/origin`, and firewall convergence to `internal/firewall`. The
+  adapter has explicit fresh cleanup ownership and refuses empty-manifest
+  upgrade restore until an artifact journal is available. Full local tests pass;
+  no staging mutation was performed.
 
 - **T8-B Reality input and complete planner drift (implemented locally;
   concrete Linux adapters still pending):** Germany requests now carry only
