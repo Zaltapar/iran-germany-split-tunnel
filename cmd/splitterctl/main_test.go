@@ -48,11 +48,10 @@ func TestRunMutationParsersRejectMalformedArguments(t *testing.T) {
 	}
 }
 
-func TestRunMutationParsersAcceptValidShapesBeforeWiring(t *testing.T) {
+func TestRunMutationParsersAcceptValidShapes(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
 	cases := [][]string{
 		{"install", "iran"}, {"install", "germany"},
-		{"pair", "generate"}, {"pair", "apply"}, {"pair", "finalize"},
 		{"upgrade"}, {"upgrade", "--xray"},
 		{"rollback", "--to", "state-1"}, {"uninstall"}, {"uninstall", "--purge"},
 		{"config", "set"},
@@ -62,6 +61,17 @@ func TestRunMutationParsersAcceptValidShapesBeforeWiring(t *testing.T) {
 		err := run(context.Background(), args, &out, &out)
 		if !errors.Is(err, errNotWired) {
 			t.Errorf("%v: error = %v, want not-wired error", args, err)
+		}
+	}
+}
+
+func TestRunPairRequiresPersistedState(t *testing.T) {
+	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
+	for _, args := range [][]string{{"pair", "generate"}, {"pair", "apply"}, {"pair", "finalize"}} {
+		var out bytes.Buffer
+		err := run(context.Background(), args, &out, &out)
+		if err == nil || !strings.Contains(err.Error(), "pair: load deployment state") {
+			t.Errorf("%v: error = %v, want missing-state error", args, err)
 		}
 	}
 }
@@ -204,7 +214,7 @@ func TestDoctorFailsClosedOnTamperedState(t *testing.T) {
 
 func TestMutatingCommandsReportNotWired(t *testing.T) {
 	t.Setenv("SPLITTERCTL_STATE_ROOT", t.TempDir())
-	for _, args := range [][]string{{"install", "iran"}, {"pair", "generate"}, {"upgrade"}, {"rollback", "--to", "state-1"}, {"uninstall"}, {"config", "set"}} {
+	for _, args := range [][]string{{"install", "iran"}, {"upgrade"}, {"rollback", "--to", "state-1"}, {"uninstall"}, {"config", "set"}} {
 		var out bytes.Buffer
 		err := run(context.Background(), args, &out, &out)
 		if !errors.Is(err, errNotWired) {

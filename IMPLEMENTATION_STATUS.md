@@ -1,9 +1,17 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B Linux-adapter checkpoint (full local tests pending)
+Latest recorded commit: pending T8-B pairing-CLI checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8-B real pairing CLI slice (implemented locally; install/upgrade/rollback/
+  uninstall/config mutation still pending):** `splitterctl pair` now uses the
+  existing `internal/deploy.Pairing` and T1 validators. Iran `pair generate`
+  reads an absolute protected secret file and upload-domain input, emits Blob A
+  once, and commits only fingerprint/state. Germany `pair apply` accepts Blob A;
+  Iran `pair finalize` accepts Blob B. Raw blobs and tunnel secrets are not
+  persisted. Full local tests pass.
 
 - **T8-B concrete Linux composition root (implemented locally; CLI mutation
   wiring and retained-artifact rollback still pending):** `internal/deploy`

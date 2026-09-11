@@ -69,7 +69,7 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if len(args) != 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
 			return fmt.Errorf("%w: pair requires generate, apply, or finalize", errUsage)
 		}
-		return notWired(args)
+		return pairCommand(ctx, store, args[1], out)
 	case "upgrade":
 		if len(args) > 2 || (len(args) == 2 && !isUpgradeTarget(args[1])) {
 			return fmt.Errorf("%w: upgrade accepts at most one of --xray, --origin, or --splitter", errUsage)
@@ -101,6 +101,72 @@ func isUpgradeTarget(arg string) bool {
 	default:
 		return false
 	}
+}
+
+func pairCommand(_ context.Context, store *deploy.Store, action string, out io.Writer) error {
+	manifest, err := store.Load()
+	if err != nil {
+		return fmt.Errorf("pair: load deployment state: %w", err)
+	}
+	p := deploy.Pairing{Store: store}
+	var state deploy.PairingState
+	var blob string
+	switch action {
+	case "generate":
+		if manifest.Role != deploy.RoleIran {
+			return fmt.Errorf("pair: generate is currently supported on Iran; Germany requires provisioned Reality public parameters")
+		}
+		secretPath := os.Getenv("SPLITTERCTL_SECRET_FILE")
+		domain := os.Getenv("SPLITTERCTL_UPLOAD_DOMAIN")
+		if secretPath == "" || domain == "" || !filepath.IsAbs(secretPath) {
+			return fmt.Errorf("pair: set absolute SPLITTERCTL_SECRET_FILE and SPLITTERCTL_UPLOAD_DOMAIN")
+		}
+		secretBytes, err := os.ReadFile(secretPath)
+		if err != nil {
+			return fmt.Errorf("pair: read protected secret file: %w", err)
+		}
+		blob, state, err = p.GenerateA(strings.TrimSpace(string(secretBytes)), domain)
+		if err != nil {
+			return err
+		}
+	case "apply", "finalize":
+		blobPath := os.Getenv("SPLITTERCTL_PAIR_BLOB_FILE")
+		if blobPath == "" || !filepath.IsAbs(blobPath) {
+			return fmt.Errorf("pair: set absolute SPLITTERCTL_PAIR_BLOB_FILE")
+		}
+		data, err := os.ReadFile(blobPath)
+		if err != nil {
+			return fmt.Errorf("pair: read blob file: %w", err)
+		}
+		encoded := strings.TrimSpace(string(data))
+		if manifest.Role == deploy.RoleGermany {
+			if action != "apply" {
+				return fmt.Errorf("pair: Germany accepts only pair apply for Blob A")
+			}
+			_, state, err = p.ApplyA(encoded)
+		} else {
+			if action != "finalize" {
+				return fmt.Errorf("pair: Iran accepts only pair finalize for Blob B")
+			}
+			_, state, err = p.ApplyB(encoded)
+		}
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: unsupported pair action", errUsage)
+	}
+	manifest.Pairing = state
+	committed, err := store.Commit(manifest, "pair-"+action)
+	if err != nil {
+		return err
+	}
+	if blob != "" {
+		_, _ = fmt.Fprintln(out, blob)
+	} else {
+		_, _ = fmt.Fprintf(out, "pairing: %s\nfingerprint: %s\ngeneration: %s\n", state.State, state.Fingerprints[0], committed.Generation)
+	}
+	return nil
 }
 
 func status(_ context.Context, store *deploy.Store, out io.Writer) error {
