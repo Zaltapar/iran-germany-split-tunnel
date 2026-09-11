@@ -1,15 +1,22 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 CLI/config checkpoint (full local tests pending)
+Latest recorded commit: pending T8 rollback-core checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 rollback core (implemented locally; CLI host adapter still pending):**
+  `internal/deploy.Store.Rollback` restores a retained same-role revision via an
+  injected artifact callback, checks current and target manifest integrity,
+  rejects active/foreign targets, preserves state when restoration fails, and
+  commits a new rollback revision only after restoration succeeds. Deploy tests
+  cover success, failure preservation, role mismatch, and active-target refusal.
 
 - **T8 read-only CLI/config slice (implemented locally; host adapters still
   pending):** `cmd/splitterctl` provides strict `status` and `doctor` commands,
   redacted `config show`, explicit help/usage handling, and clear not-wired
   errors for mutating commands until the systemd/Xray/origin/firewall adapters
-  are composed. Focused CLI tests pass; the full suite is the next gate.
+  are composed. Focused CLI tests and the full suite pass.
 
 - **T8/T7 transaction, diagnostics, and pairing orchestration (implemented
   locally, pending CLI/integration):** `internal/deploy` now has explicit
