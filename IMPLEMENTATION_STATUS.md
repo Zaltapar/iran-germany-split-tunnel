@@ -1,11 +1,11 @@
 # Implementation Status — Production Hardening
 
-Branch: `feat/t5-systemd`
-Base commit: `dd0ba82` (T5 approved design + scoped `.gitattributes`)
+Branch: `main`
+Last merge: `906c340` (Merge T5: transactional systemd service management)
 
 ## Current state
 
-- **T5 systemd/service management (branch `feat/t5-systemd`, implementation in progress):**
+- **T5 systemd/service management (MERGED to `main`, `906c340`):**
   `internal/systemd` owns deterministic unit rendering, D4 `EnvironmentFile`
   management, service-user/directory convergence, binary-pointer safety,
   transactional ApplyUnit installation with rollback, bounded health checks,
@@ -13,14 +13,23 @@ Base commit: `dd0ba82` (T5 approved design + scoped `.gitattributes`)
   Germany splitter, Germany Xray, Iran splitter, Iran origin, and Iran
   no-origin variants. The package includes cross-platform fake-based tests;
   Linux-only ownership/chown and symlink cases are gated appropriately.
-  Local Windows verification currently passes `gofmt`, `go test ./internal/systemd/`,
-  `go build ./...`, and `go vet ./...`; authoritative Linux `-race` verification
-  remains pending.
+  **CI green (run #53, job `103178589637`, commit `f57d9a8`):** gofmt, go vet,
+  `go test ./...`, the authoritative Linux `go test -race` (47s), both
+  pinned-binary gates, host build, L4 two-process gate, and linux/amd64
+  cross-build all passed.
   - **Security contract:** splitter secrets are written only to 0600 env files;
     shipped units contain `EnvironmentFile=` and no secret values. Managed paths
     reject unsafe symlinks, unit names are allowlisted, and executor calls use
     separated argv without a shell.
-  NEXT: Linux CI race verification, adversarial implementation review, and PR.
+  - **CI fixes (`f57d9a8`, run #52 failure):** Linux-only planted env fixtures
+    were 0644 and rejected by the Linux-gated preflight (mode must be ≤ 0640) →
+    fixtures now planted 0600 (production mode, D4); symlink-refusal subtests
+    now run on isolated temp trees (shared tree caused EEXIST; the non-empty
+    stateDir is renamed, not removed); the 200-session budget stress test's
+    tail-session drain contention behind 199 other sessions on a loaded
+    2-vCPU runner is bounded by a finite, declared `drainExtra` (3 min) in
+    `readDeadline` — a corrected worst-case bound, not a masked timeout.
+  NEXT: T8 (`cmd/splitterctl`); triage issues #20/#21; L5 prep per #19.
 - **Self-contained deployment — T4 origin/Caddy provider (branch
   `feat/t4-origin`, review gate PASSED — pending PR + Linux CI merge)**:
   `internal/origin` is the managed TLS-origin provider for the Iran node
