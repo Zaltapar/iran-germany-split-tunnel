@@ -5,6 +5,15 @@ Latest recorded commit: `2b88b42` (aggregate budget waiter starvation fix; CI Go
 
 ## Current state
 
+- **T8/T7 manifest and planner (implemented locally, pending orchestration):**
+  `internal/deploy` now provides typed manifest/state models, canonical
+  integrity hashing, atomic 0600 state/revision writes, ten-revision retention,
+  traversal/symlink guards, desired-vs-current planning, and destructive-change
+  classification. Tests cover round-trip/tamper rejection, retention, unsafe
+  paths, fresh install, no-op convergence, role changes, and origin deltas.
+  Windows skips symlink creation when the host privilege is unavailable;
+  Linux CI remains authoritative for that case.
+
 - **T8/T6 firewall boundary (implemented locally, pending integration):**
   `internal/firewall` provides typed role/port plans, UFW/nftables/none
   backends, stable `split-tunnel` ownership markers, structured argv execution,
