@@ -1,9 +1,17 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 rollback-core checkpoint (full local tests pending)
+Latest recorded commit: pending T8 adapter-boundary checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 adapter composition boundary (implemented locally; production role
+  adapters still pending):** `internal/deploy.ApplyDesired` maps the typed
+  transaction phases to an injected host adapter and delegates recovery to the
+  adapter. Tests verify prepare/validate/backup/activate/transition/health
+  ordering, activation recovery, and nil-adapter fail-closed behavior.
+  This prevents `splitterctl` from duplicating systemd, Xray, origin, or
+  firewall policy.
 
 - **T8 rollback core (implemented locally; CLI host adapter still pending):**
   `internal/deploy.Store.Rollback` restores a retained same-role revision via an
