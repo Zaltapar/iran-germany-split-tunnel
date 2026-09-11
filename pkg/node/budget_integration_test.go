@@ -274,6 +274,14 @@ func TestAggregateBudgetStress200SessionsCarrierCycling(t *testing.T) {
 		cycles = 3
 	)
 	tp := newTopoBudget(t, 3*time.Second, 64<<10, limit)
+	// Drain-contention bound (see readDeadline, dimension 3): 200
+	// sessions release 200×32 KiB through ONE 32 KiB aggregate per
+	// cycle, so a TAIL session's bytes wait behind up to 199 other
+	// sessions' drains. On a loaded 2-vCPU runner that delay far
+	// exceeds the per-byte margin (observed 100 s+, CI run #52); the
+	// bound is the worst case scaled for runner load, and stays finite
+	// so a stuck relay still fails.
+	tp.drainExtra = 3 * time.Minute
 	tp.setup()
 	sam := startInvariantSampler(t, tp.iran.SessionBufferAccounted, limit64(limit))
 

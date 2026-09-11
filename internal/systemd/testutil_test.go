@@ -180,10 +180,24 @@ func okHandler(args []string) (string, error) {
 // test fixture planting only.
 func writeRaw(t *testing.T, path string, data []byte) {
 	t.Helper()
+	writeMode(t, path, data, 0o644)
+}
+
+// writeRaw0600 plants a fixture at 0600 — the mode the production env
+// files carry (D4). The Linux-gated preflight (env mode ≤ 0640) rejects
+// 0644 fixtures, so every planted env file must use this. On non-Linux
+// hosts the permission bits are not meaningful and the check is absent.
+func writeRaw0600(t *testing.T, path string, data []byte) {
+	t.Helper()
+	writeMode(t, path, data, 0o600)
+}
+
+func writeMode(t *testing.T, path string, data []byte, mode os.FileMode) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("mkdir for %s: %v", path, err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, mode); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }

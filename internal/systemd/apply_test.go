@@ -29,7 +29,9 @@ func plantApplyPreconditions(t *testing.T, s Spec) {
 	t.Helper()
 	writeRaw(t, s.BinPath, []byte("fake binary\n"))
 	if s.Component == ComponentSplitter {
-		writeRaw(t, envPath(s.Role), []byte("SPLIT_SECRET="+secretMarker+"\n"))
+		// 0600: production env files are 0600 root:root (D4), and the
+		// Linux-gated preflight rejects env files more permissive than 0640.
+		writeRaw0600(t, envPath(s.Role), []byte("SPLIT_SECRET="+secretMarker+"\n"))
 	}
 	for _, unit := range s.RequiresUnits {
 		writeRaw(t, filepath.Join(unitDir, unit), []byte("[Unit]\n"))
