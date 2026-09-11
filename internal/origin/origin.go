@@ -149,6 +149,11 @@ type Plan struct {
 	CDNOriginTrust CDNOriginTrust // pullCA | unauthenticatedTLS — REQUIRED for cdn mode A (D9)
 }
 
+// ValidatePlan exposes the provider's pure, fail-closed plan validation to
+// deployment orchestration. It performs no filesystem, process, or network
+// operations.
+func ValidatePlan(p Plan) error { return p.validate() }
+
 // validate is fail-closed: it returns a single error naming the
 // offending fields (never their values). Mirrors xray and pairing.
 func (p Plan) validate() error {

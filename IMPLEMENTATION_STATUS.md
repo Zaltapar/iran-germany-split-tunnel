@@ -1,9 +1,18 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8 controller checkpoint (full local tests pending)
+Latest recorded commit: pending T8 request-input checkpoint (full local tests pending)
 
 ## Current state
+
+- **T8 typed request input boundary (implemented locally; production role
+  adapters still pending):** `internal/deploy.InstallRequest` validates
+  role-specific splitter configuration through `internal/config`, origin plans
+  through the exported pure `origin.ValidatePlan`, pinned Xray/Caddy version
+  shapes through their authoritative validators, absolute managed paths, and
+  public Iran origin restrictions. Conversion to `DesiredState` excludes the
+  tunnel secret and performs no I/O. Tests cover valid Iran/Germany requests,
+  delegated validation failures, incomplete artifacts, and unsafe paths.
 
 - **T8 controller boundary (implemented locally; production role adapters
   still pending):** `internal/deploy.Controller` owns current-state loading,
