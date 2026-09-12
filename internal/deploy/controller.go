@@ -62,6 +62,14 @@ func (c *Controller) ApplyRequest(ctx context.Context, request InstallRequest) (
 	if previous.Generation != "" && previous.Role != desired.Role {
 		return Result{}, fmt.Errorf("deploy: host is installed as %q; refusing to install %q on the same state root", previous.Role, desired.Role)
 	}
+	// install is not authoritative over pairing: the committed pairing state
+	// (and its fingerprints) is owned by the pair generate|apply|finalize
+	// commands. Carry it forward into the desired state so a re-apply compares
+	// like-for-like — an identical request stays a true no-op, and a committed
+	// pairing state is never silently reset to "none" by an install.
+	if previous.Generation != "" {
+		desired.Pairing = previous.Pairing
+	}
 	return ApplyDesired(ctx, c.Store, previous, desired, c.Adapter)
 }
 

@@ -196,7 +196,12 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 		},
 		Paths:    Paths{StateRoot: r.StateRoot, Env: r.EnvPath, Config: r.ConfigPath},
 		Services: services,
-		Pairing:  PairingState{State: "none"},
+		// Desired expresses only install's pairing baseline. install does not
+		// own pairing: the pair generate|apply|finalize commands do. The
+		// controller carries a committed pairing state forward over this
+		// baseline so a re-apply neither detects spurious drift nor clobbers
+		// the committed state.
+		Pairing:  PairingState{State: PairingStateNone},
 		Firewall: FirewallState{Backend: string(r.Firewall.Backend), Ownership: firewall.Marker, RulesHash: firewallFingerprint(r.Firewall)},
 	}
 	return d, nil

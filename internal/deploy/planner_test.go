@@ -54,3 +54,21 @@ func TestPlanRejectsRoleChange(t *testing.T) {
 		t.Fatal("role change unexpectedly accepted")
 	}
 }
+
+// TestPlanReportsGenuinePairingDrift guards the comparison the controller's
+// carry-forward relies on: when desired really differs from the committed
+// pairing state the planner must still report it, so the fix cannot merely
+// delete the comparison.
+func TestPlanReportsGenuinePairingDrift(t *testing.T) {
+	current := testManifest("/tmp/state", RoleIran)
+	current.Pairing = PairingState{State: "a-generated", Fingerprints: []string{"fp"}}
+	desired := desiredFor(current)
+	desired.Pairing = PairingState{State: "finalized", Fingerprints: []string{"fp"}}
+	plan, err := PlanDesired(&current, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Unchanged || len(plan.Changes) != 1 || plan.Changes[0].Field != "pairing.state" {
+		t.Fatalf("plan = %+v, want one pairing.state change", plan)
+	}
+}

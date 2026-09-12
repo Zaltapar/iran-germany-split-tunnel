@@ -56,6 +56,14 @@ type PairingState struct {
 	Fingerprints []string `json:"fingerprints,omitempty"`
 }
 
+// PairingStateNone is the pairing baseline a request expresses before any
+// pairing has occurred. install is deliberately NOT authoritative over
+// pairing: the committed pairing state is owned by the pair
+// generate|apply|finalize commands, and Controller.ApplyRequest carries that
+// committed state forward so a re-apply compares like-for-like instead of
+// resetting it.
+const PairingStateNone = "none"
+
 type ServiceState struct {
 	Unit      string `json:"unit"`
 	Component string `json:"component"`
