@@ -13,7 +13,10 @@ type Adapter interface {
 	Activate(context.Context, DesiredState) error
 	Transition(context.Context, DesiredState) error
 	Health(context.Context, DesiredState) error
-	// Restore is used only when a committed previous manifest exists.
+	// Restore is used only when a committed previous manifest exists:
+	// a failed transaction calls it to return the host to that manifest,
+	// and an operator rollback (Store.Rollback) calls it to converge the
+	// host to a retained revision. It must be bounded by ownership.
 	Restore(context.Context, Manifest) error
 	// CleanupFresh removes only artifacts recorded as created by this
 	// transaction when a fresh install has no previous manifest to restore.
@@ -28,8 +31,13 @@ func ApplyDesired(ctx context.Context, store *Store, previous Manifest, desired 
 	if adapter == nil {
 		return Result{}, ErrTransaction
 	}
+	journal, err := BuildJournal(store.Root, previous, desired)
+	if err != nil {
+		return Result{}, err
+	}
 	tx := Transaction{
 		Store:    store,
+		Journal:  journal,
 		Previous: previous,
 		Desired:  desired,
 		Recover: func(recoveryCtx context.Context, old Manifest) error {
