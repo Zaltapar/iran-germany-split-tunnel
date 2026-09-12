@@ -1,17 +1,64 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: pending T8-B artifact-journal checkpoint (full local tests pending)
+Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests green, Linux staging pending)
 
 ## Current state
 
-- **T8-B artifact journal foundation (implemented locally; journal persistence/
-  adapter restore and CLI rollback still pending):** `ArtifactJournal` records
-  only project-owned files, units, firewall ownership, and managed artifact
-  directories. Validation rejects invalid roles, traversal, unsafe units, and
-  paths outside the managed state root. This is the prerequisite for truthful
-  retained-revision restore and ownership-scoped uninstall; no state-only
-  rollback is exposed.
+- **T8-B real CLI mutations (implemented locally; Linux staging still pending):**
+  `cmd/splitterctl` now wires `install iran|germany`, `rollback --to state-id`,
+  `uninstall [--purge]`, and `recover [--ack]` to the production
+  `LinuxAdapter` + `Controller` on the canonical T5 state root
+  (`/etc/split-tunnel`). Mutation commands are Linux-gated (a stray run on
+  another platform fails fast, nothing is touched), build a complete
+  `InstallRequest` from the documented environment contract
+  (`SPLIT_*` config vars, `SPLITTERCTL_SPLITTER_BIN`/`_VERSION`, Germany
+  `SPLITTERCTL_XRAY_VERSION` (default pinned) + `SPLITTERCTL_REALITY_SNI`/
+  `_SHORT_ID`/`_UUID`, Iran `SPLITTERCTL_ORIGIN_MODE`/`_UPLOAD_DOMAIN`/
+  `_ORIGIN_PORT` + ACME and CDN sub-fields, optional
+  `SPLITTERCTL_FIREWALL_BACKEND`/`_FW_ALLOW`/`_FW_DENY`), and enforce
+  canonical paths (`NewLinuxAdapter` rejects non-canonical requests).
+  `upgrade` and `config set` remain explicit not-wired errors with
+  documented rationale (component-scoped and in-place-reconfiguration
+  transactions need their own semantics). Error text names fields, never
+  values. Rollback/uninstall re-derive the request from the CURRENT role's
+  environment (the manifest stores fingerprints, not secrets) and exit
+  early with "nothing installed" on an empty canonical root. Full local
+  suite green on Windows; no staging mutation was performed and T8 is NOT
+  claimed complete without a clean-Ubuntu L5 acceptance run.
+
+- **T8-B bounded restore + journal lifecycle (implemented locally; Linux
+  staging still pending):** `LinuxAdapter.Restore` has three dispatch paths —
+  (1) journal present: precise in-flight recovery bounded by the journal's
+  pre-state (replaced units → T5 `RollbackLast`, new units → `RemoveUnit`,
+  applied firewall → owned-rule removal, env file → `RollbackEnvFile` when
+  the previous state had one, new files removed, pre-existing files left to
+  their owner's rollback artifact); (2) no journal + no in-flight units:
+  operator rollback via `Store.Rollback` → `rollbackTo`, which converges the
+  host to the retained revision by RE-RENDERING (xray pointer re-point,
+  remove units absent from the target, idempotent `ApplyUnit` per target
+  unit, `WaitActive` health pass) — not by re-running install, and with
+  fail-closed guards where the manifest is not reconstructible (firewall
+  rules hash, Germany Reality fingerprint — the prior keypair is not
+  retained, Iran origin mode/version/domain); (3) no journal but in-flight
+  units remain: fail closed with `ErrTransaction` (manual recovery).
+  `Transaction` now persists the ownership journal BEFORE the first
+  mutation and retains it on EVERY failure path (even when in-process
+  recovery succeeds) as the recovery evidence; only a successful commit
+  clears it. `Controller` gates install/rollback on a stale journal
+  (`finish recovery before installing/rolling back`), and the new
+  `splitterctl recover` command reports the retained journal (secret-free
+  by construction) and, with `--ack`, clears it after the operator verifies
+  the host. The env file is deliberately never rewritten by rollback (the
+  secret is not in the manifest and is invariant across revisions in the
+  current product; no config-set exists).
+
+- **T8-B artifact journal foundation (committed `10b4b84`):**
+  `ArtifactJournal` records only project-owned files, units, firewall
+  ownership, and managed artifact directories. Validation rejects invalid
+  roles, traversal, unsafe units, and paths outside the managed state
+  root. This is the prerequisite for truthful retained-revision restore and
+  ownership-scoped uninstall; no state-only rollback is exposed.
 
 - **T8-B real pairing CLI slice (implemented locally; install/upgrade/rollback/
   uninstall/config mutation still pending):** `splitterctl pair` now uses the
@@ -21,15 +68,14 @@ Latest recorded commit: pending T8-B artifact-journal checkpoint (full local tes
   Iran `pair finalize` accepts Blob B. Raw blobs and tunnel secrets are not
   persisted. Full local tests pass.
 
-- **T8-B concrete Linux composition root (implemented locally; CLI mutation
-  wiring and retained-artifact rollback still pending):** `internal/deploy`
-  now provides `LinuxAdapter`, which is Linux-only, canonical-T5-path guarded,
-  and delegates user/directories/env/units to `internal/systemd`, Germany Xray
-  install/keygen/config activation to `internal/xray`, Iran origin to
-  `internal/origin`, and firewall convergence to `internal/firewall`. The
-  adapter has explicit fresh cleanup ownership and refuses empty-manifest
-  upgrade restore until an artifact journal is available. Full local tests pass;
-  no staging mutation was performed.
+- **T8-B concrete Linux composition root (committed `10b4b84`):**
+  `internal/deploy` now provides `LinuxAdapter`, which is Linux-only,
+  canonical-T5-path guarded, and delegates user/directories/env/units to
+  `internal/systemd`, Germany Xray install/keygen/config activation to
+  `internal/xray`, Iran origin to `internal/origin`, and firewall convergence
+  to `internal/firewall`. The adapter has explicit fresh cleanup ownership and
+  refuses empty-manifest upgrade restore until an artifact journal is
+  available. Full local tests pass; no staging mutation was performed.
 
 - **T8-B Reality input and complete planner drift (implemented locally;
   concrete Linux adapters still pending):** Germany requests now carry only
