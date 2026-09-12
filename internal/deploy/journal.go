@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 )
 
 // ArtifactJournal records the ownership-scoped pre-state and scope of one
@@ -22,7 +25,9 @@ import (
 // PreFiles are the config files that existed before the transaction (newly
 // created files are deletable on recovery; pre-existing ones are left for
 // their owner's rollback path). XrayDir/OriginDir are the canonical
-// project-owned version directories (outside the state root by design).
+// project-owned version directories: outside the state root but always
+// contained within the managed binary prefix (validate enforces this, and
+// CleanupFresh's removal is prefix-bounded and symlink-safe).
 type ArtifactJournal struct {
 	Generation string   `json:"generation"`
 	Role       string   `json:"role"`
@@ -49,7 +54,27 @@ func (j ArtifactJournal) validate(root string) error {
 			return fmt.Errorf("deploy: journal unit is invalid")
 		}
 	}
+	// XrayDir/OriginDir are the persisted version directories CleanupFresh
+	// recursively removes, so they are containment-checked against the
+	// managed binary prefix (RF-3): a tampered journal must not be able to
+	// point a recursive delete outside /opt/split-tunnel.
+	for _, dir := range []string{j.XrayDir, j.OriginDir} {
+		if dir == "" {
+			continue
+		}
+		if !binaryPrefixContained(dir) {
+			return fmt.Errorf("deploy: journal directory is outside binary prefix")
+		}
+	}
 	return nil
+}
+
+// binaryPrefixContained reports whether dir is an absolute, rooted path
+// strictly inside systemd.BinaryPrefix. Rootedness is checked textually (a
+// leading "/") because filepath.IsAbs is false for "/opt/..." on non-Unix
+// hosts, while the managed paths are always Unix-absolute by construction.
+func binaryPrefixContained(dir string) bool {
+	return strings.HasPrefix(dir, "/") && within(systemd.BinaryPrefix, dir)
 }
 
 // journalPath is the single in-flight journal location under the state root.

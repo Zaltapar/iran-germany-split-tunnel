@@ -574,13 +574,13 @@ func (a *LinuxAdapter) CleanupFresh(ctx context.Context, desired DesiredState) e
 				return err
 			}
 			if j.XrayDir != "" {
-				if err := os.RemoveAll(j.XrayDir); err != nil {
+				if err := removePrefixDir(j.XrayDir, systemd.BinaryPrefix); err != nil {
 					return err
 				}
 			}
 		}
 		if a.Request.Role == RoleIran && j.OriginDir != "" {
-			if err := os.RemoveAll(j.OriginDir); err != nil {
+			if err := removePrefixDir(j.OriginDir, systemd.BinaryPrefix); err != nil {
 				return err
 			}
 		}
@@ -589,6 +589,53 @@ func (a *LinuxAdapter) CleanupFresh(ctx context.Context, desired DesiredState) e
 		return err
 	}
 	return nil
+}
+
+// removePrefixDir removes a project-owned version directory only when it is
+// strictly inside the managed binary prefix. It is the symlink-safe,
+// prefix-bounded replacement for a raw os.RemoveAll on a persisted journal
+// field: a malformed or tampered journal must never direct a recursive
+// deletion outside prefix (defense in depth — the prefix is re-asserted here
+// and not merely trusted from journal validation). A symlink is removed as a
+// link only, never followed into its target; a non-directory is refused.
+func removePrefixDir(dir, prefix string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("deploy: resolve %s: %w", filepath.Base(dir), err)
+	}
+	absPrefix, err := filepath.Abs(prefix)
+	if err != nil {
+		return fmt.Errorf("deploy: resolve binary prefix: %w", err)
+	}
+	if abs != absPrefix && !within(absPrefix, abs) {
+		return fmt.Errorf("deploy: refusing to remove %s outside binary prefix", filepath.Base(dir))
+	}
+	return removeWithinPrefix(abs)
+}
+
+// removeWithinPrefix Lstat's a path that the caller has already verified is
+// inside the managed prefix and removes it without following symlinks: a
+// symlink is unlinked (never recursed into), a directory is removed
+// recursively, and any other object is refused. Kept separate from the
+// prefix check so the symlink/non-directory branches are unit-testable
+// without writing to the fixed production prefix.
+func removeWithinPrefix(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		// A symlinked version dir: unlink the link only. Recursing would
+		// delete the (arbitrary) link target.
+		return os.Remove(path)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("deploy: refusing to remove non-directory %s", filepath.Base(path))
+	}
+	return os.RemoveAll(path)
 }
 
 // Uninstall removes the currently-committed deployment for the adapter's
