@@ -21,9 +21,13 @@ type recoveryOpsFake struct {
 	removed   []string
 	rolled    []string
 	reapplied []string
-	envRoll   int
-	unitDir   string
-	failWith  error
+	// reappliedSpecs records the FULL spec passed to ReapplyUnit so a test
+	// can assert the DEFECT-3 fallback renders the committed unit faithfully
+	// (dependency ordering and canonical env path included).
+	reappliedSpecs []systemd.Spec
+	envRoll        int
+	unitDir        string
+	failWith       error
 	// noBackup makes RollbackLast report systemd.ErrNoUnitBackup — the
 	// no-managed-backup condition DEFECT-3 recovery must converge through.
 	noBackup bool
@@ -47,6 +51,7 @@ func (o *recoveryOpsFake) RollbackLast(_ context.Context, _ *systemd.ServiceMana
 
 func (o *recoveryOpsFake) ReapplyUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
 	o.reapplied = append(o.reapplied, s.UnitName)
+	o.reappliedSpecs = append(o.reappliedSpecs, s)
 	return o.failWith
 }
 
@@ -173,6 +178,38 @@ func newRecoveryFixture(t *testing.T, role string, journal ArtifactJournal) *rec
 		unitDir: unitDir, config: config, env: env, xrayDir: xrayDir,
 		sentinel: sentinel, unrelated: unrelated,
 	}
+}
+
+// withValidRequest gives the fixture adapter a COMPLETE, validated request
+// rooted at the fixture's temp state. Production adapters always carry such a
+// request (NewLinuxAdapter validates it), and recovery's faithful spec
+// derivation (recoverySpecFor → BuildSystemdPlan) requires it; the fixture's
+// minimal request lacks the role-specific artifact metadata. The request is
+// returned so a test can build the authoritative plan for comparison.
+func (fx *recoveryFixture) withValidRequest(t *testing.T, role string) InstallRequest {
+	t.Helper()
+	var req InstallRequest
+	if role == RoleGermany {
+		req = validGermanyRequest()
+	} else {
+		req = validIranRequest()
+	}
+	req.StateRoot = fx.store.Root
+	req.EnvPath = fx.env
+	req.ConfigPath = fx.config
+	fx.adapter.Request = req
+	return req
+}
+
+// renderSafeSplitterPath returns an absolute, whitespace-free path that
+// InstallRequest.Validate accepts on both Windows and Unix and that
+// systemd.RenderUnit (which rejects whitespace) can render. The request
+// helpers root artifacts under the checkout, whose path may contain spaces.
+func renderSafeSplitterPath() string {
+	if vol := filepath.VolumeName(absoluteTestPath("x")); vol != "" {
+		return vol + string(filepath.Separator) + "split-tunnel-test-splitter"
+	}
+	return "/split-tunnel-test-splitter"
 }
 
 func mustExist(t *testing.T, path string) {
@@ -599,6 +636,10 @@ func TestRecoverFreshRemovesOwnedEnv(t *testing.T) {
 func TestRecoverUpgradeConvergesWhenNoUnitBackup(t *testing.T) {
 	journal := ArtifactJournal{Role: RoleGermany, Generation: "pending-2"}
 	fx := newRecoveryFixture(t, RoleGermany, journal)
+	// Production adapters always carry a complete, validated request, and the
+	// faithful re-apply (recoverySpecFor → BuildSystemdPlan) requires one; the
+	// fixture's minimal request lacks the Germany artifact metadata.
+	fx.withValidRequest(t, RoleGermany)
 	previous := testManifest(fx.store.Root, RoleGermany)
 	previous.Generation = "g1"
 	previous.Services = []ServiceState{{Unit: "germany-splitter.service", Component: "splitter"}}
@@ -632,5 +673,158 @@ func TestRecoverUpgradeConvergesWhenNoUnitBackup(t *testing.T) {
 	}
 	if _, err := fx.store.Load(); err != nil {
 		t.Fatalf("committed manifest must survive recovery: %v", err)
+	}
+}
+
+// TestRecoveryReapplyMatchesNormalApply is the DEFECT-3 spec-fidelity
+// regression: the recovery re-apply fallback must reproduce the EXACT unit
+// the normal apply path installs — same spec and same rendered bytes — for
+// both roles. Before the fix, unitSpecFor omitted RequiresUnits/OriginEnabled,
+// so the fallback wrote a unit missing the After=/Wants= dependency ordering
+// (a silent divergence from the committed content).
+func TestRecoveryReapplyMatchesNormalApply(t *testing.T) {
+	cases := []struct {
+		name string
+		role string
+		unit string
+	}{
+		{"germany splitter requires xray", RoleGermany, "germany-splitter.service"},
+		{"iran splitter origin-enabled", RoleIran, "iran-splitter.service"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var request InstallRequest
+			if tc.role == RoleGermany {
+				request = validGermanyRequest()
+			} else {
+				request = validIranRequest()
+			}
+			// Render-safe splitter path. RenderUnit rejects whitespace, and
+			// the request helpers root artifacts under the checkout (which may
+			// contain spaces); the path does not affect the fidelity property
+			// under test, only that the request validates and renders.
+			request.SplitterPath = renderSafeSplitterPath()
+
+			adapter := &LinuxAdapter{Request: request}
+			got, err := adapter.recoverySpecFor(tc.unit)
+			if err != nil {
+				t.Fatalf("recoverySpecFor(%s): %v", tc.unit, err)
+			}
+
+			// The authoritative normal-apply spec: BuildSystemdPlan is the
+			// single source of truth, normalised exactly as the production
+			// Activate path normalises the xray unit. The normalisation is
+			// written out here (rather than reusing the helper) so the test
+			// pins the intended contract independently of the helper.
+			plan, err := BuildSystemdPlan(request)
+			if err != nil {
+				t.Fatalf("BuildSystemdPlan: %v", err)
+			}
+			var want systemd.Spec
+			found := false
+			for _, spec := range plan.Specs {
+				if unitName(spec) == tc.unit {
+					if spec.Component == systemd.ComponentXray {
+						spec.BinPath = systemd.XrayBinaryPath
+					}
+					spec.UnitName = tc.unit
+					want = spec
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("unit %s absent from the normal plan %#v", tc.unit, plan.Specs)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("recovery spec = %#v, want the normal-apply spec %#v", got, want)
+			}
+
+			// The substantive property: the rendered BYTES match.
+			gotBytes, err := systemd.RenderUnit(got)
+			if err != nil {
+				t.Fatalf("RenderUnit(recovery): %v", err)
+			}
+			wantBytes, err := systemd.RenderUnit(want)
+			if err != nil {
+				t.Fatalf("RenderUnit(normal): %v", err)
+			}
+			if string(gotBytes) != string(wantBytes) {
+				t.Fatalf("recovery unit bytes differ from the normal apply path:\n--- recovery ---\n%s\n--- normal ---\n%s", gotBytes, wantBytes)
+			}
+
+			// Pin the specific fidelity properties the defect was about.
+			switch tc.unit {
+			case "germany-splitter.service":
+				if len(got.RequiresUnits) != 1 || got.RequiresUnits[0] != "xray-germany.service" {
+					t.Fatalf("germany splitter RequiresUnits = %#v, want [xray-germany.service]", got.RequiresUnits)
+				}
+			case "iran-splitter.service":
+				if !got.OriginEnabled {
+					t.Fatal("iran splitter lost its OriginEnabled flag on recovery re-apply")
+				}
+			}
+			if got.EnvFile != systemd.EnvFile(systemd.Role(request.Role)) {
+				t.Fatalf("env file = %q, want the canonical %q", got.EnvFile, systemd.EnvFile(systemd.Role(request.Role)))
+			}
+		})
+	}
+}
+
+// TestRecoverySpecForUnknownUnitFailsClosed asserts an unknown unit name (one
+// not in the request's plan) is refused rather than re-applied with a guessed
+// spec.
+func TestRecoverySpecForUnknownUnitFailsClosed(t *testing.T) {
+	adapter := &LinuxAdapter{Request: validGermanyRequest()}
+	if _, err := adapter.recoverySpecFor("iran-origin.service"); err == nil {
+		t.Fatal("recoverySpecFor accepted a unit absent from the request's plan")
+	}
+}
+
+// TestRecoverUpgradeReapplyIsSpecFaithful drives the DEFECT-3 fallback through
+// the real recovery path and asserts the spec handed to ReapplyUnit equals the
+// normal-apply spec (not the minimal name-scoped one).
+func TestRecoverUpgradeReapplyIsSpecFaithful(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleGermany, Generation: "pending-2"}
+	fx := newRecoveryFixture(t, RoleGermany, journal)
+	req := fx.withValidRequest(t, RoleGermany)
+
+	previous := testManifest(fx.store.Root, RoleGermany)
+	previous.Generation = "g1"
+	previous.Services = []ServiceState{{Unit: "germany-splitter.service", Component: "splitter"}}
+	if _, err := fx.store.Commit(previous, "install"); err != nil {
+		t.Fatal(err)
+	}
+	journal.Units = []string{"germany-splitter.service"}
+	journal.PreUnits = []string{"germany-splitter.service"}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	fx.ops.noBackup = true
+
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err != nil {
+		t.Fatalf("recovery did not converge: %v", err)
+	}
+	if len(fx.ops.reappliedSpecs) != 1 {
+		t.Fatalf("reapplied specs = %#v, want exactly one", fx.ops.reappliedSpecs)
+	}
+	got := fx.ops.reappliedSpecs[0]
+	if len(got.RequiresUnits) != 1 || got.RequiresUnits[0] != "xray-germany.service" {
+		t.Fatalf("recovery re-apply lost the xray dependency: %#v", got.RequiresUnits)
+	}
+	plan, err := BuildSystemdPlan(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want systemd.Spec
+	for _, spec := range plan.Specs {
+		if unitName(spec) == "germany-splitter.service" {
+			spec.UnitName = "germany-splitter.service"
+			want = spec
+			break
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovery re-apply spec = %#v, want the normal-apply spec %#v", got, want)
 	}
 }

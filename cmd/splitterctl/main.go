@@ -377,12 +377,23 @@ func recoverCommand(ctx context.Context, ack bool, out io.Writer) error {
 		journal.Firewall)
 	if ack {
 		// --ack is the explicit manual escape hatch, but it must not silently
-		// unblock mutations on a host whose committed role CONTRADICTS the
+		// unblock mutations on a host whose committed state CONTRADICTS the
 		// in-flight journal: that is evidence of an inconsistent host, not a
-		// reconciled one. Fail closed with a diagnosable error. When no
-		// committed manifest exists there is nothing to contradict, so the
-		// ack-clear proceeds (a crashed fresh install).
-		if committed, err := store.Load(); err == nil && committed.Role != "" && committed.Role != journal.Role {
+		// reconciled one. Fail closed with a diagnosable error.
+		//
+		//   - No committed manifest (os.ErrNotExist): nothing to contradict,
+		//     so the ack-clear proceeds (a crashed fresh install).
+		//   - A committed manifest whose role AGREES with the journal: safe.
+		//   - A committed manifest whose role DIFFERS: refuse.
+		//   - ANY other Load error (notably ErrTampered): the committed state
+		//     cannot be trusted to prove the roles agree, so refuse. Silently
+		//     proceeding here would let --ack unblock mutations against a
+		//     host whose committed state is unreadable or tampered.
+		committed, lerr := store.Load()
+		if lerr != nil && !errors.Is(lerr, os.ErrNotExist) {
+			return fmt.Errorf("recover: refusing --ack: committed state could not be read (%v); reconcile the host (or run recover without --ack) before acknowledging", lerr)
+		}
+		if lerr == nil && committed.Role != "" && committed.Role != journal.Role {
 			return fmt.Errorf("recover: refusing --ack: journal role %q does not match committed role %q; reconcile the host (or run recover without --ack) before acknowledging", journal.Role, committed.Role)
 		}
 		if err := store.ClearJournal(); err != nil {

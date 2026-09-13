@@ -290,9 +290,7 @@ func (a *LinuxAdapter) Activate(ctx context.Context, desired DesiredState) error
 		}
 	}
 	for _, spec := range a.units {
-		if spec.Component == systemd.ComponentXray {
-			spec.BinPath = systemd.XrayBinaryPath
-		}
+		spec = applyReadySpec(spec)
 		if _, err := systemd.ApplyUnit(ctx, a.Services, spec); err != nil {
 			return err
 		}
@@ -612,11 +610,23 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 			// DEFECT-3 convergence: a pre-existing unit with NO managed
 			// backup to restore (created by a fresh install, never backed
 			// up) must not deadlock recovery. The unit's committed content
-			// is reconstructible from the manifest/request, so re-apply it
-			// instead of failing; recovery stays ownership-scoped and the
-			// host converges to the previous state.
+			// is reconstructible from the request, so re-apply it instead
+			// of failing; recovery stays ownership-scoped and the host
+			// converges to the previous state.
 			if errors.Is(err, systemd.ErrNoUnitBackup) {
-				if rerr := a.ops().ReapplyUnit(ctx, a.Services, spec); rerr != nil {
+				// The re-apply RENDERS unit bytes (unlike RemoveUnit/
+				// RollbackLast, which consume only the unit name), so it
+				// must use the SAME spec the normal apply path writes —
+				// dependency ordering (RequiresUnits/OriginEnabled) and
+				// the canonical env path included. recoverySpecFor derives
+				// that spec from the single authoritative source
+				// (BuildSystemdPlan), so the fallback converges to the
+				// committed unit bytes rather than a divergent minimal one.
+				faithful, ferr := a.recoverySpecFor(unit)
+				if ferr != nil {
+					return ferr
+				}
+				if rerr := a.ops().ReapplyUnit(ctx, a.Services, faithful); rerr != nil {
 					return fmt.Errorf("deploy: recovery: re-apply unit %s after missing backup: %w", unit, rerr)
 				}
 				continue
@@ -633,6 +643,11 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 // managed file; both operations derive the file from the unit name, so the
 // remaining spec fields are informational. The unit name is validated by T5
 // (Spec.unitName) inside those operations.
+//
+// unitSpecFor is deliberately name-scoped: it is correct ONLY for the
+// name-consuming operations (RemoveUnit, RollbackLast, DisableUnit). It does
+// NOT render bytes, so it must never feed ApplyUnit — use recoverySpecFor for
+// that, which reproduces the committed unit content.
 func (a *LinuxAdapter) unitSpecFor(unit string) (systemd.Spec, error) {
 	switch unit {
 	case "xray-germany.service":
@@ -642,6 +657,54 @@ func (a *LinuxAdapter) unitSpecFor(unit string) (systemd.Spec, error) {
 	default:
 		return systemd.Spec{Role: systemd.Role(a.Request.Role), Component: systemd.ComponentSplitter, UnitName: unit, BinPath: a.Request.SplitterPath, EnvFile: systemd.EnvFile(systemd.Role(a.Request.Role))}, nil
 	}
+}
+
+// applyReadySpec returns the spec exactly as the apply path must write it.
+// BuildSystemdPlan emits the request's VERSIONED xray artifact path, but the
+// xray unit is version-independent by design (design §4.7 — an xray upgrade
+// never rewrites the unit) and must always run the "current" pointer. Both the
+// normal apply path (Activate) and the DEFECT-3 recovery re-apply normalise
+// through this ONE helper, so the bytes written on the host have a single
+// source of truth instead of two divergent copies of the same rule.
+func applyReadySpec(spec systemd.Spec) systemd.Spec {
+	if spec.Component == systemd.ComponentXray {
+		spec.BinPath = systemd.XrayBinaryPath
+	}
+	return spec
+}
+
+// recoverySpecFor returns the FULLY-FAITHFUL spec for a unit NAME recorded in
+// the journal, suitable for rendering/ApplyUnit. It derives the spec from the
+// single authoritative source, BuildSystemdPlan(a.Request), which is exactly
+// what the normal apply path (Validate/Activate) installs, so the DEFECT-3
+// recovery fallback converges to the committed unit BYTES rather than a
+// divergent minimal spec:
+//
+//   - the Germany splitter keeps its RequiresUnits=[xray-germany.service]
+//     dependency (After=/Wants= ordering);
+//   - the Iran splitter keeps its OriginEnabled flag (the origin-mode-driven
+//     After=/Wants= reference to iran-origin.service);
+//   - the canonical EnvFile is used (BuildSystemdPlan reads it from the
+//     authoritative systemd.EnvFile helper — the same value unitSpecFor sets).
+//
+// The spec is then passed through applyReadySpec — the SAME normalisation
+// Activate uses — so an xray re-apply is a byte no-op. The requested unit name
+// is pinned onto the matched plan spec so the operation targets the journal's
+// unit even if the plan's derived name were to differ.
+func (a *LinuxAdapter) recoverySpecFor(unit string) (systemd.Spec, error) {
+	plan, err := BuildSystemdPlan(a.Request)
+	if err != nil {
+		return systemd.Spec{}, fmt.Errorf("deploy: recovery: build unit plan: %w", err)
+	}
+	for _, spec := range plan.Specs {
+		if unitName(spec) != unit {
+			continue
+		}
+		spec = applyReadySpec(spec)
+		spec.UnitName = unit
+		return spec, nil
+	}
+	return systemd.Spec{}, fmt.Errorf("deploy: recovery: unit %s is not part of the request's plan", unit)
 }
 
 // removeOwnedFiles removes each file in owned that is NOT recorded as

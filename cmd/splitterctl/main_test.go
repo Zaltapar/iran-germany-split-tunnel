@@ -341,6 +341,46 @@ func TestRecoverAckAllowedWhenRolesAgree(t *testing.T) {
 	}
 }
 
+// TestRecoverAckRefusesUnreadableCommittedState asserts --ack fails closed when
+// the committed manifest exists but cannot be trusted: a non-os.ErrNotExist
+// Load error (here ErrTampered) means the committed state cannot prove the
+// roles agree, so --ack must refuse and RETAIN the journal. The roles in this
+// test AGREE, so only the fail-closed-on-unreadable rule can refuse the ack.
+func TestRecoverAckRefusesUnreadableCommittedState(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitRole(t, store, deploy.RoleGermany)
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleGermany, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	// Tamper the committed manifest so Load returns ErrTampered (the stored
+	// hash no longer matches) rather than os.ErrNotExist.
+	statePath := filepath.Join(store.Root, "state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-2] ^= 1
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"recover", "--ack"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "refusing --ack") {
+		t.Fatalf("error = %v, want an ack refusal on unreadable committed state", err)
+	}
+	if _, jerr := store.ReadJournal(); jerr != nil {
+		t.Fatalf("journal must be retained after a refused ack: %v", jerr)
+	}
+}
+
 // TestRecoverAckAllowedWithNoManifest asserts --ack clears the journal when no
 // committed manifest exists (a crashed fresh install has nothing to contradict).
 func TestRecoverAckAllowedWithNoManifest(t *testing.T) {
