@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,6 +62,12 @@ var managedBinaryPrefix = systemd.BinaryPrefix
 type recoveryOps interface {
 	RemoveUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
 	RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
+	// ReapplyUnit re-applies a committed unit spec from the manifest. It is
+	// the convergence fallback for DEFECT-3: when RollbackLast finds no
+	// managed backup to restore (the unit was created by a fresh install and
+	// never backed up), recovery re-renders and re-applies the committed
+	// unit instead of failing, so a crashed upgrade converges.
+	ReapplyUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
 	RollbackEnvFile(ctx context.Context, role systemd.Role) error
 }
 
@@ -73,6 +80,14 @@ func (systemdRecoveryOps) RemoveUnit(ctx context.Context, m *systemd.ServiceMana
 
 func (systemdRecoveryOps) RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
 	return systemd.RollbackLast(ctx, m, s)
+}
+
+// ReapplyUnit converges a committed unit by re-rendering it from its spec and
+// applying it through T5's transactional ApplyUnit (a byte no-op when the live
+// bytes already match, a validated/backed-up swap otherwise).
+func (systemdRecoveryOps) ReapplyUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
+	_, err := systemd.ApplyUnit(ctx, m, s)
+	return err
 }
 
 func (systemdRecoveryOps) RollbackEnvFile(ctx context.Context, role systemd.Role) error {
@@ -488,11 +503,40 @@ func (a *LinuxAdapter) recoverFresh(ctx context.Context, j ArtifactJournal) erro
 	if err := a.removeOwnedVersionDirs(ctx, j); err != nil {
 		return err
 	}
-	// Env file (created by this transaction; a fresh install has none before).
-	if err := os.Remove(a.Request.EnvPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("deploy: recovery: env file: %w", err)
+	// Env file: removed ONLY when this transaction created it. BuildJournal
+	// classifies the env path into Files (absent before → owned) vs PreFiles
+	// (pre-existing → NOT owned). A fresh install normally has no prior env,
+	// but a journal may record one that pre-existed (or that the crashed
+	// transaction never reached); deleting it then would destroy a resource
+	// this transaction does not own. Mirrors removeOwnedFiles.
+	if envOwnedByJournal(j, a.Request.EnvPath) {
+		if err := os.Remove(a.Request.EnvPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("deploy: recovery: env file: %w", err)
+		}
 	}
 	return nil
+}
+
+// envOwnedByJournal reports whether the env file at envPath was created by
+// the journal's transaction: present in j.Files (absent before the
+// transaction) and NOT in j.PreFiles (which would mean it pre-existed and is
+// left to its owner's rollback path). This is the exact ownership rule
+// removeOwnedFiles applies to config files.
+func envOwnedByJournal(j ArtifactJournal, envPath string) bool {
+	if envPath == "" {
+		return false
+	}
+	for _, f := range j.PreFiles {
+		if f == envPath {
+			return false
+		}
+	}
+	for _, f := range j.Files {
+		if f == envPath {
+			return true
+		}
+	}
+	return false
 }
 
 // removeUnitsReverse removes the given unit names in reverse dependency order
@@ -565,6 +609,18 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 			continue
 		}
 		if err := a.ops().RollbackLast(ctx, a.Services, spec); err != nil {
+			// DEFECT-3 convergence: a pre-existing unit with NO managed
+			// backup to restore (created by a fresh install, never backed
+			// up) must not deadlock recovery. The unit's committed content
+			// is reconstructible from the manifest/request, so re-apply it
+			// instead of failing; recovery stays ownership-scoped and the
+			// host converges to the previous state.
+			if errors.Is(err, systemd.ErrNoUnitBackup) {
+				if rerr := a.ops().ReapplyUnit(ctx, a.Services, spec); rerr != nil {
+					return fmt.Errorf("deploy: recovery: re-apply unit %s after missing backup: %w", unit, rerr)
+				}
+				continue
+			}
 			return fmt.Errorf("deploy: recovery: rollback unit %s: %w", unit, err)
 		}
 	}
@@ -845,6 +901,27 @@ func removeWithinPrefix(path string) error {
 		return fmt.Errorf("deploy: refusing to remove non-directory %s", filepath.Base(path))
 	}
 	return os.RemoveAll(path)
+}
+
+// removeStoreOwnedDir is the store-owned analogue of removePrefixDir: it
+// removes a recursive target that lives below the state root WITHOUT a binary
+// prefix. The caller has already derived the path from store-owned state
+// (never from untrusted input); it re-asserts containment under root as
+// defense in depth and delegates the symlink-refusing, non-directory-refusing
+// removal to removeWithinPrefix, so no destructive logic is duplicated.
+func removeStoreOwnedDir(path, root string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("deploy: resolve %s: %w", filepath.Base(path), err)
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("deploy: resolve state root: %w", err)
+	}
+	if !within(absRoot, abs) {
+		return fmt.Errorf("deploy: refusing to remove %s outside the state root", filepath.Base(path))
+	}
+	return removeWithinPrefix(abs)
 }
 
 // Uninstall removes the currently-committed deployment for the adapter's

@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,11 +18,15 @@ import (
 // test can assert real removal. It is the seam that lets the adapter's
 // ownership logic run without a root Linux host.
 type recoveryOpsFake struct {
-	removed  []string
-	rolled   []string
-	envRoll  int
-	unitDir  string
-	failWith error
+	removed   []string
+	rolled    []string
+	reapplied []string
+	envRoll   int
+	unitDir   string
+	failWith  error
+	// noBackup makes RollbackLast report systemd.ErrNoUnitBackup — the
+	// no-managed-backup condition DEFECT-3 recovery must converge through.
+	noBackup bool
 }
 
 func (o *recoveryOpsFake) RemoveUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
@@ -33,7 +38,15 @@ func (o *recoveryOpsFake) RemoveUnit(_ context.Context, _ *systemd.ServiceManage
 }
 
 func (o *recoveryOpsFake) RollbackLast(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
+	if o.noBackup {
+		return fmt.Errorf("%w: %w for %s (nothing to roll back to)", systemd.ErrPreflight, systemd.ErrNoUnitBackup, s.UnitName)
+	}
 	o.rolled = append(o.rolled, s.UnitName)
+	return o.failWith
+}
+
+func (o *recoveryOpsFake) ReapplyUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
+	o.reapplied = append(o.reapplied, s.UnitName)
 	return o.failWith
 }
 
@@ -193,7 +206,8 @@ func TestRecoverFreshIsJournalDriven(t *testing.T) {
 			}
 			fx := newRecoveryFixture(t, role, journal)
 			// Re-persist with the real owned paths now that they are known.
-			journal.Files = []string{fx.config}
+			// The env file is created by a fresh install → owned (j.Files).
+			journal.Files = []string{fx.config, fx.env}
 			if role == RoleGermany {
 				journal.Units = []string{"germany-splitter.service", "xray-germany.service"}
 				journal.XrayDir = fx.xrayDir
@@ -521,5 +535,102 @@ func TestRecoverJournalRejectsRoleMismatch(t *testing.T) {
 	err := adapter.RecoverJournal(context.Background(), ArtifactJournal{Role: RoleGermany}, Manifest{})
 	if err == nil {
 		t.Fatal("role-mismatched journal accepted")
+	}
+}
+
+// TestRecoverFreshPreservesPreexistingEnv is the DEFECT-2 regression: a fresh
+// recovery must remove the env file ONLY when the journal records it as
+// created by the transaction (present in Files). Here the journal owns the
+// config but NOT the env (the env is neither in Files nor PreFiles — it
+// pre-existed the transaction), so the env file must SURVIVE.
+func TestRecoverFreshPreservesPreexistingEnv(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleIran, Generation: "pending-1"}
+	fx := newRecoveryFixture(t, RoleIran, journal)
+	// Own the config only; the env is NOT owned by this transaction.
+	journal.Files = []string{fx.config}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, fx.env)
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	mustNotExist(t, fx.config) // owned config removed
+	mustExist(t, fx.env)       // pre-existing env must SURVIVE
+}
+
+// TestRecoverFreshPreservesEnvRecordedAsPreFile asserts PreFiles wins even if
+// the env also appears in Files: a resource recorded as pre-existing is never
+// deleted (it is left to its owner's rollback path).
+func TestRecoverFreshPreservesEnvRecordedAsPreFile(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleIran, Generation: "pending-1"}
+	fx := newRecoveryFixture(t, RoleIran, journal)
+	journal.Files = []string{fx.config, fx.env}
+	journal.PreFiles = []string{fx.env}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	mustExist(t, fx.env) // pre-existing → never removed
+}
+
+// TestRecoverFreshRemovesOwnedEnv pins the normal fresh case unchanged: when
+// the journal records the env as created (j.Files, not j.PreFiles), fresh
+// recovery removes it.
+func TestRecoverFreshRemovesOwnedEnv(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleIran, Generation: "pending-1"}
+	fx := newRecoveryFixture(t, RoleIran, journal)
+	journal.Files = []string{fx.config, fx.env}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	mustNotExist(t, fx.env) // owned env removed
+}
+
+// TestRecoverUpgradeConvergesWhenNoUnitBackup is the DEFECT-3 regression: a
+// crashed upgrade whose pre-existing unit has NO managed backup (created by a
+// fresh install and never backed up) must CONVERGE by re-applying the
+// committed unit from the manifest, not error and retain the journal.
+func TestRecoverUpgradeConvergesWhenNoUnitBackup(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleGermany, Generation: "pending-2"}
+	fx := newRecoveryFixture(t, RoleGermany, journal)
+	previous := testManifest(fx.store.Root, RoleGermany)
+	previous.Generation = "g1"
+	previous.Services = []ServiceState{{Unit: "germany-splitter.service", Component: "splitter"}}
+	if _, err := fx.store.Commit(previous, "install"); err != nil {
+		t.Fatal(err)
+	}
+	// The crashed upgrade owned the pre-existing splitter unit; it has no
+	// managed backup to restore.
+	journal.Units = []string{"germany-splitter.service"}
+	journal.PreUnits = []string{"germany-splitter.service"}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	fx.ops.noBackup = true
+
+	result, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background())
+	if err != nil {
+		t.Fatalf("recovery did not converge (no-backup upgrade): %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("recovery reported no change")
+	}
+	if !reflect.DeepEqual(fx.ops.reapplied, []string{"germany-splitter.service"}) {
+		t.Fatalf("reapplied = %#v, want the pre-existing unit re-applied", fx.ops.reapplied)
+	}
+	if len(fx.ops.rolled) != 0 {
+		t.Fatalf("rolled = %#v, want no successful rollback", fx.ops.rolled)
+	}
+	if _, err := fx.store.ReadJournal(); !os.IsNotExist(err) {
+		t.Fatalf("journal not cleared after convergence: %v", err)
+	}
+	if _, err := fx.store.Load(); err != nil {
+		t.Fatalf("committed manifest must survive recovery: %v", err)
 	}
 }

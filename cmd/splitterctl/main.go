@@ -376,6 +376,15 @@ func recoverCommand(ctx context.Context, ack bool, out io.Writer) error {
 		joinOrNone(journal.Files), joinOrNone(journal.PreFiles),
 		journal.Firewall)
 	if ack {
+		// --ack is the explicit manual escape hatch, but it must not silently
+		// unblock mutations on a host whose committed role CONTRADICTS the
+		// in-flight journal: that is evidence of an inconsistent host, not a
+		// reconciled one. Fail closed with a diagnosable error. When no
+		// committed manifest exists there is nothing to contradict, so the
+		// ack-clear proceeds (a crashed fresh install).
+		if committed, err := store.Load(); err == nil && committed.Role != "" && committed.Role != journal.Role {
+			return fmt.Errorf("recover: refusing --ack: journal role %q does not match committed role %q; reconcile the host (or run recover without --ack) before acknowledging", journal.Role, committed.Role)
+		}
 		if err := store.ClearJournal(); err != nil {
 			return fmt.Errorf("recover: clear journal: %w", err)
 		}

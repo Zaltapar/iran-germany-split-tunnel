@@ -276,6 +276,94 @@ func TestRecoverAckForceClearsWithoutRecovery(t *testing.T) {
 	}
 }
 
+// commitRole commits a minimal manifest for role so the ack role check has a
+// committed role to compare against.
+func commitRole(t *testing.T, store *deploy.Store, role string) {
+	t.Helper()
+	if _, err := store.Commit(deploy.Manifest{
+		Role:       role,
+		Generation: "g-committed",
+		Paths:      deploy.Paths{StateRoot: store.Root},
+		Firewall:   deploy.FirewallState{Backend: "none"},
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRecoverAckRefusesRoleMismatch is the DEFECT-4 regression: when the
+// committed manifest role CONTRADICTS the in-flight journal role, --ack must
+// refuse and RETAIN the journal (fail closed) rather than silently unblock
+// mutations on a possibly-inconsistent host.
+func TestRecoverAckRefusesRoleMismatch(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitRole(t, store, deploy.RoleGermany)
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleIran, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"recover", "--ack"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "refusing --ack") {
+		t.Fatalf("error = %v, want an ack refusal", err)
+	}
+	if _, jerr := store.ReadJournal(); jerr != nil {
+		t.Fatalf("journal must be retained after a refused ack: %v", jerr)
+	}
+}
+
+// TestRecoverAckAllowedWhenRolesAgree asserts --ack still clears the journal
+// when the committed role matches the journal role.
+func TestRecoverAckAllowedWhenRolesAgree(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitRole(t, store, deploy.RoleGermany)
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleGermany, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"recover", "--ack"}, &out, &out); err != nil {
+		t.Fatalf("recover --ack: %v", err)
+	}
+	if _, jerr := store.ReadJournal(); !os.IsNotExist(jerr) {
+		t.Fatalf("journal not cleared: %v", jerr)
+	}
+}
+
+// TestRecoverAckAllowedWithNoManifest asserts --ack clears the journal when no
+// committed manifest exists (a crashed fresh install has nothing to contradict).
+func TestRecoverAckAllowedWithNoManifest(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleIran, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"recover", "--ack"}, &out, &out); err != nil {
+		t.Fatalf("recover --ack: %v", err)
+	}
+	if _, jerr := store.ReadJournal(); !os.IsNotExist(jerr) {
+		t.Fatalf("journal not cleared: %v", jerr)
+	}
+}
+
 // TestRecoverFailsClosedOnRecoveryError asserts a failing recovery surfaces a
 // wrapped error and RETAINS the journal.
 func TestRecoverFailsClosedOnRecoveryError(t *testing.T) {

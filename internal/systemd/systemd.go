@@ -145,6 +145,13 @@ var (
 	// ErrRollback: the rollback itself failed (the apply already failed;
 	// the operator must intervene).
 	ErrRollback = errors.New("systemd: rollback failed (manual intervention required)")
+	// ErrNoUnitBackup: RollbackLast found no managed backup to restore
+	// (the unit was never backed up — e.g. a fresh install that created it —
+	// or the managed backups were swept). It is wrapped alongside ErrPreflight
+	// so existing callers keep their classification, while deploy recovery can
+	// errors.Is on it to CONVERGE (re-apply from the committed manifest)
+	// instead of deadlocking on a crashed upgrade.
+	ErrNoUnitBackup = errors.New("systemd: no unit backup exists")
 )
 
 // Step names used in structured error context.

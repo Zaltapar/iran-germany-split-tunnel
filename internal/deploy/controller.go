@@ -119,7 +119,14 @@ func (c *Controller) Uninstall(ctx context.Context, purge bool) error {
 		if err := c.Store.ClearJournal(); err != nil {
 			return err
 		}
-		if err := os.RemoveAll(c.Store.revisionsDir()); err != nil {
+		// The revisions directory is store-owned (derived from the state
+		// root, never from untrusted input), but a raw recursive delete would
+		// follow a symlink planted there and delete its target. removeStore
+		// OwnedDir re-asserts containment under the state root and refuses to
+		// follow a symlink (unlinking the link only) or remove a
+		// non-directory — the same symlink-safe semantics used for
+		// journal-derived directories.
+		if err := removeStoreOwnedDir(c.Store.revisionsDir(), c.Store.Root); err != nil {
 			return fmt.Errorf("deploy: uninstall: purge revisions: %v", err)
 		}
 	}

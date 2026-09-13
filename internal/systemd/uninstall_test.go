@@ -80,3 +80,18 @@ func TestRollbackLast(t *testing.T) {
 	}
 	assertCalls(t, ex.calls, []string{"systemctl daemon-reload", "systemctl restart germany-splitter.service"})
 }
+
+// TestRollbackLastNoBackupIsClassified pins DEFECT-3's sentinel contract: with
+// no managed backup, RollbackLast reports BOTH ErrPreflight (existing callers'
+// classification) and ErrNoUnitBackup (deploy recovery's convergence signal).
+func TestRollbackLastNoBackupIsClassified(t *testing.T) {
+	redirectPaths(t)
+	s := splitterSpec(RoleGermany)
+	err := RollbackLast(context.Background(), newTestManager(&fakeExec{}), s)
+	if !errors.Is(err, ErrPreflight) {
+		t.Fatalf("error=%v, want ErrPreflight", err)
+	}
+	if !errors.Is(err, ErrNoUnitBackup) {
+		t.Fatalf("error=%v, want ErrNoUnitBackup", err)
+	}
+}

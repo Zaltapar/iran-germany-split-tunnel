@@ -216,3 +216,70 @@ func TestControllerRollbackAndUninstallDelegate(t *testing.T) {
 	}
 	_ = current
 }
+
+// TestUninstallPurgeRefusesSymlinkedRevisionsDir is the DEFECT-1 regression:
+// a symlink planted at the store-owned revisions directory must NOT be
+// followed by `uninstall --purge`; the link is unlinked and its target (a
+// directory of unrelated data) survives.
+func TestUninstallPurgeRefusesSymlinkedRevisionsDir(t *testing.T) {
+	store, _, _ := commitRollbackFixture(t)
+	// Replace the real revisions dir with a symlink to an unrelated target.
+	if err := os.RemoveAll(store.revisionsDir()); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.MkdirAll(filepath.Join(target, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, store.revisionsDir()); err != nil {
+		t.Skipf("symlinks unavailable on this host: %v", err)
+	}
+	if err := (&Controller{Store: store, Adapter: &controllerFake{}}).Uninstall(context.Background(), true); err != nil {
+		t.Fatalf("Uninstall --purge: %v", err)
+	}
+	if _, err := os.Lstat(store.revisionsDir()); !os.IsNotExist(err) {
+		t.Fatalf("revisions symlink survived purge: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "keep")); err != nil {
+		t.Fatalf("purge followed the symlink and deleted its target: %v", err)
+	}
+}
+
+// TestUninstallPurgeRemovesRealRevisionsDir pins the normal purge path: a real
+// revisions directory (with contents) is removed recursively.
+func TestUninstallPurgeRemovesRealRevisionsDir(t *testing.T) {
+	store, _, _ := commitRollbackFixture(t)
+	if err := os.MkdirAll(store.revisionsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.revisionsDir(), "r.json"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Controller{Store: store, Adapter: &controllerFake{}}).Uninstall(context.Background(), true); err != nil {
+		t.Fatalf("Uninstall --purge: %v", err)
+	}
+	if _, err := os.Stat(store.revisionsDir()); !os.IsNotExist(err) {
+		t.Fatalf("revisions dir survived purge: %v", err)
+	}
+}
+
+// TestUninstallPurgeRefusesNonDirectoryRevisions exercises the non-directory
+// refusal branch of the symlink-safe removal on every host (the symlink case
+// skips where symlinks are unprivileged): a regular file planted at the
+// store-owned revisions path is refused, not deleted.
+func TestUninstallPurgeRefusesNonDirectoryRevisions(t *testing.T) {
+	store, _, _ := commitRollbackFixture(t)
+	if err := os.RemoveAll(store.revisionsDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.revisionsDir(), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := (&Controller{Store: store, Adapter: &controllerFake{}}).Uninstall(context.Background(), true)
+	if err == nil {
+		t.Fatal("purge accepted a non-directory revisions path")
+	}
+	if _, serr := os.Stat(store.revisionsDir()); serr != nil {
+		t.Fatalf("non-directory revisions path was removed: %v", serr)
+	}
+}

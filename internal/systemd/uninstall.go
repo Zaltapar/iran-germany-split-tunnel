@@ -72,7 +72,10 @@ func RollbackLast(ctx context.Context, m *ServiceManager, s Spec) error {
 		return err
 	}
 	if len(backups) == 0 {
-		return fmt.Errorf("%w: no unit backup exists for %s (nothing to roll back to)", ErrPreflight, unit)
+		// Wrapped alongside ErrPreflight so existing callers keep their
+		// classification, while deploy recovery can errors.Is on
+		// ErrNoUnitBackup and converge by re-applying the committed unit.
+		return fmt.Errorf("%w: %w for %s (nothing to roll back to)", ErrPreflight, ErrNoUnitBackup, unit)
 	}
 	latest := backups[len(backups)-1]
 	data, err := os.ReadFile(latest)
