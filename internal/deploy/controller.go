@@ -126,6 +126,62 @@ func (c *Controller) Uninstall(ctx context.Context, purge bool) error {
 	return nil
 }
 
+// Recover executes post-crash recovery from the persisted in-flight journal.
+// It is the operator entrypoint that resolves the deadlock a crashed mutation
+// leaves behind (install/rollback/uninstall all refuse while a stale journal
+// is present).
+//
+//   - No journal (os.ErrNotExist) → nothing to recover: no error, no mutation,
+//     Result{Phase: PhaseRecover} with Changed=false.
+//   - Tampered journal (ErrTampered) → fail closed: nothing is deleted, the
+//     journal is retained, and a diagnosable error is returned.
+//   - Otherwise the adapter performs journal-driven, ownership-scoped
+//     recovery (RecoverJournal). On success the journal is cleared and the
+//     operator deadlock is resolved; on failure the journal is RETAINED and
+//     the wrapped error is returned.
+func (c *Controller) Recover(ctx context.Context) (Result, error) {
+	if err := c.check(); err != nil {
+		return Result{}, err
+	}
+	if ctx == nil {
+		return Result{}, fmt.Errorf("%w: nil context", ErrTransaction)
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	j, err := c.Store.ReadJournal()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Nothing in flight: no mutation, no error.
+			return Result{Phase: PhaseRecover}, nil
+		}
+		if errors.Is(err, ErrTampered) {
+			// Fail closed: a tampered/malformed journal must delete nothing
+			// and must be retained for an operator to inspect. The original
+			// ErrTampered is WRAPPED so the cause stays diagnosable.
+			return Result{Phase: PhaseRecover}, fmt.Errorf("%w: journal is tampered or malformed; refusing to recover (journal retained): %w", ErrTransaction, err)
+		}
+		return Result{Phase: PhaseRecover}, fmt.Errorf("%w: read journal: %v", ErrTransaction, err)
+	}
+	previous, err := c.Store.Load()
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return Result{Phase: PhaseRecover}, fmt.Errorf("%w: load current state: %v", ErrTransaction, err)
+		}
+		previous = Manifest{}
+	}
+	if previous.Generation != "" && previous.Role != j.Role {
+		return Result{Phase: PhaseRecover}, fmt.Errorf("%w: journal role %q does not match committed role %q", ErrTransaction, j.Role, previous.Role)
+	}
+	if err := c.Adapter.RecoverJournal(ctx, j, previous); err != nil {
+		return Result{Phase: PhaseRecover}, fmt.Errorf("%w: recovery failed (journal retained): %w", ErrTransaction, err)
+	}
+	if err := c.Store.ClearJournal(); err != nil {
+		return Result{Phase: PhaseRecover}, fmt.Errorf("%w: recovery succeeded but journal removal failed: %v", ErrTransaction, err)
+	}
+	return Result{Manifest: previous, Phase: PhaseRecover, Changed: true}, nil
+}
+
 // StaleJournal reports a leftover in-flight journal (crashed mutation). A
 // stale journal means the host may be inconsistent; doctor surfaces it and
 // the operator must finish recovery before any new mutation is accepted.

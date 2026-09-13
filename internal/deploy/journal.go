@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 )
 
 // ArtifactJournal records the ownership-scoped pre-state and scope of one
@@ -70,11 +68,16 @@ func (j ArtifactJournal) validate(root string) error {
 }
 
 // binaryPrefixContained reports whether dir is an absolute, rooted path
-// strictly inside systemd.BinaryPrefix. Rootedness is checked textually (a
-// leading "/") because filepath.IsAbs is false for "/opt/..." on non-Unix
-// hosts, while the managed paths are always Unix-absolute by construction.
+// strictly inside the managed binary prefix (systemd.BinaryPrefix, exposed
+// via managedBinaryPrefix so tests can redirect it). Rootedness accepts
+// either a leading "/" (the production Unix shape; filepath.IsAbs is false
+// for "/opt/..." on non-Unix hosts) or a native absolute path (the redirected
+// test shape). The real containment guarantee is `within`.
 func binaryPrefixContained(dir string) bool {
-	return strings.HasPrefix(dir, "/") && within(systemd.BinaryPrefix, dir)
+	if !filepath.IsAbs(dir) && !strings.HasPrefix(dir, "/") {
+		return false
+	}
+	return within(managedBinaryPrefix, dir)
 }
 
 // journalPath is the single in-flight journal location under the state root.

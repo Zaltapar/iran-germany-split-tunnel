@@ -8,9 +8,52 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/deploy"
 )
+
+// recoverAdapterFake satisfies deploy.Adapter for the CLI tests. It records
+// RecoverJournal calls and can block until the recovery context is done (to
+// prove the CLI's timeout is applied) or fail.
+type recoverAdapterFake struct {
+	recoverCalls      int
+	blockUntilCtxDone bool
+	err               error
+}
+
+func (f *recoverAdapterFake) Prepare(context.Context, deploy.DesiredState) error  { return nil }
+func (f *recoverAdapterFake) Validate(context.Context, deploy.DesiredState) error { return nil }
+func (f *recoverAdapterFake) Backup(context.Context, *deploy.Manifest) error      { return nil }
+func (f *recoverAdapterFake) Activate(context.Context, deploy.DesiredState) error { return nil }
+func (f *recoverAdapterFake) Transition(context.Context, deploy.DesiredState) error {
+	return nil
+}
+func (f *recoverAdapterFake) Health(context.Context, deploy.DesiredState) error { return nil }
+func (f *recoverAdapterFake) Restore(context.Context, deploy.Manifest) error    { return nil }
+func (f *recoverAdapterFake) CleanupFresh(context.Context, deploy.DesiredState) error {
+	return nil
+}
+func (f *recoverAdapterFake) Uninstall(context.Context, deploy.Manifest) error { return nil }
+func (f *recoverAdapterFake) RecoverJournal(ctx context.Context, _ deploy.ArtifactJournal, _ deploy.Manifest) error {
+	f.recoverCalls++
+	if f.blockUntilCtxDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return f.err
+}
+
+// stubRecoverController substitutes newRecoverController with a controller
+// backed by the fake adapter, restoring the production constructor on
+// cleanup.
+func stubRecoverController(store *deploy.Store, fake *recoverAdapterFake) func() {
+	old := newRecoverController
+	newRecoverController = func(*deploy.Store, deploy.ArtifactJournal) (*deploy.Controller, error) {
+		return &deploy.Controller{Store: store, Adapter: fake}, nil
+	}
+	return func() { newRecoverController = old }
+}
 
 func TestRunHelp(t *testing.T) {
 	var out bytes.Buffer
@@ -137,10 +180,10 @@ func TestInstallFailsClosedOnMissingEnv(t *testing.T) {
 	}
 }
 
-// TestRecoverReportsAndClearsJournal covers the operator recovery loop:
-// report (journal retained) → verify → ack (journal cleared) → ack with no
-// journal is an error.
-func TestRecoverReportsAndClearsJournal(t *testing.T) {
+// TestRecoverExecutesRecovery covers the post-crash recovery loop: `recover`
+// (no --ack) EXECUTES journal-driven recovery and clears the journal; a second
+// recover reports nothing in flight; `--ack` with no journal is an error.
+func TestRecoverExecutesRecovery(t *testing.T) {
 	withLinux(t)
 	root := t.TempDir()
 	withCanonicalRoot(t, root)
@@ -158,35 +201,136 @@ func TestRecoverReportsAndClearsJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Substitute a controller backed by the fake adapter (the recovery
+	// EXECUTION is covered exhaustively in internal/deploy; here we pin the
+	// CLI wiring: recover without --ack must build a controller and invoke
+	// Recover, then clear the journal).
+	fake := &recoverAdapterFake{}
+	restore := stubRecoverController(store, fake)
+	defer restore()
+
 	var out bytes.Buffer
 	if err := run(context.Background(), []string{"recover"}, &out, &out); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 	got := out.String()
-	for _, want := range []string{"in-flight journal:", "role: germany", "generation: pending-1", "germany-splitter.service", "splitterctl recover --ack"} {
+	for _, want := range []string{"in-flight journal:", "role: germany", "generation: pending-1", "germany-splitter.service", "recovered; journal cleared"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("recover output %q does not contain %q", got, want)
 		}
 	}
-	if _, err := store.ReadJournal(); err != nil {
-		t.Fatalf("journal should be retained after report: %v", err)
-	}
-
-	out.Reset()
-	if err := run(context.Background(), []string{"recover", "--ack"}, &out, &out); err != nil {
-		t.Fatalf("recover --ack: %v", err)
-	}
-	if !strings.Contains(out.String(), "journal cleared") {
-		t.Fatalf("ack output = %q", out.String())
+	if fake.recoverCalls != 1 {
+		t.Fatalf("RecoverJournal calls = %d, want 1", fake.recoverCalls)
 	}
 	if _, err := store.ReadJournal(); !os.IsNotExist(err) {
-		t.Fatalf("journal not cleared: %v", err)
+		t.Fatalf("journal not cleared after recovery: %v", err)
 	}
 
+	// A second recover finds nothing in flight and mutates nothing.
+	out.Reset()
+	if err := run(context.Background(), []string{"recover"}, &out, &out); err != nil {
+		t.Fatalf("second recover: %v", err)
+	}
+	if !strings.Contains(out.String(), "no in-flight journal") {
+		t.Fatalf("second recover output = %q", out.String())
+	}
+
+	// --ack with no journal is an explicit operator error.
 	out.Reset()
 	err = run(context.Background(), []string{"recover", "--ack"}, &out, &out)
 	if err == nil || !strings.Contains(err.Error(), "no in-flight journal to acknowledge") {
 		t.Fatalf("error = %v, want no-journal ack error", err)
+	}
+}
+
+// TestRecoverAckForceClearsWithoutRecovery pins the --ack escape hatch: it
+// clears the journal WITHOUT building an adapter or touching the host.
+func TestRecoverAckForceClearsWithoutRecovery(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleGermany, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &recoverAdapterFake{}
+	restore := stubRecoverController(store, fake)
+	defer restore()
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"recover", "--ack"}, &out, &out); err != nil {
+		t.Fatalf("recover --ack: %v", err)
+	}
+	if !strings.Contains(out.String(), "journal cleared without host changes") {
+		t.Fatalf("ack output = %q", out.String())
+	}
+	if fake.recoverCalls != 0 {
+		t.Fatalf("--ack must not execute recovery (calls = %d)", fake.recoverCalls)
+	}
+	if _, err := store.ReadJournal(); !os.IsNotExist(err) {
+		t.Fatalf("journal not cleared: %v", err)
+	}
+}
+
+// TestRecoverFailsClosedOnRecoveryError asserts a failing recovery surfaces a
+// wrapped error and RETAINS the journal.
+func TestRecoverFailsClosedOnRecoveryError(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleIran, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &recoverAdapterFake{err: errors.New("injected")}
+	restore := stubRecoverController(store, fake)
+	defer restore()
+
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"recover"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "recover:") {
+		t.Fatalf("error = %v, want a wrapped recover error", err)
+	}
+	if _, jerr := store.ReadJournal(); jerr != nil {
+		t.Fatalf("journal must be retained after a failed recovery: %v", jerr)
+	}
+}
+
+// TestRecoverBoundedByTimeout asserts the CLI applies a context timeout to
+// recovery (a blocked recovery must not hang the operator).
+func TestRecoverBoundedByTimeout(t *testing.T) {
+	withLinux(t)
+	root := t.TempDir()
+	withCanonicalRoot(t, root)
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteJournal(deploy.ArtifactJournal{Role: deploy.RoleIran, Generation: "pending-1"}); err != nil {
+		t.Fatal(err)
+	}
+	// A recovery that blocks until its context is done must return promptly
+	// with a context error — proving the CLI passed a bounded context.
+	fake := &recoverAdapterFake{blockUntilCtxDone: true}
+	restore := stubRecoverController(store, fake)
+	defer restore()
+	old := recoverTimeout
+	recoverTimeout = 50 * time.Millisecond
+	defer func() { recoverTimeout = old }()
+
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"recover"}, &out, &out)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 }
 

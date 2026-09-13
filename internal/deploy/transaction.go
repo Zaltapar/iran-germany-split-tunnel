@@ -18,6 +18,9 @@ const (
 	PhaseTransition Phase = "transition"
 	PhaseHealth     Phase = "health"
 	PhaseCommit     Phase = "commit"
+	// PhaseRecover is the outcome phase of an explicit post-crash recovery
+	// (Controller.Recover). It is not part of a Transaction's step sequence.
+	PhaseRecover Phase = "recover"
 )
 
 var (

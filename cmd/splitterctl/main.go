@@ -55,6 +55,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/deploy"
@@ -66,6 +67,34 @@ import (
 
 var errUsage = errors.New("usage error")
 var errNotWired = errors.New("command is not wired to host adapters")
+
+// recoverTimeout bounds a single post-crash recovery run: recovery is a
+// synchronous, best-effort convergence of project-owned artifacts and must
+// never hang the operator. It is a var so tests can shorten it.
+var recoverTimeout = 60 * time.Second
+
+// newRecoverController builds the controller used by `recover`. It mirrors
+// installCommand's construction (installRequestFromEnv + NewLinuxAdapter) but
+// derives the role from the committed manifest when one exists, falling back
+// to the journal's role (a crashed FRESH install has no committed manifest).
+// It is a var — like goos and canonicalStateRoot — so tests can substitute a
+// controller backed by a fake adapter without a Linux/root host or the full
+// mutation environment contract. Production always uses the real adapter.
+var newRecoverController = func(store *deploy.Store, journal deploy.ArtifactJournal) (*deploy.Controller, error) {
+	role := journal.Role
+	if current, err := store.Load(); err == nil && current.Role != "" {
+		role = current.Role
+	}
+	request, err := installRequestFromEnv(role)
+	if err != nil {
+		return nil, err
+	}
+	adapter, err := deploy.NewLinuxAdapter(request, systemd.OSExecutor{}, firewall.OSExecutor{})
+	if err != nil {
+		return nil, err
+	}
+	return &deploy.Controller{Store: store, Adapter: adapter}, nil
+}
 
 // goos is the platform probe behind the Linux gate. It is a var (like
 // systemd's managed-path vars) so tests exercise the gate on any host;
@@ -171,10 +200,10 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return uninstallCommand(ctx, len(args) == 2, out)
 	case "recover":
 		if len(args) == 1 {
-			return recoverCommand(false, out)
+			return recoverCommand(ctx, false, out)
 		}
 		if len(args) == 2 && args[1] == "--ack" {
-			return recoverCommand(true, out)
+			return recoverCommand(ctx, true, out)
 		}
 		return fmt.Errorf("%w: recover accepts only --ack", errUsage)
 	default:
@@ -306,13 +335,21 @@ func uninstallCommand(ctx context.Context, purge bool, out io.Writer) error {
 	return nil
 }
 
-// recoverCommand reports the in-flight journal left by a failed mutation
-// and, with --ack, clears it after the operator has verified the host. The
-// journal is deliberately retained after EVERY failed transaction (even
-// when in-process recovery succeeded) as the ownership record: the ack is
-// the explicit operator acknowledgement that recovery is complete. Without
-// it, install/rollback fail closed on the stale journal.
-func recoverCommand(ack bool, out io.Writer) error {
+// recoverCommand is the post-crash recovery entrypoint.
+//
+// Without --ack it EXECUTES journal-driven recovery: it reads the in-flight
+// journal, derives ownership from the PERSISTED journal (never from runtime
+// state), and reverts the crashed transaction — a fresh install is cleaned up
+// to "not deployed"; an upgrade converges to the committed previous
+// generation. On success the journal is cleared and install/rollback/uninstall
+// are unblocked. A tampered/malformed journal fails closed (nothing is
+// deleted, the journal is retained).
+//
+// With --ack it remains the explicit, documented manual force-clear escape
+// hatch: it deletes the journal WITHOUT touching the host, for the case where
+// an operator has already reconciled the host by hand. It is intentionally
+// destructive and must be run only after verifying the host.
+func recoverCommand(ctx context.Context, ack bool, out io.Writer) error {
 	if err := requireLinux("recover"); err != nil {
 		return err
 	}
@@ -338,14 +375,25 @@ func recoverCommand(ack bool, out io.Writer) error {
 		joinOrNone(journal.Units), joinOrNone(journal.PreUnits),
 		joinOrNone(journal.Files), joinOrNone(journal.PreFiles),
 		journal.Firewall)
-	if !ack {
-		_, _ = fmt.Fprintln(out, "verify the host against this journal, then run: splitterctl recover --ack")
+	if ack {
+		if err := store.ClearJournal(); err != nil {
+			return fmt.Errorf("recover: clear journal: %w", err)
+		}
+		_, _ = fmt.Fprintln(out, "recover: journal cleared without host changes (--ack); mutations are unblocked")
 		return nil
 	}
-	if err := store.ClearJournal(); err != nil {
-		return fmt.Errorf("recover: clear journal: %w", err)
+	controller, err := newRecoverController(store, journal)
+	if err != nil {
+		return fmt.Errorf("recover: build adapter: %w", err)
 	}
-	_, _ = fmt.Fprintln(out, "recover: journal cleared; mutations are unblocked (run status and doctor to verify)")
+	recoverCtx, cancel := context.WithTimeout(ctx, recoverTimeout)
+	defer cancel()
+	if _, err := controller.Recover(recoverCtx); err != nil {
+		return fmt.Errorf("recover: %w", err)
+	}
+	// Summary-only: no paths or hashes (the journal echo above already showed
+	// the ownership scope; recovery output stays secret-free).
+	_, _ = fmt.Fprintln(out, "recover: recovered; journal cleared and mutations are unblocked (run status and doctor to verify)")
 	return nil
 }
 
@@ -739,6 +787,7 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  (not wired: see IMPLEMENTATION_STATUS.md)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")
 	fmt.Fprintln(out, "  uninstall [--purge]                 remove the deployment (Linux root)")
-	fmt.Fprintln(out, "  recover [--ack]                     report / acknowledge an in-flight journal (Linux root)")
+	fmt.Fprintln(out, "  recover                             execute journal-driven post-crash recovery (Linux root)")
+	fmt.Fprintln(out, "  recover --ack                       force-clear the journal without host changes (Linux root)")
 	fmt.Fprintln(out, "  config show|set                     show (wired) / set (not wired) deployment config")
 }

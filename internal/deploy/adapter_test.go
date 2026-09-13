@@ -8,9 +8,13 @@ import (
 )
 
 type adapterFake struct {
-	calls      []string
-	errAt      string
-	cleanupErr bool
+	calls        []string
+	errAt        string
+	cleanupErr   bool
+	recoverErr   bool
+	recovered    ArtifactJournal
+	recoverPrev  Manifest
+	recoverCalls int
 }
 
 func (f *adapterFake) call(name string) error {
@@ -33,6 +37,16 @@ func (f *adapterFake) CleanupFresh(context.Context, DesiredState) error {
 	f.calls = append(f.calls, "cleanup-fresh")
 	if f.cleanupErr {
 		return errors.New("cleanup-fresh failed")
+	}
+	return nil
+}
+func (f *adapterFake) RecoverJournal(_ context.Context, j ArtifactJournal, previous Manifest) error {
+	f.calls = append(f.calls, "recover-journal")
+	f.recoverCalls++
+	f.recovered = j
+	f.recoverPrev = previous
+	if f.recoverErr {
+		return errors.New("recover-journal failed")
 	}
 	return nil
 }

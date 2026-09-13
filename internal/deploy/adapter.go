@@ -16,11 +16,26 @@ type Adapter interface {
 	// Restore is used only when a committed previous manifest exists:
 	// a failed transaction calls it to return the host to that manifest,
 	// and an operator rollback (Store.Rollback) calls it to converge the
-	// host to a retained revision. It must be bounded by ownership.
+	// host to a retained revision. It must be bounded by ownership. It is
+	// an IN-PROCESS recovery path: it may consult the adapter's runtime
+	// ownership record, so it is NOT sufficient after a process crash —
+	// post-crash recovery must use RecoverJournal.
 	Restore(context.Context, Manifest) error
 	// CleanupFresh removes only artifacts recorded as created by this
 	// transaction when a fresh install has no previous manifest to restore.
+	// Like Restore it is an IN-PROCESS path that may consult the adapter's
+	// runtime ownership record; RecoverJournal is the post-crash
+	// equivalent.
 	CleanupFresh(context.Context, DesiredState) error
+	// RecoverJournal performs ownership-scoped recovery from a persisted
+	// journal after a process crash. It must derive what to remove from the
+	// JOURNAL, not from runtime state (the runtime ownership record is empty
+	// in a fresh process). previous.Generation == "" means a fresh install
+	// (no committed previous generation) and selects owned-artifact cleanup;
+	// a committed previous generation selects convergence to previous
+	// (Restore semantics). It must be idempotent, bounded by ctx, and must
+	// leave unrelated host resources untouched.
+	RecoverJournal(ctx context.Context, j ArtifactJournal, previous Manifest) error
 	Uninstall(context.Context, Manifest) error
 }
 

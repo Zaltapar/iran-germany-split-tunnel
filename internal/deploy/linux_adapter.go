@@ -35,11 +35,56 @@ type LinuxAdapter struct {
 	firewallApplied bool
 	xrayBinary      string
 
+	// recoveryOps is the seam for the T5 operations recovery performs.
+	// nil → the real T5 calls (systemd.RemoveUnit / RollbackLast /
+	// RollbackEnvFile). It exists ONLY so the adapter's journal-driven
+	// ownership logic can be exercised deterministically without a root Linux
+	// host; it reimplements no T5 policy.
+	recoveryOps recoveryOps
+
 	// In-flight ownership (runtime only; never persisted — the persisted
 	// journal is the pre-state record written before mutation begins).
 	// CleanupFresh uses the disk journal plus these sets.
 	inFlightUnits []string
 	inFlightFiles []string
+}
+
+// managedBinaryPrefix is the managed binary prefix (systemd.BinaryPrefix). It
+// is a package var — mirroring systemd's own test-redirectable managed-path
+// vars — so the prefix-bounded directory removal in recovery and the journal's
+// containment check can be exercised on a temporary tree. Production never
+// reassigns it; only _test.go files do (restored via t.Cleanup).
+var managedBinaryPrefix = systemd.BinaryPrefix
+
+// recoveryOps abstracts the T5 operations journal-driven recovery needs.
+// Production delegates to the authoritative T5 package (systemdRecoveryOps).
+type recoveryOps interface {
+	RemoveUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
+	RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
+	RollbackEnvFile(ctx context.Context, role systemd.Role) error
+}
+
+// systemdRecoveryOps is the production recoveryOps: a thin delegation to T5.
+type systemdRecoveryOps struct{}
+
+func (systemdRecoveryOps) RemoveUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
+	return systemd.RemoveUnit(ctx, m, s)
+}
+
+func (systemdRecoveryOps) RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
+	return systemd.RollbackLast(ctx, m, s)
+}
+
+func (systemdRecoveryOps) RollbackEnvFile(ctx context.Context, role systemd.Role) error {
+	return systemd.RollbackEnvFile(ctx, role)
+}
+
+// ops returns the adapter's recovery-operations seam (real T5 by default).
+func (a *LinuxAdapter) ops() recoveryOps {
+	if a.recoveryOps != nil {
+		return a.recoveryOps
+	}
+	return systemdRecoveryOps{}
 }
 
 // NewLinuxAdapter constructs production dependencies. It intentionally
@@ -309,6 +354,10 @@ func (a *LinuxAdapter) Health(ctx context.Context, desired DesiredState) error {
 // Xray/origin binary directories are never removed here: T2/T4 leave old
 // versions on disk, and the pointer still targets the version the previous
 // state used (the adapter re-points only after Activate succeeds).
+//
+// Restore is the IN-PROCESS recovery path and may consult the runtime
+// in-flight record. After a process crash that record is gone, so
+// post-crash recovery uses RecoverJournal (journal-driven) instead.
 func (a *LinuxAdapter) Restore(ctx context.Context, previous Manifest) error {
 	// Refuse to "restore" a state that was never committed: a restore must
 	// return the host to a real previous generation. A fresh install (no
@@ -336,60 +385,241 @@ func (a *LinuxAdapter) Restore(ctx context.Context, previous Manifest) error {
 		}
 		return a.rollbackTo(ctx, previous)
 	}
-	prevUnits := map[string]bool{}
-	for _, s := range previous.Services {
-		prevUnits[s.Unit] = true
+	// In-flight recovery is bounded by the journal's pre-state (the previous
+	// manifest is the source of truth for unit pre-state; its PreUnits mirror
+	// it). The unit set reverted here is the RUNTIME in-flight set, which is
+	// the exact set this process attempted to replace.
+	if err := a.revertUnits(ctx, j, previous, a.inFlightUnits); err != nil {
+		return err
 	}
-	// Unit rollback / removal, reverse dependency order. The previous
-	// manifest is the single source of truth for unit pre-state (the
-	// journal's PreUnits mirror it); file recovery below is bounded by
-	// the journal's PreFiles (empty when no journal was written).
-	for i := len(a.units) - 1; i >= 0; i-- {
-		spec := a.units[i]
-		unit := unitName(spec)
-		inFlight := contains(a.inFlightUnits, unit)
-		if !inFlight {
-			// This transaction never replaced the unit (failure before
-			// Activate, or the swap itself failed and T5's ApplyUnit
-			// already restored the live unit file): nothing to revert.
-			continue
-		}
-		if !prevUnits[unit] {
-			// Created by this transaction: remove it entirely.
-			if err := systemd.RemoveUnit(ctx, a.Services, spec); err != nil {
-				return fmt.Errorf("deploy: restore unit %s: %w", unit, err)
-			}
-			continue
-		}
-		if err := systemd.RollbackLast(ctx, a.Services, spec); err != nil {
-			return fmt.Errorf("deploy: restore unit %s: %w", unit, err)
-		}
-	}
-	// 3: firewall.
+	// Firewall: only the snapshot this process actually applied.
 	if a.firewallApplied {
 		if err := a.Firewall.Remove(ctx, a.firewallState); err != nil {
 			return fmt.Errorf("deploy: restore firewall: %w", err)
 		}
 	}
-	// 4: env file.
+	// Env file: the previous generation had one → restore its backup.
 	if previous.Paths.Env != "" {
-		if err := systemd.RollbackEnvFile(ctx, systemd.Role(a.Request.Role)); err != nil {
+		if err := a.ops().RollbackEnvFile(ctx, systemd.Role(a.Request.Role)); err != nil {
 			return fmt.Errorf("deploy: restore env file: %w", err)
 		}
 	}
-	// 6: config files this transaction created.
+	// Config files this transaction created (not recorded as pre-existing).
+	if err := a.removeOwnedFiles(j, a.inFlightFiles, a.Request.EnvPath); err != nil {
+		return fmt.Errorf("deploy: restore: %w", err)
+	}
+	return nil
+}
+
+// RecoverJournal is the POST-CRASH recovery entrypoint: it reconstructs the
+// crashed transaction's ownership from the PERSISTED journal alone (the
+// runtime in-flight sets are empty in a fresh process) and reverts the host.
+//
+//   - Fresh case (previous.Generation == ""): there is no committed previous
+//     generation to converge to, so only artifacts the crashed transaction
+//     created are removed — the owned firewall state, units in j.Units that
+//     are NOT in j.PreUnits (reverse dependency order), files in j.Files that
+//     are NOT in j.PreFiles, the xray/caddy binary pointer and the journal's
+//     version dir (prefix-bounded). Restore is deliberately NOT called: a
+//     fresh install has nothing to restore to.
+//   - Upgrade case (a committed previous generation exists): converge to
+//     previous using Restore's journal-driven semantics (unit rollback/removal
+//     from the journal's unit sets plus previous.Services, env rollback, and
+//     removal of files the transaction created).
+//
+// It is idempotent (already-reverted artifacts are absent → no-ops) and
+// bounded by ctx. It never reads the runtime in-flight record, so it behaves
+// identically in the crashed process's successor.
+func (a *LinuxAdapter) RecoverJournal(ctx context.Context, j ArtifactJournal, previous Manifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if j.Role != a.Request.Role {
+		return fmt.Errorf("deploy: recovery: journal role %q does not match adapter role %q", j.Role, a.Request.Role)
+	}
+	if previous.Generation == "" {
+		return a.recoverFresh(ctx, j)
+	}
+	// Upgrade: converge to the committed previous generation. The journal's
+	// unit set (j.Units) is the ownership record — the runtime in-flight set
+	// is unavailable post-crash.
+	if err := a.revertUnits(ctx, j, previous, j.Units); err != nil {
+		return err
+	}
+	if previous.Paths.Env != "" {
+		if err := a.ops().RollbackEnvFile(ctx, systemd.Role(a.Request.Role)); err != nil {
+			return fmt.Errorf("deploy: recovery: env file: %w", err)
+		}
+	}
+	if err := a.removeOwnedFiles(j, j.Files, a.Request.EnvPath); err != nil {
+		return fmt.Errorf("deploy: recovery: %w", err)
+	}
+	return nil
+}
+
+// recoverFresh reverts a crashed FRESH install (no committed previous
+// generation): everything the journal records as created is removed; nothing
+// is restored. Order mirrors CleanupFresh (firewall → units reverse order →
+// config files → binary pointer + version dir → env file).
+func (a *LinuxAdapter) recoverFresh(ctx context.Context, j ArtifactJournal) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if j.Firewall {
+		// Reconstruct the owned rule set from the request (the journal only
+		// records THAT the project applied a firewall, not the rules). A
+		// failure here must not silently skip the removal: report it.
+		snapshot, err := a.Firewall.Inspect(ctx, a.Request.Firewall)
+		if err != nil {
+			return fmt.Errorf("deploy: recovery: inspect firewall: %w", err)
+		}
+		if err := a.Firewall.Remove(ctx, snapshot); err != nil {
+			return fmt.Errorf("deploy: recovery: firewall: %w", err)
+		}
+	}
+	// Units the transaction created: j.Units minus j.PreUnits, reverse order.
+	if err := a.removeUnitsReverse(ctx, subtractUnits(j.Units, j.PreUnits)); err != nil {
+		return err
+	}
+	// Config files the transaction created: j.Files minus j.PreFiles.
+	if err := a.removeOwnedFiles(j, j.Files, a.Request.EnvPath); err != nil {
+		return fmt.Errorf("deploy: recovery: %w", err)
+	}
+	if err := a.removeOwnedVersionDirs(ctx, j); err != nil {
+		return err
+	}
+	// Env file (created by this transaction; a fresh install has none before).
+	if err := os.Remove(a.Request.EnvPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("deploy: recovery: env file: %w", err)
+	}
+	return nil
+}
+
+// removeUnitsReverse removes the given unit names in reverse dependency order
+// through T5's RemoveUnit (via the unitOps seam). Absent units are no-ops
+// (RemoveUnit tolerates a missing live file), so the sweep is idempotent.
+func (a *LinuxAdapter) removeUnitsReverse(ctx context.Context, units []string) error {
+	for i := len(units) - 1; i >= 0; i-- {
+		spec, err := a.unitSpecFor(units[i])
+		if err != nil {
+			return err
+		}
+		if err := a.ops().RemoveUnit(ctx, a.Services, spec); err != nil {
+			return fmt.Errorf("deploy: recovery: unit %s: %w", units[i], err)
+		}
+	}
+	return nil
+}
+
+// removeOwnedVersionDirs removes the binary pointer and the journal's version
+// directory (XrayDir for Germany, OriginDir for Iran). The removal is
+// prefix-bounded and symlink-safe (removePrefixDir). Shared by CleanupFresh
+// and recoverFresh so both paths derive ownership identically.
+func (a *LinuxAdapter) removeOwnedVersionDirs(ctx context.Context, j ArtifactJournal) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if a.Request.Role == RoleGermany {
+		// Only the "current" symlink and the journal's XrayDir are
+		// project-owned by THIS transaction; other version dirs belong to
+		// previous installs and are untouched.
+		if err := os.Remove(managedBinaryPrefix + "/xray/current"); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("deploy: recovery: xray pointer: %w", err)
+		}
+		if j.XrayDir != "" {
+			if err := removePrefixDir(j.XrayDir, managedBinaryPrefix); err != nil {
+				return fmt.Errorf("deploy: recovery: %w", err)
+			}
+		}
+	}
+	if a.Request.Role == RoleIran && j.OriginDir != "" {
+		if err := removePrefixDir(j.OriginDir, managedBinaryPrefix); err != nil {
+			return fmt.Errorf("deploy: recovery: %w", err)
+		}
+	}
+	return nil
+}
+
+// revertUnits rolls back (or removes) the given units in reverse dependency
+// order, bounded by the journal's pre-state and previous.Services. A unit in
+// previous.Services (or j.PreUnits) is pre-existing → RollbackLast restores
+// its managed backup; otherwise it was created by the transaction → RemoveUnit.
+func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previous Manifest, units []string) error {
+	prevUnits := map[string]bool{}
+	for _, s := range previous.Services {
+		prevUnits[s.Unit] = true
+	}
+	for _, u := range j.PreUnits {
+		prevUnits[u] = true
+	}
+	for i := len(units) - 1; i >= 0; i-- {
+		unit := units[i]
+		spec, err := a.unitSpecFor(unit)
+		if err != nil {
+			return err
+		}
+		if !prevUnits[unit] {
+			if err := a.ops().RemoveUnit(ctx, a.Services, spec); err != nil {
+				return fmt.Errorf("deploy: recovery: remove unit %s: %w", unit, err)
+			}
+			continue
+		}
+		if err := a.ops().RollbackLast(ctx, a.Services, spec); err != nil {
+			return fmt.Errorf("deploy: recovery: rollback unit %s: %w", unit, err)
+		}
+	}
+	return nil
+}
+
+// unitSpecFor reconstructs a minimal T5 spec for a unit NAME recorded in the
+// journal (post-crash recovery has no runtime specs). The component is derived
+// from the canonical unit name so RemoveUnit/RollbackLast target the right
+// managed file; both operations derive the file from the unit name, so the
+// remaining spec fields are informational. The unit name is validated by T5
+// (Spec.unitName) inside those operations.
+func (a *LinuxAdapter) unitSpecFor(unit string) (systemd.Spec, error) {
+	switch unit {
+	case "xray-germany.service":
+		return systemd.Spec{Role: systemd.RoleGermany, Component: systemd.ComponentXray, UnitName: unit, BinPath: systemd.XrayBinaryPath}, nil
+	case "iran-origin.service":
+		return systemd.Spec{Role: systemd.RoleIran, Component: systemd.ComponentOrigin, UnitName: unit, BinPath: systemd.BinaryPrefix + "/caddy/" + origin.PinnedVersion + "/caddy", OriginVersion: origin.PinnedVersion}, nil
+	default:
+		return systemd.Spec{Role: systemd.Role(a.Request.Role), Component: systemd.ComponentSplitter, UnitName: unit, BinPath: a.Request.SplitterPath, EnvFile: systemd.EnvFile(systemd.Role(a.Request.Role))}, nil
+	}
+}
+
+// removeOwnedFiles removes each file in owned that is NOT recorded as
+// pre-existing in j.PreFiles and is not the env file (env is handled by its
+// own rollback/removal path). Absent files are no-ops (idempotent).
+func (a *LinuxAdapter) removeOwnedFiles(j ArtifactJournal, owned []string, envPath string) error {
 	preFiles := map[string]bool{}
 	for _, f := range j.PreFiles {
 		preFiles[f] = true
 	}
-	for _, f := range a.inFlightFiles {
-		if !preFiles[f] && f != a.Request.EnvPath {
-			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("deploy: restore config %s: %w", filepath.Base(f), err)
-			}
+	for _, f := range owned {
+		if preFiles[f] || f == envPath {
+			continue
+		}
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove config %s: %w", filepath.Base(f), err)
 		}
 	}
 	return nil
+}
+
+// subtractUnits returns the entries of all that are not present in exclude.
+func subtractUnits(all, exclude []string) []string {
+	skip := make(map[string]bool, len(exclude))
+	for _, u := range exclude {
+		skip[u] = true
+	}
+	var out []string
+	for _, u := range all {
+		if !skip[u] {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // rollbackTo converges the host to the target manifest for an operator
@@ -535,6 +765,11 @@ func (a *LinuxAdapter) targetUnitSpecs(target Manifest) ([]systemd.Spec, error) 
 // binary pointer and the journal's version dir (when present) → the env
 // file. A fresh install has no previously-existing units by definition; the
 // journal's pre-state records still bound the file sweep defensively.
+//
+// CleanupFresh is the IN-PROCESS path: it uses the runtime in-flight sets.
+// Its post-crash twin is recoverFresh (journal-driven); both share the
+// removeUnitsReverse / removeOwnedFiles / removeOwnedVersionDirs helpers so
+// ownership is derived identically.
 func (a *LinuxAdapter) CleanupFresh(ctx context.Context, desired DesiredState) error {
 	if a.firewallApplied {
 		if err := a.Firewall.Remove(ctx, a.firewallState); err != nil {
@@ -542,7 +777,7 @@ func (a *LinuxAdapter) CleanupFresh(ctx context.Context, desired DesiredState) e
 		}
 	}
 	for i := len(a.units) - 1; i >= 0; i-- {
-		if err := systemd.RemoveUnit(ctx, a.Services, a.units[i]); err != nil {
+		if err := a.ops().RemoveUnit(ctx, a.Services, a.units[i]); err != nil {
 			return err
 		}
 	}
@@ -551,38 +786,12 @@ func (a *LinuxAdapter) CleanupFresh(ctx context.Context, desired DesiredState) e
 	if a.Store != nil {
 		j, jerr = a.Store.ReadJournal()
 	}
-	preFiles := map[string]bool{}
-	if jerr == nil {
-		for _, f := range j.PreFiles {
-			preFiles[f] = true
-		}
-	}
-	for _, f := range a.inFlightFiles {
-		if !preFiles[f] && f != a.Request.EnvPath {
-			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
+	if err := a.removeOwnedFiles(j, a.inFlightFiles, a.Request.EnvPath); err != nil {
+		return err
 	}
 	if jerr == nil {
-		if a.Request.Role == RoleGermany {
-			// Remove the binary pointer and the version dir this transaction
-			// installed. Only the "current" symlink and the journal's
-			// XrayDir are project-owned by THIS transaction; other version
-			// dirs are untouched (they belong to previous installs).
-			if err := os.Remove(systemd.BinaryPrefix + "/xray/current"); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			if j.XrayDir != "" {
-				if err := removePrefixDir(j.XrayDir, systemd.BinaryPrefix); err != nil {
-					return err
-				}
-			}
-		}
-		if a.Request.Role == RoleIran && j.OriginDir != "" {
-			if err := removePrefixDir(j.OriginDir, systemd.BinaryPrefix); err != nil {
-				return err
-			}
+		if err := a.removeOwnedVersionDirs(ctx, j); err != nil {
+			return err
 		}
 	}
 	if err := os.Remove(a.Request.EnvPath); err != nil && !os.IsNotExist(err) {
