@@ -768,7 +768,7 @@ func (a *LinuxAdapter) rollbackTo(ctx context.Context, target Manifest) error {
 		return fmt.Errorf("%w: rollback: firewall rules differ from the current deployment and are not reconstructible; manual firewall recovery required", ErrTransaction)
 	}
 	if a.Request.Role == RoleGermany {
-		if got := realityFingerprint(a.Request.Reality); target.Components.Xray.SHA256 != got {
+		if got := realityFingerprint(a.Request.Reality); target.Components.Xray.RealityFingerprint != got {
 			return fmt.Errorf("%w: rollback: Reality parameters differ from the current deployment and the prior keypair is not retained; manual recovery required", ErrTransaction)
 		}
 	}

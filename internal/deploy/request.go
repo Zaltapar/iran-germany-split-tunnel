@@ -12,6 +12,7 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
@@ -34,6 +35,16 @@ type InstallRequest struct {
 	XrayPath        string
 	OriginVersion   string
 	OriginPath      string
+
+	// SplitterSHA256 and XraySHA256 are OPTIONAL artifact content hashes. They
+	// are intentionally not required by Validate: the current CLI contract
+	// carries only a version and a path, so no authoritative binary hash is
+	// available. When set (e.g. by an operator tool that verified a download),
+	// Desired records them as true binary hashes and the planner detects an
+	// in-place replacement that keeps the same path/version. When empty the
+	// field is left unasserted rather than fabricated.
+	SplitterSHA256 string
+	XraySHA256     string
 
 	Reality xray.RealityParams
 
@@ -163,6 +174,68 @@ func realityFingerprint(params xray.RealityParams) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// originCaddyfileHash is the SHA-256 of the rendered Caddyfile for a plan, or
+// "" when the mode generates no Caddyfile (none, cdn plainOrigin). It reuses
+// the authoritative renderer (origin.RenderCaddyfile) rather than duplicating
+// the template.
+func originCaddyfileHash(p origin.Plan) string {
+	data, err := origin.RenderCaddyfile(p)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// unitContentHash is the SHA-256 of the exact unit bytes the apply path writes
+// for a spec, or "" when the spec cannot be rendered in the current
+// environment (e.g. an artifact path that RenderUnit rejects). Rendering is
+// delegated to the authoritative systemd.RenderUnit — never re-implemented —
+// and a render failure leaves the hash unasserted instead of failing the plan,
+// because the adapter's Validate phase renders the same spec inside the
+// transaction and surfaces a real failure there.
+func unitContentHash(spec systemd.Spec) string {
+	data, err := systemd.RenderUnit(spec)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// managedPaths returns every fixed managed path the adapter uses, derived from
+// the authoritative internal/systemd constants (never hard-coded duplicates).
+func managedPaths(r InstallRequest) Paths {
+	return Paths{
+		StateRoot:      r.StateRoot,
+		Env:            r.EnvPath,
+		Config:         r.ConfigPath,
+		UnitDir:        systemd.UnitDir,
+		WantsDir:       systemd.WantsDir,
+		LogDir:         systemd.LogDir,
+		DataDir:        systemd.DataDir,
+		BinaryPrefix:   systemd.BinaryPrefix,
+		UnitsBackupDir: systemd.UnitsBackupDir,
+	}
+}
+
+// desiredServices projects the canonical unit plan into planner service state.
+// Unit bytes remain owned by systemd.RenderUnit; this only hashes the exact
+// spec the apply path writes (applyReadySpec normalises the xray pointer, the
+// same normalisation Activate applies).
+func desiredServices(plan SystemdPlan) []ServiceState {
+	services := make([]ServiceState, 0, len(plan.Specs))
+	for _, spec := range plan.Specs {
+		spec = applyReadySpec(spec)
+		services = append(services, ServiceState{
+			Unit:      unitName(spec),
+			Component: string(spec.Component),
+			Hash:      unitContentHash(spec),
+		})
+	}
+	return services
+}
+
 func firewallFingerprint(plan firewall.Plan) string {
 	parts := make([]string, 0, len(plan.Allow)+len(plan.Deny)+len(plan.CDNEgress)+2)
 	parts = append(parts, string(plan.Backend), plan.Role)
@@ -177,25 +250,55 @@ func firewallFingerprint(plan firewall.Plan) string {
 
 // Desired converts a validated request into planner state. It does not read,
 // write, install, or start anything.
+//
+// Services are derived from the single authoritative unit plan
+// (BuildSystemdPlan), so the manifest records exactly the units the adapter
+// deploys — including the cdn plainOrigin case, where no origin unit exists.
 func (r InstallRequest) Desired() (DesiredState, error) {
 	if err := r.Validate(); err != nil {
 		return DesiredState{}, err
 	}
-	services := []ServiceState{{Unit: r.Role + "-splitter.service", Component: "splitter"}}
+	plan, err := BuildSystemdPlan(r)
+	if err != nil {
+		return DesiredState{}, err
+	}
+	paths := managedPaths(r)
+	for _, spec := range plan.Specs {
+		paths.UnitFiles = append(paths.UnitFiles, systemd.UnitDir+"/"+unitName(spec))
+	}
 	if r.Role == RoleGermany {
-		services = append([]ServiceState{{Unit: "xray-germany.service", Component: "xray"}}, services...)
-	} else if r.Origin.Mode != origin.ModeNone {
-		services = append([]ServiceState{{Unit: "iran-origin.service", Component: "origin"}}, services...)
+		// The version-independent managed pointer the xray unit runs. It is
+		// derived from the authoritative systemd constant with a string
+		// operation (not filepath.Dir) so the recorded value is the canonical
+		// Unix path on every host — the manifest must be host-independent.
+		paths.BinaryPointer = strings.TrimSuffix(systemd.XrayBinaryPath, "/xray")
+	}
+	xray := ComponentState{Version: r.XrayVersion, Path: r.XrayPath, SHA256: r.XraySHA256}
+	if r.Role == RoleGermany {
+		// The Reality public-parameter fingerprint is xray/germany-only and is
+		// kept in its own field, never overloaded onto the binary hash.
+		xray.RealityFingerprint = realityFingerprint(r.Reality)
 	}
 	d := DesiredState{
 		Role: r.Role,
 		Components: Components{
-			Splitter: ComponentState{Version: r.SplitterVersion, Path: r.SplitterPath},
-			Xray:     ComponentState{Version: r.XrayVersion, Path: r.XrayPath, SHA256: realityFingerprint(r.Reality)},
-			Origin:   OriginState{Mode: string(r.Origin.Mode), Domain: r.Origin.Domain, Version: r.OriginVersion},
+			Splitter: ComponentState{Version: r.SplitterVersion, Path: r.SplitterPath, SHA256: r.SplitterSHA256},
+			Xray:     xray,
+			Origin: OriginState{
+				Mode:           string(r.Origin.Mode),
+				Version:        r.OriginVersion,
+				Domain:         r.Origin.Domain,
+				UpstreamAddr:   r.Origin.UpstreamAddr,
+				OriginPort:     r.Origin.OriginPort,
+				ACMEChallenge:  string(r.Origin.ACMEChallenge),
+				ACMEEmail:      r.Origin.ACMEEmail,
+				CDNSecurity:    string(r.Origin.CDNSecurity),
+				CDNOriginTrust: string(r.Origin.CDNOriginTrust),
+				CaddyfileHash:  originCaddyfileHash(r.Origin),
+			},
 		},
-		Paths:    Paths{StateRoot: r.StateRoot, Env: r.EnvPath, Config: r.ConfigPath},
-		Services: services,
+		Paths:    paths,
+		Services: desiredServices(plan),
 		// Desired expresses only install's pairing baseline. install does not
 		// own pairing: the pair generate|apply|finalize commands do. The
 		// controller carries a committed pairing state forward over this

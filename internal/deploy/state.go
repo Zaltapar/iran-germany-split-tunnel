@@ -94,7 +94,11 @@ func (s *Store) Save(m Manifest) error {
 // are pruned only after the new manifest is safely installed.
 func (s *Store) Commit(m Manifest, label string) (Manifest, error) {
 	now := s.now()
-	if m.Schema == 0 {
+	// Commit always writes the CURRENT schema: a manifest loaded from an older
+	// on-disk schema is upgraded here, which is the documented migration
+	// expectation (legacy files load read-only; the next commit rewrites them
+	// at the current schema).
+	if m.Schema != SchemaVersion {
 		m.Schema = SchemaVersion
 	}
 	if m.CreatedAt.IsZero() {
@@ -197,8 +201,14 @@ func (s *Store) prune(revisions []Revision) error {
 	return nil
 }
 
+// validateManifest accepts the current schema and the single recognised legacy
+// schema (1). Any other value fails closed. Legacy acceptance is what lets an
+// existing on-disk state.json load without error; every field added since
+// schema 1 is `omitempty`, so a legacy file re-marshals byte-identically and
+// its stored ManifestHash still validates. The schema is bumped to the current
+// value only by Store.Commit.
 func validateManifest(m Manifest) error {
-	if m.Schema != SchemaVersion {
+	if m.Schema != SchemaVersion && !legacySchema(m.Schema) {
 		return fmt.Errorf("%w: schema %d", ErrInvalidManifest, m.Schema)
 	}
 	if m.Role != RoleIran && m.Role != RoleGermany {
