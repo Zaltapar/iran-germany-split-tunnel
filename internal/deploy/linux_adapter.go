@@ -741,6 +741,19 @@ func subtractUnits(all, exclude []string) []string {
 	return out
 }
 
+// recordedRealityFingerprint resolves the Reality public-parameter fingerprint
+// a manifest records for Germany. Schema 2 keeps it in the dedicated
+// RealityFingerprint field; schema 1 predated that field and overloaded the
+// binary-hash field (its sha256 held the fingerprint), so a legacy manifest
+// falls back to SHA256. It returns "" when neither is recorded, which the
+// rollback guard treats as a mismatch (fail closed).
+func recordedRealityFingerprint(c ComponentState) string {
+	if c.RealityFingerprint != "" {
+		return c.RealityFingerprint
+	}
+	return c.SHA256
+}
+
 // rollbackTo converges the host to the target manifest for an operator
 // rollback (Store.Rollback). It is bounded by ownership and runs the same
 // validation and health gates as an ordinary deployment: every target unit is
@@ -768,7 +781,9 @@ func (a *LinuxAdapter) rollbackTo(ctx context.Context, target Manifest) error {
 		return fmt.Errorf("%w: rollback: firewall rules differ from the current deployment and are not reconstructible; manual firewall recovery required", ErrTransaction)
 	}
 	if a.Request.Role == RoleGermany {
-		if got := realityFingerprint(a.Request.Reality); target.Components.Xray.RealityFingerprint != got {
+		// recordedRealityFingerprint keeps a schema-1 revision rollbackable:
+		// its overloaded sha256 still holds the fingerprint.
+		if got := realityFingerprint(a.Request.Reality); recordedRealityFingerprint(target.Components.Xray) != got {
 			return fmt.Errorf("%w: rollback: Reality parameters differ from the current deployment and the prior keypair is not retained; manual recovery required", ErrTransaction)
 		}
 	}

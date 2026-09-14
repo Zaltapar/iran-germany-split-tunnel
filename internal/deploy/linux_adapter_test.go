@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
@@ -172,5 +173,71 @@ func TestRemoveWithinPrefixSymlinkAndNonDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "keep")); err != nil {
 		t.Fatalf("symlink target was deleted (must not be followed): %v", err)
+	}
+}
+
+// TestRollbackAcceptsLegacyRealityFingerprint is the backward-compatibility
+// regression for the convergence-field split: a schema-1 Germany revision
+// stored the Reality public fingerprint in the overloaded SHA256 field, so the
+// rollback guard must still recognise it after the fingerprint moved to its
+// own field. Before the fix the guard read RealityFingerprint only, saw "",
+// and refused a rollback that the parent commit allowed — making every
+// pre-existing Germany revision un-rollbackable after an upgrade.
+func TestRollbackAcceptsLegacyRealityFingerprint(t *testing.T) {
+	request := validGermanyRequest()
+	fingerprint := realityFingerprint(request.Reality)
+	if fingerprint == "" {
+		t.Fatal("test fixture produced an empty Reality fingerprint")
+	}
+
+	cases := []struct {
+		name    string
+		target  ComponentState
+		wantErr bool
+	}{
+		{
+			"legacy schema-1 revision (fingerprint in sha256)",
+			ComponentState{Version: request.XrayVersion, SHA256: fingerprint},
+			false,
+		},
+		{
+			"current schema-2 revision (dedicated field)",
+			ComponentState{Version: request.XrayVersion, RealityFingerprint: fingerprint},
+			false,
+		},
+		{
+			"genuinely different Reality parameters still fail closed",
+			ComponentState{Version: request.XrayVersion, RealityFingerprint: "different-fingerprint"},
+			true,
+		},
+		{
+			"nothing recorded still fails closed",
+			ComponentState{Version: request.XrayVersion},
+			true,
+		},
+	}
+	const realityGuard = "Reality parameters differ"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := testManifest("/tmp/state", RoleGermany)
+			target.Components.Xray = tc.target
+			target.Firewall.RulesHash = firewallFingerprint(request.Firewall)
+			adapter := &LinuxAdapter{
+				Request:  request,
+				Services: systemd.NewServiceManager(nil),
+				Firewall: &firewallFake{},
+			}
+			// Past the Reality guard rollbackTo reaches systemd (root-gated on
+			// this host), so assert the GUARD's decision by its diagnostic
+			// rather than requiring the whole convergence to succeed.
+			err := adapter.rollbackTo(context.Background(), target)
+			guarded := err != nil && strings.Contains(err.Error(), realityGuard)
+			if tc.wantErr && !guarded {
+				t.Fatalf("rollback did not fail closed on mismatched Reality: %v", err)
+			}
+			if !tc.wantErr && guarded {
+				t.Fatalf("rollback refused a matching Reality fingerprint: %v", err)
+			}
+		})
 	}
 }
