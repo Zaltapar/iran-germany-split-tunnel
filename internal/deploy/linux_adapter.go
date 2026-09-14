@@ -192,7 +192,10 @@ func BuildJournal(root string, previous Manifest, desired DesiredState) (Artifac
 		}
 	}
 	if desired.Role == RoleIran && desired.Components.Origin.Version != "" {
-		if d, err := origin.VersionDir(systemd.BinaryPrefix+"/caddy", desired.Components.Origin.Version); err == nil {
+		// VersionDir derives the canonical Caddy layout as
+		// <prefix>/caddy/<version>. Pass the managed binary prefix itself;
+		// passing <prefix>/caddy would duplicate the component directory.
+		if d, err := origin.VersionDir(systemd.BinaryPrefix, desired.Components.Origin.Version); err == nil {
 			j.OriginDir = d
 		}
 	}

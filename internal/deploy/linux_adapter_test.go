@@ -13,6 +13,22 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 )
 
+func TestBuildJournalUsesCanonicalIranOriginVersionDir(t *testing.T) {
+	root := t.TempDir()
+	desired := DesiredState{
+		Role:       RoleIran,
+		Components: Components{Origin: OriginState{Version: "v2.11.4"}},
+	}
+	j, err := BuildJournal(root, Manifest{}, desired)
+	if err != nil {
+		t.Fatalf("BuildJournal: %v", err)
+	}
+	want := systemd.BinaryPrefix + "/caddy/v2.11.4"
+	if j.OriginDir != want {
+		t.Fatalf("OriginDir=%q, want %q", j.OriginDir, want)
+	}
+}
+
 func TestNewLinuxAdapterRejectsNonCanonicalPaths(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("production adapter is Linux-only")

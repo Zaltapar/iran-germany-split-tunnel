@@ -105,7 +105,7 @@ func TestApplyUnitFreshAndUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCalls(t, ex.calls, []string{
-		"systemd-analyze verify " + live + ".tmp-" + strconv.Itoa(os.Getpid()),
+		"systemd-analyze verify " + filepath.Join(filepath.Dir(live), ".germany-splitter.service.verify-"+strconv.Itoa(os.Getpid()), "germany-splitter.service"),
 		"systemctl daemon-reload", "systemctl enable germany-splitter.service",
 		"systemctl start germany-splitter.service", "systemctl is-active germany-splitter.service"})
 	want, _ := RenderUnit(s)
@@ -163,7 +163,7 @@ func TestApplyUnitUpgradeAndRollback(t *testing.T) {
 	if len(unitBackups(t, live)) != 1 {
 		t.Fatalf("backups=%v", unitBackups(t, live))
 	}
-	assertCalls(t, ex.calls, []string{"systemctl is-active germany-splitter.service", "systemd-analyze verify " + live + ".tmp-" + strconv.Itoa(os.Getpid()), "systemctl daemon-reload", "systemctl enable germany-splitter.service", "systemctl restart germany-splitter.service", "systemctl is-active germany-splitter.service"})
+	assertCalls(t, ex.calls, []string{"systemctl is-active germany-splitter.service", "systemd-analyze verify " + filepath.Join(filepath.Dir(live), ".germany-splitter.service.verify-"+strconv.Itoa(os.Getpid()), "germany-splitter.service"), "systemctl daemon-reload", "systemctl enable germany-splitter.service", "systemctl restart germany-splitter.service", "systemctl is-active germany-splitter.service"})
 
 	redirectPaths(t)
 	s = applySpec(t, RoleGermany, ComponentSplitter)
@@ -186,7 +186,7 @@ func TestApplyUnitUpgradeAndRollback(t *testing.T) {
 	}
 	assertCalls(t, ex.calls, []string{
 		"systemctl is-active germany-splitter.service",
-		"systemd-analyze verify " + live + ".tmp-" + strconv.Itoa(os.Getpid()),
+		"systemd-analyze verify " + filepath.Join(filepath.Dir(live), ".germany-splitter.service.verify-"+strconv.Itoa(os.Getpid()), "germany-splitter.service"),
 	})
 }
 

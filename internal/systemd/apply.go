@@ -140,7 +140,26 @@ func ApplyUnit(ctx context.Context, m *ServiceManager, s Spec) (Result, error) {
 	}
 
 	// --- 4. validation (systemd-analyze verify the CANDIDATE) ------------
-	if out, verr := m.run(ctx, "systemd-analyze", "verify", candidate); verr != nil {
+	// systemd-analyze requires a unit-shaped basename and rejects the crash-safe
+	// <unit>.tmp-<pid> candidate name. Validate the exact candidate bytes through
+	// a private hard link with the real unit filename; the crash-recovery
+	// candidate remains unchanged and is still swept by preflight.
+	verifyDir := filepath.Join(filepath.Dir(live), "."+unit+".verify-"+strconv.Itoa(os.Getpid()))
+	verifyPath := filepath.Join(verifyDir, unit)
+	if err := os.Mkdir(verifyDir, 0o700); err != nil {
+		return failPreSwap(StepVerify, fmt.Errorf("create validation directory: %w", err))
+	}
+	cleanupVerify := func() {
+		_ = os.Remove(verifyPath)
+		_ = os.Remove(verifyDir)
+	}
+	if err := os.Link(candidate, verifyPath); err != nil {
+		cleanupVerify()
+		return failPreSwap(StepVerify, fmt.Errorf("link validation unit: %w", err))
+	}
+	out, verr := m.run(ctx, "systemd-analyze", "verify", verifyPath)
+	cleanupVerify()
+	if verr != nil {
 		os.Remove(candidate)
 		return Result{}, fmt.Errorf("%w: %v (step %s); output: %s", ErrVerify, verr, StepVerify, excerpt(out))
 	}
