@@ -103,6 +103,51 @@ func RollbackLast(ctx context.Context, m *ServiceManager, s Spec) error {
 	return nil
 }
 
+// RemoveUnitIfAbsent is the recovery-only idempotence path. It performs the
+// ordinary destructive uninstall when the managed unit file exists, but when
+// the live unit is genuinely absent it does not call systemctl at all. In that
+// case it removes only the exact managed wants symlink, and refuses every other
+// wants entry type. This narrow behavior must not weaken ordinary uninstall.
+func RemoveUnitIfAbsent(ctx context.Context, m *ServiceManager, s Spec) error {
+	if err := contextCheck(ctx); err != nil {
+		return err
+	}
+	if err := m.rootCheck(); err != nil {
+		return err
+	}
+	unit, err := s.unitName()
+	if err != nil {
+		return err
+	}
+	live, err := unitPath(unit)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(live)
+	if err == nil {
+		if st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+			return fmt.Errorf("%w: %s is a symlink or special file (refusing)", ErrUnsafeTarget, live)
+		}
+		return RemoveUnit(ctx, m, s)
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("%w: cannot stat unit: %v", ErrPreflight, err)
+	}
+	wants := filepath.Join(wantsDir, unit)
+	link, err := os.Lstat(wants)
+	if err == nil {
+		if link.Mode()&os.ModeSymlink == 0 {
+			return fmt.Errorf("%w: %s is not the managed wants symlink (refusing)", ErrUnsafeTarget, wants)
+		}
+		if err := os.Remove(wants); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("%w: cannot remove wants symlink for %s: %v", ErrPreflight, unit, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("%w: cannot stat wants entry: %v", ErrPreflight, err)
+	}
+	return nil
+}
+
 // RemoveUnit removes the unit file entirely (design §4.11): DisableUnit +
 // back up the unit file to <UnitsBackupDir>/<unit>.<unixnano> (keep-latest-3
 // sweep, managed entries only) + remove the live file + daemon-reload.

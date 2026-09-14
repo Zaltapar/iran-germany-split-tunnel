@@ -41,6 +41,10 @@ func (o *recoveryOpsFake) RemoveUnit(_ context.Context, _ *systemd.ServiceManage
 	return o.failWith
 }
 
+func (o *recoveryOpsFake) RemoveUnitIfAbsent(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
+	return o.RemoveUnit(ctx, m, s)
+}
+
 func (o *recoveryOpsFake) RollbackLast(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
 	if o.noBackup {
 		return fmt.Errorf("%w: %w for %s (nothing to roll back to)", systemd.ErrPreflight, systemd.ErrNoUnitBackup, s.UnitName)
@@ -154,14 +158,20 @@ func newRecoveryFixture(t *testing.T, role string, journal ArtifactJournal) *rec
 
 	ops := &recoveryOpsFake{unitDir: unitDir}
 	fw := &firewallFake{}
+	var request InstallRequest
+	if role == RoleGermany {
+		request = validGermanyRequest()
+	} else {
+		request = validIranRequest()
+	}
+	// Keep the fixture's ownership paths redirected while retaining a complete
+	// role-valid request so recovery can construct the canonical plan before it
+	// performs any destructive operation.
+	request.StateRoot = stateRoot
+	request.EnvPath = env
+	request.ConfigPath = config
 	adapter := &LinuxAdapter{
-		Request: InstallRequest{
-			Role:         role,
-			StateRoot:    stateRoot,
-			EnvPath:      env,
-			ConfigPath:   config,
-			SplitterPath: "/opt/split-tunnel/splitter",
-		},
+		Request:     request,
 		Store:       store,
 		Firewall:    fw,
 		recoveryOps: ops,
@@ -493,8 +503,12 @@ func TestRecoverOwnershipIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	ops := &recoveryOpsFake{unitDir: unitDir}
+	request := validIranRequest()
+	request.StateRoot = stateRoot
+	request.EnvPath = env
+	request.ConfigPath = newFile
 	adapter := &LinuxAdapter{
-		Request:     InstallRequest{Role: RoleIran, StateRoot: stateRoot, EnvPath: env, SplitterPath: "/opt/splitter"},
+		Request:     request,
 		Store:       store,
 		recoveryOps: ops,
 	}
@@ -778,6 +792,21 @@ func TestRecoverySpecForUnknownUnitFailsClosed(t *testing.T) {
 	adapter := &LinuxAdapter{Request: validGermanyRequest()}
 	if _, err := adapter.recoverySpecFor("iran-origin.service"); err == nil {
 		t.Fatal("recoverySpecFor accepted a unit absent from the request's plan")
+	}
+}
+
+func TestRecoverFreshRejectsUnexpectedCanonicalLookingUnitBeforeMutation(t *testing.T) {
+	journal := ArtifactJournal{Role: RoleIran, Generation: "pending-1", Units: []string{"germany-splitter.service"}}
+	fx := newRecoveryFixture(t, RoleIran, journal)
+	fx.withValidRequest(t, RoleIran)
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err == nil {
+		t.Fatal("recovery accepted a unit outside the Iran plan")
+	}
+	if len(fx.ops.removed) != 0 {
+		t.Fatalf("recovery mutated units before allowlist validation: %#v", fx.ops.removed)
+	}
+	if _, err := fx.store.ReadJournal(); err != nil {
+		t.Fatalf("journal was not retained: %v", err)
 	}
 }
 

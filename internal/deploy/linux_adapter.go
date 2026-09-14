@@ -66,6 +66,7 @@ var managedBinaryPrefix = systemd.BinaryPrefix
 // Production delegates to the authoritative T5 package (systemdRecoveryOps).
 type recoveryOps interface {
 	RemoveUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
+	RemoveUnitIfAbsent(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
 	RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error
 	// ReapplyUnit re-applies a committed unit spec from the manifest. It is
 	// the convergence fallback for DEFECT-3: when RollbackLast finds no
@@ -81,6 +82,10 @@ type systemdRecoveryOps struct{}
 
 func (systemdRecoveryOps) RemoveUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
 	return systemd.RemoveUnit(ctx, m, s)
+}
+
+func (systemdRecoveryOps) RemoveUnitIfAbsent(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
+	return systemd.RemoveUnitIfAbsent(ctx, m, s)
 }
 
 func (systemdRecoveryOps) RollbackLast(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) error {
@@ -512,6 +517,12 @@ func (a *LinuxAdapter) RecoverJournal(ctx context.Context, j ArtifactJournal, pr
 	if j.Role != a.Request.Role {
 		return fmt.Errorf("deploy: recovery: journal role %q does not match adapter role %q", j.Role, a.Request.Role)
 	}
+	// Validate every journal unit against the exact role-specific plan before
+	// any destructive recovery operation. A syntactically valid service name is
+	// not sufficient ownership proof: recovery must never act on a foreign unit.
+	if _, err := a.recoveryPlanSpecs(append(append([]string{}, j.Units...), j.PreUnits...)); err != nil {
+		return err
+	}
 	if previous.Generation == "" {
 		return a.recoverFresh(ctx, j)
 	}
@@ -608,7 +619,7 @@ func (a *LinuxAdapter) removeUnitsReverse(ctx context.Context, units []string) e
 		if err != nil {
 			return err
 		}
-		if err := a.ops().RemoveUnit(ctx, a.Services, spec); err != nil {
+		if err := a.ops().RemoveUnitIfAbsent(ctx, a.Services, spec); err != nil {
 			return fmt.Errorf("deploy: recovery: unit %s: %w", units[i], err)
 		}
 	}
@@ -663,7 +674,7 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 			return err
 		}
 		if !prevUnits[unit] {
-			if err := a.ops().RemoveUnit(ctx, a.Services, spec); err != nil {
+			if err := a.ops().RemoveUnitIfAbsent(ctx, a.Services, spec); err != nil {
 				return fmt.Errorf("deploy: recovery: remove unit %s: %w", unit, err)
 			}
 			continue
@@ -711,14 +722,36 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 // NOT render bytes, so it must never feed ApplyUnit — use recoverySpecFor for
 // that, which reproduces the committed unit content.
 func (a *LinuxAdapter) unitSpecFor(unit string) (systemd.Spec, error) {
-	switch unit {
-	case "xray-germany.service":
-		return systemd.Spec{Role: systemd.RoleGermany, Component: systemd.ComponentXray, UnitName: unit, BinPath: systemd.XrayBinaryPath}, nil
-	case "iran-origin.service":
-		return systemd.Spec{Role: systemd.RoleIran, Component: systemd.ComponentOrigin, UnitName: unit, BinPath: systemd.BinaryPrefix + "/caddy/" + origin.PinnedVersion + "/caddy", OriginVersion: origin.PinnedVersion}, nil
-	default:
-		return systemd.Spec{Role: systemd.Role(a.Request.Role), Component: systemd.ComponentSplitter, UnitName: unit, BinPath: a.Request.SplitterPath, EnvFile: systemd.EnvFile(systemd.Role(a.Request.Role))}, nil
+	plan, err := BuildSystemdPlan(a.Request)
+	if err != nil {
+		return systemd.Spec{}, fmt.Errorf("deploy: recovery: build unit plan: %w", err)
 	}
+	for _, spec := range plan.Specs {
+		if unitName(spec) == unit {
+			spec.UnitName = unit
+			return applyReadySpec(spec), nil
+		}
+	}
+	return systemd.Spec{}, fmt.Errorf("deploy: recovery: unit %s is not part of the request's plan", unit)
+}
+
+func (a *LinuxAdapter) recoveryPlanSpecs(units []string) (map[string]systemd.Spec, error) {
+	plan, err := BuildSystemdPlan(a.Request)
+	if err != nil {
+		return nil, fmt.Errorf("deploy: recovery: build unit plan: %w", err)
+	}
+	allowed := make(map[string]systemd.Spec, len(plan.Specs))
+	for _, spec := range plan.Specs {
+		spec = applyReadySpec(spec)
+		spec.UnitName = unitName(spec)
+		allowed[spec.UnitName] = spec
+	}
+	for _, unit := range units {
+		if _, ok := allowed[unit]; !ok {
+			return nil, fmt.Errorf("deploy: recovery: unit %s is not part of the request's plan", unit)
+		}
+	}
+	return allowed, nil
 }
 
 // applyReadySpec returns the spec exactly as the apply path must write it.

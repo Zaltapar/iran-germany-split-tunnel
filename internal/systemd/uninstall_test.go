@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -49,6 +50,64 @@ func TestDisableUnitAndRemoveUnit(t *testing.T) {
 		t.Fatalf("backup count mismatch")
 	}
 	assertCalls(t, ex.calls, []string{"systemctl is-active germany-splitter.service", "systemctl disable germany-splitter.service", "systemctl daemon-reload"})
+}
+
+func TestRemoveUnitIfAbsentSkipsSystemctlAndRemovesOnlyManagedWantsLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink test requires Windows symlink privilege/dev mode")
+	}
+	redirectPaths(t)
+	s := splitterSpec(RoleGermany)
+	wants := filepath.Join(wantsDir, "germany-splitter.service")
+	if err := os.Symlink("/etc/systemd/system/germany-splitter.service", wants); err != nil {
+		t.Fatal(err)
+	}
+	ex := &fakeExec{}
+	if err := RemoveUnitIfAbsent(context.Background(), newTestManager(ex), s); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.calls) != 0 {
+		t.Fatalf("systemctl calls = %#v, want none", ex.calls)
+	}
+	if _, err := os.Lstat(wants); !os.IsNotExist(err) {
+		t.Fatalf("managed wants link remains: %v", err)
+	}
+}
+
+func TestRemoveUnitIfAbsentRefusesUnsafeWantsTarget(t *testing.T) {
+	redirectPaths(t)
+	s := splitterSpec(RoleGermany)
+	wants := filepath.Join(wantsDir, "germany-splitter.service")
+	if err := os.WriteFile(wants, []byte("foreign"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ex := &fakeExec{}
+	if err := RemoveUnitIfAbsent(context.Background(), newTestManager(ex), s); !errors.Is(err, ErrUnsafeTarget) {
+		t.Fatalf("error = %v, want ErrUnsafeTarget", err)
+	}
+	if len(ex.calls) != 0 {
+		t.Fatalf("systemctl calls = %#v, want none", ex.calls)
+	}
+}
+
+func TestRemoveUnitIfAbsentExistingUnitPreservesDisableErrors(t *testing.T) {
+	redirectPaths(t)
+	s := splitterSpec(RoleGermany)
+	live := unitLive(t, s)
+	writeRaw(t, live, []byte("unit\n"))
+	wantErr := errors.New("disable failed")
+	ex := &fakeExec{handler: func(args []string) (string, error) {
+		if args[0] == "systemctl" && args[1] == "disable" {
+			return "", wantErr
+		}
+		return "inactive", errors.New("inactive")
+	}}
+	if err := RemoveUnitIfAbsent(context.Background(), newTestManager(ex), s); !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want disable error", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("existing unit was removed after disable failure: %v", err)
+	}
 }
 
 func maybeUnitBackups(t *testing.T, unit string) []string {
