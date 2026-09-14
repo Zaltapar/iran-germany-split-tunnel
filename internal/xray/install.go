@@ -113,12 +113,13 @@ type Installer struct {
 	Prefix      string
 	DL          Downloader
 	Exec        Executor
-	Force       bool // overwrite an existing version dir
+	Force       bool // transactionally replace an existing version dir
 	WithGeodata bool // extract geoip.dat/geosite.dat (default: skip)
 
-	// Chmod sets the executable bit on the installed binary. It is a
-	// field (default: os.Chmod) so a failure is injectable in tests.
+	// Chmod is injectable so permission normalization failures are testable.
 	Chmod func(path string, mode os.FileMode) error
+	// Rename is injectable so the live-directory exchange is failure-testable.
+	Rename func(oldPath, newPath string) error
 }
 
 // Installed records what Install placed on disk (the manifest row).
@@ -165,6 +166,9 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	if in.Chmod == nil {
 		in.Chmod = os.Chmod
 	}
+	if in.Rename == nil {
+		in.Rename = os.Rename
+	}
 	zipURL, err := ZipURL(version, arch)
 	if err != nil {
 		return nil, err
@@ -172,6 +176,19 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	dgstURL, err := DigestURL(version, arch)
 	if err != nil {
 		return nil, err
+	}
+
+	// A verified existing pinned directory is the safe convergence target for
+	// ordinary re-entry. It must be a project-owned regular directory and its
+	// binary must pass the same smoke/config gates as a new candidate.
+	versionDir, err := VersionDir(in.Prefix, version)
+	if err != nil {
+		return nil, err
+	}
+	if _, statErr := os.Lstat(versionDir); statErr == nil && !in.Force {
+		return in.reuseExisting(versionDir, version, arch, zipURL, testConfig)
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("xray: cannot inspect existing version dir: %w", statErr)
 	}
 
 	// Step 2-3: fetch the .dgst sidecar and parse its SHA-256.
@@ -209,42 +226,59 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 		return nil, err
 	}
 
-	// Step 6: move into the versioned layout (atomic rename within the
-	// prefix; the copyTree fallback covers exotic cross-device setups).
-	versionDir, err := VersionDir(in.Prefix, version)
-	if err != nil {
-		return nil, err
+	// Step 6: exchange the candidate with the live version directory. The
+	// existing directory is first moved to a private same-prefix backup, never
+	// blindly removed. Any later failure restores that backup byte-for-byte.
+	existingInfo, existingErr := os.Lstat(versionDir)
+	hadPrevious := existingErr == nil
+	if hadPrevious && (existingInfo.Mode()&os.ModeSymlink != 0 || !existingInfo.IsDir()) {
+		return nil, fmt.Errorf("%w: existing version dir is not a safe directory", ErrInstallAborted)
 	}
-	if _, err := os.Stat(versionDir); err == nil {
-		if !in.Force {
-			return nil, fmt.Errorf("xray: %s already exists (use Force to overwrite); existing versions are preserved for rollback", versionDir)
+	backupDir := ""
+	if hadPrevious {
+		backupDir = filepath.Join(in.Prefix, ".xray-backup-"+fmt.Sprint(time.Now().UnixNano()))
+		if err := in.Rename(versionDir, backupDir); err != nil {
+			return nil, fmt.Errorf("%w: preserve existing version: %v", ErrInstallAborted, err)
 		}
-		if err := os.RemoveAll(versionDir); err != nil {
-			return nil, fmt.Errorf("xray: removing existing version dir: %w", err)
+	}
+	restorePrevious := func() {
+		_ = os.RemoveAll(versionDir)
+		if hadPrevious {
+			_ = in.Rename(backupDir, versionDir)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(versionDir), 0o755); err != nil {
+		restorePrevious()
 		return nil, fmt.Errorf("xray: prefix: %w", err)
 	}
-	if err := os.Rename(stage, versionDir); err != nil {
+	if err := in.Rename(stage, versionDir); err != nil {
 		// Cross-device fallback: copy then remove the stage.
 		if err := copyTree(stage, versionDir); err != nil {
+			restorePrevious()
 			return nil, fmt.Errorf("%w: %v", ErrInstallAborted, err)
 		}
 	}
 	bin := filepath.Join(versionDir, "xray")
+	if err := in.Chmod(versionDir, 0o755); err != nil {
+		restorePrevious()
+		return nil, fmt.Errorf("xray: chmod version directory: %w", err)
+	}
+	if err := normalizeTraversalDirs(in.Chmod, in.Prefix, filepath.Dir(versionDir)); err != nil {
+		restorePrevious()
+		return nil, err
+	}
 	if err := in.Chmod(bin, 0o755); err != nil {
 		// Must clean up like every other post-move step: otherwise a
 		// poisoned (non-executable) version dir would survive, and a
 		// later install would refuse it without Force.
-		cleanupVersionDir(versionDir)
+		restorePrevious()
 		return nil, fmt.Errorf("xray: chmod: %w", err)
 	}
 
 	// Step 7: smoke check.
 	out, err := in.Exec.VersionOutput(bin)
 	if err != nil || !strings.Contains(out, "Xray") {
-		cleanupVersionDir(versionDir)
+		restorePrevious()
 		reason := "output did not contain 'Xray'"
 		if err != nil {
 			reason = err.Error()
@@ -257,9 +291,12 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 	if testConfig != "" {
 		out, err := in.Exec.RunTest(bin, testConfig)
 		if err != nil {
-			cleanupVersionDir(versionDir)
+			restorePrevious()
 			return nil, fmt.Errorf("%w: %s; xray output: %s", ErrConfigGate, err, excerpt(out))
 		}
+	}
+	if hadPrevious {
+		_ = os.RemoveAll(backupDir)
 	}
 
 	return &Installed{
@@ -270,6 +307,46 @@ func (in *Installer) Install(version string, arch Arch, testConfig string) (*Ins
 		Path:        bin,
 		InstalledAt: time.Now().UTC(),
 	}, nil
+}
+
+func (in *Installer) reuseExisting(versionDir, version string, arch Arch, zipURL, testConfig string) (*Installed, error) {
+	st, err := os.Lstat(versionDir)
+	if err != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("xray: existing version dir is not a safe directory")
+	}
+	if err := in.Chmod(versionDir, 0o755); err != nil {
+		return nil, fmt.Errorf("xray: chmod existing version directory: %w", err)
+	}
+	if err := normalizeTraversalDirs(in.Chmod, in.Prefix, filepath.Dir(versionDir)); err != nil {
+		return nil, err
+	}
+	bin := filepath.Join(versionDir, "xray")
+	bst, err := os.Lstat(bin)
+	if err != nil || !bst.Mode().IsRegular() || bst.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("xray: existing version binary is not a safe regular file")
+	}
+	if err := in.Chmod(bin, 0o755); err != nil {
+		return nil, fmt.Errorf("xray: chmod existing binary: %w", err)
+	}
+	out, err := in.Exec.VersionOutput(bin)
+	if err != nil || !strings.Contains(out, "Xray") {
+		return nil, fmt.Errorf("%w: existing artifact is not verified", ErrSmokeCheck)
+	}
+	if testConfig != "" {
+		if out, err := in.Exec.RunTest(bin, testConfig); err != nil {
+			return nil, fmt.Errorf("%w: %s; xray output: %s", ErrConfigGate, err, excerpt(out))
+		}
+	}
+	return &Installed{Version: version, Arch: string(arch), ZipURL: zipURL, Path: bin, InstalledAt: time.Now().UTC()}, nil
+}
+
+func normalizeTraversalDirs(chmod func(string, os.FileMode) error, prefix, versionParent string) error {
+	for _, dir := range []string{prefix, versionParent} {
+		if err := chmod(dir, 0o755); err != nil {
+			return fmt.Errorf("xray: chmod traversal directory: %w", err)
+		}
+	}
+	return nil
 }
 
 // prepareStageDir creates the staging directory inside the prefix (so

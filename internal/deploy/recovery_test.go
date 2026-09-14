@@ -339,7 +339,9 @@ func TestRecoverUpgradeConvergesToPrevious(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// In-flight journal for an upgrade that ADDED xray and REPLACED splitter.
+	// In-flight journal for an upgrade that changed env bytes, ADDED xray and
+	// REPLACED splitter.
+	journal.EnvChanged = true
 	journal.Units = []string{"germany-splitter.service", "xray-germany.service"}
 	journal.PreUnits = []string{"germany-splitter.service"}
 	journal.Files = []string{fx.config}

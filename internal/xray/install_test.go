@@ -418,14 +418,20 @@ func TestInstallSmokeCheckFailureCleansUp(t *testing.T) {
 	assertNoStageDirs(t, prefix)
 }
 
-func TestInstallExistingVersionRefusedWithoutForce(t *testing.T) {
+func TestInstallExistingVersionReusesVerifiedArtifact(t *testing.T) {
 	zipBytes := makeZip(t, false)
-	in, _, _ := installFixture(t, zipBytes)
+	in, fe, _ := installFixture(t, zipBytes)
 	if _, err := in.Install(PinnedVersion, ArchLinux64, ""); err != nil {
 		t.Fatalf("first install: %v", err)
 	}
-	if _, err := in.Install(PinnedVersion, ArchLinux64, ""); err == nil {
-		t.Fatal("second install should be refused")
+	fe.calls = nil
+	if _, err := in.Install(PinnedVersion, ArchLinux64, ""); err != nil {
+		t.Fatalf("identical re-entry: %v", err)
+	}
+	for _, call := range fe.calls {
+		if strings.HasPrefix(call, "version:") && strings.Contains(call, ".xray-stage-") {
+			t.Fatalf("re-entry downloaded/replaced instead of reusing: %v", fe.calls)
+		}
 	}
 	in.Force = true
 	if _, err := in.Install(PinnedVersion, ArchLinux64, ""); err != nil {

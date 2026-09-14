@@ -27,8 +27,11 @@ import (
 // contained within the managed binary prefix (validate enforces this, and
 // CleanupFresh's removal is prefix-bounded and symlink-safe).
 type ArtifactJournal struct {
-	Generation string   `json:"generation"`
-	Role       string   `json:"role"`
+	Generation string `json:"generation"`
+	Role       string `json:"role"`
+	// EnvChanged records the expected real byte mutation before Prepare starts,
+	// so recovery never invents an env backup that does not exist.
+	EnvChanged bool     `json:"envChanged,omitempty"`
 	Files      []string `json:"files,omitempty"`
 	PreFiles   []string `json:"preFiles,omitempty"`
 	Units      []string `json:"units,omitempty"`

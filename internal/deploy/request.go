@@ -416,6 +416,8 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 	splitterPath := r.SplitterPath
 	if r.Role == RoleIran {
 		splitterPath = canonicalIranSplitterPath()
+	} else {
+		splitterPath = canonicalGermanySplitterPath()
 	}
 	xray := ComponentState{Version: r.XrayVersion, Path: r.XrayPath, SHA256: r.XraySHA256}
 	if r.Role == RoleGermany {

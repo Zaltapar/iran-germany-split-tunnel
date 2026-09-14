@@ -29,6 +29,29 @@ func TestBuildSystemdPlanGermany(t *testing.T) {
 	}
 }
 
+func TestGermanyStagingSplitterNeverReachesExecStartOrManifest(t *testing.T) {
+	r := validGermanyRequest()
+	r.SplitterPath = filepath.Join(t.TempDir(), "staging", "germany-splitter")
+	plan, err := BuildSystemdPlan(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := systemd.RenderUnit(plan.Specs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unit), "staging") || !strings.Contains(string(unit), "ExecStart=/opt/split-tunnel/germany-splitter\n") {
+		t.Fatalf("Germany unit has non-canonical ExecStart:\n%s", unit)
+	}
+	desired, err := r.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := desired.Components.Splitter.Path; got != "/opt/split-tunnel/germany-splitter" {
+		t.Fatalf("manifest splitter path = %q, want canonical path", got)
+	}
+}
+
 func TestIranStagingSplitterNeverReachesExecStartOrManifest(t *testing.T) {
 	r := validIranRequest()
 	r.SplitterPath = filepath.Join(t.TempDir(), "staging", "iran-splitter")

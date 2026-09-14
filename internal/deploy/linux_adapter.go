@@ -54,6 +54,7 @@ type LinuxAdapter struct {
 	// CleanupFresh uses the disk journal plus these sets.
 	inFlightUnits []string
 	inFlightFiles []string
+	envChanged    bool
 }
 
 // managedBinaryPrefix is the managed binary prefix (systemd.BinaryPrefix). It
@@ -164,6 +165,18 @@ func BuildJournal(root string, previous Manifest, desired DesiredState) (Artifac
 		return ArtifactJournal{}, fmt.Errorf("deploy: journal role is invalid")
 	}
 	j := ArtifactJournal{Role: desired.Role}
+	// The planner's configuration fingerprint is the non-secret identity of
+	// the exact env projection. Persist the expected mutation before Prepare
+	// starts so recovery never relies on a post-write journal update.
+	if desired.Paths.Env != "" {
+		if _, err := os.Lstat(desired.Paths.Env); os.IsNotExist(err) {
+			j.EnvChanged = true
+		} else if err != nil {
+			return ArtifactJournal{}, fmt.Errorf("deploy: journal env stat: %w", err)
+		} else if previous.Generation != "" {
+			j.EnvChanged = previous.ConfigFingerprint != "" && desired.ConfigFingerprint != previous.ConfigFingerprint
+		}
+	}
 	files := make([]string, 0, 3)
 	if desired.Paths.Env != "" {
 		files = append(files, desired.Paths.Env)
@@ -235,12 +248,11 @@ func (a *LinuxAdapter) Prepare(ctx context.Context, desired DesiredState) error 
 		return err
 	}
 	if applied {
+		a.envChanged = true
 		a.inFlightFiles = append(a.inFlightFiles, a.Request.EnvPath)
 	}
-	if a.Request.Role == RoleIran {
-		if err := installCanonicalSplitter(a.Request.SplitterPath, canonicalIranSplitterPath()); err != nil {
-			return err
-		}
+	if err := installCanonicalSplitter(a.Request.SplitterPath, canonicalSplitterPath(a.Request.Role)); err != nil {
+		return err
 	}
 	if a.Origin != nil {
 		if err := a.Origin.Configure(ctx, a.Request.Origin); err != nil {
@@ -493,7 +505,7 @@ func (a *LinuxAdapter) Restore(ctx context.Context, previous Manifest) error {
 		}
 	}
 	// Env file: the previous generation had one → restore its backup.
-	if previous.Paths.Env != "" {
+	if j.EnvChanged && previous.Paths.Env != "" {
 		if err := a.ops().RollbackEnvFile(ctx, systemd.Role(a.Request.Role)); err != nil {
 			return fmt.Errorf("deploy: restore env file: %w", err)
 		}
@@ -546,7 +558,7 @@ func (a *LinuxAdapter) RecoverJournal(ctx context.Context, j ArtifactJournal, pr
 	if err := a.revertUnits(ctx, j, previous, j.Units); err != nil {
 		return err
 	}
-	if previous.Paths.Env != "" {
+	if j.EnvChanged && previous.Paths.Env != "" {
 		if err := a.ops().RollbackEnvFile(ctx, systemd.Role(a.Request.Role)); err != nil {
 			return fmt.Errorf("deploy: recovery: env file: %w", err)
 		}
@@ -987,7 +999,7 @@ func (a *LinuxAdapter) targetUnitSpecs(target Manifest) ([]systemd.Spec, error) 
 			spec := systemd.Spec{
 				Role:          role,
 				Component:     systemd.ComponentSplitter,
-				BinPath:       target.Components.Splitter.Path,
+				BinPath:       canonicalSplitterPath(string(role)),
 				EnvFile:       systemd.EnvFile(role),
 				OriginEnabled: hasOrigin,
 			}
@@ -1168,8 +1180,15 @@ func componentFor(c string) systemd.Component {
 // spec.UnitName wins; otherwise derived from role+component). The specs
 // this adapter builds always use the derived names, so this is exact.
 // installCanonicalSplitter copies the operator-supplied artifact into the
-// managed Iran location without following a destination symlink. The source
-// may be a staging path; it is never emitted into a unit or manifest.
+// managed location without following a destination symlink. The source may
+// be a staging path; it is never emitted into a unit or manifest.
+func canonicalSplitterPath(role string) string {
+	if role == RoleGermany {
+		return canonicalGermanySplitterPath()
+	}
+	return canonicalIranSplitterPath()
+}
+
 func installCanonicalSplitter(source, target string) error {
 	if source == target {
 		return nil
