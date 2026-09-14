@@ -174,7 +174,7 @@ func TestJournalTailBoundsAndNoSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ex.has("journalctl -u germany-splitter.service -n 20 --no-pager -q -o short-iso") {
+	if !ex.has("journalctl -u germany-split-tunnel.service -n 20 --no-pager -q -o short-iso") {
 		t.Fatalf("calls=%v", ex.calls)
 	}
 	for _, call := range ex.calls {
@@ -196,23 +196,28 @@ func TestEnsureUserArgv(t *testing.T) {
 			t.Fatalf("calls=%v", ex.calls)
 		}
 	})
-	t.Run("absent creates exact user", func(t *testing.T) {
+	t.Run("absent creates exact user and group", func(t *testing.T) {
 		redirectPaths(t)
+		var useraddArgv []string
 		ex := &fakeExec{handler: func(args []string) (string, error) {
 			if args[0] == "id" {
 				return "", errors.New("not found")
 			}
+			useraddArgv = append([]string(nil), args...)
 			return "", nil
 		}}
 		if err := EnsureUser(ctx, ex); err != nil {
 			t.Fatal(err)
 		}
-		want := "id -u split-tunnel|useradd --system --group --shell /usr/sbin/nologin --home-dir /nonexistent --comment split-tunnel service user split-tunnel"
+		want := []string{"useradd", "--system", "--user-group", "--shell", "/usr/sbin/nologin", "--home-dir", "/nonexistent", "--comment", "split-tunnel service user", "split-tunnel"}
 		if len(ex.calls) != 2 || ex.calls[0] != "id -u split-tunnel" {
 			t.Fatalf("calls=%v", ex.calls)
 		}
-		if !strings.HasPrefix(ex.calls[1], "useradd --system --group --shell /usr/sbin/nologin --home-dir /nonexistent --comment") {
-			t.Fatalf("calls=%v want prefix=%q", ex.calls, want)
+		if strings.Join(useraddArgv, " ") != strings.Join(want, " ") {
+			t.Fatalf("useradd argv=%v want=%v", useraddArgv, want)
+		}
+		if useraddArgv[2] == "--group" || useraddArgv[3] == "--group" {
+			t.Fatalf("ambiguous group option in argv=%v", useraddArgv)
 		}
 	})
 	t.Run("useradd failure", func(t *testing.T) {
