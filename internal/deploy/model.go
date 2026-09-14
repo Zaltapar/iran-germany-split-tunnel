@@ -55,7 +55,21 @@ type Manifest struct {
 	Pairing      PairingState   `json:"pairing"`
 	Services     []ServiceState `json:"services,omitempty"`
 	Firewall     FirewallState  `json:"firewall"`
-	Revisions    []Revision     `json:"revisions,omitempty"`
+	// ConfigFingerprint is the deployment's CONFIGURATION identity: the
+	// SHA-256 of the projected env map (InstallRequest.Env) in canonical key
+	// order. It is the only planner-visible record of a configuration-only
+	// change (splitterctl config set); without it such a change would be
+	// invisible to PlanDesired and the transaction would short-circuit
+	// before the adapter rewrote the env file, silently dropping the
+	// operator's request.
+	//
+	// It is a digest, never a value: no env value is recoverable from it and
+	// it is never printed by any command. It follows the same non-invertible
+	// fingerprint class as PairingState.Fingerprints, which is likewise
+	// derived from secret-bearing material. It is `omitempty` so a legacy
+	// (schema 1) manifest still re-marshals byte-identically.
+	ConfigFingerprint string     `json:"configFingerprint,omitempty"`
+	Revisions         []Revision `json:"revisions,omitempty"`
 }
 
 type Components struct {
@@ -164,6 +178,12 @@ type DesiredState struct {
 	Pairing    PairingState
 	Services   []ServiceState
 	Firewall   FirewallState
+	// ConfigFingerprint is the desired configuration identity recorded in
+	// Manifest.ConfigFingerprint. It follows the documented empty/unknown
+	// rule: an EMPTY value means "this request does not assert a
+	// configuration", so a legacy manifest never plans spurious drift and a
+	// re-apply of an identical configuration stays a true no-op.
+	ConfigFingerprint string
 }
 
 type Change struct {

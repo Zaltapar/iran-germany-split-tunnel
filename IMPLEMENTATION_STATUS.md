@@ -5,6 +5,58 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
 
 ## Current state
 
+- **T8 M5 — `config set` and `upgrade` wired (implemented locally; Linux
+  staging still pending):** the last two `errNotWired` commands are now real
+  transactions; no `errNotWired` path remains in `cmd/splitterctl`.
+  - `config set KEY=VALUE ...` folds each assignment into the
+    environment-derived request and applies it through the EXISTING
+    `Controller.ApplyRequest` path. Keys are resolved through one
+    authoritative projection table (`deploy.ConfigKeys`) that names the
+    `internal/config` env variable each field projects to; values are judged by
+    `config.Config.Validate(role)` inside the transaction, so no validation
+    rule or env name is duplicated. Unknown keys are usage errors, and a
+    role-inapplicable key is refused by name. The one field with no env
+    projection, `keepalive.interval` (`config.DefaultKeepAlive`, 30s), is
+    REFUSED explicitly with its reason rather than silently ignored. Values are
+    never echoed (output names accepted keys only; errors name fields).
+  - `upgrade [--xray|--origin|--splitter]` requires a committed generation,
+    derives the request from the same environment contract as
+    rollback/uninstall, and applies it through the same controller path. No
+    flag = re-apply (a converged host is a true no-op). `--splitter` requires
+    the environment to supply an actual change (version or path) and is
+    refused otherwise. `--xray` is Germany-only (Iran uses an external Xray)
+    and pins `xray.PinnedVersion`; a conflicting environment pin is refused,
+    not silently overridden. `--origin` requires a configured origin and pins
+    `origin.PinnedVersion` likewise. Stale-journal refusal, role immutability,
+    pairing carry-forward, and commit-last semantics all come from the
+    controller.
+  - **New convergence identity:** `Manifest.ConfigFingerprint` is the SHA-256
+    of the projected env map in canonical key order. Without it a
+    configuration-only change was invisible to `PlanDesired`, so the
+    transaction short-circuited before the adapter could rewrite the env file
+    and the operator's request was silently dropped. The digest is
+    non-invertible (no env value, least of all the secret, is recoverable
+    from it), is never printed, and follows the empty/unknown rule so legacy
+    manifests plan as unchanged. It is `omitempty`, so schema-1 files still
+    re-marshal byte-identically and remain valid.
+  - **Configuration-change restart:** a unit whose rendered bytes are
+    unchanged is now explicitly restarted through T5's own `Restart` when the
+    env projection changed — the unit reads its configuration via
+    `EnvironmentFile=`, so a byte no-op would leave the running process on the
+    old configuration until reboot. Units whose bytes changed keep T5's own
+    transition (no double restart).
+  - **Fixed while wiring `--xray`:** `installRequestFromEnv` never built a
+    Germany origin plan, so every Germany request carried an empty origin mode
+    and failed `origin.ValidatePlan` — meaning `install germany` (and the new
+    `upgrade --xray`) could not work at all. Germany now gets the explicit
+    `none` mode with a loopback upstream derived from its own down-carrier
+    listener.
+  - **Documented limitation:** the env file is still not restored by rollback
+    (only a digest of it is recorded, never its content), so `rollback` keeps
+    the operator's current environment while converging unit/origin artifacts;
+    the pre-existing rollback guards refuse a target whose origin/Reality/
+    firewall state the current environment cannot reproduce.
+
 - **T8-B real CLI mutations (implemented locally; Linux staging still pending):**
   `cmd/splitterctl` now wires `install iran|germany`, `rollback --to state-id`,
   `uninstall [--purge]`, and `recover [--ack]` to the production
@@ -18,14 +70,13 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
   `_ORIGIN_PORT` + ACME and CDN sub-fields, optional
   `SPLITTERCTL_FIREWALL_BACKEND`/`_FW_ALLOW`/`_FW_DENY`), and enforce
   canonical paths (`NewLinuxAdapter` rejects non-canonical requests).
-  `upgrade` and `config set` remain explicit not-wired errors with
-  documented rationale (component-scoped and in-place-reconfiguration
-  transactions need their own semantics). Error text names fields, never
-  values. Rollback/uninstall re-derive the request from the CURRENT role's
-  environment (the manifest stores fingerprints, not secrets) and exit
-  early with "nothing installed" on an empty canonical root. Full local
-  suite green on Windows; no staging mutation was performed and T8 is NOT
-  claimed complete without a clean-Ubuntu L5 acceptance run.
+  `upgrade [--xray|--origin|--splitter]` and `config set KEY=VALUE ...` are now
+  WIRED too (see the M5 entry below); no `errNotWired` path remains. Error text
+  names fields, never values. Rollback/uninstall re-derive the request from the
+  CURRENT role's environment (the manifest stores fingerprints, not secrets)
+  and exit early with "nothing installed" on an empty canonical root. Full
+  local suite green on Windows; no staging mutation was performed and T8 is
+  NOT claimed complete without a clean-Ubuntu L5 acceptance run.
 
 - **T8-B bounded restore + journal lifecycle (implemented locally; Linux
   staging still pending):** `LinuxAdapter.Restore` has three dispatch paths —
@@ -49,9 +100,10 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
   (`finish recovery before installing/rolling back`), and the new
   `splitterctl recover` command reports the retained journal (secret-free
   by construction) and, with `--ack`, clears it after the operator verifies
-  the host. The env file is deliberately never rewritten by rollback (the
-  secret is not in the manifest and is invariant across revisions in the
-  current product; no config-set exists).
+  the host. The env file is deliberately never rewritten by rollback (its
+  content carries the secret and is not recorded in the manifest — only a
+  non-invertible digest is; see the M5 entry below), so rollback converges
+  unit/origin artifacts while the live env keeps the operator's environment.
 
 - **T8-B artifact journal foundation (committed `10b4b84`):**
   `ArtifactJournal` records only project-owned files, units, firewall
@@ -124,11 +176,12 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
   cover secret separation and traversal rejection, and the full local suite is
   green.
 
-- **T8 strict CLI command boundary (implemented locally; mutation adapters still
+- **T8 strict CLI command boundary (implemented locally; Linux staging still
   pending):** `cmd/splitterctl` validates exact subcommand shapes for install,
-  pair, upgrade, rollback, uninstall, and config set before returning explicit
-  not-wired errors. Read-only status/doctor/config-show behavior remains
-  unchanged. Tests cover malformed and valid-but-unwired command shapes.
+  pair, upgrade, rollback, uninstall, recover, and config set/show before any
+  host work; malformed shapes are usage errors. Read-only
+  status/doctor/config-show behavior remains unchanged. Tests cover malformed
+  command shapes for every command.
 
 - **T8 typed request input boundary (implemented locally; production role
   adapters still pending):** `internal/deploy.InstallRequest` validates

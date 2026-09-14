@@ -2,12 +2,14 @@ package deploy
 
 import (
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
@@ -100,6 +102,213 @@ func TestInstallRequestEnvProjectionKeepsSecretOutOfDesiredState(t *testing.T) {
 	}
 	if strings.Contains(strings.Join([]string{desired.Components.Splitter.Path, desired.Paths.Env, desired.Paths.Config}, "\n"), r.Config.Secret) {
 		t.Fatal("desired state contains the tunnel secret")
+	}
+}
+
+// TestConfigFingerprintTracksEveryProjectedValue pins the configuration
+// identity that makes `config set` planner-visible: any change to a projected
+// value — the shared secret included — changes the digest, while an identical
+// configuration yields an identical one.
+func TestConfigFingerprintTracksEveryProjectedValue(t *testing.T) {
+	base := validIranRequest()
+	basePrint, err := base.ConfigFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if basePrint == "" {
+		t.Fatal("empty config fingerprint")
+	}
+	if strings.Contains(basePrint, base.Config.Secret) {
+		t.Fatal("config fingerprint contains the tunnel secret")
+	}
+	again, err := base.ConfigFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != basePrint {
+		t.Fatalf("fingerprint is not deterministic: %q != %q", again, basePrint)
+	}
+	// The Desired projection must record the SAME identity the helper
+	// returns, so the CLI's change detection and the planner agree.
+	desired, err := base.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desired.ConfigFingerprint != basePrint {
+		t.Fatalf("desired fingerprint = %q, want %q", desired.ConfigFingerprint, basePrint)
+	}
+
+	// A changed secret (or any other projected value) is a different
+	// configuration; each case must be detected.
+	cases := []struct {
+		name   string
+		mutate func(*InstallRequest)
+	}{
+		{"secret", func(r *InstallRequest) { r.Config.Secret = strings.Repeat("c", 64) }},
+		{"socks listener", func(r *InstallRequest) { r.Config.SocksListen = "127.0.0.1:10901" }},
+		{"ws listener", func(r *InstallRequest) { r.Config.WsListen = "127.0.0.1:9002" }},
+		{"down carrier", func(r *InstallRequest) { r.Config.DownCarrierAddr = "127.0.0.1:10803" }},
+		{"metrics port", func(r *InstallRequest) { r.Config.MetricsPort = 9100 }},
+		{"relay buffer", func(r *InstallRequest) { r.Config.RelayBufSize = 65536 }},
+		{"queue bytes", func(r *InstallRequest) { r.Config.QueueBytesPerStream = 1 << 20 }},
+		{"queue frames", func(r *InstallRequest) { r.Config.QueueFramesPerStream = 8 }},
+		{"queue total", func(r *InstallRequest) { r.Config.QueueBytesTotal = 4 << 20 }},
+		{"overflow wait", func(r *InstallRequest) { r.Config.OverflowWaitMs = 250 }},
+		{"carrier grace", func(r *InstallRequest) { r.Config.CarrierGraceMs = 7000 }},
+		{"bootstrap wait", func(r *InstallRequest) { r.Config.BootstrapWaitMs = 1000 }},
+		{"session buffer", func(r *InstallRequest) { r.Config.SessionBufBytes = 512 << 10 }},
+		{"session buffer total", func(r *InstallRequest) { r.Config.SessionBufTotal = 8 << 20 }},
+		{"liveness rounds", func(r *InstallRequest) { r.Config.LivenessRounds = 5 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := base
+			tc.mutate(&changed)
+			got, err := changed.ConfigFingerprint()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == basePrint {
+				t.Fatalf("%s change did not alter the config fingerprint", tc.name)
+			}
+		})
+	}
+}
+
+// TestPlanDetectsConfigOnlyChange is the core of the config-set wiring: a
+// change that touches ONLY the projected configuration must be planned, so
+// the transaction reaches the adapter (which rewrites the env file) instead
+// of short-circuiting as unchanged.
+func TestPlanDetectsConfigOnlyChange(t *testing.T) {
+	request := validIranRequest()
+	desired, err := request.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := Manifest{
+		Schema:            SchemaVersion,
+		Role:              desired.Role,
+		Generation:        "g1",
+		Components:        desired.Components,
+		Paths:             desired.Paths,
+		Pairing:           desired.Pairing,
+		Services:          desired.Services,
+		Firewall:          desired.Firewall,
+		ConfigFingerprint: desired.ConfigFingerprint,
+	}
+	// Baseline: an identical configuration is a true no-op.
+	plan, err := PlanDesired(&current, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Unchanged {
+		t.Fatalf("identical configuration planned drift: %#v", plan.Changes)
+	}
+
+	// A configuration-only change (nothing else differs) must be planned.
+	changed := request
+	changed.Config.RelayBufSize = 65536
+	changedDesired, err := changed.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedDesired.Components != desired.Components || !reflect.DeepEqual(changedDesired.Paths, desired.Paths) {
+		t.Fatal("fixture changed more than the configuration")
+	}
+	plan, err = PlanDesired(&current, changedDesired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Unchanged || !hasChange(plan, "config.fingerprint") {
+		t.Fatalf("plan = %#v, want config.fingerprint drift", plan.Changes)
+	}
+	if plan.Changes[0].Destructive {
+		t.Fatalf("config change marked destructive: %#v", plan.Changes)
+	}
+}
+
+// TestPlanDoesNotFabricateConfigIdentity pins the empty/unknown rule for the
+// configuration identity: a legacy manifest that never recorded it must not
+// plan spurious drift against a request that asserts one.
+func TestPlanDoesNotFabricateConfigIdentity(t *testing.T) {
+	m := testManifest("/tmp/state", RoleIran)
+	d := desiredFor(m)
+	d.ConfigFingerprint = ""
+	plan, err := PlanDesired(&m, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Unchanged {
+		t.Fatalf("unasserted config identity planned drift: %#v", plan.Changes)
+	}
+}
+
+// TestConfigKeyTableIsCompleteAndConsistent pins the projection table the CLI
+// resolves `config set` keys through: every settable key names a real
+// config.Env* variable, is unique, and applies to at least one role.
+func TestConfigKeyTableIsCompleteAndConsistent(t *testing.T) {
+	seen := map[string]bool{}
+	for _, key := range ConfigKeys {
+		if key.Name == "" || key.EnvVar == "" {
+			t.Fatalf("incomplete key entry: %+v", key)
+		}
+		if len(key.Roles) == 0 {
+			t.Fatalf("key %q applies to no role", key.Name)
+		}
+		normalized := NormalizeConfigKey(key.Name)
+		if seen[normalized] {
+			t.Fatalf("duplicate key %q", key.Name)
+		}
+		seen[normalized] = true
+		for _, role := range key.Roles {
+			if role != RoleIran && role != RoleGermany {
+				t.Fatalf("key %q has invalid role %q", key.Name, role)
+			}
+		}
+	}
+	// Lookup accepts the canonical spelling and a normalized variant.
+	if _, ok := LookupConfigKey("relay.buf"); !ok {
+		t.Fatal("canonical key not found")
+	}
+	if _, ok := LookupConfigKey("RELAY_BUF"); !ok {
+		t.Fatal("normalized key not found")
+	}
+	if _, ok := LookupConfigKey("nope"); ok {
+		t.Fatal("unknown key unexpectedly resolved")
+	}
+	// The one deliberately non-settable field is refused with a reason and is
+	// NOT settable.
+	if reason := ConfigKeyRefusal(ConfigKeyKeepAlive); reason == "" {
+		t.Fatalf("%s has no documented refusal reason", ConfigKeyKeepAlive)
+	}
+	if _, ok := LookupConfigKey(ConfigKeyKeepAlive); ok {
+		t.Fatalf("%s must not be settable", ConfigKeyKeepAlive)
+	}
+}
+
+// TestRestartAfterConfigChange pins the adapter's restart decision: a
+// configuration-only change restarts an unchanged unit (the env file it reads
+// was rewritten), while a unit whose bytes changed is left to T5's own
+// transition and an unchanged configuration never restarts anything.
+func TestRestartAfterConfigChange(t *testing.T) {
+	cases := []struct {
+		name          string
+		unchanged     bool
+		configChanged bool
+		want          bool
+	}{
+		{"config change with unchanged unit bytes", true, true, true},
+		{"config change with rewritten unit", false, true, false},
+		{"no config change with unchanged unit bytes", true, false, false},
+		{"no config change with rewritten unit", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := restartAfterConfigChange(systemd.Result{Unchanged: tc.unchanged}, tc.configChanged)
+			if got != tc.want {
+				t.Fatalf("restartAfterConfigChange = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

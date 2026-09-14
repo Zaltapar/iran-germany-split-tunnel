@@ -86,6 +86,14 @@ func PlanDesired(current *Manifest, desired DesiredState) (Plan, error) {
 			changes = append(changes, Change{Field: "paths.unitFiles", Before: strconv.Itoa(len(current.Paths.UnitFiles)), After: strconv.Itoa(len(desired.Paths.UnitFiles)), Destructive: true})
 		}
 
+		// Configuration identity: the digest of the projected env map. It is
+		// identity (unasserted when empty), so a legacy manifest that never
+		// recorded it plans as unchanged while a genuine configuration change
+		// (splitterctl config set) is planned and therefore reaches the
+		// adapter, which rewrites the protected env file inside the
+		// transaction.
+		compareIdentity("config.fingerprint", current.ConfigFingerprint, desired.ConfigFingerprint, false)
+
 		// Firewall.
 		compare("firewall.backend", current.Firewall.Backend, desired.Firewall.Backend, true)
 		compare("firewall.ownership", current.Firewall.Ownership, desired.Firewall.Ownership, true)

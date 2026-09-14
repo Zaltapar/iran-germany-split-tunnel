@@ -102,13 +102,14 @@ func (t *Transaction) Apply(ctx context.Context) (Result, error) {
 		}
 	}
 	m := Manifest{
-		Schema:     SchemaVersion,
-		Role:       t.Desired.Role,
-		Components: t.Desired.Components,
-		Paths:      t.Desired.Paths,
-		Pairing:    t.Desired.Pairing,
-		Services:   append([]ServiceState(nil), t.Desired.Services...),
-		Firewall:   t.Desired.Firewall,
+		Schema:            SchemaVersion,
+		Role:              t.Desired.Role,
+		Components:        t.Desired.Components,
+		Paths:             t.Desired.Paths,
+		Pairing:           t.Desired.Pairing,
+		Services:          append([]ServiceState(nil), t.Desired.Services...),
+		Firewall:          t.Desired.Firewall,
+		ConfigFingerprint: t.Desired.ConfigFingerprint,
 	}
 	label := "install"
 	if t.Previous.Generation != "" {

@@ -36,6 +36,11 @@ type LinuxAdapter struct {
 	firewallApplied bool
 	xrayBinary      string
 
+	// configChanged records whether this transaction changes the projected
+	// env configuration (the planner's config.fingerprint change). It is
+	// runtime-only: the persisted identity is Manifest.ConfigFingerprint.
+	configChanged bool
+
 	// recoveryOps is the seam for the T5 operations recovery performs.
 	// nil → the real T5 calls (systemd.RemoveUnit / RollbackLast /
 	// RollbackEnvFile). It exists ONLY so the adapter's journal-driven
@@ -269,7 +274,52 @@ func (a *LinuxAdapter) Validate(ctx context.Context, desired DesiredState) error
 
 func (a *LinuxAdapter) Backup(context.Context, *Manifest) error { return nil }
 
+// applyUnit applies one unit spec transactionally. It is the single place the
+// adapter calls T5's ApplyUnit, so the configuration-change case is handled
+// exactly once for every component.
+//
+// T5's ApplyUnit is a byte no-op when the live unit file already matches the
+// rendered spec. That is correct for unit CONTENT, but a configuration-only
+// change (splitterctl config set) rewrites the protected env file the unit
+// reads via EnvironmentFile= while leaving the unit bytes identical — so a
+// bare no-op would leave the running process on the old configuration until
+// the next reboot. When the env projection changed (the desired configuration
+// identity differs from the previous committed one), an unchanged unit is
+// explicitly restarted through T5's own Restart, which is exactly the
+// transition T5 performs after a real unit swap.
+func (a *LinuxAdapter) applyUnit(ctx context.Context, spec systemd.Spec) error {
+	result, err := systemd.ApplyUnit(ctx, a.Services, spec)
+	if err != nil {
+		return err
+	}
+	if !restartAfterConfigChange(result, a.configChanged) {
+		return nil
+	}
+	if err := a.Services.Restart(ctx, unitName(spec)); err != nil {
+		return fmt.Errorf("deploy: restart %s after configuration change: %w", unitName(spec), err)
+	}
+	return nil
+}
+
+// restartAfterConfigChange reports whether an applied unit must be restarted
+// even though T5 found its bytes unchanged. That is exactly the
+// configuration-only change case: the unit reads its configuration from the
+// protected env file (EnvironmentFile=) which Prepare rewrote, so the running
+// process still holds the old values. A unit whose bytes DID change is already
+// transitioned by T5 (start/restart), so it never needs the extra restart.
+func restartAfterConfigChange(result systemd.Result, configChanged bool) bool {
+	return result.Unchanged && configChanged
+}
+
 func (a *LinuxAdapter) Activate(ctx context.Context, desired DesiredState) error {
+	// Record whether this transaction changes the configuration identity
+	// BEFORE mutating: the env file written in Prepare is already the new
+	// one, so the comparison must use the manifest that was committed when
+	// this transaction started.
+	a.configChanged = false
+	if previous, err := a.previousManifest(); err == nil {
+		a.configChanged = desired.ConfigFingerprint != "" && previous.ConfigFingerprint != desired.ConfigFingerprint
+	}
 	if a.Request.Role == RoleGermany {
 		keypair, err := xray.GenerateRealityKeypair(nil, a.xrayBinary)
 		if err != nil {
@@ -291,12 +341,21 @@ func (a *LinuxAdapter) Activate(ctx context.Context, desired DesiredState) error
 	}
 	for _, spec := range a.units {
 		spec = applyReadySpec(spec)
-		if _, err := systemd.ApplyUnit(ctx, a.Services, spec); err != nil {
+		if err := a.applyUnit(ctx, spec); err != nil {
 			return err
 		}
 		a.inFlightUnits = append(a.inFlightUnits, unitName(spec))
 	}
 	return nil
+}
+
+// previousManifest returns the committed manifest this transaction started
+// from, or os.ErrNotExist for a fresh install.
+func (a *LinuxAdapter) previousManifest() (Manifest, error) {
+	if a.Store == nil {
+		return Manifest{}, os.ErrNotExist
+	}
+	return a.Store.Load()
 }
 
 func (a *LinuxAdapter) Transition(ctx context.Context, desired DesiredState) error {
@@ -773,9 +832,12 @@ func recordedRealityFingerprint(c ComponentState) string {
 // target's artifact is not reconstructible from the retained manifest (rule
 // set, Reality keypair, and Caddyfile plan are not persisted in full), so the
 // rollback is refused rather than applied partially. The env file is never
-// rewritten here: it is invariant across revisions in the current product
-// (there is no config-set mutation), and its content (which carries the
-// secret) is not recorded in the manifest.
+// rewritten here: its content (which carries the secret) is not recorded in
+// the manifest, only a digest, so a revision's configuration is not
+// reconstructible. The rollback therefore converges unit/origin artifacts to
+// the target revision while the live env file keeps the configuration the
+// operator supplied in the environment — which the guards above keep
+// compatible with the target (origin/Reality/firewall are derived from it).
 func (a *LinuxAdapter) rollbackTo(ctx context.Context, target Manifest) error {
 	if target.Firewall.RulesHash != firewallFingerprint(a.Request.Firewall) {
 		return fmt.Errorf("%w: rollback: firewall rules differ from the current deployment and are not reconstructible; manual firewall recovery required", ErrTransaction)

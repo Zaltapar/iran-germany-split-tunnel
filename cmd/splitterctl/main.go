@@ -66,7 +66,6 @@ import (
 )
 
 var errUsage = errors.New("usage error")
-var errNotWired = errors.New("command is not wired to host adapters")
 
 // recoverTimeout bounds a single post-crash recovery run: recovery is a
 // synchronous, best-effort convergence of project-owned artifacts and must
@@ -96,18 +95,56 @@ var newRecoverController = func(store *deploy.Store, journal deploy.ArtifactJour
 	return &deploy.Controller{Store: store, Adapter: adapter}, nil
 }
 
+// newMutationController builds the controller a mutation command uses from the
+// operator's environment-derived request and the canonical store. It mirrors
+// installCommand's construction exactly (deploy.NewLinuxAdapter over the
+// canonical T5 paths), so `config set` and `upgrade` share one composition
+// with install/rollback/uninstall and never build a second transaction path.
+// It is a var — like newRecoverController — so tests can substitute a
+// controller backed by a fake adapter without a Linux/root host or the full
+// mutation environment contract. Production always uses the real adapter.
+var newMutationController = func(store *deploy.Store, request deploy.InstallRequest) (*deploy.Controller, error) {
+	adapter, err := deploy.NewLinuxAdapter(request, systemd.OSExecutor{}, firewall.OSExecutor{})
+	if err != nil {
+		return nil, err
+	}
+	return &deploy.Controller{Store: store, Adapter: adapter}, nil
+}
+
+// mutationRequestEnvError labels an environment-contract failure raised while
+// building a mutation request, so every command reports it under its own name
+// (the shared builder reports it as "install").
+func mutationRequestEnvError(command string, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.HasPrefix(msg, "install: ") {
+		msg = command + ": " + strings.TrimPrefix(msg, "install: ")
+	}
+	return errors.New(msg)
+}
+
 // goos is the platform probe behind the Linux gate. It is a var (like
 // systemd's managed-path vars) so tests exercise the gate on any host;
 // production always sees runtime.GOOS. Only _test.go files reassign it.
 var goos = runtime.GOOS
 
 // canonicalStateRoot is the production state root for the mutation
-// commands (rollback, uninstall, recover). It is a var — mirroring
-// systemd's test-redirectable managed paths — so tests can point it at a
-// temporary root. Only _test.go files reassign it (restored via
+// commands (rollback, uninstall, recover, config set, upgrade). It is a var —
+// mirroring systemd's test-redirectable managed paths — so tests can point it
+// at a temporary root. Only _test.go files reassign it (restored via
 // t.Cleanup). NewLinuxAdapter independently enforces the canonical
 // systemd.StateDir for install requests.
 var canonicalStateRoot = systemd.StateDir
+
+// canonicalBinaryPrefix is the managed binary prefix the mutation request
+// builder derives component paths from. In production it is exactly
+// systemd.BinaryPrefix (the constant T5 and the adapter enforce); it is a var
+// so the request-building path can be exercised on a host whose filesystem
+// roots differ (Windows), where the Unix "/opt/..." prefix is not absolute.
+// Only _test.go files reassign it (restored via t.Cleanup).
+var canonicalBinaryPrefix = systemd.BinaryPrefix
 
 // canonicalStore returns the store the mutation commands operate on.
 func canonicalStore() (*deploy.Store, error) {
@@ -165,10 +202,10 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if len(args) < 2 || args[1] != "set" {
 			return fmt.Errorf("%w: config supports show or set", errUsage)
 		}
-		// config set is not wired: in-place reconfiguration of a committed
-		// deployment (env-file rewrite + unit re-apply + health gate) needs
-		// its own transaction semantics; see IMPLEMENTATION_STATUS.md.
-		return notWired(args)
+		if len(args) == 2 {
+			return fmt.Errorf("%w: config set requires at least one KEY=VALUE", errUsage)
+		}
+		return configSetCommand(ctx, args[2:], out)
 	case "install":
 		if len(args) != 2 || (args[1] != deploy.RoleIran && args[1] != deploy.RoleGermany) {
 			return fmt.Errorf("%w: install requires exactly iran or germany", errUsage)
@@ -183,11 +220,11 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if len(args) > 2 || (len(args) == 2 && !isUpgradeTarget(args[1])) {
 			return fmt.Errorf("%w: upgrade accepts at most one of --xray, --origin, or --splitter", errUsage)
 		}
-		// upgrade is not wired: component-level upgrades (xray pointer
-		// re-point, origin re-pin, splitter re-apply) must be planned as
-		// their own desired-state transactions with component-scoped
-		// recovery; see IMPLEMENTATION_STATUS.md.
-		return notWired(args)
+		target := ""
+		if len(args) == 2 {
+			target = args[1]
+		}
+		return upgradeCommand(ctx, target, out)
 	case "rollback":
 		if len(args) != 3 || args[1] != "--to" || args[2] == "" || strings.ContainsAny(args[2], `/\\`) {
 			return fmt.Errorf("%w: rollback requires --to state-id", errUsage)
@@ -209,10 +246,6 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, args[0])
 	}
-}
-
-func notWired(args []string) error {
-	return fmt.Errorf("%w: %s", errNotWired, strings.Join(args, " "))
 }
 
 func isUpgradeTarget(arg string) bool {
@@ -257,6 +290,296 @@ func installCommand(ctx context.Context, role string, out io.Writer) error {
 	// Deliberately summary-only: no paths, hashes, or key material.
 	_, _ = fmt.Fprintf(out, "install: committed\nrole: %s\ngeneration: %s\nrevisions: %d\nservices: %d\nfirewall: %s\n",
 		m.Role, m.Generation, len(m.Revisions), len(m.Services), m.Firewall.Backend)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// config set
+// ---------------------------------------------------------------------------
+
+// applyConfigOverrides folds `config set KEY=VALUE ...` assignments into the
+// environment-derived request and returns the accepted key names, in the
+// order they were given.
+//
+// Every key is resolved through deploy's authoritative projection table
+// (deploy.ConfigKeys), so no environment-variable name or validation rule is
+// re-declared here: the value is written to the config.Config field the table
+// names, and the authoritative validator (config.Config.Validate, reached
+// through InstallRequest.Validate) is what actually judges it inside the
+// transaction. A field with no environment projection is refused explicitly
+// (deploy.ConfigKeyRefusal) rather than silently ignored.
+func applyConfigOverrides(request *deploy.InstallRequest, assignments []string) ([]string, error) {
+	var applied []string
+	seen := make(map[string]bool, len(assignments))
+	for _, assignment := range assignments {
+		key, value, ok := strings.Cut(assignment, "=")
+		if !ok {
+			return nil, fmt.Errorf("%w: config set expects KEY=VALUE (got %q)", errUsage, assignment)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("%w: config set expects KEY=VALUE with a non-empty key", errUsage)
+		}
+		field, settable := deploy.LookupConfigKey(key)
+		if !settable {
+			if reason := deploy.ConfigKeyRefusal(key); reason != "" {
+				return nil, fmt.Errorf("config set: %s cannot be set: %s", key, reason)
+			}
+			return nil, fmt.Errorf("%w: config set: unknown key %q", errUsage, key)
+		}
+		if !configKeyAppliesTo(field, request.Role) {
+			return nil, fmt.Errorf("%w: config set: key %q applies to %s, not %s",
+				errUsage, field.Name, strings.Join(field.Roles, " or "), request.Role)
+		}
+		if seen[field.Name] {
+			return nil, fmt.Errorf("%w: config set: key %q was given more than once", errUsage, field.Name)
+		}
+		if err := setConfigField(request, field, strings.TrimSpace(value)); err != nil {
+			return nil, err
+		}
+		seen[field.Name] = true
+		applied = append(applied, field.Name)
+	}
+	return applied, nil
+}
+
+func configKeyAppliesTo(field deploy.ConfigKey, role string) bool {
+	for _, r := range field.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// setConfigField writes one parsed value into the config.Config the request
+// carries. Only the field assignment lives here; the VALUE is never echoed in
+// an error, and no validation happens at this layer.
+func setConfigField(request *deploy.InstallRequest, field deploy.ConfigKey, value string) error {
+	c := &request.Config
+	switch field.Kind {
+	case deploy.ConfigBool:
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("%w: config set: %s expects a boolean (true/false, 1/0)", errUsage, field.Name)
+		}
+		c.AllowWeakSecret = parsed
+		return nil
+	case deploy.ConfigInt:
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("%w: config set: %s expects an integer", errUsage, field.Name)
+		}
+		switch field.Name {
+		case "metrics.port":
+			c.MetricsPort = n
+		case "relay.buf":
+			c.RelayBufSize = n
+		case "stream.queue.bytes":
+			c.QueueBytesPerStream = n
+		case "stream.queue.frames":
+			c.QueueFramesPerStream = n
+		case "stream.queue.total.bytes":
+			c.QueueBytesTotal = n
+		case "stream.overflow.ms":
+			c.OverflowWaitMs = n
+		case "carrier.grace":
+			c.CarrierGraceMs = n
+		case "bootstrap.wait":
+			c.BootstrapWaitMs = n
+		case "session.buffer.bytes":
+			c.SessionBufBytes = n
+		case "session.buffer.total.bytes":
+			c.SessionBufTotal = n
+		case "liveness.rounds":
+			c.LivenessRounds = n
+		default:
+			return fmt.Errorf("%w: config set: key %q has no integer projection", errUsage, field.Name)
+		}
+		return nil
+	default:
+		switch field.Name {
+		case "socks.listen":
+			c.SocksListen = value
+		case "ws.listen":
+			c.WsListen = value
+		case "down.carrier.addr":
+			c.DownCarrierAddr = value
+		case "up.ws.url":
+			c.UpWsUrl = value
+		case "down.listen":
+			c.DownListen = value
+		case "secret":
+			c.Secret = value
+		default:
+			return fmt.Errorf("%w: config set: key %q has no string projection", errUsage, field.Name)
+		}
+		return nil
+	}
+}
+
+// configSetCommand applies `config set KEY=VALUE ...` as a TRANSACTIONAL
+// desired-state change.
+//
+// The current environment (the same contract install/rollback/uninstall use)
+// is the baseline and each KEY=VALUE overrides exactly one field of it. The
+// resulting request is validated by the authoritative internal/config
+// validator inside the transaction, and the change is applied through the
+// existing Controller.ApplyRequest path — there is no second transaction
+// engine, and the env file is never written outside the transaction (the
+// adapter's Prepare phase owns that write, and the transaction journal
+// protects it).
+//
+// A configuration change is planner-visible through the projected-config
+// digest (Manifest.ConfigFingerprint), so a real change always reaches the
+// adapter and restarts the units that read the env file, while re-running the
+// same `config set` is a true no-op that touches nothing.
+//
+// Secret hygiene: values are never echoed. The summary names the accepted
+// keys only, and every error names a field, never a value.
+func configSetCommand(ctx context.Context, assignments []string, out io.Writer) error {
+	if err := requireLinux("config set"); err != nil {
+		return err
+	}
+	store, err := canonicalStore()
+	if err != nil {
+		return err
+	}
+	current, err := store.Load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("config: not installed")
+		}
+		return fmt.Errorf("config: load deployment state: %w", err)
+	}
+	request, err := installRequestFromEnv(current.Role)
+	if err != nil {
+		return mutationRequestEnvError("config", err)
+	}
+	applied, err := applyConfigOverrides(&request, assignments)
+	if err != nil {
+		return err
+	}
+	// The projected-config digest is the SAME identity the planner compares,
+	// so "nothing changed" is decided here exactly as the planner would
+	// decide it — and a request that changes nothing starts no transaction
+	// and writes no journal.
+	wanted, err := request.ConfigFingerprint()
+	if err != nil {
+		return err
+	}
+	if current.ConfigFingerprint != "" && wanted == current.ConfigFingerprint {
+		_, _ = fmt.Fprintf(out, "config: already converged (no changes)\nrole: %s\ngeneration: %s\nkeys: %s\n",
+			current.Role, current.Generation, strings.Join(applied, ", "))
+		return nil
+	}
+	controller, err := newMutationController(store, request)
+	if err != nil {
+		return err
+	}
+	result, err := controller.ApplyRequest(ctx, request)
+	if err != nil {
+		return err
+	}
+	m := result.Manifest
+	if result.Plan.Unchanged {
+		_, _ = fmt.Fprintf(out, "config: already converged (no changes)\nrole: %s\ngeneration: %s\nkeys: %s\n",
+			m.Role, m.Generation, strings.Join(applied, ", "))
+		return nil
+	}
+	_, _ = fmt.Fprintf(out, "config: committed\nrole: %s\ngeneration: %s\nkeys: %s\nservices: %d\n",
+		m.Role, m.Generation, strings.Join(applied, ", "), len(m.Services))
+	return nil
+}
+
+// upgradeCommand upgrades exactly one component, or re-applies the current
+// deployment, through the existing Controller.ApplyRequest path.
+//
+// The request is always re-derived from the environment, exactly as rollback
+// and uninstall do: the manifest records identities, not secrets, so the
+// operator's environment is the authoritative input for what the host should
+// converge to.
+//
+//   - no flag: re-apply the current deployment. Nothing in the environment
+//     changed, so the plan is Unchanged and no transaction runs — the
+//     documented way to converge/verify a host against its environment.
+//   - --splitter: the splitter artifact the environment supplies. The
+//     environment IS the source for it, so the flag is accepted only when it
+//     actually supplies a change (a different version or path) and is refused
+//     otherwise, rather than silently re-applying the same deployment.
+//   - --xray: Germany only (Iran uses an external Xray). Xray is a pinned
+//     constant, so the upgrade re-points the managed binary at
+//     xray.PinnedVersion and re-applies the Reality parameters; a
+//     conflicting environment pin is refused instead of silently overridden.
+//   - --origin: a role with a configured origin. The origin is pinned
+//     (origin.PinnedVersion); a conflicting environment value is refused.
+//
+// Stale-journal refusal, role immutability, pairing carry-forward and
+// commit-last semantics all come from the controller. Output is summary-only:
+// role, generation, component, and counts — never paths, hashes, or key
+// material.
+func upgradeCommand(ctx context.Context, target string, out io.Writer) error {
+	if err := requireLinux("upgrade"); err != nil {
+		return err
+	}
+	store, err := canonicalStore()
+	if err != nil {
+		return err
+	}
+	current, err := store.Load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("upgrade: nothing installed (no committed state)")
+		}
+		return fmt.Errorf("upgrade: load deployment state: %w", err)
+	}
+	if current.Generation == "" {
+		return errors.New("upgrade: nothing installed (no committed generation)")
+	}
+	request, err := installRequestFromEnv(current.Role)
+	if err != nil {
+		return mutationRequestEnvError("upgrade", err)
+	}
+	component := "re-apply"
+	switch target {
+	case "--splitter":
+		component = "splitter " + request.SplitterVersion
+		if request.SplitterVersion == current.Components.Splitter.Version && request.SplitterPath == current.Components.Splitter.Path {
+			return fmt.Errorf("upgrade: the environment supplies no splitter change (same version and path); set %s and/or %s", envSplitterVersion, envSplitterBin)
+		}
+	case "--xray":
+		if current.Role != deploy.RoleGermany {
+			return fmt.Errorf("upgrade: --xray applies to %s; %s uses an external Xray", deploy.RoleGermany, current.Role)
+		}
+		if request.XrayVersion != xray.PinnedVersion {
+			return fmt.Errorf("upgrade: --xray installs the pinned Xray %s; the environment requests %s", xray.PinnedVersion, request.XrayVersion)
+		}
+		component = "xray " + xray.PinnedVersion
+	case "--origin":
+		if request.Origin.Mode == origin.ModeNone {
+			return fmt.Errorf("upgrade: --origin requires a configured origin; role %s has none", current.Role)
+		}
+		if request.OriginVersion != origin.PinnedVersion {
+			return fmt.Errorf("upgrade: --origin installs the pinned origin %s; the environment requests %s", origin.PinnedVersion, request.OriginVersion)
+		}
+		component = "origin " + origin.PinnedVersion
+	}
+	controller, err := newMutationController(store, request)
+	if err != nil {
+		return err
+	}
+	result, err := controller.ApplyRequest(ctx, request)
+	if err != nil {
+		return err
+	}
+	m := result.Manifest
+	if result.Plan.Unchanged {
+		_, _ = fmt.Fprintf(out, "upgrade: already converged (no changes)\nrole: %s\ngeneration: %s\ncomponent: %s\n",
+			m.Role, m.Generation, component)
+		return nil
+	}
+	_, _ = fmt.Fprintf(out, "upgrade: committed\nrole: %s\ngeneration: %s\ncomponent: %s\nservices: %d\n",
+		m.Role, m.Generation, component, len(m.Services))
 	return nil
 }
 
@@ -463,9 +786,11 @@ func installRequestFromEnv(role string) (deploy.InstallRequest, error) {
 	request.Role = role
 	request.Config = *cfg
 	// Canonical T5 paths (the production adapter enforces these; NewLinux
-	// Adapter rejects non-canonical requests).
-	request.StateRoot = systemd.StateDir
-	request.EnvPath = systemd.EnvFile(systemd.Role(role))
+	// Adapter rejects non-canonical requests). In production canonicalStateRoot
+	// IS systemd.StateDir and the env path IS systemd.EnvFile(role); the seams
+	// exist only so tests can exercise this builder off a Linux host.
+	request.StateRoot = canonicalStateRoot
+	request.EnvPath = filepath.Join(canonicalStateRoot, role+".env")
 
 	splitterBin := strings.TrimSpace(os.Getenv(envSplitterBin))
 	splitterVersion := strings.TrimSpace(os.Getenv(envSplitterVersion))
@@ -490,8 +815,8 @@ func installRequestFromEnv(role string) (deploy.InstallRequest, error) {
 			xrayVersion = xray.PinnedVersion
 		}
 		request.XrayVersion = xrayVersion
-		request.XrayPath = systemd.BinaryPrefix + "/xray/" + xrayVersion + "/xray"
-		request.ConfigPath = systemd.StateDir + "/xray-germany.json"
+		request.XrayPath = canonicalBinaryPrefix + "/xray/" + xrayVersion + "/xray"
+		request.ConfigPath = canonicalStateRoot + "/xray-germany.json"
 		reality := xray.RealityParams{
 			SNI:     strings.TrimSpace(os.Getenv(envRealitySNI)),
 			ShortID: strings.TrimSpace(os.Getenv(envRealityShortID)),
@@ -511,6 +836,17 @@ func installRequestFromEnv(role string) (deploy.InstallRequest, error) {
 			return request, fmt.Errorf("install: Germany requires %s", strings.Join(missing, ", "))
 		}
 		request.Reality = reality
+		// Germany runs no origin provider (Reality is the public entrypoint),
+		// so its origin plan is the explicit "none" mode. The upstream is
+		// derived from Germany's only local listener so the plan stays valid
+		// and host-independent; the none-mode provider never dials it. Without
+		// this the plan carries the empty mode, which the origin validator
+		// correctly rejects — making every Germany request unbuildable.
+		upstream, err := loopbackUpstream(cfg.DownListen, config.EnvDownListen)
+		if err != nil {
+			return request, err
+		}
+		request.Origin = origin.Plan{Mode: origin.ModeNone, UpstreamAddr: upstream}
 	case deploy.RoleIran:
 		plan, err := originPlanFromEnv(cfg)
 		if err != nil {
@@ -522,9 +858,9 @@ func installRequestFromEnv(role string) (deploy.InstallRequest, error) {
 		// (no operator knob — a mismatch would diverge from what T4
 		// actually installs).
 		request.OriginVersion = origin.PinnedVersion
-		request.OriginPath = systemd.BinaryPrefix + "/caddy/" + origin.PinnedVersion + "/caddy"
+		request.OriginPath = canonicalBinaryPrefix + "/caddy/" + origin.PinnedVersion + "/caddy"
 		if plan.Mode == origin.ModeCaddy || (plan.Mode == origin.ModeCDN && plan.CDNSecurity == origin.CDNTLSOrigin) {
-			request.ConfigPath = systemd.StateDir + "/Caddyfile"
+			request.ConfigPath = canonicalStateRoot + "/Caddyfile"
 		}
 	default:
 		return request, fmt.Errorf("install: invalid role %q", role)
@@ -616,20 +952,27 @@ func cdnOriginPortFromEnv() (int, error) {
 }
 
 // originUpstreamFromWsListen canonicalizes the splitter's WS listener into
-// the loopback upstream the origin fronts. An empty host (bind-all) is
-// fronted at 127.0.0.1; a non-loopback host is a topology mismatch the
-// origin refuses (it only ever dials 127.0.0.1/::1).
+// the loopback upstream the origin fronts.
 func originUpstreamFromWsListen(wsListen string) (string, error) {
-	host, portStr, err := net.SplitHostPort(wsListen)
+	return loopbackUpstream(wsListen, config.EnvWsListen)
+}
+
+// loopbackUpstream canonicalizes a role's local listener into the loopback
+// upstream the origin provider dials. An empty host (bind-all) is fronted at
+// 127.0.0.1; a non-loopback host is a topology mismatch the origin refuses
+// (it only ever dials 127.0.0.1/::1). envName names the source variable so the
+// error stays field-only.
+func loopbackUpstream(addr, envName string) (string, error) {
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", fmt.Errorf("install: %s is not a valid host:port", config.EnvWsListen)
+		return "", fmt.Errorf("install: %s is not a valid host:port", envName)
 	}
 	if host == "" {
 		host = "127.0.0.1"
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return "", fmt.Errorf("install: the origin can only front a loopback %s", config.EnvWsListen)
+		return "", fmt.Errorf("install: the origin can only front a loopback %s", envName)
 	}
 	return net.JoinHostPort(ip.String(), portStr), nil
 }
@@ -804,10 +1147,11 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  doctor                              run read-only deployment checks")
 	fmt.Fprintln(out, "  install iran|germany                install a role (Linux root; env contract in package docs)")
 	fmt.Fprintln(out, "  pair generate|apply|finalize        exchange pairing blobs")
-	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  (not wired: see IMPLEMENTATION_STATUS.md)")
+	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")
 	fmt.Fprintln(out, "  uninstall [--purge]                 remove the deployment (Linux root)")
 	fmt.Fprintln(out, "  recover                             execute journal-driven post-crash recovery (Linux root)")
 	fmt.Fprintln(out, "  recover --ack                       force-clear the journal without host changes (Linux root)")
-	fmt.Fprintln(out, "  config show|set                     show (wired) / set (not wired) deployment config")
+	fmt.Fprintln(out, "  config show                         show the committed deployment config")
+	fmt.Fprintln(out, "  config set KEY=VALUE ...            apply configuration changes transactionally (Linux root)")
 }

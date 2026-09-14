@@ -121,16 +121,19 @@ func TestPlanDetectsOriginDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Build the current manifest from the desired state so the unmutated
-	// baseline is a genuine no-op first.
+	// baseline is a genuine no-op first. ConfigFingerprint is part of that
+	// state: a manifest built from a desired state must record the same
+	// configuration identity, or the baseline would plan drift on it.
 	current := Manifest{
-		Schema:     SchemaVersion,
-		Role:       RoleIran,
-		Generation: "g1",
-		Components: base.Components,
-		Paths:      base.Paths,
-		Pairing:    base.Pairing,
-		Services:   base.Services,
-		Firewall:   base.Firewall,
+		Schema:            SchemaVersion,
+		Role:              RoleIran,
+		Generation:        "g1",
+		Components:        base.Components,
+		Paths:             base.Paths,
+		Pairing:           base.Pairing,
+		Services:          base.Services,
+		Firewall:          base.Firewall,
+		ConfigFingerprint: base.ConfigFingerprint,
 	}
 
 	cases := []struct {
