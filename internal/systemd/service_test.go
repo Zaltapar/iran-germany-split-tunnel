@@ -167,10 +167,10 @@ func TestJournalTailBoundsAndNoSecret(t *testing.T) {
 	if err != nil || out != "journal marker" {
 		t.Fatalf("out=%q err=%v", out, err)
 	}
-	if !ex.has("journalctl -u germany-splitter.service -n 200 --no-pager -q -o short-iso") {
+	if !ex.has("journalctl -u germany-split-tunnel.service -n 200 --no-pager -q -o short-iso") {
 		t.Fatalf("calls=%v", ex.calls)
 	}
-	_, err = m.JournalTail(context.Background(), "germany-splitter.service", 0)
+	_, err = m.JournalTail(context.Background(), "germany-split-tunnel.service", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
