@@ -139,7 +139,7 @@ func TestHealthCheck(t *testing.T) {
 		port := ln.Addr().(*net.TCPAddr).Port
 		ln.Close()
 		m := newTestManager(&fakeExec{handler: func([]string) (string, error) { return "active", nil }})
-		h, err := HealthCheck(context.Background(), m, "germany-split-tunnel.service", port)
+		h, err := HealthCheck(context.Background(), m, "germany-splitter.service", port)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestHealthCheck(t *testing.T) {
 
 	t.Run("port zero skips", func(t *testing.T) {
 		m := newTestManager(&fakeExec{handler: func([]string) (string, error) { return "inactive", errors.New("inactive") }})
-		h, err := HealthCheck(context.Background(), m, "germany-split-tunnel.service", 0)
+		h, err := HealthCheck(context.Background(), m, "germany-splitter.service", 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -170,11 +170,11 @@ func TestJournalTailBoundsAndNoSecret(t *testing.T) {
 	if !ex.has("journalctl -u germany-splitter.service -n 200 --no-pager -q -o short-iso") {
 		t.Fatalf("calls=%v", ex.calls)
 	}
-	_, err = m.JournalTail(context.Background(), "germany-split-tunnel.service", 0)
+	_, err = m.JournalTail(context.Background(), "germany-splitter.service", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ex.has("journalctl -u germany-split-tunnel.service -n 20 --no-pager -q -o short-iso") {
+	if !ex.has("journalctl -u germany-splitter.service -n 20 --no-pager -q -o short-iso") {
 		t.Fatalf("calls=%v", ex.calls)
 	}
 	for _, call := range ex.calls {
