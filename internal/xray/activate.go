@@ -9,8 +9,9 @@ package xray
 //     (RenderGermanyConfig; any validation failure changes nothing);
 //  2. write tmp   — <dir>/<file>.tmp created with 0600 (O_EXCL), fsync'd;
 //  3. gate        — the pinned binary's own `xray run -test` validates the
-//     candidate BEFORE it becomes live; on failure the tmp is removed and
-//     the directory is left byte-identical, NOTHING is (re)started;
+//     exact candidate bytes through a private hard link with the canonical
+//     `.json` basename; on failure the tmp is removed and the directory is
+//     left byte-identical, NOTHING is (re)started;
 //  4. backup      — the previous live config (if any) is preserved as
 //     <dir>/<file>.prev with 0600 (rollback artifact; it contains the
 //     previous private key, hence the explicit permission);
@@ -33,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -94,6 +96,9 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	if file == "." || file == ".." || file != filepath.Base(file) {
 		return "", fmt.Errorf("%w: file name must be a plain name (no path)", ErrActivateDir)
 	}
+	if filepath.Ext(file) != ".json" {
+		return "", fmt.Errorf("%w: file name must use the .json extension", ErrActivateDir)
+	}
 	// The directory must already exist and be a real directory (T5
 	// creates it 0700); we never create the project prefix ourselves.
 	if st, err := os.Lstat(dir); err != nil || !st.IsDir() {
@@ -152,11 +157,33 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	}
 
 	// --- gate: the pinned binary validates the candidate itself ---
+	// Xray derives the config format from the filename and rejects the
+	// crash-safe .tmp suffix with "Failed to get format". Validate the
+	// exact candidate bytes through a private hard link whose basename is
+	// the live, canonical .json name. The candidate itself remains in place
+	// for crash recovery and is still the file removed on gate failure.
+	verifyDir := filepath.Join(dir, "."+file+".verify-"+strconv.Itoa(os.Getpid()))
+	verifyPath := filepath.Join(verifyDir, file)
+	if err := os.Mkdir(verifyDir, 0o700); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("%w: cannot create validation directory: %v", ErrActivateWrite, err)
+	}
+	cleanupVerify := func() {
+		_ = os.Remove(verifyPath)
+		_ = os.Remove(verifyDir)
+	}
+	if err := os.Link(tmp, verifyPath); err != nil {
+		cleanupVerify()
+		os.Remove(tmp)
+		return "", fmt.Errorf("%w: cannot link validation config: %v", ErrActivateWrite, err)
+	}
 	exec := a.Exec
 	if exec == nil {
 		exec = OSExecutor{}
 	}
-	if out2, gerr := exec.RunTest(a.Bin, tmp); gerr != nil {
+	out2, gerr := exec.RunTest(a.Bin, verifyPath)
+	cleanupVerify()
+	if gerr != nil {
 		os.Remove(tmp)
 		// xray's decode error can echo the privateKey value — mask the
 		// exact key strings before any excerpt leaves this function.

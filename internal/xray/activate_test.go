@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -58,6 +59,14 @@ func dirSnapshot(t *testing.T, dir string) map[string]string {
 
 func newActivateFake() *activateFake { return &activateFake{} }
 
+// gateVerifyPath is the private canonical-basename hard link activation
+// creates for the `xray run -test` gate (same pattern as the systemd
+// unit-apply verify dir): Xray derives the config format from the BASENAME,
+// so the crash-safe .tmp candidate is never handed to it directly.
+func gateVerifyPath(dir, file string) string {
+	return filepath.Join(dir, "."+file+".verify-"+strconv.Itoa(os.Getpid()), file)
+}
+
 func activateBase(t *testing.T, dir string) ActivateParams {
 	t.Helper()
 	return ActivateParams{
@@ -71,8 +80,8 @@ func activateBase(t *testing.T, dir string) ActivateParams {
 }
 
 // Gate PASS, no previous config: live file created with the rendered
-// bytes; no .prev, no .tmp; the gate ran against the TMP path (never the
-// live path).
+// bytes; no .prev, no .tmp; the gate ran against the private canonical
+// .json hard link (never the .tmp candidate, never the live path).
 func TestActivateFirstRun(t *testing.T) {
 	dir := t.TempDir()
 	a := activateBase(t, dir)
@@ -102,9 +111,21 @@ func TestActivateFirstRun(t *testing.T) {
 	if _, err := os.Stat(live + ".tmp"); !errors.Is(err, os.ErrNotExist) {
 		t.Error("tmp must be gone after activation")
 	}
-	// The gate must have validated the tmp, not the live path.
-	if len(fake.calls) != 1 || !strings.HasSuffix(fake.calls[0], ".tmp") {
-		t.Errorf("gate calls = %v, want exactly one against the .tmp path", fake.calls)
+	// Regression (staging): the gate must NOT receive the .tmp candidate
+	// path — `xray run -test` derives the format from the basename and
+	// rejects *.tmp with "Failed to get format". It must receive the exact
+	// candidate bytes through the private canonical .json hard link, never
+	// the live path.
+	vp := gateVerifyPath(dir, "xray-germany.json")
+	wantCall := "run-test:" + a.Bin + ":" + vp
+	if len(fake.calls) != 1 || fake.calls[0] != wantCall {
+		t.Errorf("gate calls = %v, want exactly [%s]", fake.calls, wantCall)
+	}
+	if _, err := os.Lstat(vp); !errors.Is(err, os.ErrNotExist) {
+		t.Error("validation hard link must be removed after activation")
+	}
+	if st, err := os.Lstat(filepath.Dir(vp)); err == nil && st.IsDir() {
+		t.Error("validation directory must be removed after activation")
 	}
 	assertPerm0600(t, live)
 }
@@ -170,6 +191,17 @@ func TestActivateGateFailChangesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(live + ".prev"); !errors.Is(err, os.ErrNotExist) {
 		t.Error(".prev must not be created when the gate fails")
+	}
+	vp := gateVerifyPath(dir, "xray-germany.json")
+	if _, err := os.Lstat(vp); !errors.Is(err, os.ErrNotExist) {
+		t.Error("validation hard link leaked after gate failure")
+	}
+	if st, err := os.Lstat(filepath.Dir(vp)); err == nil && st.IsDir() {
+		t.Error("validation directory leaked after gate failure")
+	}
+	// The gate saw the canonical hard link name, never the .tmp candidate.
+	if len(fake.calls) != 1 || !strings.HasSuffix(fake.calls[0], filepath.Join(filepath.Base(filepath.Dir(vp)), "xray-germany.json")) {
+		t.Errorf("gate calls = %v, want exactly one against the canonical .json link path", fake.calls)
 	}
 }
 
@@ -290,6 +322,21 @@ func TestActivateStaleTmp(t *testing.T) {
 	if _, err := ActivateGermanyConfig(a); err != nil {
 		t.Fatalf("stale regular tmp should be cleaned, got %v", err)
 	}
+	// Candidate recovery semantics: the crash residue is replaced by the
+	// freshly rendered candidate (NOT the stale bytes), and the new config
+	// reached the live path through the canonical gate.
+	got, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatalf("read live: %v", err)
+	}
+	if string(got) == "stale" {
+		t.Error("stale tmp bytes were activated instead of the new render")
+	}
+	fake := a.Exec.(*activateFake)
+	wantCall := "run-test:" + a.Bin + ":" + gateVerifyPath(dir, "xray-germany.json")
+	if len(fake.calls) != 1 || fake.calls[0] != wantCall {
+		t.Errorf("gate calls = %v, want exactly [%s]", fake.calls, wantCall)
+	}
 
 	// Now plant a symlink at the tmp path.
 	os.Remove(tmp)
@@ -299,6 +346,59 @@ func TestActivateStaleTmp(t *testing.T) {
 	a2 := activateBase(t, dir)
 	if _, err := ActivateGermanyConfig(a2); !errors.Is(err, ErrActivateTarget) {
 		t.Fatalf("want ErrActivateTarget for symlink tmp, got %v", err)
+	}
+}
+
+// Regression for the staging defect: `xray run -test` on
+// xray-germany.json.tmp failed with "Failed to get format" because Xray
+// derives the config format from the file extension. The gate must never
+// be invoked with a .tmp (or any non-.json) config path.
+func TestActivateGateNeverSeesTmpOrNonJsonName(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		file string
+	}{
+		{"default canonical name", "xray-germany.json"},
+		{"custom plain .json name", "germany-relay.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := activateBase(t, dir)
+			a.FileName = tc.file
+			fake := a.Exec.(*activateFake)
+			if _, err := ActivateGermanyConfig(a); err != nil {
+				t.Fatalf("activate: %v", err)
+			}
+			if len(fake.calls) != 1 {
+				t.Fatalf("gate calls = %v, want exactly one", fake.calls)
+			}
+			cfg := strings.TrimPrefix(fake.calls[0], "run-test:"+a.Bin+":")
+			if filepath.Ext(cfg) != ".json" || strings.HasSuffix(cfg, ".tmp") {
+				t.Errorf("gate received a non-canonical config path: %q", cfg)
+			}
+			if cfg != gateVerifyPath(dir, tc.file) {
+				t.Errorf("gate config path = %q, want the private canonical link %q", cfg, gateVerifyPath(dir, tc.file))
+			}
+		})
+	}
+
+	// A FileName without the .json extension is refused BEFORE any write
+	// or gate invocation: Xray must never be pointed at an extension it
+	// cannot parse.
+	before := dirSnapshot(t, dir)
+	for _, name := range []string{"xray-germany.tmp", "xray-germany", "x.txt", "x.json.tmp"} {
+		a := activateBase(t, dir)
+		a.FileName = name
+		fake := a.Exec.(*activateFake)
+		if _, err := ActivateGermanyConfig(a); !errors.Is(err, ErrActivateDir) {
+			t.Errorf("FileName %q: want ErrActivateDir, got %v", name, err)
+		}
+		if len(fake.calls) != 0 {
+			t.Errorf("FileName %q: gate must not run at all, calls=%v", name, fake.calls)
+		}
+	}
+	if after := dirSnapshot(t, dir); len(before) != len(after) {
+		t.Errorf("rejected file names changed the directory: before=%v after=%v", before, after)
 	}
 }
 
