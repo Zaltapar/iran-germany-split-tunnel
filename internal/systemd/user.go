@@ -44,7 +44,7 @@ const (
 //
 // Exact useradd args (asserted by tests):
 //
-//	useradd --system --group --shell /usr/sbin/nologin --home-dir
+//	useradd --system --user-group --shell /usr/sbin/nologin --home-dir
 //	/nonexistent --comment "split-tunnel service user" split-tunnel
 func EnsureUser(ctx context.Context, ex SystemdExecutor) error {
 	if err := contextCheck(ctx); err != nil {
@@ -59,7 +59,7 @@ func EnsureUser(ctx context.Context, ex SystemdExecutor) error {
 	if _, err := ex.Run(ctx, "id", "-u", ServiceUser); err == nil {
 		return nil // exists — no-op, never mutated
 	}
-	if _, cerr := ex.Run(ctx, "useradd", "--system", "--group",
+	if _, cerr := ex.Run(ctx, "useradd", "--system", "--user-group",
 		"--shell", userShell,
 		"--home-dir", userHome,
 		"--comment", userComment,
