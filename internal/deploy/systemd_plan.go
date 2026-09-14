@@ -32,6 +32,9 @@ func BuildSystemdPlan(request InstallRequest) (SystemdPlan, error) {
 		BinPath:   request.SplitterPath,
 		EnvFile:   systemd.EnvFile(systemd.Role(request.Role)),
 	}
+	if request.Role == RoleIran {
+		splitter.BinPath = canonicalIranSplitterPath()
+	}
 	if request.Role == RoleIran && request.Origin.Mode != origin.ModeNone {
 		splitter.OriginEnabled = true
 	}
@@ -60,4 +63,11 @@ func BuildSystemdPlan(request InstallRequest) (SystemdPlan, error) {
 		plan.Specs = append([]systemd.Spec{originSpec}, plan.Specs...)
 	}
 	return plan, nil
+}
+
+// canonicalIranSplitterPath is the only path the managed Iran unit may
+// execute. InstallRequest.SplitterPath is the operator-supplied source
+// artifact and may be a staging path; it must never cross the render boundary.
+func canonicalIranSplitterPath() string {
+	return systemd.BinaryPrefix + "/iran-splitter"
 }

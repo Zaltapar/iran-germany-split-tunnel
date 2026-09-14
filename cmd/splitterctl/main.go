@@ -544,7 +544,13 @@ func upgradeCommand(ctx context.Context, target string, out io.Writer) error {
 	switch target {
 	case "--splitter":
 		component = "splitter " + request.SplitterVersion
-		if request.SplitterVersion == current.Components.Splitter.Version && request.SplitterPath == current.Components.Splitter.Path {
+		currentPath := request.SplitterPath
+		if current.Role == deploy.RoleIran {
+			// Iran's source artifact may live in staging, but the committed
+			// deployment identity is always the canonical managed target.
+			currentPath = systemd.BinaryPrefix + "/iran-splitter"
+		}
+		if request.SplitterVersion == current.Components.Splitter.Version && currentPath == current.Components.Splitter.Path {
 			return fmt.Errorf("upgrade: the environment supplies no splitter change (same version and path); set %s and/or %s", envSplitterVersion, envSplitterBin)
 		}
 	case "--xray":

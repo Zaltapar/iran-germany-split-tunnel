@@ -5,6 +5,7 @@ package systemd
 import (
 	"context"
 	"os"
+	"os/exec"
 	"os/user"
 	"strconv"
 	"syscall"
@@ -23,20 +24,27 @@ func TestPermissionChainConvergence(t *testing.T) {
 		t.Skipf("service group %q unavailable: %v", ServiceGroup, err)
 	}
 	live := stateDir + "/xray-germany.json"
+	caddy := stateDir + "/Caddyfile"
+	env := stateDir + "/iran.env"
 	prev := stateDir + "/xray-germany.json.prev"
+	caddyPrev := stateDir + "/Caddyfile.prev"
 	writeRaw(t, live, []byte("{}\n"))
+	writeRaw(t, caddy, []byte(":443\n"))
+	writeRaw(t, env, []byte("SPLIT_SECRET=private\n"))
 	writeRaw(t, prev, []byte("previous private material\n"))
-	if err := os.Chmod(live, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(prev, 0o600); err != nil {
-		t.Fatal(err)
+	writeRaw(t, caddyPrev, []byte("previous private material\n"))
+	for _, path := range []string{live, caddy, env, prev, caddyPrev} {
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.Chown(live, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chown(prev, 0, 0); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{caddy, env, prev, caddyPrev} {
+		if err := os.Chown(path, 0, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if err := EnsureUser(context.Background(), OSExecutor{}); err != nil {
@@ -51,8 +59,18 @@ func TestPermissionChainConvergence(t *testing.T) {
 
 	assertModeOwner(t, stateDir, 0o750, 0, ServiceGroup)
 	assertModeOwner(t, live, 0o640, 0, ServiceGroup)
+	assertModeOwner(t, caddy, 0o640, 0, ServiceGroup)
+	assertModeOwner(t, env, 0o600, 0, "root")
 	assertModeOwner(t, prev, 0o600, 0, "root")
+	assertModeOwner(t, caddyPrev, 0o600, 0, "root")
+	if err := runAsServiceGroup(caddy); err != nil {
+		t.Fatalf("service account cannot read converged Caddyfile: %v", err)
+	}
 	assertModeOwner(t, logDir, 0o775, 0, ServiceGroup)
+}
+
+func runAsServiceGroup(path string) error {
+	return exec.Command("runuser", "-u", ServiceUser, "--", "test", "-r", path).Run()
 }
 
 func assertModeOwner(t *testing.T, path string, wantMode os.FileMode, wantUID int, wantGroup string) {

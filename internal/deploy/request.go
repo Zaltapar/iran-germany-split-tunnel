@@ -413,6 +413,10 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 		// Unix path on every host — the manifest must be host-independent.
 		paths.BinaryPointer = strings.TrimSuffix(systemd.XrayBinaryPath, "/xray")
 	}
+	splitterPath := r.SplitterPath
+	if r.Role == RoleIran {
+		splitterPath = canonicalIranSplitterPath()
+	}
 	xray := ComponentState{Version: r.XrayVersion, Path: r.XrayPath, SHA256: r.XraySHA256}
 	if r.Role == RoleGermany {
 		// The Reality public-parameter fingerprint is xray/germany-only and is
@@ -426,7 +430,7 @@ func (r InstallRequest) Desired() (DesiredState, error) {
 		// recorded digest always describes what T5 actually rendered.
 		ConfigFingerprint: envFingerprint(plan.Env),
 		Components: Components{
-			Splitter: ComponentState{Version: r.SplitterVersion, Path: r.SplitterPath, SHA256: r.SplitterSHA256},
+			Splitter: ComponentState{Version: r.SplitterVersion, Path: splitterPath, SHA256: r.SplitterSHA256},
 			Xray:     xray,
 			Origin: OriginState{
 				Mode:           string(r.Origin.Mode),

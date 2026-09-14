@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -236,9 +237,22 @@ func (a *LinuxAdapter) Prepare(ctx context.Context, desired DesiredState) error 
 	if applied {
 		a.inFlightFiles = append(a.inFlightFiles, a.Request.EnvPath)
 	}
+	if a.Request.Role == RoleIran {
+		if err := installCanonicalSplitter(a.Request.SplitterPath, canonicalIranSplitterPath()); err != nil {
+			return err
+		}
+	}
 	if a.Origin != nil {
 		if err := a.Origin.Configure(ctx, a.Request.Origin); err != nil {
 			return err
+		}
+		// Origin activation deliberately creates live Caddyfile candidates and
+		// rollback artifacts as 0600. Converge only the live service-readable
+		// file after activation; .prev/.tmp and iran.env remain private.
+		if a.Request.Role == RoleIran && (a.Request.Origin.Mode == origin.ModeCaddy || (a.Request.Origin.Mode == origin.ModeCDN && a.Request.Origin.CDNSecurity == origin.CDNTLSOrigin)) {
+			if err := systemd.EnsureStateDir(ctx); err != nil {
+				return err
+			}
 		}
 		if a.Request.Origin.Mode == origin.ModeCaddy || (a.Request.Origin.Mode == origin.ModeCDN && a.Request.Origin.CDNSecurity == origin.CDNTLSOrigin) {
 			a.inFlightFiles = append(a.inFlightFiles, a.Request.ConfigPath)
@@ -1153,6 +1167,62 @@ func componentFor(c string) systemd.Component {
 // unitName mirrors the T5 default unit naming for a spec (explicit
 // spec.UnitName wins; otherwise derived from role+component). The specs
 // this adapter builds always use the derived names, so this is exact.
+// installCanonicalSplitter copies the operator-supplied artifact into the
+// managed Iran location without following a destination symlink. The source
+// may be a staging path; it is never emitted into a unit or manifest.
+func installCanonicalSplitter(source, target string) error {
+	if source == target {
+		return nil
+	}
+	st, err := os.Lstat(source)
+	if err != nil || !st.Mode().IsRegular() {
+		return fmt.Errorf("deploy: Iran splitter source must be a regular file")
+	}
+	if dst, err := os.Lstat(target); err == nil {
+		if dst.Mode()&os.ModeSymlink != 0 || !dst.Mode().IsRegular() {
+			return fmt.Errorf("deploy: refusing unsafe Iran splitter target")
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("deploy: stat Iran splitter target: %w", err)
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("deploy: open Iran splitter source: %w", err)
+	}
+	defer in.Close()
+	parent := filepath.Dir(target)
+	parentInfo, err := os.Lstat(parent)
+	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("deploy: Iran splitter managed directory is not a real directory")
+	}
+	tmp := target + ".tmp-" + fmt.Sprint(os.Getpid())
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		return fmt.Errorf("deploy: stage Iran splitter: %w", err)
+	}
+	ok := false
+	defer func() {
+		_ = out.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("deploy: copy Iran splitter: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("deploy: sync Iran splitter: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("deploy: close Iran splitter: %w", err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return fmt.Errorf("deploy: activate Iran splitter: %w", err)
+	}
+	ok = true
+	return nil
+}
+
 func unitName(spec systemd.Spec) string {
 	if spec.UnitName != "" {
 		return spec.UnitName

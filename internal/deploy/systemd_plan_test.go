@@ -1,6 +1,8 @@
 package deploy
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -24,6 +26,58 @@ func TestBuildSystemdPlanGermany(t *testing.T) {
 	}
 	if plan.Env[config.EnvSecret] == "" {
 		t.Fatal("env projection omitted secret")
+	}
+}
+
+func TestIranStagingSplitterNeverReachesExecStartOrManifest(t *testing.T) {
+	r := validIranRequest()
+	r.SplitterPath = filepath.Join(t.TempDir(), "staging", "iran-splitter")
+	plan, err := BuildSystemdPlan(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit, err := systemd.RenderUnit(plan.Specs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unit), "staging") || !strings.Contains(string(unit), "ExecStart=/opt/split-tunnel/iran-splitter\n") {
+		t.Fatalf("Iran unit has non-canonical ExecStart:\n%s", unit)
+	}
+	desired, err := r.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := desired.Components.Splitter.Path; got != "/opt/split-tunnel/iran-splitter" {
+		t.Fatalf("manifest splitter path = %q, want canonical path", got)
+	}
+}
+
+func TestInstallCanonicalSplitterCopiesStagingArtifact(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "staging", "iran-splitter")
+	managed := filepath.Join(root, "managed", "iran-splitter")
+	if err := os.MkdirAll(filepath.Dir(staging), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(managed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("canonical artifact")
+	if err := os.WriteFile(staging, want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := installCanonicalSplitter(staging, managed); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("managed artifact = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("staging source was removed: %v", err)
 	}
 }
 
