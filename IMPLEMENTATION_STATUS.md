@@ -1,9 +1,85 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests green, Linux staging pending)
+Latest recorded commit: `2927f847` (T8-B M5: `config set` + `upgrade` wired
+through `Controller.ApplyRequest`; full local tests green, Linux staging
+pending)
 
 ## Current state
+
+- **T8-B deployment work — RF-1..RF-4, DEFECT-1..4, M4 convergence
+  identity, M5 wiring (all committed; Linux staging still pending):** the
+  adversarial-audit findings recorded in `plans/t8-audit-checkpoint.md`
+  (RF-1..RF-4) and the defects found while remediating them are resolved
+  in `main`:
+  - **RF-3 (containment, `be28167`):** journal-driven artifact removal is
+    bounded by the binary prefix and symlink-safe; a tampered
+    `xrayDir`/`originDir` can no longer drive a destructive removal
+    outside it.
+  - **RF-4 (idempotency, `96e1267`):** the committed pairing state is
+    projected into `Desired()`, so re-applying an identical request after
+    pairing is a TRUE no-op (the previous behavior compared against a
+    hard-coded `none` and silently reset the pairing state).
+  - **RF-1/RF-2 (post-crash recovery, `c00b9fb`):** the journal records
+    the ACTUAL created-by-this-transaction set and is consumed by
+    `LinuxAdapter.RecoverJournal` / `Controller.Recover`; `splitterctl
+    recover` (without `--ack`) EXECUTES that recovery instead of only
+    reporting the journal. `--ack` remains the explicit, documented
+    manual force-clear, and it fails closed on an unreadable/tampered
+    committed state or a role mismatch (`c5046ed`). The operator deadlock
+    (install/rollback/uninstall all refusing on a stale journal with no
+    exit but manual cleanup) is removed.
+  - **DEFECT-1..4 (`e76edf5`):** purge symlink-safety, env-file ownership
+    on a fresh-install recovery, no-backup upgrade convergence, and the
+    `--ack` role guard.
+  - **Faithful recovery re-apply (`c5046ed`):** recovery re-applies a
+    unit through the SAME spec the normal apply path writes (dependency
+    ordering + canonical env path included), from one authoritative spec
+    source.
+  - **M4 — `DesiredState` convergence completeness (`a0c75f5`):**
+    `ComponentState.SHA256` is a TRUE binary content hash and the xray
+    Reality fingerprint lives in its own field (it was previously
+    overloaded into `SHA256`); `OriginState` carries the Caddyfile hash
+    plus the ACME/CDN identity; `Paths` carries every managed path (unit
+    dirs, log/data dirs, binary prefix, unit files, binary pointer);
+    `ServiceState.Hash` is populated; `Manifest.ConfigFingerprint` is the
+    SHA-256 of the projected env map in canonical key order (a digest
+    only — no env value, least of all the secret, is recoverable from it,
+    and it is never printed). The persisted `Manifest` schema was bumped
+    1 -> 2 with backward-compatible loading: schema-1 files still load and
+    re-marshal byte-identically (`omitempty`) and are upgraded on the next
+    commit. `641dea0a` fixed legacy schema-1 revision rollback (the
+    rollback guard falls back to the legacy overloaded `SHA256` when the
+    fingerprint field is absent, and fails closed when neither is
+    recorded).
+  - **M5 (`2927f847`):** `config set KEY=VALUE ...` and `upgrade
+    [--xray|--origin|--splitter]` are wired through the existing
+    `Controller.ApplyRequest` path (see the M5 entry below); no
+    `errNotWired` path remains for any command.
+  - **Intentional limitations (explicit):** splitter/Xray binary hashes
+    are asserted only when the operator's environment supplies them (the
+    CLI supplies none, so the planner treats them as unasserted rather
+    than fabricating a value); `upgrade --splitter` compares version +
+    path, not binary content; rollback does NOT rewrite the env file (only
+    a non-invertible digest of it is recorded), so it keeps the operator's
+    current environment while converging unit/origin artifacts;
+    `keepalive.interval` has no env projection and is refused by
+    `config set` with its reason.
+  - **Status: T8 is NOT claimed complete.** No staging mutation was
+    performed; a clean-Ubuntu L5 acceptance run is still required (see the
+    open issues below).
+
+- **Open issues (must remain OPEN — NOT resolved by the T8-B work):**
+  [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19)
+  (L5 acceptance blocked: staging infra missing the required CDN/TLS +
+  VLESS+Reality transports),
+  [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20)
+  (session stranded when the peer-side incarnation never existed),
+  [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21)
+  (closed-port target returns `0x00` + bounded termination, not the
+  RUNBOOK-expected `0x06`). L5 acceptance remains blocked on #19; #20/#21
+  are product-engine prerequisites for a clean L5 verdict and are tracked
+  separately. T8-B does not close them.
 
 - **T8 M5 — `config set` and `upgrade` wired (implemented locally; Linux
   staging still pending):** the last two `errNotWired` commands are now real
@@ -97,10 +173,12 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
   mutation and retains it on EVERY failure path (even when in-process
   recovery succeeds) as the recovery evidence; only a successful commit
   clears it. `Controller` gates install/rollback on a stale journal
-  (`finish recovery before installing/rolling back`), and the new
-  `splitterctl recover` command reports the retained journal (secret-free
-  by construction) and, with `--ack`, clears it after the operator verifies
-  the host. The env file is deliberately never rewritten by rollback (its
+  (`finish recovery before installing/rolling back`). **SUPERSEDED by
+  `c00b9fb`:** this entry originally recorded that `splitterctl recover`
+  only reported the retained journal and cleared it with `--ack`; it now
+  EXECUTES journal-driven recovery from the persisted journal (which is
+  secret-free by construction), and `--ack` remains the explicit manual
+  force-clear. The env file is deliberately never rewritten by rollback (its
   content carries the secret and is not recorded in the manifest — only a
   non-invertible digest is; see the M5 entry below), so rollback converges
   unit/origin artifacts while the live env keeps the operator's environment.
@@ -112,8 +190,10 @@ Latest recorded commit: `ac573c6` (T8-B real CLI mutations; full local tests gre
   root. This is the prerequisite for truthful retained-revision restore and
   ownership-scoped uninstall; no state-only rollback is exposed.
 
-- **T8-B real pairing CLI slice (implemented locally; install/upgrade/rollback/
-  uninstall/config mutation still pending):** `splitterctl pair` now uses the
+- **T8-B real pairing CLI slice (implemented locally; the "still pending"
+  mutations in this entry are SUPERSEDED — install/rollback/uninstall/recover
+  were wired in `ac573c6`, and `upgrade`/`config set` in `2927f847`):**
+  `splitterctl pair` now uses the
   existing `internal/deploy.Pairing` and T1 validators. Iran `pair generate`
   reads an absolute protected secret file and upload-domain input, emits Blob A
   once, and commits only fingerprint/state. Germany `pair apply` accepts Blob A;
@@ -848,6 +928,17 @@ items, in priority order:
   that long per attempt before the connection is closed (before this
   follow-up, the Germany-side dial path could block indefinitely on a
   silent peer because `wsConn` has no `SetDeadline`).
+- **T8 deployment (current, explicit):** splitter/Xray binary hashes are
+  asserted only when the operator's environment supplies them (the CLI
+  supplies none today, so those identities are recorded empty and treated
+  as unasserted); `upgrade --splitter` compares version + path, not binary
+  content; rollback does not rewrite the env file (a non-invertible digest
+  of it is recorded, never its content), so it keeps the operator's current
+  environment and refuses a target the current environment cannot
+  reproduce; `keepalive.interval` has no env projection (`config set`
+  refuses it by name). The mutation commands are Linux-root only and were
+  verified by local tests with fake adapters — **no staging mutation has
+  been performed and no L5 acceptance run exists yet.**
 
 ## Historical phase records
 

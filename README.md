@@ -32,7 +32,72 @@ tunneled over VLESS+Reality. One direction per carrier — no cross-traffic.
 
 ## Quick Start
 
-### Install (interactive installer)
+### Self-contained deployment — `splitterctl` (T8)
+
+`splitterctl` is the project's transactional deployment CLI. It manages
+the deployment through `internal/deploy` (state, planner, journal,
+controller, Linux adapter) on the canonical state root `/etc/split-tunnel`
+(`systemd.StateDir`); every mutation command is Linux-root only and
+delegates host work to the T2–T6 packages (Xray, origin/Caddy, systemd,
+firewall) rather than duplicating their policy.
+
+```
+usage: splitterctl <install|pair|status|doctor|upgrade|rollback|uninstall|recover|config>
+  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)
+  doctor                              run read-only deployment checks
+  install iran|germany                install a role (Linux root; env contract in package docs)
+  pair generate|apply|finalize        exchange pairing blobs
+  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)
+  rollback --to state-id              converge the host to a retained revision (Linux root)
+  uninstall [--purge]                 remove the deployment (Linux root)
+  recover                             execute journal-driven post-crash recovery (Linux root)
+  recover --ack                       force-clear the journal without host changes (Linux root)
+  config show                         show the committed deployment config
+  config set KEY=VALUE ...            apply configuration changes transactionally (Linux root)
+```
+
+**Roles.**
+
+* **Iran** — manages the splitter, the origin (Caddy or the CDN
+  sub-modes) where configured, systemd units, firewall and deployment
+  state. **The external Xray/3x-ui installation is NOT managed**: the
+  splitter exposes the SOCKS5 service and your Xray routes into it (see
+  [Xray Config (Iran)](#xray-config-iran)).
+* **Germany** — self-contained: installs and supervises the pinned
+  Xray-core (a supervised child process, i.e. its own systemd unit) as
+  well as the splitter, systemd, firewall and state.
+
+**State root.** `/etc/split-tunnel` (`systemd.StateDir`); the read-only
+commands honor `SPLITTERCTL_STATE_ROOT`.
+
+**Pairing.** The only cross-host human step: `pair generate` on Iran emits
+Blob A once (tunnel secret + public upload domain); `pair apply` on Germany
+consumes Blob A and emits the return Blob B (Reality/VLESS public
+parameters only); `pair finalize` on Iran consumes Blob B. Raw blobs and
+tunnel secrets are never persisted — only fingerprints.
+
+**Crash recovery.** If a transaction is interrupted, the ownership journal
+is retained and install/rollback/uninstall refuse until recovery is done.
+`splitterctl recover` (no flags) **executes** journal-driven recovery from
+the persisted journal (bounded to the journal's pre-state); `recover --ack`
+is the explicit manual force-clear that deletes the journal **without
+touching the host** and must only be used after the operator has verified
+the host. `--ack` fails closed on an unreadable/tampered committed state or
+a journal/committed role mismatch.
+
+> **Status:** the CLI is implemented and its local test suite is green, but
+> **no staging acceptance run has been performed** — T8 is not claimed
+> complete until a clean-Ubuntu L5 acceptance run exists. See
+> [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) and
+> [`docs/self-contained-deployment-architecture.md`](docs/self-contained-deployment-architecture.md).
+
+### Legacy path — interactive installer (`install.sh`)
+
+> **Status relative to the CLI:** `install.sh` is the LEGACY, standalone
+> deployment path (it predates `splitterctl` and duplicates part of its
+> role). It is still supported and documented below; `splitterctl` is the
+> transactional path with journaled state, revisions and rollback.
+> `deploy.sh` is DEPRECATED.
 
 The installer asks for every setting (role, shared secret, ports, CDN domain,
 Xray inbound tag, nginx, metrics) with sensible defaults — just press Enter to
