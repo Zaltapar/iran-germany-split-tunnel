@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/deploy"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
 // recoverAdapterFake satisfies deploy.Adapter for the CLI tests. It records
@@ -472,6 +475,410 @@ func TestRunPairRequiresPersistedState(t *testing.T) {
 			t.Errorf("%v: error = %v, want missing-state error", args, err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// pair generate / apply / finalize (CLI wiring of the two-blob exchange)
+// ---------------------------------------------------------------------------
+
+// fixedPrivateRawTest is the documented fixed non-production X25519 test
+// vector (internal/xray keygen_test.go); it is a TEST vector, not a deployed
+// key, and the pairing tests below only ever prove that Blob B carries the
+// public key DERIVED from it.
+const fixedPrivateRawTest = "gAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHkA"
+
+const cliInstalledSNI = "www.example.org"
+const cliInstalledShortID = "0123456789abcdef"
+const cliInstalledUUID = "550e8400-e29b-41d4-a716-446655440000"
+const cliDownHost = "203.0.113.10"
+
+// writeInstalledGermanyConfig renders a realistic Germany Xray config through
+// the authoritative generator into its own temp dir and returns the path.
+func writeInstalledGermanyConfig(t *testing.T) string {
+	t.Helper()
+	out, err := xray.RenderGermanyConfig(
+		xray.RealityParams{SNI: cliInstalledSNI, ShortID: cliInstalledShortID, UUID: cliInstalledUUID},
+		&xray.Keypair{PrivateRaw: fixedPrivateRawTest, PublicRaw: strings.Repeat("A", 43)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "xray-germany.json")
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// commitPairingManifest commits a minimal manifest for one role, optionally
+// carrying a pre-set pairing state, and returns its store.
+func commitPairingManifest(t *testing.T, role string, configPath string, pairingState deploy.PairingState) *deploy.Store {
+	t.Helper()
+	root := t.TempDir()
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(deploy.Manifest{
+		Role:       role,
+		Generation: "g-pair",
+		Paths:      deploy.Paths{StateRoot: store.Root, Config: configPath},
+		Pairing:    pairingState,
+		Firewall:   deploy.FirewallState{Backend: "none"},
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_STATE_ROOT", store.Root)
+	return store
+}
+
+// blobFileFor writes an encoded blob to an absolute temp path and sets the
+// SPLITTERCTL_PAIR_BLOB_FILE contract variable.
+func blobFileFor(t *testing.T, encoded string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "blob.in")
+	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_PAIR_BLOB_FILE", path)
+	return path
+}
+
+// generateBlobAForTest produces a valid Blob A through the deploy boundary.
+func generateBlobAForTest(t *testing.T, secret string) string {
+	t.Helper()
+	encoded, _, err := (deploy.Pairing{}).GenerateA(secret, "upload.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+// TestPairApplyGermanyEmitsReturnBlob is the CLI half of the fixed gap:
+// generate→apply(emits B)→finalize, plus the idempotent re-apply that re-
+// emits the SAME Blob B from the installed reality params.
+func TestPairApplyGermanyEmitsReturnBlob(t *testing.T) {
+	configPath := writeInstalledGermanyConfig(t)
+	store := commitPairingManifest(t, deploy.RoleGermany, configPath, deploy.PairingState{State: deploy.PairingStateNone})
+	secret := strings.Repeat("a", 64)
+	blobA := generateBlobAForTest(t, secret)
+	blobFileFor(t, blobA)
+	t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", cliDownHost)
+
+	outPath := filepath.Join(t.TempDir(), "blob-b.out")
+	t.Setenv("SPLITTERCTL_PAIR_BLOB_OUT", outPath)
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"pair", "apply"}, &out, &out); err != nil {
+		t.Fatalf("pair apply (germany): %v", err)
+	}
+	first := out.String()
+	blobB := lastLine(t, first)
+	parsed, err := pairing.ParseBlobB(blobB)
+	if err != nil {
+		t.Fatalf("emitted blob B must parse: %v", err)
+	}
+	if parsed.Germany.Host != cliDownHost || parsed.Germany.Port != 443 {
+		t.Fatalf("down target = %+v", parsed.Germany)
+	}
+	if parsed.Public.SNI != cliInstalledSNI || parsed.Public.ShortID != cliInstalledShortID || parsed.Public.UUID != cliInstalledUUID {
+		t.Fatalf("public params = %+v", parsed.Public)
+	}
+	installed, err := xray.ReadInstalledRealityParams(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Public.RealityPublicKey != installed.RealityPublicKey {
+		t.Fatal("Blob B must carry the public key DERIVED from the installed private key")
+	}
+
+	// Non-display relay: the same blob, written 0600 to the absolute path.
+	rawOut, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(rawOut)) != blobB {
+		t.Fatal("SPLITTERCTL_PAIR_BLOB_OUT content differs from stdout blob")
+	}
+	if runtime.GOOS != "windows" {
+		if st, err := os.Stat(outPath); err != nil {
+			t.Fatal(err)
+		} else if st.Mode().Perm() != 0o600 {
+			t.Fatalf("blob-out mode = %v, want -rw-------", st.Mode().Perm())
+		}
+	}
+
+	// A re-apply (Blob B was lost) re-emits the IDENTICAL blob.
+	out.Reset()
+	if err := run(context.Background(), []string{"pair", "apply"}, &out, &out); err != nil {
+		t.Fatalf("pair apply re-run: %v", err)
+	}
+	if again := lastLine(t, out.String()); again != blobB {
+		t.Fatal("re-apply must emit the same Blob B deterministically")
+	}
+
+	// Committed state: a-applied with exactly two fingerprints, never raw
+	// blobs or the tunnel secret.
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Pairing.State != "a-applied" || loaded.Pairing.PeerRole != deploy.RoleIran || len(loaded.Pairing.Fingerprints) != 2 {
+		t.Fatalf("pairing state = %+v", loaded.Pairing)
+	}
+	stateData, err := os.ReadFile(filepath.Join(store.Root, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// stdout contract: the Germany apply echoes Blob B exactly once and never
+	// Blob A (which carries the tunnel secret) or any private material.
+	if n := strings.Count(first, "splat-v1."); n != 1 {
+		t.Fatalf("stdout contains %d blobs, want exactly 1 (the return blob)", n)
+	}
+	for _, forbidden := range []string{blobA, secret, fixedPrivateRawTest} {
+		if strings.Contains(first, forbidden) {
+			t.Fatalf("stdout leaked %q", forbidden)
+		}
+	}
+	// Persisted state contract: fingerprints only — no raw blob or key/secret
+	// material anywhere in state.json.
+	for _, forbidden := range []string{blobA, blobB, secret, fixedPrivateRawTest} {
+		if strings.Contains(string(stateData), forbidden) {
+			t.Fatalf("committed state contains raw material %q", forbidden)
+		}
+	}
+}
+
+// TestPairHappyPathGenerateApplyFinalize runs the complete documented flow
+// across two role state roots: Iran generate → Germany apply (emits B) →
+// Iran finalize (consumes B).
+func TestPairHappyPathGenerateApplyFinalize(t *testing.T) {
+	secret := strings.Repeat("d", 64)
+
+	// Iran: pair generate emits Blob A (last stdout line) and commits
+	// a-generated with one fingerprint.
+	iranStore := commitPairingManifest(t, deploy.RoleIran, "", deploy.PairingState{State: deploy.PairingStateNone})
+	secretPath := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secretPath, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_SECRET_FILE", secretPath)
+	t.Setenv("SPLITTERCTL_UPLOAD_DOMAIN", "upload.example.org")
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"pair", "generate"}, &out, &out); err != nil {
+		t.Fatalf("pair generate: %v", err)
+	}
+	blobA := lastLine(t, out.String())
+	if _, err := pairing.ParseBlobA(blobA); err != nil {
+		t.Fatalf("generated blob A must parse: %v", err)
+	}
+	iranState, err := iranStore.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iranState.Pairing.State != "a-generated" || len(iranState.Pairing.Fingerprints) != 1 {
+		t.Fatalf("iran state = %+v", iranState.Pairing)
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatal("generate leaked the secret outside the blob")
+	}
+
+	// Germany: pair apply consumes Blob A and emits Blob B.
+	configPath := writeInstalledGermanyConfig(t)
+	commitPairingManifest(t, deploy.RoleGermany, configPath, deploy.PairingState{State: deploy.PairingStateNone})
+	blobFileFor(t, blobA)
+	t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", cliDownHost)
+	out.Reset()
+	if err := run(context.Background(), []string{"pair", "apply"}, &out, &out); err != nil {
+		t.Fatalf("pair apply: %v", err)
+	}
+	blobB := lastLine(t, out.String())
+	if _, err := pairing.ParseBlobB(blobB); err != nil {
+		t.Fatalf("emitted blob B must parse: %v", err)
+	}
+
+	// Iran: pair finalize consumes Blob B and commits finalized. finalize
+	// emits NO blob of its own (stdout carries only the summary).
+	commitPairingManifest(t, deploy.RoleIran, "", iranState.Pairing)
+	blobFileFor(t, blobB)
+	out.Reset()
+	if err := run(context.Background(), []string{"pair", "finalize"}, &out, &out); err != nil {
+		t.Fatalf("pair finalize: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "pairing: finalized") {
+		t.Fatalf("finalize output = %q", got)
+	}
+	if strings.Contains(got, "splat-v1.") {
+		t.Fatalf("finalize must not emit a blob: %q", got)
+	}
+}
+
+// TestPairApplyGermanyIdempotentAfterBlobLost covers the staging failure mode
+// fixed here: Germany had already committed a-applied (old binary) but Blob B
+// never reached Iran; re-running apply with the new binary must re-emit B.
+func TestPairApplyGermanyIdempotentAfterBlobLost(t *testing.T) {
+	configPath := writeInstalledGermanyConfig(t)
+	secret := strings.Repeat("e", 64)
+	blobA := generateBlobAForTest(t, secret)
+	store := commitPairingManifest(t, deploy.RoleGermany, configPath, deploy.PairingState{
+		PeerRole: deploy.RoleIran, State: "a-applied", Fingerprints: []string{"legacy-fingerprint"},
+	})
+	blobFileFor(t, blobA)
+	t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", cliDownHost)
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"pair", "apply"}, &out, &out); err != nil {
+		t.Fatalf("re-apply from a-applied must succeed: %v", err)
+	}
+	blobB := lastLine(t, out.String())
+	if _, err := pairing.ParseBlobB(blobB); err != nil {
+		t.Fatalf("re-emitted blob B must parse: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Pairing.State != "a-applied" || len(loaded.Pairing.Fingerprints) != 2 {
+		t.Fatalf("pairing state = %+v", loaded.Pairing)
+	}
+}
+
+// TestPairRoleAndStateGates pins the preserved security semantics: wrong-role
+// rejection on both hosts, terminal-state rejection, finalize with Blob A,
+// and the config-path precondition.
+func TestPairRoleAndStateGates(t *testing.T) {
+	secret := strings.Repeat("f", 64)
+	blobA := generateBlobAForTest(t, secret)
+
+	cases := []struct {
+		name    string
+		role    string
+		action  []string
+		state   deploy.PairingState
+		input   string
+		wantMsg string
+	}{
+		{"iran rejects apply", deploy.RoleIran, []string{"pair", "apply"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "Iran accepts only pair finalize"},
+		{"germany rejects finalize", deploy.RoleGermany, []string{"pair", "finalize"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "Germany accepts only pair apply"},
+		{"germany rejects generate", deploy.RoleGermany, []string{"pair", "generate"}, deploy.PairingState{State: deploy.PairingStateNone}, "", "generate is currently supported on Iran"},
+		{"apply after finalized rejected", deploy.RoleGermany, []string{"pair", "apply"}, deploy.PairingState{PeerRole: deploy.RoleIran, State: "finalized"}, blobA, "only valid before or after a-applied"},
+		{"apply without config path", deploy.RoleGermany, []string{"pair", "apply"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "records no Xray config path"},
+	}
+	for _, tc := range cases {
+		if tc.wantMsg == "" {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := ""
+			if tc.role == deploy.RoleGermany && tc.name != "apply without config path" {
+				configPath = writeInstalledGermanyConfig(t)
+			}
+			commitPairingManifest(t, tc.role, configPath, tc.state)
+			if tc.input != "" {
+				blobFileFor(t, tc.input)
+			}
+			t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", cliDownHost)
+			var out bytes.Buffer
+			err := run(context.Background(), tc.action, &out, &out)
+			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("error = %v, want %q", err, tc.wantMsg)
+			}
+			if strings.Contains(err.Error(), blobA) {
+				t.Fatalf("error echoed blob content: %v", err)
+			}
+		})
+	}
+
+	// Iran generate without a role-2 manifest is exercised above; confirm the
+	// positive counterpart works so the gate is role-based, not global.
+	store := commitPairingManifest(t, deploy.RoleIran, "", deploy.PairingState{State: deploy.PairingStateNone})
+	secretPath := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secretPath, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_SECRET_FILE", secretPath)
+	t.Setenv("SPLITTERCTL_UPLOAD_DOMAIN", "upload.example.org")
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"pair", "generate"}, &out, &out); err != nil {
+		t.Fatalf("iran generate: %v", err)
+	}
+	if _, err := pairing.ParseBlobA(lastLine(t, out.String())); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := store.Load(); s.Pairing.State != "a-generated" {
+		t.Fatalf("state = %+v", s.Pairing)
+	}
+}
+
+// TestPairFinalizeRejectsBlobA pins the wrong-blob boundary on Iran: Blob A
+// fails the pairing role check with a sentinel, echoing no content.
+func TestPairFinalizeRejectsBlobA(t *testing.T) {
+	commitPairingManifest(t, deploy.RoleIran, "", deploy.PairingState{State: "a-generated"})
+	blobA := generateBlobAForTest(t, strings.Repeat("7", 64))
+	blobFileFor(t, blobA)
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"pair", "finalize"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "role mismatch") {
+		t.Fatalf("error = %v, want pairing role mismatch", err)
+	}
+	if strings.Contains(err.Error(), blobA) {
+		t.Fatalf("error echoed blob content: %v", err)
+	}
+}
+
+// TestPairBlobOutMustBeAbsolute pins the relay-path contract: a relative
+// SPLITTERCTL_PAIR_BLOB_OUT is refused BEFORE the state commit happens.
+func TestPairBlobOutMustBeAbsolute(t *testing.T) {
+	configPath := writeInstalledGermanyConfig(t)
+	store := commitPairingManifest(t, deploy.RoleGermany, configPath, deploy.PairingState{State: deploy.PairingStateNone})
+	blobFileFor(t, generateBlobAForTest(t, strings.Repeat("8", 64)))
+	t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", cliDownHost)
+	t.Setenv("SPLITTERCTL_PAIR_BLOB_OUT", "relative/blob.out")
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"pair", "apply"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "must be an absolute path") {
+		t.Fatalf("error = %v, want absolute-path refusal", err)
+	}
+	loaded, lerr := store.Load()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if loaded.Pairing.State != deploy.PairingStateNone {
+		t.Fatalf("refused apply mutated pairing state: %+v", loaded.Pairing)
+	}
+}
+
+// TestPairDownHostFailureNamesFieldOnly pins the error hygiene for the Blob B
+// target: a bad host is rejected by the pairing validator naming the FIELD,
+// and nothing about the value (or the blob) reaches the error.
+func TestPairDownHostFailureNamesFieldOnly(t *testing.T) {
+	configPath := writeInstalledGermanyConfig(t)
+	store := commitPairingManifest(t, deploy.RoleGermany, configPath, deploy.PairingState{State: deploy.PairingStateNone})
+	blobFileFor(t, generateBlobAForTest(t, strings.Repeat("9", 64)))
+	t.Setenv("SPLITTERCTL_PAIR_DOWN_HOST", "bad host!")
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"pair", "apply"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "germany.host") {
+		t.Fatalf("error = %v, want the germany.host field named", err)
+	}
+	if strings.Contains(err.Error(), "bad host") {
+		t.Fatalf("error echoed the invalid value: %v", err)
+	}
+	loaded, lerr := store.Load()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if loaded.Pairing.State != deploy.PairingStateNone {
+		t.Fatalf("failed apply must not commit: %+v", loaded.Pairing)
+	}
+}
+
+// lastLine returns the final non-empty line of a command's output (the
+// emitted blob, by the documented output contract).
+func lastLine(t *testing.T, output string) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func TestRunReadOnlyCommandsRejectArguments(t *testing.T) {

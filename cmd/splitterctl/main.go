@@ -30,6 +30,15 @@
 //	SPLITTERCTL_CDN_SECURITY         cdn only: tlsOrigin | plainOrigin
 //	SPLITTERCTL_CDN_ORIGIN_TRUST     cdn tlsOrigin only (D9):
 //	                                 pullCA | unauthenticatedTLS
+//	Pairing (see pairCommand docs for the full state machine):
+//	SPLITTERCTL_SECRET_FILE          Iran pair generate: absolute protected file
+//	SPLITTERCTL_UPLOAD_DOMAIN        Iran pair generate: public upload domain
+//	SPLITTERCTL_PAIR_BLOB_FILE       apply/finalize: absolute file holding the
+//	                                 blob to consume (A on Germany, B on Iran)
+//	SPLITTERCTL_PAIR_DOWN_HOST       Germany pair apply: the public down host to
+//	                                 embed in Blob B (defaults to auto-detected)
+//	SPLITTERCTL_PAIR_BLOB_OUT        optional: absolute path the emitted blob is
+//	                                 ALSO written to, 0600, for non-display relay
 //	Both:
 //	SPLITTERCTL_FIREWALL_BACKEND     none (default) | ufw | nftables | auto
 //	SPLITTERCTL_FW_ALLOW / _DENY     comma-separated TCP ports, applied as
@@ -53,6 +62,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1032,10 +1042,96 @@ func firewallRulesFromEnv(name, action string) ([]firewall.Rule, error) {
 // Read-only commands
 // ---------------------------------------------------------------------------
 
+// Pairing environment variable names (the pair commands' input contract;
+// errors name fields, never values — blob/secret material never reaches an
+// error string, and the committed state stores fingerprints only).
+const (
+	envPairDownHost = "SPLITTERCTL_PAIR_DOWN_HOST"
+	envPairBlobOut  = "SPLITTERCTL_PAIR_BLOB_OUT"
+)
+
+// detectGermanyHost is the seam behind the Blob B down-host auto-detection
+// used when SPLITTERCTL_PAIR_DOWN_HOST is unset. It is a var (like goos) so
+// tests can substitute a deterministic address; production always probes the
+// host's own interfaces.
+var detectGermanyHost = detectGermanyHostFromInterfaces
+
+// detectGermanyHostFromInterfaces returns the host's public address for the
+// pairing return blob: the lowest-sorted global non-loopback, non-private
+// IPv4 if one exists, else the lowest-sorted global IPv6. Sorting makes the
+// choice deterministic across interface orderings. On a host with several
+// public addresses the operator should set SPLITTERCTL_PAIR_DOWN_HOST
+// explicitly; auto-detection is the convenience path for the documented
+// single-public-address staging topology (see integration/RUNBOOK.md §2.2).
+func detectGermanyHostFromInterfaces() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", fmt.Errorf("pair: auto-detect Germany down host failed: %w", err)
+	}
+	var v4, v6 []string
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP
+		if ip.IsLoopback() || !ip.IsGlobalUnicast() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
+			continue
+		}
+		if ip.To4() != nil {
+			v4 = append(v4, ip.String())
+		} else {
+			v6 = append(v6, ip.String())
+		}
+	}
+	sort.Strings(v4)
+	sort.Strings(v6)
+	switch {
+	case len(v4) > 0:
+		return v4[0], nil
+	case len(v6) > 0:
+		return v6[0], nil
+	default:
+		return "", fmt.Errorf("pair: no public Germany address to auto-detect; set %s", envPairDownHost)
+	}
+}
+
+// pairCommand is the two-blob pairing exchange (architecture doc §6.1):
+//
+//	pair generate  (Iran)    — emits Blob A once (tunnel secret + upload
+//	                           domain) for the operator to carry to Germany.
+//	pair apply     (Germany) — consumes Blob A AND emits the RETURN Blob B,
+//	                           built from the INSTALLED Reality parameters
+//	                           (public key derived from the installed private
+//	                           key — never a fresh pair) plus this host's
+//	                           public down host and the inbound port. The
+//	                           emission is idempotent: a re-run while already
+//	                           a-applied (e.g. Blob B was lost) re-emits the
+//	                           SAME Blob B deterministically. State machine:
+//	                           none → a-applied (and emit); a-applied →
+//	                           a-applied (re-emit); any other state fails
+//	                           closed.
+//	pair finalize  (Iran)    — consumes Blob B, committing "finalized".
+//
+// Emitted blobs go to stdout once. When SPLITTERCTL_PAIR_BLOB_OUT names an
+// absolute path the emitted blob is additionally written there 0600 (symlink
+// targets refused) for a non-display relay (scp) instead of a terminal.
+// Persisted state carries pairing progress and SHA-256 fingerprints ONLY —
+// raw blobs (Blob A carries the tunnel secret) never enter state, logs, or
+// errors; Blob B itself contains only public Reality parameters + host/port.
+// Role gates are unchanged: Iran rejects apply/finalize mismatches, Germany
+// rejects generate/finalize.
 func pairCommand(_ context.Context, store *deploy.Store, action string, out io.Writer) error {
 	manifest, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("pair: load deployment state: %w", err)
+	}
+	// Validate the optional blob-output path BEFORE any state mutation: a
+	// misconfigured relay path is an operator mistake, not something a
+	// committed pairing state should ever record.
+	blobOutPath := strings.TrimSpace(os.Getenv(envPairBlobOut))
+	if blobOutPath != "" && !filepath.IsAbs(blobOutPath) {
+		return fmt.Errorf("pair: %s must be an absolute path", envPairBlobOut)
 	}
 	p := deploy.Pairing{Store: store}
 	var state deploy.PairingState
@@ -1043,7 +1139,7 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, out io.W
 	switch action {
 	case "generate":
 		if manifest.Role != deploy.RoleIran {
-			return fmt.Errorf("pair: generate is currently supported on Iran; Germany requires provisioned Reality public parameters")
+			return fmt.Errorf("pair: generate is currently supported on Iran; Germany derives its return blob from pair apply")
 		}
 		secretPath := os.Getenv("SPLITTERCTL_SECRET_FILE")
 		domain := os.Getenv("SPLITTERCTL_UPLOAD_DOMAIN")
@@ -1072,7 +1168,22 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, out io.W
 			if action != "apply" {
 				return fmt.Errorf("pair: Germany accepts only pair apply for Blob A")
 			}
-			_, state, err = p.ApplyA(encoded)
+			switch manifest.Pairing.State {
+			case "", deploy.PairingStateNone, "a-applied":
+			default:
+				return fmt.Errorf("pair: apply is only valid before or after a-applied; current pairing state is %q", manifest.Pairing.State)
+			}
+			if manifest.Paths.Config == "" {
+				return errors.New("pair: Germany committed state records no Xray config path (re-run install first)")
+			}
+			downHost := strings.TrimSpace(os.Getenv(envPairDownHost))
+			if downHost == "" {
+				downHost, err = detectGermanyHost()
+				if err != nil {
+					return err
+				}
+			}
+			blob, state, err = p.ApplyAGermany(encoded, downHost, manifest.Paths.Config)
 		} else {
 			if action != "finalize" {
 				return fmt.Errorf("pair: Iran accepts only pair finalize for Blob B")
@@ -1090,12 +1201,49 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, out io.W
 	if err != nil {
 		return err
 	}
+	// Human summary first, then the emitted blob as the LAST stdout line so a
+	// clipboard copy or `... | tail -n1` reliably captures the blob. The state
+	// itself carries fingerprints only (never the raw blob); the blob reaches
+	// stdout exactly once. When SPLITTERCTL_PAIR_BLOB_OUT is set, the blob is
+	// ALSO written there 0600 for a non-display relay.
+	_, _ = fmt.Fprintf(out, "pairing: %s\nfingerprints: %s\ngeneration: %s\n", state.State, strings.Join(state.Fingerprints, ", "), committed.Generation)
 	if blob != "" {
+		if blobOutPath != "" {
+			if err := writeEmittedBlob(blobOutPath, blob); err != nil {
+				return fmt.Errorf("pair: %s: %w", envPairBlobOut, err)
+			}
+		}
 		_, _ = fmt.Fprintln(out, blob)
-	} else {
-		_, _ = fmt.Fprintf(out, "pairing: %s\nfingerprint: %s\ngeneration: %s\n", state.State, state.Fingerprints[0], committed.Generation)
 	}
 	return nil
+}
+
+// writeEmittedBlob writes an emitted pairing blob 0600 to an operator-chosen
+// absolute path for non-display relay. It refuses symlinked targets, creates
+// with 0600, fsyncs, and re-asserts the mode on overwrite (package-level
+// os.Chmod, matching the rest of the CLI's file writes). The blob is by
+// design a one-time, human-carried artifact — this helper never logs or
+// echoes its content.
+func writeEmittedBlob(path, blob string) error {
+	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() {
+		return errors.New("target exists and is not a regular file (refusing)")
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(blob + "\n"); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 func status(_ context.Context, store *deploy.Store, out io.Writer) error {
@@ -1152,7 +1300,7 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)")
 	fmt.Fprintln(out, "  doctor                              run read-only deployment checks")
 	fmt.Fprintln(out, "  install iran|germany                install a role (Linux root; env contract in package docs)")
-	fmt.Fprintln(out, "  pair generate|apply|finalize        exchange pairing blobs")
+	fmt.Fprintln(out, "  pair generate|apply|finalize        exchange pairing blobs (Germany apply also emits the return Blob B)")
 	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")
 	fmt.Fprintln(out, "  uninstall [--purge]                 remove the deployment (Linux root)")

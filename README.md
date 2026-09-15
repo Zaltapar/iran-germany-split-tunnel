@@ -46,7 +46,7 @@ usage: splitterctl <install|pair|status|doctor|upgrade|rollback|uninstall|recove
   status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)
   doctor                              run read-only deployment checks
   install iran|germany                install a role (Linux root; env contract in package docs)
-  pair generate|apply|finalize        exchange pairing blobs
+  pair generate|apply|finalize        exchange pairing blobs (Germany apply also emits the return Blob B)
   upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)
   rollback --to state-id              converge the host to a retained revision (Linux root)
   uninstall [--purge]                 remove the deployment (Linux root)
@@ -72,9 +72,18 @@ commands honor `SPLITTERCTL_STATE_ROOT`.
 
 **Pairing.** The only cross-host human step: `pair generate` on Iran emits
 Blob A once (tunnel secret + public upload domain); `pair apply` on Germany
-consumes Blob A and emits the return Blob B (Reality/VLESS public
-parameters only); `pair finalize` on Iran consumes Blob B. Raw blobs and
-tunnel secrets are never persisted — only fingerprints.
+consumes Blob A AND emits the return Blob B — built from the host's
+INSTALLED Reality configuration (public key derived from the installed
+private key, never a fresh pair) plus the public down host/port, so a
+re-run while already `a-applied` (e.g. Blob B was lost) deterministically
+re-emits the SAME Blob B without regenerating anything; `pair finalize` on
+Iran consumes Blob B. Blob B carries only public Reality parameters + host
+and port. The down host is taken from `SPLITTERCTL_PAIR_DOWN_HOST`
+(otherwise auto-detected from the host's public interface address) and the
+inbound port from the installed config. Emitted blobs go to stdout as the
+last line; `SPLITTERCTL_PAIR_BLOB_OUT` (absolute path) additionally writes
+the blob 0600 for a non-display relay (scp). Raw blobs and tunnel secrets
+are never persisted — only fingerprints.
 
 **Crash recovery.** If a transaction is interrupted, the ownership journal
 is retained and install/rollback/uninstall refuse until recovery is done.

@@ -196,9 +196,16 @@ pending)
   `splitterctl pair` now uses the
   existing `internal/deploy.Pairing` and T1 validators. Iran `pair generate`
   reads an absolute protected secret file and upload-domain input, emits Blob A
-  once, and commits only fingerprint/state. Germany `pair apply` accepts Blob A;
-  Iran `pair finalize` accepts Blob B. Raw blobs and tunnel secrets are not
-  persisted. Full local tests pass.
+  once, and commits only fingerprint/state. Germany `pair apply` accepts Blob A
+  AND emits the return Blob B — derived from the host's installed Reality
+  configuration (the public key is re-derived from the installed private key
+  via `xray.ReadInstalledRealityParams`, never regenerated; the port from the
+  inbound; the host from `SPLITTERCTL_PAIR_DOWN_HOST` or auto-detection), so a
+  re-run while `a-applied` re-emits the SAME Blob B (fixes the staging gap
+  where apply consumed Blob A but emitted nothing, leaving Iran finalize
+  broken); `pair finalize` on Iran accepts Blob B. Emitted blobs print to
+  stdout last-line and optionally 0600 to `SPLITTERCTL_PAIR_BLOB_OUT`. Raw
+  blobs and tunnel secrets are not persisted. Full local tests pass.
 
 - **T8-B concrete Linux composition root (committed `10b4b84`):**
   `internal/deploy` now provides `LinuxAdapter`, which is Linux-only,
