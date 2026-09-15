@@ -30,6 +30,7 @@ package xray
 // cannot clobber each other (the second fails on the existing tmp).
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -70,21 +71,36 @@ type ActivateParams struct {
 
 const defaultConfigFileName = "xray-germany.json"
 
+// ActivationResult reports the outcome of ActivateGermanyConfig.
+type ActivationResult struct {
+	// LivePath is the activated config file path.
+	LivePath string
+	// Changed reports whether the LIVE config bytes actually changed.
+	// RenderGermanyConfig is deterministic, so comparing the rendered
+	// candidate against the previous live bytes decides this exactly: a
+	// fresh install (no previous config) is a change; a re-activation that
+	// renders identical bytes is not. Callers use it to decide whether the
+	// service reading this config must be restarted — the config can rotate
+	// (a new Reality keypair) while the public parameters that the Reality
+	// fingerprint covers (SNI/shortId/UUID) stay identical.
+	Changed bool
+}
+
 // ActivateGermanyConfig renders the Germany Xray config and atomically
 // activates it behind the pinned binary's own `xray run -test` gate. On
-// success it returns the live path; on any failure the previous live
+// success it returns the activation result; on any failure the previous live
 // config (if any) is byte-identical and no candidate file remains.
-func ActivateGermanyConfig(a ActivateParams) (string, error) {
+func ActivateGermanyConfig(a ActivateParams) (ActivationResult, error) {
 	// Traversal is rejected on the RAW input (filepath.Clean would
 	// resolve ".." away before the guard could see it). Both separator
 	// styles are checked (Windows accepts / as well as \).
 	if a.Dir == "" || a.Dir == "." {
-		return "", fmt.Errorf("%w: directory is empty", ErrActivateDir)
+		return ActivationResult{}, fmt.Errorf("%w: directory is empty", ErrActivateDir)
 	}
 	for _, sep := range []string{string(os.PathSeparator), "/"} {
 		for _, comp := range strings.Split(a.Dir, sep) {
 			if comp == ".." {
-				return "", fmt.Errorf("%w: directory contains a .. component", ErrActivateDir)
+				return ActivationResult{}, fmt.Errorf("%w: directory contains a .. component", ErrActivateDir)
 			}
 		}
 	}
@@ -94,20 +110,20 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 		file = defaultConfigFileName
 	}
 	if file == "." || file == ".." || file != filepath.Base(file) {
-		return "", fmt.Errorf("%w: file name must be a plain name (no path)", ErrActivateDir)
+		return ActivationResult{}, fmt.Errorf("%w: file name must be a plain name (no path)", ErrActivateDir)
 	}
 	if filepath.Ext(file) != ".json" {
-		return "", fmt.Errorf("%w: file name must use the .json extension", ErrActivateDir)
+		return ActivationResult{}, fmt.Errorf("%w: file name must use the .json extension", ErrActivateDir)
 	}
 	// The directory must already exist and be a real directory (T5
 	// creates it 0700); we never create the project prefix ourselves.
 	if st, err := os.Lstat(dir); err != nil || !st.IsDir() {
-		return "", fmt.Errorf("%w: %s must exist and be a directory", ErrActivateDir, dir)
+		return ActivationResult{}, fmt.Errorf("%w: %s must exist and be a directory", ErrActivateDir, dir)
 	}
 
 	out, err := RenderGermanyConfig(a.Params, a.Keypair)
 	if err != nil {
-		return "", err
+		return ActivationResult{}, err
 	}
 
 	live := filepath.Join(dir, file)
@@ -119,23 +135,24 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	var oldBytes []byte
 	if st, err := os.Lstat(live); err == nil {
 		if !st.Mode().IsRegular() {
-			return "", fmt.Errorf("%w: %s is a symlink or special file", ErrActivateTarget, live)
+			return ActivationResult{}, fmt.Errorf("%w: %s is a symlink or special file", ErrActivateTarget, live)
 		}
 		oldBytes, err = os.ReadFile(live)
 		if err != nil {
-			return "", fmt.Errorf("%w: cannot read previous config: %v", ErrActivateWrite, err)
+			return ActivationResult{}, fmt.Errorf("%w: cannot read previous config: %v", ErrActivateWrite, err)
 		}
 		oldExists = true
 	}
+	bytesChanged := !oldExists || !bytes.Equal(oldBytes, out)
 
 	// --- leftover tmp from a crashed run: regular file is ours (delete);
 	// anything else is a planted object (refuse) ---
 	if st, err := os.Lstat(tmp); err == nil {
 		if !st.Mode().IsRegular() {
-			return "", fmt.Errorf("%w: %s is a symlink or special file", ErrActivateTarget, tmp)
+			return ActivationResult{}, fmt.Errorf("%w: %s is a symlink or special file", ErrActivateTarget, tmp)
 		}
 		if err := os.Remove(tmp); err != nil {
-			return "", fmt.Errorf("%w: cannot remove stale tmp: %v", ErrActivateWrite, err)
+			return ActivationResult{}, fmt.Errorf("%w: cannot remove stale tmp: %v", ErrActivateWrite, err)
 		}
 	}
 
@@ -145,7 +162,7 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	// accepted per design §6 (same prefix, 0700 dir, single deploy user). ---
 	candidate, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrActivateWrite, err)
+		return ActivationResult{}, fmt.Errorf("%w: %v", ErrActivateWrite, err)
 	}
 	_, werr := candidate.Write(out)
 	serr := candidate.Sync()
@@ -153,7 +170,7 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	if werr != nil || serr != nil || cerr != nil {
 		candidate.Close()
 		os.Remove(tmp)
-		return "", fmt.Errorf("%w: %v", ErrActivateWrite, firstErr(werr, serr, cerr))
+		return ActivationResult{}, fmt.Errorf("%w: %v", ErrActivateWrite, firstErr(werr, serr, cerr))
 	}
 
 	// --- gate: the pinned binary validates the candidate itself ---
@@ -166,7 +183,7 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	verifyPath := filepath.Join(verifyDir, file)
 	if err := os.Mkdir(verifyDir, 0o700); err != nil {
 		os.Remove(tmp)
-		return "", fmt.Errorf("%w: cannot create validation directory: %v", ErrActivateWrite, err)
+		return ActivationResult{}, fmt.Errorf("%w: cannot create validation directory: %v", ErrActivateWrite, err)
 	}
 	cleanupVerify := func() {
 		_ = os.Remove(verifyPath)
@@ -175,7 +192,7 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 	if err := os.Link(tmp, verifyPath); err != nil {
 		cleanupVerify()
 		os.Remove(tmp)
-		return "", fmt.Errorf("%w: cannot link validation config: %v", ErrActivateWrite, err)
+		return ActivationResult{}, fmt.Errorf("%w: cannot link validation config: %v", ErrActivateWrite, err)
 	}
 	exec := a.Exec
 	if exec == nil {
@@ -192,14 +209,14 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 		// case a future error path surfaces it).
 		kp := a.Keypair
 		masked := maskSecrets(out2, kp.PrivateRaw, kp.PublicRaw, kp.PrivateStd, kp.PublicStd)
-		return "", fmt.Errorf("%w: %v; xray output: %s", ErrConfigGate, gerr, excerpt(masked))
+		return ActivationResult{}, fmt.Errorf("%w: %v; xray output: %s", ErrConfigGate, gerr, excerpt(masked))
 	}
 
 	// --- backup the previous live config (rollback artifact, 0600) ---
 	if oldExists {
 		if err := writeSecretFile(prev, oldBytes); err != nil {
 			os.Remove(tmp)
-			return "", fmt.Errorf("%w: cannot write rollback backup: %v", ErrActivateWrite, err)
+			return ActivationResult{}, fmt.Errorf("%w: cannot write rollback backup: %v", ErrActivateWrite, err)
 		}
 	}
 
@@ -209,9 +226,9 @@ func ActivateGermanyConfig(a ActivateParams) (string, error) {
 		if oldExists {
 			os.Remove(prev) // restore the exact pre-activation file set
 		}
-		return "", fmt.Errorf("%w: %v", ErrActivateRename, err)
+		return ActivationResult{}, fmt.Errorf("%w: %v", ErrActivateRename, err)
 	}
-	return live, nil
+	return ActivationResult{LivePath: live, Changed: bytesChanged}, nil
 }
 
 // writeSecretFile writes data to path with 0600 from creation (tmp +

@@ -1260,8 +1260,17 @@ func status(_ context.Context, store *deploy.Store, out io.Writer) error {
 	return nil
 }
 
+// doctor runs the read-only deployment checks and reports findings. It is a
+// hard READ-ONLY guarantee: it inspects and prints only. It never chmods,
+// chowns, writes, or removes anything — every check (deploy.StateDirCheck and
+// the store-integrity check included) observes state, and remediation is
+// always delegated to a lifecycle command.
 func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
-	findings := (deploy.Diagnostics{Store: store}).Run(ctx)
+	diags := deploy.Diagnostics{
+		Store:  store,
+		Checks: []deploy.Check{deploy.StateDirCheck(store.Root)},
+	}
+	findings := diags.Run(ctx)
 	for _, f := range findings {
 		_, _ = fmt.Fprintf(out, "%s [%s] %s", f.ID, f.Severity, f.Summary)
 		if f.Action != "" {

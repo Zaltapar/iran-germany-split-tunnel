@@ -42,12 +42,54 @@ type LinuxAdapter struct {
 	// runtime-only: the persisted identity is Manifest.ConfigFingerprint.
 	configChanged bool
 
+	// xrayConfigChanged records whether this transaction's Activate rotated
+	// the managed Germany Xray config BYTES (a regenerated Reality keypair).
+	// It is runtime-only and deliberately NOT part of any persisted
+	// identity: the planner-visible Reality fingerprint covers only the
+	// PUBLIC parameters (SNI/shortId/UUID) and never the keypair, so a
+	// keypair rotation is invisible to every recorded fingerprint. That is
+	// precisely why it must still restart the xray-germany unit — the live
+	// inbound would otherwise keep serving a stale keypair while `pair
+	// apply` derives Blob B from the on-disk config, and Blob B could never
+	// authenticate.
+	xrayConfigChanged bool
+
+	// convergeStateDir is the test seam for EnsureStateDir on the
+	// lifecycle-entry convergence (ConvergeStateDir). nil → no-op. ONLY
+	// NewLinuxAdapter wires the real systemd.EnsureStateDir; test adapters
+	// are built as struct literals, so a nil seam must never reach the
+	// host. Tests inject a counting fake to pin that every mutating
+	// lifecycle op re-converges the state-dir permission chain even when
+	// the plan converges to a no-op.
+	convergeStateDir func(ctx context.Context) error
+
+	// keypairFn is the test seam for xray.GenerateRealityKeypair (nil → the
+	// real generator). Only _test.go files inject it.
+	keypairFn func(ex xray.Executor, bin string) (*xray.Keypair, error)
+
+	// activateConfigFn is the test seam for xray.ActivateGermanyConfig
+	// (nil → the real activation). Only _test.go files inject it. It lets a
+	// test drive the REAL restart logic with a redirected temp dir and a
+	// fake `xray run -test` gate while reimplementing no activation policy.
+	activateConfigFn func(params xray.ActivateParams) (xray.ActivationResult, error)
+
 	// recoveryOps is the seam for the T5 operations recovery performs.
 	// nil → the real T5 calls (systemd.RemoveUnit / RollbackLast /
 	// RollbackEnvFile). It exists ONLY so the adapter's journal-driven
 	// ownership logic can be exercised deterministically without a root Linux
 	// host; it reimplements no T5 policy.
 	recoveryOps recoveryOps
+
+	// unitApply is the seam for T5's ApplyUnit on the activate/health phase.
+	// nil → the real systemd.ApplyUnit. It exists for the same reason as
+	// recoveryOps and reimplements no T5 policy: ApplyUnit's preflight
+	// asserts the canonical /etc paths and is root-gated, so the adapter's
+	// restart DECISION logic (which unit to restart, and when) cannot
+	// otherwise be exercised deterministically off a root Linux host. Tests
+	// inject a fake Result; the restart itself flows through the adapter's
+	// real ServiceManager and its injected SystemdExecutor, so the recorded
+	// argv is the production argv.
+	unitApply unitApplier
 
 	// In-flight ownership (runtime only; never persisted — the persisted
 	// journal is the pre-state record written before mutation begins).
@@ -114,9 +156,35 @@ func (a *LinuxAdapter) ops() recoveryOps {
 	return systemdRecoveryOps{}
 }
 
+// unitApplier abstracts T5's ApplyUnit for the activate phase. The production
+// implementation delegates straight to systemd.ApplyUnit.
+type unitApplier interface {
+	ApplyUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) (systemd.Result, error)
+}
+
+// systemdUnitApplier is the production unitApplier: a thin delegation to T5.
+type systemdUnitApplier struct{}
+
+func (systemdUnitApplier) ApplyUnit(ctx context.Context, m *systemd.ServiceManager, s systemd.Spec) (systemd.Result, error) {
+	return systemd.ApplyUnit(ctx, m, s)
+}
+
+// unitOps returns the adapter's apply-unit seam (real T5 by default).
+func (a *LinuxAdapter) unitOps() unitApplier {
+	if a.unitApply != nil {
+		return a.unitApply
+	}
+	return systemdUnitApplier{}
+}
+
 // NewLinuxAdapter constructs production dependencies. It intentionally
 // refuses non-Linux execution and non-canonical T5 paths; tests should use the
 // existing deploy Adapter fake rather than weakening T5's production paths.
+//
+// It is the ONLY production constructor: it wires the real state-dir
+// convergence seam. Struct-literal adapters (tests) leave that seam nil,
+// which ConvergeStateDir treats as a no-op, so test recovery paths never
+// touch the host's real /etc.
 func NewLinuxAdapter(request InstallRequest, serviceExec systemd.SystemdExecutor, firewallExec firewall.Executor) (*LinuxAdapter, error) {
 	if runtime.GOOS != "linux" {
 		return nil, fmt.Errorf("deploy: LinuxAdapter requires Linux")
@@ -139,11 +207,12 @@ func NewLinuxAdapter(request InstallRequest, serviceExec systemd.SystemdExecutor
 		return nil, err
 	}
 	adapter := &LinuxAdapter{
-		Request:  request,
-		Store:    store,
-		Services: systemd.NewServiceManager(serviceExec),
-		Firewall: firewall.New(firewallExec),
-		Xray:     &xray.Installer{Prefix: systemd.BinaryPrefix + "/xray"},
+		Request:          request,
+		Store:            store,
+		Services:         systemd.NewServiceManager(serviceExec),
+		Firewall:         firewall.New(firewallExec),
+		Xray:             &xray.Installer{Prefix: systemd.BinaryPrefix + "/xray"},
+		convergeStateDir: systemd.EnsureStateDir,
 	}
 	if request.Role == RoleIran && request.Origin.Mode != origin.ModeNone {
 		provider, err := origin.New(request.Origin.Mode, origin.Deps{Prefix: systemd.BinaryPrefix, Dir: systemd.StateDir})
@@ -321,12 +390,28 @@ func (a *LinuxAdapter) Backup(context.Context, *Manifest) error { return nil }
 // identity differs from the previous committed one), an unchanged unit is
 // explicitly restarted through T5's own Restart, which is exactly the
 // transition T5 performs after a real unit swap.
+//
+// The Germany xray unit has a second, independent rotation channel: the
+// managed Xray config bytes (/etc/split-tunnel/xray-germany.json). Activate
+// regenerates the Reality keypair on every transaction that reaches it, and
+// the Reality fingerprint the planner and manifest record covers only the
+// PUBLIC parameters (SNI/shortId/UUID) — NEVER the keypair — so a keypair
+// rotation changes NO recorded identity. If the unit file is byte-identical
+// (the normal case) ApplyUnit is a no-op, the live inbound keeps the old
+// keypair, and `pair apply` — which derives Blob B from the ON-DISK config —
+// emits a blob that can never authenticate (observed in staging on
+// 2026-09-14/15; manual `systemctl restart xray-germany` was required).
+// xray-germany.service defines no ExecReload (a reload cannot swap the
+// keypair into a running process), so restart is the only correct
+// transition. Splitter handling is deliberately unchanged: the extra trigger
+// applies to the xray component only.
 func (a *LinuxAdapter) applyUnit(ctx context.Context, spec systemd.Spec) error {
-	result, err := systemd.ApplyUnit(ctx, a.Services, spec)
+	result, err := a.unitOps().ApplyUnit(ctx, a.Services, spec)
 	if err != nil {
 		return err
 	}
-	if !restartAfterConfigChange(result, a.configChanged) {
+	rotate := a.xrayConfigChanged && spec.Component == systemd.ComponentXray
+	if !restartAfterConfigChange(result, a.configChanged || rotate) {
 		return nil
 	}
 	if err := a.Services.Restart(ctx, unitName(spec)); err != nil {
@@ -354,22 +439,38 @@ func (a *LinuxAdapter) Activate(ctx context.Context, desired DesiredState) error
 	if previous, err := a.previousManifest(); err == nil {
 		a.configChanged = desired.ConfigFingerprint != "" && previous.ConfigFingerprint != desired.ConfigFingerprint
 	}
+	// Reset the config-rotation flag BEFORE any mutation so a transaction
+	// that converges to a config byte-identity never restarts the xray unit
+	// needlessly.
+	a.xrayConfigChanged = false
 	if a.Request.Role == RoleGermany {
-		keypair, err := xray.GenerateRealityKeypair(nil, a.xrayBinary)
+		keypair, err := a.generateRealityKeypair()
 		if err != nil {
 			return err
 		}
-		if _, err := xray.ActivateGermanyConfig(xray.ActivateParams{
+		res, err := a.activateGermanyConfig(xray.ActivateParams{
 			Params:   a.Request.Reality,
 			Keypair:  keypair,
 			Dir:      systemd.StateDir,
 			FileName: "xray-germany.json",
 			Bin:      a.xrayBinary,
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		// The activation reports whether the LIVE config bytes actually
+		// changed (fresh install, or a regenerated Reality keypair whose
+		// rotation is invisible to the public-parameter fingerprint). The
+		// unit loop below applies that exactly: an unchanged xray unit is
+		// restarted ONLY when these bytes rotated — see applyUnit.
+		a.xrayConfigChanged = res.Changed
 		a.inFlightFiles = append(a.inFlightFiles, a.Request.ConfigPath)
-		if err := systemd.EnsureStateDir(ctx); err != nil {
+		// T3 wrote the live config 0600 root:root; re-converge the
+		// permission chain BEFORE any ApplyUnit/restart so the service user
+		// can read what it is about to start with (T5 contract, user.go).
+		// Same seam as the lifecycle-entry convergence, so production always
+		// runs the real EnsureStateDir (NewLinuxAdapter wires it).
+		if err := a.ConvergeStateDir(ctx); err != nil {
 			return err
 		}
 	}
@@ -383,6 +484,28 @@ func (a *LinuxAdapter) Activate(ctx context.Context, desired DesiredState) error
 	return nil
 }
 
+// generateRealityKeypair is the keypair-generation seam (real xray
+// generator unless a test injects keypairFn — same idiom as recoveryOps:
+// the seam exists ONLY to exercise the adapter's orchestration without a
+// root Linux host and a real xray binary; it reimplements no policy).
+func (a *LinuxAdapter) generateRealityKeypair() (*xray.Keypair, error) {
+	if a.keypairFn != nil {
+		return a.keypairFn(nil, a.xrayBinary)
+	}
+	return xray.GenerateRealityKeypair(nil, a.xrayBinary)
+}
+
+// activateGermanyConfig is the T3 activation seam (real xray
+// ActivateGermanyConfig unless a test injects activateConfigFn). Production
+// never substitutes it; tests run the REAL transaction through the seam with
+// a redirected temp dir and a fake gate.
+func (a *LinuxAdapter) activateGermanyConfig(params xray.ActivateParams) (xray.ActivationResult, error) {
+	if a.activateConfigFn != nil {
+		return a.activateConfigFn(params)
+	}
+	return xray.ActivateGermanyConfig(params)
+}
+
 // previousManifest returns the committed manifest this transaction started
 // from, or os.ErrNotExist for a fresh install.
 func (a *LinuxAdapter) previousManifest() (Manifest, error) {
@@ -390,6 +513,30 @@ func (a *LinuxAdapter) previousManifest() (Manifest, error) {
 		return Manifest{}, os.ErrNotExist
 	}
 	return a.Store.Load()
+}
+
+// ConvergeStateDir re-asserts the state-directory permission chain
+// (EnsureStateDir: /etc/split-tunnel 0750 root:split-tunnel, live configs
+// 0640 root:split-tunnel). It is the lifecycle-entry guard for DEFECT-2.
+//
+// The trap it closes: T3 writes the live Germany config 0600 root:root and
+// origin activation creates its candidates 0600, so the dir can be left at
+// 0700 by an earlier sequence; EnsureStateDir intends 0750. A User=
+// split-tunnel service then cannot read its own 0640 config after a restart.
+// A CONVERGED no-op install returns from Transaction.Apply before any
+// adapter phase runs, so Prepare's EnsureStateDir never executes and the
+// drifted mode persists indefinitely. Every mutating lifecycle command
+// therefore converges the state dir FIRST — even when the plan is a no-op —
+// so the permission chain is re-converged before anything reads or restarts
+// a service. EnsureStateDir is idempotent and writes no journal or manifest.
+//
+// It is a no-op when the convergeStateDir seam is nil (a struct-literal test
+// adapter), so non-production adapters never touch the host's real /etc.
+func (a *LinuxAdapter) ConvergeStateDir(ctx context.Context) error {
+	if a.convergeStateDir == nil {
+		return nil
+	}
+	return a.convergeStateDir(ctx)
 }
 
 func (a *LinuxAdapter) Transition(ctx context.Context, desired DesiredState) error {
@@ -485,6 +632,15 @@ func (a *LinuxAdapter) Restore(ctx context.Context, previous Manifest) error {
 	if haveJournal && j.Role != a.Request.Role {
 		return fmt.Errorf("deploy: restore: journal role %q does not match adapter role %q", j.Role, a.Request.Role)
 	}
+	// DEFECT-2: a restore/rollback converges units and restarts services, so
+	// re-assert the state-dir permission chain before any of that — Restore
+	// does not run Prepare and would otherwise inherit a drifted 0700 dir
+	// that leaves a User=split-tunnel service unable to read its 0640
+	// config. A tampered journal returned above, so nothing is mutated on a
+	// fail-closed path.
+	if err := a.ConvergeStateDir(ctx); err != nil {
+		return fmt.Errorf("deploy: restore: converge state dir: %w", err)
+	}
 	if !haveJournal {
 		if len(a.units) != 0 {
 			return fmt.Errorf("%w: restore found in-flight units without a journal; manual recovery required", ErrTransaction)
@@ -542,6 +698,13 @@ func (a *LinuxAdapter) RecoverJournal(ctx context.Context, j ArtifactJournal, pr
 	}
 	if j.Role != a.Request.Role {
 		return fmt.Errorf("deploy: recovery: journal role %q does not match adapter role %q", j.Role, a.Request.Role)
+	}
+	// DEFECT-2: post-crash recovery is a mutating lifecycle operation that
+	// may restart services; converge the state-dir permission chain first
+	// (recovery never runs Prepare). EnsureStateDir never deletes artifacts,
+	// so it cannot interfere with the ownership-scoped revert below.
+	if err := a.ConvergeStateDir(ctx); err != nil {
+		return fmt.Errorf("deploy: recovery: converge state dir: %w", err)
 	}
 	// Validate every journal unit against the exact role-specific plan before
 	// any destructive recovery operation. A syntactically valid service name is

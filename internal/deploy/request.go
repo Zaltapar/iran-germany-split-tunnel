@@ -169,6 +169,17 @@ func within(root, path string) bool {
 	return len(rel) < len(prefix) || rel[:len(prefix)] != prefix
 }
 
+// realityFingerprint is the deployment identity of the PUBLIC Reality
+// parameters: SNI, shortId and the client UUID. It deliberately covers ONLY
+// those fields — never the Reality keypair. The Germany adapter regenerates
+// the keypair on every activation and rotates it into
+// /etc/split-tunnel/xray-germany.json without moving this fingerprint, so
+// this fingerprint can never tell a planner or rollback guard that the live
+// config bytes changed. That is exactly why the activation result's byte
+// delta (xray.ActivationResult.Changed), not any recorded fingerprint, is
+// what forces the xray-germany restart in LinuxAdapter.applyUnit — see the
+// DEFECT-1 story there and its staging root cause (a stale live inbound vs
+// the on-disk config `pair apply` derives Blob B from).
 func realityFingerprint(params xray.RealityParams) string {
 	sum := sha256.Sum256([]byte(params.SNI + "\n" + params.ShortID + "\n" + params.UUID))
 	return hex.EncodeToString(sum[:])

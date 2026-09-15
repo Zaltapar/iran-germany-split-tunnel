@@ -39,6 +39,31 @@ type Adapter interface {
 	Uninstall(context.Context, Manifest) error
 }
 
+// StateDirConverger is the OPTIONAL adapter capability for the lifecycle-entry
+// convergence of the state-directory permission chain (T5's EnsureStateDir:
+// /etc/split-tunnel 0750 root:split-tunnel, live configs 0640
+// root:split-tunnel). ApplyDesired runs it BEFORE planning so that even a
+// transaction which converges to a no-op re-converges the directory: T3 and
+// the origin provider write their artifacts 0600, and a drifted 0700 state
+// dir otherwise survives a converged no-op install indefinitely (the
+// transaction returns before any adapter phase, and Prepare is what usually
+// runs EnsureStateDir) — leaving User=split-tunnel services unable to read
+// their own configs after a restart. Implementations must be idempotent,
+// write no journal or manifest, and delete no artifacts.
+type StateDirConverger interface {
+	ConvergeStateDir(context.Context) error
+}
+
+// convergeStateDir resolves the optional StateDirConverger capability of an
+// adapter (nil when the adapter does not implement it — the documented host
+// fakes, which must not gain hidden mutation hooks).
+func convergeStateDir(adapter Adapter) func(context.Context) error {
+	if c, ok := adapter.(StateDirConverger); ok {
+		return c.ConvergeStateDir
+	}
+	return nil
+}
+
 // ApplyDesired executes a desired-state transaction through one injected host
 // adapter. Planning and manifest commit remain owned by Transaction; this
 // helper only maps the adapter lifecycle to the transaction phases.
@@ -55,6 +80,11 @@ func ApplyDesired(ctx context.Context, store *Store, previous Manifest, desired 
 		Journal:  journal,
 		Previous: previous,
 		Desired:  desired,
+		// Lifecycle-entry convergence (DEFECT-2): runs inside Transaction
+		// before planning, so it executes even when the plan is a no-op and
+		// no adapter phase ever runs. The controller still performs no host
+		// mutation itself — the mutation is the adapter's EnsureStateDir.
+		Converge: convergeStateDir(adapter),
 		Recover: func(recoveryCtx context.Context, old Manifest) error {
 			if old.Generation == "" {
 				return adapter.CleanupFresh(recoveryCtx, desired)

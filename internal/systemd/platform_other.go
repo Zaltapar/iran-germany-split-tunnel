@@ -17,6 +17,9 @@ import (
 // uidOf: no Stat_t shape on non-Linux — -1 (treat as not root-owned).
 func uidOf(any) int { return -1 }
 
+// gidOf: no Stat_t shape on non-Linux — -1 (treat as not group-owned).
+func gidOf(any) int { return -1 }
+
 // lookupUserUID / lookupGroupGID: NSS is unavailable — refuse.
 func lookupUserUID(name string) (int, error) {
 	return -1, errors.New("user lookup is Linux-only (target platform)")

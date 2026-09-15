@@ -44,6 +44,13 @@ type Transaction struct {
 	Steps    []Step
 	Recover  func(context.Context, Manifest) error
 	Now      func() time.Time
+	// Converge optionally re-asserts the state-directory permission chain
+	// (the adapter's EnsureStateDir) at the start of the transaction —
+	// BEFORE the no-op early return — so a converged install/upgrade/re-
+	// apply still heals a drifted /etc/split-tunnel. It is idempotent and
+	// mutates no deployment artifacts; nil means the adapter offers no
+	// convergence hook.
+	Converge func(context.Context) error
 }
 
 type Result struct {
@@ -59,6 +66,15 @@ func (t *Transaction) Apply(ctx context.Context) (Result, error) {
 	}
 	if t.Store == nil {
 		return Result{}, fmt.Errorf("%w: nil store", ErrTransaction)
+	}
+	// Lifecycle-entry convergence (DEFECT-2): must run before the plan's
+	// no-op early return, otherwise a converged re-apply never heals a
+	// drifted state dir and a User=split-tunnel service cannot read its
+	// config after any restart.
+	if t.Converge != nil {
+		if err := t.Converge(ctx); err != nil {
+			return Result{}, fmt.Errorf("%w: converge state dir: %w", ErrTransaction, err)
+		}
 	}
 	var current *Manifest
 	if t.Previous.Generation != "" {

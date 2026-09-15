@@ -52,7 +52,12 @@ func (p Pairing) ApplyA(encoded string) (*pairing.BlobA, PairingState, error) {
 // caller (operator env or auto-detected interface address). When the
 // committed manifest asserts a Reality public-parameter fingerprint, the
 // read-back parameters must reproduce it, or the live config is not what this
-// host deployed and apply fails closed.
+// host deployed and apply fails closed. The fingerprint's guard scope is the
+// PUBLIC parameters only (SNI/shortId/UUID, never the keypair — see
+// realityFingerprint), so it authenticates parameters, not keys: the derived
+// public key matches the live inbound only because the deployment restarts
+// xray-germany whenever the config BYTES rotate (LinuxAdapter.applyUnit,
+// DEFECT-1). A stale inbound would otherwise make Blob B un-authenticatable.
 //
 // The returned state is "a-applied" with fingerprints [A, B] — digests only.
 // Raw blobs, the tunnel secret, and all key material never enter state, logs,

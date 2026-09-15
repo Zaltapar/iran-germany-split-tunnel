@@ -26,6 +26,17 @@ func uidOf(sys any) int {
 	return int(st.Uid)
 }
 
+// gidOf extracts the numeric group gid from a Linux stat.Sys()
+// (*syscall.Stat_t). Returns -1 when the shape is unexpected. It is the
+// read-only companion of uidOf used by the state-dir audit (doctor).
+func gidOf(sys any) int {
+	st, ok := sys.(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+	return int(st.Gid)
+}
+
 // lookupUserUID resolves a user name to its numeric uid via NSS (os/user
 // — stdlib, no shell).
 func lookupUserUID(name string) (int, error) {

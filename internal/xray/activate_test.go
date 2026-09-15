@@ -87,12 +87,16 @@ func TestActivateFirstRun(t *testing.T) {
 	a := activateBase(t, dir)
 	fake := a.Exec.(*activateFake)
 
-	live, err := ActivateGermanyConfig(a)
+	res, err := ActivateGermanyConfig(a)
 	if err != nil {
 		t.Fatalf("activate: %v", err)
 	}
+	live := res.LivePath
 	if live != filepath.Join(dir, "xray-germany.json") {
 		t.Errorf("live path = %q", live)
+	}
+	if !res.Changed {
+		t.Error("first activation must report Changed=true (no previous live config)")
 	}
 	got, err := os.ReadFile(live)
 	if err != nil {
@@ -128,6 +132,46 @@ func TestActivateFirstRun(t *testing.T) {
 		t.Error("validation directory must be removed after activation")
 	}
 	assertPerm0600(t, live)
+}
+
+// Changed=true must reflect the LIVE BYTES, not merely "activation ran":
+// a first activation changes bytes, an identical re-activation does not,
+// and a rotation that changes ANY rendered field (the Reality keypair in
+// particular — the public params fingerprint does not cover it) does.
+// The Germany adapter restarts the live service exactly on Changed.
+func TestActivateChangedReportsLiveByteDelta(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := ActivateGermanyConfig(activateBase(t, dir))
+	if err != nil {
+		t.Fatalf("first activate: %v", err)
+	}
+	if !first.Changed {
+		t.Fatal("first activation must report Changed=true")
+	}
+
+	replay, err := ActivateGermanyConfig(activateBase(t, dir))
+	if err != nil {
+		t.Fatalf("replay activate: %v", err)
+	}
+	if replay.Changed {
+		t.Fatal("byte-identical re-activation must report Changed=false")
+	}
+
+	rotated := activateBase(t, dir)
+	rotated.Keypair = &Keypair{
+		PrivateRaw: strings.Repeat("Q", 43), // distinct 32-byte RawURL material
+		PublicRaw:  strings.Repeat("W", 43),
+		PrivateStd: strings.Repeat("Q", 44),
+		PublicStd:  strings.Repeat("W", 44),
+	}
+	res, err := ActivateGermanyConfig(rotated)
+	if err != nil {
+		t.Fatalf("rotated activate: %v", err)
+	}
+	if !res.Changed {
+		t.Fatal("keypair rotation (identical public params) must report Changed=true — this is the signal that forces the service restart")
+	}
 }
 
 // Gate PASS, previous config present: the old bytes are preserved

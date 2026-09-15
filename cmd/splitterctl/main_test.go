@@ -982,6 +982,105 @@ func TestConfigShowIsRedacted(t *testing.T) {
 	}
 }
 
+// TestDoctorReportsStateDirCheckReadOnly is the CLI-level DEFECT-2 doctor
+// regression with a documented READ-ONLY GUARANTEE: `doctor` inspects the
+// state directory's permission chain and reports a finding with a suggested
+// remediation action, but it MUST NOT mutate anything — no chmod, no chown,
+// no writes. The assertion is the before/after tree snapshot: every entry
+// (names, content, and mode bits) is identical after the run, so a future
+// edit that wires remediation into doctor (instead of the lifecycle
+// commands) fails this test on both Linux CI and the Windows dev host.
+func TestDoctorReportsStateDirCheckReadOnly(t *testing.T) {
+	root := t.TempDir()
+	store, err := deploy.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Commit a valid state so the store-integrity check passes and the run
+	// exercises the new state.dir check.
+	if _, err := store.Commit(deploy.Manifest{
+		Role:       deploy.RoleGermany,
+		Generation: "g-drift",
+		Paths:      deploy.Paths{StateRoot: store.Root},
+		Firewall:   deploy.FirewallState{Backend: "none"},
+	}, "test"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Plant a live service-readable config and drift the dir toward 0700
+	// (the staging trap). On Linux the audit must flag it; on non-Linux
+	// hosts the mode bits are not observable and the check passes. EITHER
+	// WAY the run must mutate nothing — that is the read-only guarantee.
+	if err := os.WriteFile(filepath.Join(root, "xray-germany.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	type entry struct {
+		name    string
+		mode    uint32
+		content string
+	}
+	snap := func() string {
+		var b strings.Builder
+		st, err := os.Lstat(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&b, "<dir>|%o\n", st.Mode().Perm())
+		files, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			p := filepath.Join(root, f.Name())
+			fst, err := os.Lstat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := ""
+			if !f.IsDir() {
+				data, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				content = string(data)
+			}
+			fmt.Fprintf(&b, "%s|%o|%s\n", f.Name(), fst.Mode().Perm(), content)
+		}
+		return b.String()
+	}
+	before := snap()
+	t.Setenv("SPLITTERCTL_STATE_ROOT", root)
+
+	var out bytes.Buffer
+	derr := run(context.Background(), []string{"doctor"}, &out, &out)
+	// On Linux the drift is a FAIL finding → doctor exits non-zero with the
+	// documented aggregate error. Any OTHER error is a bug; on non-Linux
+	// hosts the check passes and doctor must succeed.
+	if derr != nil && !strings.HasPrefix(derr.Error(), "doctor: one or more checks failed") {
+		t.Fatalf("doctor: %v; output=%q", derr, out.String())
+	}
+	if after := snap(); after != before {
+		t.Fatalf("doctor mutated the state root (READ-ONLY GUARANTEE violated):\nbefore=%s\nafter =%s", before, after)
+	}
+	report := out.String()
+	if !strings.Contains(report, "state.dir [") {
+		t.Fatalf("doctor output must carry the state.dir finding, got %q", report)
+	}
+	if runtime.GOOS == "linux" {
+		if !strings.Contains(report, "state.dir [fail]") {
+			t.Fatalf("0700 state dir with a live config must FAIL on Linux, got %q", report)
+		}
+		if !strings.Contains(report, "mode is 0700, want 0750") {
+			t.Fatalf("finding must name the mode delta, got %q", report)
+		}
+		if !strings.Contains(report, "action:") || !strings.Contains(report, "read-only") {
+			t.Fatalf("finding must carry the remediation action + read-only note, got %q", report)
+		}
+	}
+}
+
 func TestDoctorFailsClosedOnTamperedState(t *testing.T) {
 	root := t.TempDir()
 	store, err := deploy.NewStore(filepath.Join(root, "state"))
