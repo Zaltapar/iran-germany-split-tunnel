@@ -27,6 +27,18 @@ const maxRevisions = 10
 type Store struct {
 	Root string
 	Now  func() time.Time
+
+	// RootMode is the permission the store converges the state root to on
+	// every write (create or re-assert). The safe default is 0700 (a
+	// root-only private directory). The production service state root
+	// (/etc/split-tunnel) instead converges to systemd.StateDirMode (0750
+	// root:split-tunnel) so the non-root service group can traverse the
+	// directory and read its 0640 live configs; private state (state.json,
+	// revisions/, *.env, journal.json) stays protected by its own 0600/0700
+	// file modes, never by the directory. Forcing 0700 on that root was the
+	// staging defect that locked xray-germany (User=split-tunnel) out of its
+	// own config on every committed transaction that restarted xray.
+	RootMode fs.FileMode
 }
 
 func NewStore(root string) (*Store, error) {
@@ -166,18 +178,30 @@ func (s *Store) ReadRevision(id string) (Manifest, error) {
 }
 
 func (s *Store) ensureRoot() error {
+	mode := s.rootMode()
 	if st, err := os.Lstat(s.Root); err == nil {
 		if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: root", ErrUnsafePath)
 		}
 	} else if os.IsNotExist(err) {
-		if err := os.MkdirAll(s.Root, 0o700); err != nil {
+		if err := os.MkdirAll(s.Root, mode); err != nil {
 			return fmt.Errorf("deploy: create state root: %w", err)
 		}
 	} else {
 		return err
 	}
-	return os.Chmod(s.Root, 0o700)
+	return os.Chmod(s.Root, mode)
+}
+
+// rootMode is the permission ensureRoot converges the state root to. The
+// zero-value default is 0700 (a root-only private directory); the production
+// service state root sets systemd.StateDirMode (0750) so the non-root service
+// group can traverse the directory and reach its 0640 live configs.
+func (s *Store) rootMode() fs.FileMode {
+	if s.RootMode != 0 {
+		return s.RootMode
+	}
+	return 0o700
 }
 
 func (s *Store) prune(revisions []Revision) error {

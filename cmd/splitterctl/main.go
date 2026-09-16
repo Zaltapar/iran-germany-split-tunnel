@@ -156,9 +156,25 @@ var canonicalStateRoot = systemd.StateDir
 // Only _test.go files reassign it (restored via t.Cleanup).
 var canonicalBinaryPrefix = systemd.BinaryPrefix
 
+// storeForRoot builds a store for a state root, converging the production
+// service state dir (/etc/split-tunnel) to the 0750 root:split-tunnel contract
+// on commit. A 0700 root would lock the non-root service units out of their
+// 0640 live configs after any committed transaction (staging defect). Test
+// roots (SPLITTERCTL_STATE_ROOT redirects) keep the safe 0700 default.
+func storeForRoot(root string) (*deploy.Store, error) {
+	s, err := deploy.NewStore(root)
+	if err != nil {
+		return nil, err
+	}
+	if root == systemd.StateDir {
+		s.RootMode = systemd.StateDirMode
+	}
+	return s, nil
+}
+
 // canonicalStore returns the store the mutation commands operate on.
 func canonicalStore() (*deploy.Store, error) {
-	return deploy.NewStore(canonicalStateRoot)
+	return storeForRoot(canonicalStateRoot)
 }
 
 func main() {
@@ -190,7 +206,10 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	if stateRoot == "" {
 		stateRoot = "/etc/split-tunnel"
 	}
-	store, err := deploy.NewStore(filepath.Clean(stateRoot))
+	// The dispatcher store is the one `pair apply|finalize` commits through,
+	// so it must converge the production service root to 0750 like every
+	// other mutation store (storeForRoot).
+	store, err := storeForRoot(filepath.Clean(stateRoot))
 	if err != nil {
 		return err
 	}

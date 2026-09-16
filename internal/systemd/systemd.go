@@ -34,6 +34,7 @@ package systemd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"time"
 )
@@ -76,6 +77,15 @@ const (
 
 // UnitsBackupDir holds RemoveUnit's bounded unit-file backups.
 const UnitsBackupDir = StateDir + "/units-backup"
+
+// StateDirMode is the converged permission of the service state directory
+// (design §4.8, EnsureStateDir): the service GROUP must be able to enter the
+// directory to read its 0640 live configs (xray-germany.json, Caddyfile).
+// Private state (state.json, revisions/, *.env, journal.json) stays
+// protected by its own 0600/0700 file modes, never by the directory. The
+// deployment store must converge the production root to this mode — a
+// 0700 root locks the non-root service units out of their configs.
+const StateDirMode = os.FileMode(0o750)
 
 // Managed-path variables. They default to the canonical constants above;
 // ONLY the _test.go files of this package reassign them (each test

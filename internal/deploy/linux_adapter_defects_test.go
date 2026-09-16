@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
@@ -256,6 +257,48 @@ func TestActivateXrayRestartFailureFollowsApplyErrorPolicy(t *testing.T) {
 		// a successful commit clears it.
 		if _, jerr := store.ReadJournal(); jerr != nil {
 			t.Fatalf("journal must survive a failed transaction: %v", jerr)
+		}
+	})
+}
+
+// TestActivateRotatedConfigSettlesAfterRestart is the staging-regression
+// regression (2026-09-15/16): the EXTRA configuration-change restart in
+// applyUnit is an asynchronous `systemctl restart` (it returns once the job
+// is enqueued). A crash-looping binary can present a transient
+// "active (running)" that a single is-active poll reads before it dies, so
+// the transaction committed with xray-germany FAILED. applyUnit must now
+// settle (confirm stable-active, or catch the failure) BEFORE the phase
+// reports success.
+func TestActivateRotatedConfigSettlesAfterRestart(t *testing.T) {
+	t.Run("settle runs for the rotated xray unit and is recorded", func(t *testing.T) {
+		fx := newGermanyActivateFixture(t, true)
+		var settled []string
+		fx.adapter.restartSettle = func(_ context.Context, unit string, _ time.Duration) error {
+			settled = append(settled, unit)
+			return nil
+		}
+		if err := fx.adapter.Activate(context.Background(), DesiredState{Role: RoleGermany}); err != nil {
+			t.Fatalf("Activate: %v", err)
+		}
+		if strings.Join(settled, ",") != "xray-germany.service" {
+			t.Fatalf("settled units = %v, want exactly [xray-germany.service] (only the rotated xray unit takes the extra restart)", settled)
+		}
+	})
+
+	t.Run("settle failure fails the phase with the restart wrapping", func(t *testing.T) {
+		fx := newGermanyActivateFixture(t, true)
+		fx.adapter.restartSettle = func(context.Context, string, time.Duration) error {
+			return errors.New("settle: unit failed after restart")
+		}
+		err := fx.adapter.Activate(context.Background(), DesiredState{Role: RoleGermany})
+		if err == nil {
+			t.Fatal("settle failure swallowed")
+		}
+		if !strings.Contains(err.Error(), "restart xray-germany.service after configuration change") {
+			t.Fatalf("error = %v, want the restart-after-configuration-change wrapping", err)
+		}
+		if !strings.Contains(err.Error(), "settle: unit failed after restart") {
+			t.Fatalf("error = %v, must carry the settle cause", err)
 		}
 	})
 }

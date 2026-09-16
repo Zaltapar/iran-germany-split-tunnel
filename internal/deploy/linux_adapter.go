@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
@@ -90,6 +91,16 @@ type LinuxAdapter struct {
 	// real ServiceManager and its injected SystemdExecutor, so the recorded
 	// argv is the production argv.
 	unitApply unitApplier
+
+	// restartSettle is the test seam for the bounded settle recheck that
+	// follows the extra configuration-change restart in applyUnit. nil → the
+	// real systemd settle wait. The async `systemctl restart` returns once the
+	// job is ENQUEUED, not when the unit has come up; a fast crash-looping
+	// binary can present a transient "active (running)" that a single poll
+	// reads before it dies (staging: xray-germany exited 23 ~26 ms after
+	// start, yet the transaction committed). The settle wait closes that
+	// window; tests shorten it via this seam.
+	restartSettle func(ctx context.Context, unit string, timeout time.Duration) error
 
 	// In-flight ownership (runtime only; never persisted — the persisted
 	// journal is the pre-state record written before mutation begins).
@@ -206,6 +217,11 @@ func NewLinuxAdapter(request InstallRequest, serviceExec systemd.SystemdExecutor
 	if err != nil {
 		return nil, err
 	}
+	// The production state root is the service state dir: converge it to the
+	// 0750 root:split-tunnel contract (not 0700) so the non-root service units
+	// can traverse it and read their 0640 live configs after every commit
+	// (staging defect: a 0700 root locked xray-germany out of its own config).
+	store.RootMode = systemd.StateDirMode
 	adapter := &LinuxAdapter{
 		Request:          request,
 		Store:            store,
@@ -415,6 +431,19 @@ func (a *LinuxAdapter) applyUnit(ctx context.Context, spec systemd.Spec) error {
 		return nil
 	}
 	if err := a.Services.Restart(ctx, unitName(spec)); err != nil {
+		return fmt.Errorf("deploy: restart %s after configuration change: %w", unitName(spec), err)
+	}
+	// The extra restart is asynchronous: `systemctl restart` returns once the
+	// job is enqueued, not once the unit is up. A crash-looping binary can
+	// show a transient "active (running)" that the later health poll reads
+	// before the unit dies, so the transaction commits with a failed service.
+	// Settle: confirm the unit is stably active (or catch it failing) before
+	// the phase reports success.
+	settle := a.restartSettle
+	if settle == nil {
+		settle = a.Services.RestartSettle
+	}
+	if err := settle(ctx, unitName(spec), restartSettleTimeout); err != nil {
 		return fmt.Errorf("deploy: restart %s after configuration change: %w", unitName(spec), err)
 	}
 	return nil
@@ -1429,3 +1458,9 @@ func contains(list []string, v string) bool {
 }
 
 const systemdHealthTimeout = 30 * 1000000000
+
+// restartSettleTimeout bounds the post-restart settle recheck in applyUnit:
+// enough to let a crash-looping unit die (StartLimitBurst catches it) while
+// staying far below the operator's patience for a mutating command. A var so
+// tests can shorten it.
+var restartSettleTimeout = 3 * time.Second

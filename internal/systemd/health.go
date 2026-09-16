@@ -72,6 +72,52 @@ func (m *ServiceManager) WaitActive(ctx context.Context, unit string, timeout ti
 	}
 }
 
+// restartSettleConfirmDelay is the quiet interval after WaitActive reports a
+// unit active before RestartSettle declares it stably running. It must be long
+// enough to catch a unit that exits milliseconds after start (staging: xray
+// exited 23 ~26 ms after start), yet short enough to keep a mutating command
+// snappy. Reassigned ONLY by _test.go.
+var restartSettleConfirmDelay = 500 * time.Millisecond
+
+// RestartSettle confirms that a RESTARTED unit has come up stably, not just
+// that a transient "active (running)" was observed. `systemctl restart` is
+// asynchronous — it returns once the job is enqueued — so a caller that only
+// polls is-active once can read the brief active window of a crash-looping
+// binary before it dies and wrongly report success. RestartSettle waits for
+// active (failed → immediate failure) and then re-checks after a short quiet
+// interval: a unit that died in the meantime is reported as failed, not
+// active. It never starts, restarts or otherwise mutates the unit.
+func (m *ServiceManager) RestartSettle(ctx context.Context, unit string, timeout time.Duration) error {
+	if err := contextCheck(ctx); err != nil {
+		return err
+	}
+	if err := checkUnitName(unit); err != nil {
+		return err
+	}
+	// First leg: wait until the unit is active (failed → immediate failure,
+	// never-active → deadline).
+	if err := m.WaitActive(ctx, unit, timeout); err != nil {
+		return err
+	}
+	// Second leg: confirm the unit is still alive after a quiet interval.
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %s (context during settle confirm)", ErrWaitNotActive, unit)
+	case <-time.After(restartSettleConfirmDelay):
+	}
+	state, err := m.State(ctx, unit)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnitState, err)
+	}
+	switch state {
+	case "active":
+		return nil
+	case "failed":
+		return fmt.Errorf("%w: unit %s is failed (after restart)", ErrUnitState, unit)
+	}
+	return fmt.Errorf("%w: %s (settle confirm: %s)", ErrWaitNotActive, unit, state)
+}
+
 // HealthCheck is a PURE read-only snapshot: is-active + (optionally) an
 // HTTP 200 probe of the metrics endpoint. It never starts or restarts
 // anything (doctor semantics — T7 reuses this). metricsPort <= 0 skips the

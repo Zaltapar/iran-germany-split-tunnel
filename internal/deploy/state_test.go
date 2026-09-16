@@ -4,8 +4,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 )
 
 func testManifest(root, role string) Manifest {
@@ -109,4 +112,58 @@ func TestAtomicWriteRefusesSymlink(t *testing.T) {
 	if err := atomicWrite(path, []byte("replace"), 0o600); !errors.Is(err, ErrUnsafePath) {
 		t.Fatalf("atomicWrite symlink = %v, want ErrUnsafePath", err)
 	}
+}
+
+// TestStoreCommitConvergesServiceStateRootMode is the staging-defect
+// regression: the production service state root (/etc/split-tunnel) must
+// converge to 0750 on commit, not 0700. A 0700 root locks the non-root
+// service group out of its own 0640 live configs, so any committed
+// transaction that restarted xray-germany left the unit failed while the
+// transaction reported success. The safe default for a private root stays
+// 0700; only the explicit service root opts into 0750.
+func TestStoreCommitConvergesServiceStateRootMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("unix mode bits not observable on this host")
+	}
+	t.Run("service root converges to 0750 (not 0700)", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		s, err := NewStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.RootMode = systemd.StateDirMode
+		if _, err := s.Commit(testManifest(root, RoleGermany), "install"); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		st, err := os.Stat(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.Mode().Perm(); got != 0o750 {
+			t.Fatalf("root mode = %o, want %o (service state root)", got, 0o750)
+		}
+	})
+	t.Run("private root keeps the 0700 default", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Chmod(root, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		s, err := NewStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Commit(testManifest(root, RoleGermany), "install"); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		st, err := os.Stat(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.Mode().Perm(); got != 0o700 {
+			t.Fatalf("root mode = %o, want %o (private default)", got, 0o700)
+		}
+	})
 }
