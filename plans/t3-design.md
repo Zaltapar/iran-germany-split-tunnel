@@ -83,9 +83,10 @@ Verified via raw.githubusercontent.com / api.github.com git-trees at ref v26.3.2
 3. Encoding decision (corrects the pre-verification assumption):
    - Run the keypair as plain `xray x25519` (default RawURL output, no flags).
    - `privateKey` in generated config  ← the RawURL line (43 chars) verbatim.
-   - `PublicParams.RealityPublicKey` in BlobB ← SAME bytes, re-encoded StdEncoding
-     (44 chars) — required by pairing.validRealityPublicKey (Std b64, 32 bytes).
-     One keypair, two encodings of the same 32 public bytes; never re-randomize.
+   - `PublicParams.RealityPublicKey` in BlobB ← the SAME bytes, emitted with
+     base64.RawURLEncoding (43 chars), matching Xray's reality public-key format.
+     Blob B parsing also accepts the legacy padded standard encoding.
+   - One keypair, two encodings of the same 32 public bytes; never re-randomize.
    - The generator therefore parses the `Password (PublicKey):` line with
      base64.RawURLEncoding (strict 32-byte check) and derives both forms.
    - `xray run -test` with the pinned binary is the final arbiter (CI, see §7).
@@ -141,7 +142,7 @@ Nothing in pkg/*, nothing in internal/config, pkg/node untouched (arch test stay
 | dest | derived, not operator-input: `SNI + ":443"` (doc §4.5: dest = "<SNI>:443"). Port fixed 443 in T3 (TLS 1.3 site contract; the Reality inbound itself listens on 443 too). Dest-reachability TLS 1.3 preflight is install-time (doc §4.5) → T5's preflight, NOT T3 (T3 = offline generation + `-test`). |
 | UUID | pairing.validUUID v4 lowercase (reuse) |
 | shortId | pairing.shortIDRe (16 lowercase hex) (reuse) |
-| publicKey (from keypair) | RawURL b64, exactly 32 bytes (keygen parse); StdEncoding re-encode for blob B |
+| publicKey (from keypair) | RawURL b64, exactly 32 bytes; emitted canonically in Blob B |
 | privateKey (from keypair) | RawURL b64, exactly 32 bytes, clamped shape not re-checked (binary did it) — but we DO reject if decode len != 32 |
 | key material presence | `RenderGermanyConfig` refuses a zero-value keypair (missing key material rejection) |
 | listen/port | fixed 0.0.0.0:443 in T3 (operator port choice `--down-port` arrives with T5; keeping T3 minimal and golden-stable) |

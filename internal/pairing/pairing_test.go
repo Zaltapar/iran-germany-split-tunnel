@@ -33,12 +33,11 @@ func fixtureBlobA(t *testing.T) (*BlobA, string) {
 	return a, s
 }
 
-// fixtureBlobB builds a valid, encoded blob B with a well-formed
-// base64 32-byte "public key" (validated by shape, not crypto — no Xray
-// dependency in this package).
+// fixtureBlobB builds a valid, encoded blob B with a canonical RawURL
+// 32-byte "public key" (validated by shape, not crypto — no Xray dependency).
 func fixtureBlobB(t *testing.T) (*BlobB, string) {
 	t.Helper()
-	pub := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	pub := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
 	b, err := NewBlobB(PublicParams{RealityPublicKey: pub, ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}, DownTarget{Host: "203.0.113.10", Port: 443})
 	if err != nil {
 		t.Fatalf("NewBlobB: %v", err)
@@ -79,10 +78,14 @@ func TestBlobARoundTrip(t *testing.T) {
 }
 
 func TestBlobBRoundTrip(t *testing.T) {
-	_, wire := fixtureBlobB(t)
+	want, wire := fixtureBlobB(t)
 	got, err := ParseBlobB(wire)
 	if err != nil {
 		t.Fatalf("ParseBlobB: %v", err)
+	}
+	if got.Public.RealityPublicKey != want.Public.RealityPublicKey ||
+		len(got.Public.RealityPublicKey) != 43 || strings.ContainsAny(got.Public.RealityPublicKey, "=+/") {
+		t.Fatalf("public key is not canonical RawURL: %q", got.Public.RealityPublicKey)
 	}
 	if got.Public.UUID != "123e4567-e89b-42d3-a456-426614174000" ||
 		got.Public.ShortID != "0123456789abcdef" ||
@@ -211,13 +214,44 @@ func TestBlobAInvalidFields(t *testing.T) {
 	}
 }
 
+func TestNewBlobBCanonicalizesLegacyPublicKey(t *testing.T) {
+	legacy := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	b, err := NewBlobB(PublicParams{RealityPublicKey: legacy, ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}, DownTarget{Host: "203.0.113.10", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	if b.Public.RealityPublicKey != want {
+		t.Fatalf("canonical key = %q, want %q", b.Public.RealityPublicKey, want)
+	}
+	wire, err := b.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(wire, "realityPublicKey\\\":\\\""+want) {
+		t.Fatal("encoded Blob B does not contain the canonical RawURL key")
+	}
+}
+
+func TestParseBlobBLegacyPublicKey(t *testing.T) {
+	legacy := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	payload := `{"v":1,"role":"b","public":{"realityPublicKey":"` + legacy + `","shortId":"0123456789abcdef","uuid":"123e4567-e89b-42d3-a456-426614174000","sni":"www.lovelive123.com"},"germany":{"host":"203.0.113.10","port":443}}`
+	got, err := ParseBlobB(withPayload(t, []byte(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Public.RealityPublicKey != base64.RawURLEncoding.EncodeToString(make([]byte, 32)) {
+		t.Fatal("legacy key was not normalized to RawURL")
+	}
+}
+
 func TestBlobBInvalidFields(t *testing.T) {
 	valid := func() PublicParams {
-		return PublicParams{RealityPublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)), ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}
+		return PublicParams{RealityPublicKey: base64.RawURLEncoding.EncodeToString(make([]byte, 32)), ShortID: "0123456789abcdef", UUID: "123e4567-e89b-42d3-a456-426614174000", SNI: "www.lovelive123.com"}
 	}
 	cases := map[string]func(*PublicParams){
-		"pubkey 31 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 31)) },
-		"pubkey 33 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.StdEncoding.EncodeToString(make([]byte, 33)) },
+		"pubkey 31 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.RawURLEncoding.EncodeToString(make([]byte, 31)) },
+		"pubkey 33 bytes":     func(p *PublicParams) { p.RealityPublicKey = base64.RawURLEncoding.EncodeToString(make([]byte, 33)) },
 		"pubkey not b64":      func(p *PublicParams) { p.RealityPublicKey = "not-base64!!!" },
 		"pubkey empty":        func(p *PublicParams) { p.RealityPublicKey = "" },
 		"shortid 15 hex":      func(p *PublicParams) { p.ShortID = "0123456789abcde" },

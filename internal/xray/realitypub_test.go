@@ -54,8 +54,8 @@ func TestReadInstalledRealityParamsGolden(t *testing.T) {
 		t.Fatalf("params mismatch: %+v", got)
 	}
 	// The returned public key must equal the X25519 derivation of the
-	// config's private key, re-encoded base64 StdEncoding (the pairing
-	// blob format) — independently re-derived here via crypto/ecdh.
+	// config's private key, re-encoded base64.RawURLEncoding (the Xray and
+	// pairing Blob B format) — independently re-derived here via crypto/ecdh.
 	priv, err := base64.RawURLEncoding.DecodeString(fixedPrivRawURL)
 	if err != nil {
 		t.Fatal(err)
@@ -64,13 +64,16 @@ func TestReadInstalledRealityParamsGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := base64.StdEncoding.EncodeToString(key.PublicKey().Bytes())
+	want := base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
 	if got.RealityPublicKey != want {
 		t.Fatal("derived public key mismatch")
 	}
 	// Hygiene: the private material (either alphabet) must not appear inside
 	// the public key string the reader hands to the blob.
 	stdPriv := base64.StdEncoding.EncodeToString(priv)
+	if len(got.RealityPublicKey) != 43 || strings.ContainsAny(got.RealityPublicKey, "=+/") {
+		t.Fatal("derived public key is not canonical RawURL")
+	}
 	if strings.Contains(got.RealityPublicKey, fixedPrivRawURL[:16]) ||
 		strings.Contains(got.RealityPublicKey, stdPriv[:16]) {
 		t.Fatal("private material leaked into derived public key")
@@ -96,7 +99,7 @@ func TestReadInstalledRealityParamsRoundTripAndDeterminism(t *testing.T) {
 	if err != nil || *second != *first {
 		t.Fatalf("re-read mismatch: %+v vs %+v (%v)", *second, *first, err)
 	}
-	if b, err := base64.StdEncoding.DecodeString(first.RealityPublicKey); err != nil || len(b) != 32 {
+	if b, err := base64.RawURLEncoding.DecodeString(first.RealityPublicKey); err != nil || len(b) != 32 {
 		t.Fatalf("public key shape: %v, len=%d", err, len(b))
 	}
 }

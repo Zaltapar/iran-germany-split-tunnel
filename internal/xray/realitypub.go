@@ -42,8 +42,8 @@ var ErrInstalledKey = errors.New("xray: installed Germany Reality private key fa
 // inbound's public parameters plus the Reality public key DERIVED from its
 // private key — exactly the material Blob B carries (public only).
 type InstalledRealityParams struct {
-	// RealityPublicKey is base64 StdEncoding (32-byte X25519 point) — the
-	// format the pairing blob requires.
+	// RealityPublicKey is canonical base64.RawURLEncoding (43 chars, 32-byte
+	// X25519 point), matching Xray's realitySettings.publicKey format and Blob B.
 	RealityPublicKey string
 	// SNI is the inbound's single realitySettings.serverNames entry.
 	SNI string
@@ -161,7 +161,7 @@ func ReadInstalledRealityParams(path string) (*InstalledRealityParams, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: privateKey rejected: %v", ErrInstalledKey, err)
 		}
-		params.RealityPublicKey = base64.StdEncoding.EncodeToString(key.PublicKey().Bytes())
+		params.RealityPublicKey = base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes())
 		params.SNI = sni
 		params.ShortID = shortID
 		params.UUID = uuid

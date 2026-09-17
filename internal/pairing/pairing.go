@@ -165,14 +165,24 @@ func validSNI(s string) bool {
 	return true
 }
 
-// validRealityPublicKey validates a base64 (StdEncoding) X25519 public key:
-// exactly 32 bytes when decoded.
-func validRealityPublicKey(s string) bool {
+// decodeRealityPublicKey accepts the canonical unpadded URL-safe encoding and
+// the legacy padded standard encoding, always returning exactly 32 key bytes.
+func decodeRealityPublicKey(s string) ([]byte, bool) {
 	if s == "" || strings.ContainsAny(s, " \t\n\r") {
-		return false
+		return nil, false
 	}
-	b, err := base64.StdEncoding.DecodeString(s)
-	return err == nil && len(b) == 32
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil && len(b) == 32 {
+		return b, true
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil && len(b) == 32 {
+		return b, true
+	}
+	return nil, false
+}
+
+func validRealityPublicKey(s string) bool {
+	_, ok := decodeRealityPublicKey(s)
+	return ok
 }
 
 // validateTunnelSecret reuses the Phase-6 policy as the single source of
@@ -337,7 +347,7 @@ func (a *BlobA) String() string { return a.Summary() }
 // PublicParams are the Reality/VLESS PUBLIC parameters Iran's outbound
 // needs. No private material may ever be represented here.
 type PublicParams struct {
-	RealityPublicKey string `json:"realityPublicKey"` // base64 StdEncoding, 32 bytes decoded
+	RealityPublicKey string `json:"realityPublicKey"` // base64.RawURLEncoding, 43 chars, 32 bytes decoded
 	ShortID          string `json:"shortId"`          // 16 hex chars
 	UUID             string `json:"uuid"`             // RFC 4122 v4, lowercase
 	SNI              string `json:"sni"`              // Reality SNI / TLS ServerName (lowercase RFC 1123 hostname)
@@ -359,8 +369,13 @@ type BlobB struct {
 	Germany DownTarget   `json:"germany"`
 }
 
-// NewBlobB validates its inputs and builds an in-memory BlobB.
+// NewBlobB validates its inputs and builds an in-memory BlobB. Legacy padded
+// standard Base64 public keys are accepted at this boundary and normalized to
+// the canonical RawURLEncoding representation before emission.
 func NewBlobB(p PublicParams, g DownTarget) (*BlobB, error) {
+	if key, ok := decodeRealityPublicKey(p.RealityPublicKey); ok {
+		p.RealityPublicKey = base64.RawURLEncoding.EncodeToString(key)
+	}
 	b := &BlobB{V: Version, Role: roleB, Public: p, Germany: g}
 	if err := b.validate(); err != nil {
 		return nil, err
@@ -379,7 +394,7 @@ func (b *BlobB) Encode() (string, error) {
 func (b *BlobB) validate() error {
 	var problems []string
 	if !validRealityPublicKey(b.Public.RealityPublicKey) {
-		problems = append(problems, "public.realityPublicKey: must be base64 encoding a 32-byte key")
+		problems = append(problems, "public.realityPublicKey: must be base64.RawURLEncoding (or legacy padded standard Base64) encoding a 32-byte key")
 	}
 	if !shortIDRe.MatchString(b.Public.ShortID) {
 		problems = append(problems, "public.shortId: must be 16 lowercase hex chars")
@@ -399,7 +414,9 @@ func (b *BlobB) validate() error {
 	return fieldErr(problems)
 }
 
-// ParseBlobB decodes and fully validates a blob B.
+// ParseBlobB decodes and fully validates a blob B. Canonical RawURL and
+// legacy padded standard Base64 public keys are accepted; the returned value
+// is normalized to RawURLEncoding.
 func ParseBlobB(s string) (*BlobB, error) {
 	b, err := parse(s, roleB)
 	if err != nil {
@@ -509,6 +526,9 @@ func parse(s, wantRole string) (any, error) {
 	var b BlobB
 	if err := strictDecode(payload, &b); err != nil {
 		return nil, err
+	}
+	if key, ok := decodeRealityPublicKey(b.Public.RealityPublicKey); ok {
+		b.Public.RealityPublicKey = base64.RawURLEncoding.EncodeToString(key)
 	}
 	if err := b.validate(); err != nil {
 		return nil, err

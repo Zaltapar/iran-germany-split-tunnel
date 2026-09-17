@@ -47,10 +47,9 @@ const (
 // config loader expects for realitySettings.privateKey
 // (infra/conf REALITYConfig.Build decodes RawURLEncoding, 32 bytes).
 //
-// The *Std fields are the same 32 bytes re-encoded as
-// base64.StdEncoding — the format the pairing blob requires for
-// PublicParams.RealityPublicKey. One keypair, two encodings; the
-// bytes are identical.
+// The *Std fields are the same 32 bytes re-encoded as base64.StdEncoding for
+// diagnostic redaction compatibility. Blob B and Xray config emission use
+// base64.RawURLEncoding; the bytes remain identical.
 //
 // Do not add a String()/Format() method: the private key must never
 // be printable.
