@@ -241,10 +241,25 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		}
 		return installCommand(ctx, args[1], out)
 	case "pair":
-		if len(args) != 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
+		if len(args) < 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
 			return fmt.Errorf("%w: pair requires generate, apply, or finalize", errUsage)
 		}
-		return pairCommand(ctx, store, args[1], out)
+		// DEFECT-4: only `generate` may carry an argument, and only --force
+		// (the explicit restart of a completed exchange). apply/finalize
+		// accept no extra arguments.
+		force := false
+		switch args[1] {
+		case "generate":
+			if len(args) > 3 || (len(args) == 3 && args[2] != "--force") {
+				return fmt.Errorf("%w: pair generate accepts at most --force", errUsage)
+			}
+			force = len(args) == 3
+		default:
+			if len(args) != 2 {
+				return fmt.Errorf("%w: pair %s takes no extra arguments", errUsage, args[1])
+			}
+		}
+		return pairCommand(ctx, store, args[1], force, out)
 	case "upgrade":
 		if len(args) > 2 || (len(args) == 2 && !isUpgradeTarget(args[1])) {
 			return fmt.Errorf("%w: upgrade accepts at most one of --xray, --origin, or --splitter", errUsage)
@@ -312,7 +327,9 @@ func installCommand(ctx context.Context, role string, out io.Writer) error {
 		return err
 	}
 	m := result.Manifest
-	if result.Plan.Unchanged {
+	// !result.Changed (not result.Plan.Unchanged): a DEFECT-2 drift-heal commits
+	// with Plan.Unchanged==true but Changed==true, so it must report "committed".
+	if !result.Changed {
 		_, _ = fmt.Fprintf(out, "install: already converged (no changes)\nrole: %s\ngeneration: %s\n", m.Role, m.Generation)
 		return nil
 	}
@@ -511,7 +528,9 @@ func configSetCommand(ctx context.Context, assignments []string, out io.Writer) 
 		return err
 	}
 	m := result.Manifest
-	if result.Plan.Unchanged {
+	// !result.Changed (not result.Plan.Unchanged): a DEFECT-2 drift-heal commits
+	// with Plan.Unchanged==true but Changed==true, so it must report "committed".
+	if !result.Changed {
 		_, _ = fmt.Fprintf(out, "config: already converged (no changes)\nrole: %s\ngeneration: %s\nkeys: %s\n",
 			m.Role, m.Generation, strings.Join(applied, ", "))
 		return nil
@@ -533,9 +552,10 @@ func configSetCommand(ctx context.Context, assignments []string, out io.Writer) 
 //     changed, so the plan is Unchanged and no transaction runs — the
 //     documented way to converge/verify a host against its environment.
 //   - --splitter: the splitter artifact the environment supplies. The
-//     environment IS the source for it, so the flag is accepted only when it
-//     actually supplies a change (a different version or path) and is refused
-//     otherwise, rather than silently re-applying the same deployment.
+//     environment IS the source for it, so re-applying it converges the host:
+//     with no environment change the plan is Unchanged and the command
+//     reports "already converged" without touching anything; a live host that
+//     drifted away from its committed deployment is healed by the live audit.
 //   - --xray: Germany only (Iran uses an external Xray). Xray is a pinned
 //     constant, so the upgrade re-points the managed binary at
 //     xray.PinnedVersion and re-applies the Reality parameters; a
@@ -572,16 +592,12 @@ func upgradeCommand(ctx context.Context, target string, out io.Writer) error {
 	component := "re-apply"
 	switch target {
 	case "--splitter":
+		// DEFECT-5: no same-version refusal. Re-applying the environment's
+		// splitter converges the host: an unchanged environment is the
+		// documented no-op ("already converged"), and a live host that
+		// drifted away from its committed deployment is healed by the live
+		// audit before the commit decision.
 		component = "splitter " + request.SplitterVersion
-		currentPath := request.SplitterPath
-		if current.Role == deploy.RoleIran {
-			// Iran's source artifact may live in staging, but the committed
-			// deployment identity is always the canonical managed target.
-			currentPath = systemd.BinaryPrefix + "/iran-splitter"
-		}
-		if request.SplitterVersion == current.Components.Splitter.Version && currentPath == current.Components.Splitter.Path {
-			return fmt.Errorf("upgrade: the environment supplies no splitter change (same version and path); set %s and/or %s", envSplitterVersion, envSplitterBin)
-		}
 	case "--xray":
 		if current.Role != deploy.RoleGermany {
 			return fmt.Errorf("upgrade: --xray applies to %s; %s uses an external Xray", deploy.RoleGermany, current.Role)
@@ -608,7 +624,9 @@ func upgradeCommand(ctx context.Context, target string, out io.Writer) error {
 		return err
 	}
 	m := result.Manifest
-	if result.Plan.Unchanged {
+	// !result.Changed (not result.Plan.Unchanged): a DEFECT-2 drift-heal commits
+	// with Plan.Unchanged==true but Changed==true, so it must report "committed".
+	if !result.Changed {
 		_, _ = fmt.Fprintf(out, "upgrade: already converged (no changes)\nrole: %s\ngeneration: %s\ncomponent: %s\n",
 			m.Role, m.Generation, component)
 		return nil
@@ -1117,8 +1135,14 @@ func detectGermanyHostFromInterfaces() (string, error) {
 
 // pairCommand is the two-blob pairing exchange (architecture doc §6.1):
 //
-//	pair generate  (Iran)    — emits Blob A once (tunnel secret + upload
-//	                           domain) for the operator to carry to Germany.
+//	pair generate [--force] (Iran) — emits Blob A once (tunnel secret +
+//	                           upload domain) for the operator to carry to
+//	                           Germany. DEFECT-4 state gate: a FINALIZED
+//	                           pairing refuses generate (it would silently
+//	                           reset the completed exchange) unless the
+//	                           operator passes --force to deliberately
+//	                           restart it; the reset and re-emit are one
+//	                           atomic store.Commit.
 //	pair apply     (Germany) — consumes Blob A AND emits the RETURN Blob B,
 //	                           built from the INSTALLED Reality parameters
 //	                           (public key derived from the installed private
@@ -1140,7 +1164,7 @@ func detectGermanyHostFromInterfaces() (string, error) {
 // errors; Blob B itself contains only public Reality parameters + host/port.
 // Role gates are unchanged: Iran rejects apply/finalize mismatches, Germany
 // rejects generate/finalize.
-func pairCommand(_ context.Context, store *deploy.Store, action string, out io.Writer) error {
+func pairCommand(_ context.Context, store *deploy.Store, action string, force bool, out io.Writer) error {
 	manifest, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("pair: load deployment state: %w", err)
@@ -1159,6 +1183,13 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, out io.W
 	case "generate":
 		if manifest.Role != deploy.RoleIran {
 			return fmt.Errorf("pair: generate is currently supported on Iran; Germany derives its return blob from pair apply")
+		}
+		// DEFECT-4 state gate: the completed exchange is terminal. Re-running
+		// generate here would silently reset pairing to a-generated and the
+		// old Blob A would no longer be accepted by Iran — a data-loss-class
+		// surprise. Refuse unless the operator explicitly passes --force.
+		if manifest.Pairing.State == "finalized" && !force {
+			return errors.New("pair: the pairing state is finalized; run `pair generate --force` to deliberately restart the exchange")
 		}
 		secretPath := os.Getenv("SPLITTERCTL_SECRET_FILE")
 		domain := os.Getenv("SPLITTERCTL_UPLOAD_DOMAIN")
@@ -1286,8 +1317,11 @@ func status(_ context.Context, store *deploy.Store, out io.Writer) error {
 // always delegated to a lifecycle command.
 func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
 	diags := deploy.Diagnostics{
-		Store:  store,
-		Checks: []deploy.Check{deploy.StateDirCheck(store.Root)},
+		Store: store,
+		Checks: []deploy.Check{
+			deploy.StateDirCheck(store.Root),
+			deploy.PairingStalenessCheck(store),
+		},
 	}
 	findings := diags.Run(ctx)
 	for _, f := range findings {
@@ -1328,7 +1362,7 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)")
 	fmt.Fprintln(out, "  doctor                              run read-only deployment checks")
 	fmt.Fprintln(out, "  install iran|germany                install a role (Linux root; env contract in package docs)")
-	fmt.Fprintln(out, "  pair generate|apply|finalize        exchange pairing blobs (Germany apply also emits the return Blob B)")
+	fmt.Fprintln(out, "  pair generate [--force]|apply|finalize  exchange pairing blobs (Germany apply also emits the return Blob B; generate refuses on finalized without --force)")
 	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")
 	fmt.Fprintln(out, "  uninstall [--purge]                 remove the deployment (Linux root)")

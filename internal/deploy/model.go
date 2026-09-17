@@ -139,6 +139,13 @@ type PairingState struct {
 	PeerRole     string   `json:"peerRole,omitempty"`
 	State        string   `json:"state"`
 	Fingerprints []string `json:"fingerprints,omitempty"`
+	// PairingStale is set by a config-rotating transaction (DEFECT-3): when
+	// Activate changed the live Reality keypair, the committed B-fingerprint
+	// no longer matches the on-disk config's public parameters, so `pair apply`
+	// must re-emit Blob B. doctor surfaces this marker; `pair apply` clears it
+	// by committing the fresh pairing state. omitempty keeps the legacy
+	// manifest byte-identical (state_compat_test).
+	PairingStale bool `json:"pairingStale,omitempty"`
 }
 
 // PairingStateNone is the pairing baseline a request expresses before any

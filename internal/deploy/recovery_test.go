@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
@@ -31,6 +33,12 @@ type recoveryOpsFake struct {
 	// noBackup makes RollbackLast report systemd.ErrNoUnitBackup — the
 	// no-managed-backup condition DEFECT-3 recovery must converge through.
 	noBackup bool
+	// simulate materializes the unit-file effects of RollbackLast/ReapplyUnit
+	// against unitDir so a test can observe the FINAL live unit bytes:
+	// RollbackLast restores the newest managed backup, ReapplyUnit writes the
+	// RenderUnit(spec) render. This is the DEFECT-1 regression seam (a stale
+	// backup is restored, then the re-derive overwrites it).
+	simulate bool
 }
 
 func (o *recoveryOpsFake) RemoveUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
@@ -49,6 +57,14 @@ func (o *recoveryOpsFake) RollbackLast(_ context.Context, _ *systemd.ServiceMana
 	if o.noBackup {
 		return fmt.Errorf("%w: %w for %s (nothing to roll back to)", systemd.ErrPreflight, systemd.ErrNoUnitBackup, s.UnitName)
 	}
+	if o.simulate {
+		// Restore the newest managed backup to the live unit file. A missing
+		// backup mirrors production's ErrNoUnitBackup so the DEFECT-3 fallback
+		// is exercised identically.
+		if err := o.simulateRollback(s.UnitName); err != nil {
+			return err
+		}
+	}
 	o.rolled = append(o.rolled, s.UnitName)
 	return o.failWith
 }
@@ -56,7 +72,64 @@ func (o *recoveryOpsFake) RollbackLast(_ context.Context, _ *systemd.ServiceMana
 func (o *recoveryOpsFake) ReapplyUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) error {
 	o.reapplied = append(o.reapplied, s.UnitName)
 	o.reappliedSpecs = append(o.reappliedSpecs, s)
+	if o.simulate {
+		// Re-apply writes the committed render to the live unit file — the
+		// byte-exact effect of T5's ApplyUnit on a converging unit.
+		data, err := systemd.RenderUnit(s)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(o.unitDir, s.UnitName), data, 0o644); err != nil {
+			return err
+		}
+	}
 	return o.failWith
+}
+
+// simulateRollback restores the newest managed backup (<live>.bak-<unixnano>)
+// for unit to the live unit file in unitDir, mirroring T5's RollbackLast. It
+// returns the ErrNoUnitBackup sentinel (wrapped) when no managed backup exists.
+func (o *recoveryOpsFake) simulateRollback(unit string) error {
+	backup, err := newestManagedBackup(o.unitDir, unit)
+	if err != nil {
+		return err
+	}
+	if backup == "" {
+		return fmt.Errorf("%w: %w for %s (nothing to roll back to)", systemd.ErrPreflight, systemd.ErrNoUnitBackup, unit)
+	}
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(o.unitDir, unit), data, 0o644)
+}
+
+// newestManagedBackup returns the path of the newest managed unit backup
+// (<unit>.bak-<digits>) in dir, or "" when none exists. "Newest" is the
+// largest numeric suffix, matching T5's keep-N backup naming.
+func newestManagedBackup(dir, unit string) (string, error) {
+	prefix := unit + ".bak-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	var best string
+	var bestNum int64 = -1
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		n, err := strconv.ParseInt(name[len(prefix):], 10, 64)
+		if err != nil {
+			continue
+		}
+		if n > bestNum {
+			bestNum = n
+			best = filepath.Join(dir, name)
+		}
+	}
+	return best, nil
 }
 
 func (o *recoveryOpsFake) RollbackEnvFile(context.Context, systemd.Role) error {
@@ -220,6 +293,14 @@ func renderSafeSplitterPath() string {
 		return vol + string(filepath.Separator) + "split-tunnel-test-splitter"
 	}
 	return "/split-tunnel-test-splitter"
+}
+
+// managedGermanySplitterPath is the canonical Germany splitter ExecStart
+// target (the only path a managed Germany splitter unit may run). RenderUnit
+// embeds it verbatim; the DEFECT-1 test swaps it out to build the stale
+// pre-canonicalization backup.
+func managedGermanySplitterPath() string {
+	return systemd.BinaryPrefix + "/germany-splitter"
 }
 
 func mustExist(t *testing.T, path string) {
@@ -857,5 +938,105 @@ func TestRecoverUpgradeReapplyIsSpecFaithful(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("recovery re-apply spec = %#v, want the normal-apply spec %#v", got, want)
+	}
+}
+
+// TestRecoverUpgradeHealsStaleUnitBackup is the DEFECT-1 regression: a
+// post-crash recovery restores the newest MANAGED backup, but that backup can
+// predate the latest committed re-render. Convergence commits re-render a unit
+// without writing a fresh backup when they are byte no-ops, so a pre-
+// canonicalization backup (ExecStart still pointing at the staging binary) can
+// survive as the newest. Restoring it leaves the service 203/EXEC crash-
+// looping. The fix re-derives each restored unit from the committed manifest
+// and re-applies it, so after recover the FINAL live unit content equals the
+// canonical render.
+func TestRecoverUpgradeHealsStaleUnitBackup(t *testing.T) {
+	const unit = "germany-splitter.service"
+	journal := ArtifactJournal{Role: RoleGermany, Generation: "pending-2"}
+	fx := newRecoveryFixture(t, RoleGermany, journal)
+	req := fx.withValidRequest(t, RoleGermany)
+	previous := testManifest(fx.store.Root, RoleGermany)
+	previous.Generation = "g1"
+	previous.Services = []ServiceState{{Unit: unit, Component: "splitter"}}
+	if _, err := fx.store.Commit(previous, "install"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The authoritative canonical spec + render (single source of truth: the
+	// same targetUnitSpecs derivation recovery uses).
+	plan, err := BuildSystemdPlan(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical systemd.Spec
+	for _, spec := range plan.Specs {
+		if unitName(spec) == unit {
+			canonical = spec
+			canonical.UnitName = unit
+			break
+		}
+	}
+	canonicalRender, err := systemd.RenderUnit(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := managedGermanySplitterPath()
+	if !strings.Contains(string(canonicalRender), managed) {
+		t.Fatalf("canonical render does not embed the managed splitter path %q", managed)
+	}
+	// Stale pre-canonicalization content: ExecStart points at the staging
+	// binary instead of the managed location.
+	stale := strings.Replace(string(canonicalRender), managed, "/root/staging/germany-splitter", 1)
+
+	live := filepath.Join(fx.unitDir, unit)
+	backup := live + ".bak-1234567890"
+	for _, p := range []string{live, backup} {
+		if err := os.WriteFile(p, []byte(stale), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Materialize the xray unit too (in j.Units but not in previous.Services →
+	// removed, not rolled back).
+	if err := os.WriteFile(filepath.Join(fx.unitDir, "xray-germany.service"), []byte("unit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The crashed upgrade replaced the splitter and added xray.
+	journal.Units = []string{unit, "xray-germany.service"}
+	journal.PreUnits = []string{unit}
+	journal.Files = []string{fx.config}
+	journal.PreFiles = []string{fx.config}
+	if err := fx.store.WriteJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	// Materialize the unit-file effects so the FINAL live bytes are observable.
+	fx.ops.simulate = true
+
+	if _, err := (&Controller{Store: fx.store, Adapter: fx.adapter}).Recover(context.Background()); err != nil {
+		t.Fatalf("recovery did not converge (stale backup): %v", err)
+	}
+	// The stale backup was restored AND then overwritten by the re-derive.
+	if !reflect.DeepEqual(fx.ops.rolled, []string{unit}) {
+		t.Fatalf("rolled = %#v, want the restored unit", fx.ops.rolled)
+	}
+	if !reflect.DeepEqual(fx.ops.reapplied, []string{unit}) {
+		t.Fatalf("reapplied = %#v, want the restored unit re-derived", fx.ops.reapplied)
+	}
+	// THE DEFECT-1 property: the final live unit equals the canonical render
+	// and no longer references the staging binary.
+	final, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(final) != string(canonicalRender) {
+		t.Fatalf("final live unit != canonical render:\n--- final ---\n%s\n--- canonical ---\n%s", final, canonicalRender)
+	}
+	if strings.Contains(string(final), "/root/staging/") {
+		t.Fatal("final live unit still references the staging binary (stale backup survived)")
+	}
+	// The new xray unit was removed (created by the crashed transaction).
+	mustNotExist(t, filepath.Join(fx.unitDir, "xray-germany.service"))
+	if _, err := fx.store.ReadJournal(); !os.IsNotExist(err) {
+		t.Fatalf("journal not cleared: %v", err)
 	}
 }

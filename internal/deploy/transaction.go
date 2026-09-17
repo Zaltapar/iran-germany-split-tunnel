@@ -51,6 +51,26 @@ type Transaction struct {
 	// mutates no deployment artifacts; nil means the adapter offers no
 	// convergence hook.
 	Converge func(context.Context) error
+	// AuditLive optionally audits the LIVE state of the MANAGED deployment
+	// objects (the adapter's AuditLiveDrift) and is consulted ONLY when the
+	// plan converges to a no-op (DEFECT-2): it reports whether a managed
+	// object diverges from the committed state (unit file bytes vs the
+	// committed render, managed binary presence/mode) or returns an error
+	// (fail closed). A clean audit returns the same no-op as before; a
+	// drifted one falls through to the full journal + apply sequence so the
+	// objects re-converge through the normal apply semantics. nil means the
+	// adapter offers no live audit (the no-op early return stands unchallenged).
+	AuditLive func(context.Context) (bool, error)
+	// MarkPairingStale optionally reports whether this transaction's activate
+	// phase rotated the live pairing configuration (DEFECT-3): when a config-
+	// rotating activate changed the managed Reality keypair, the committed
+	// pairing B-fingerprint no longer matches the on-disk config, so `pair
+	// apply` must re-emit Blob B. Consulted ONLY on a successful commit,
+	// after the apply steps: a true value marks the committed manifest's
+	// pairing state with the explicit pairingStale flag doctor surfaces and
+	// `pair apply` clears. nil means the adapter offers no pairing marker
+	// (the documented host fakes), so the commit stays unmarked.
+	MarkPairingStale func() bool
 }
 
 type Result struct {
@@ -85,7 +105,29 @@ func (t *Transaction) Apply(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	if plan.Unchanged {
-		return Result{Manifest: t.Previous, Plan: plan}, nil
+		drifted := false
+		if t.AuditLive != nil {
+			// Live drift audit (DEFECT-2): the plan is a no-op against the
+			// committed state, but the planner never sees the live
+			// filesystem — a managed unit file or binary may have drifted
+			// since the last commit. A read error is fail-closed: the host
+			// state is unknown, so the transaction must not report success.
+			var err error
+			drifted, err = t.AuditLive(ctx)
+			if err != nil {
+				return Result{}, fmt.Errorf("%w: audit live drift: %w", ErrTransaction, err)
+			}
+		}
+		if !drifted {
+			// Clean no-op: zero adapter phases, zero executor calls, zero
+			// PID churn — the converged re-apply guarantee.
+			return Result{Manifest: t.Previous, Plan: plan}, nil
+		}
+		// Drifted: fall through to the full transaction below. The journal
+		// is written, the apply phases run the normal byte-exact logic
+		// (ApplyUnit is a no-op per unit whose bytes already match, a
+		// validated swap for the drifted ones), and a new generation is
+		// committed so the healed state is recorded.
 	}
 	// The in-flight journal is written BEFORE the first mutation and is the
 	// sole ownership record for recovery. Its contents must be complete and
@@ -117,12 +159,20 @@ func (t *Transaction) Apply(ctx context.Context) (Result, error) {
 			return t.fail(step.Phase, fmt.Errorf("%s: %w", step.Name, err))
 		}
 	}
+	pairing := t.Desired.Pairing
+	// Pairing staleness marker (DEFECT-3): consulted after the apply steps so
+	// it reflects whether THIS transaction's activate rotated the live config.
+	// A fresh, non-rotating commit leaves the marker unset (pair apply clears
+	// it later by committing the re-emitted pairing state).
+	if t.MarkPairingStale != nil && t.MarkPairingStale() {
+		pairing.PairingStale = true
+	}
 	m := Manifest{
 		Schema:            SchemaVersion,
 		Role:              t.Desired.Role,
 		Components:        t.Desired.Components,
 		Paths:             t.Desired.Paths,
-		Pairing:           t.Desired.Pairing,
+		Pairing:           pairing,
 		Services:          append([]ServiceState(nil), t.Desired.Services...),
 		Firewall:          t.Desired.Firewall,
 		ConfigFingerprint: t.Desired.ConfigFingerprint,

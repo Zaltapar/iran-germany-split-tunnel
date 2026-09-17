@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -63,6 +65,14 @@ type LinuxAdapter struct {
 	// lifecycle op re-converges the state-dir permission chain even when
 	// the plan converges to a no-op.
 	convergeStateDir func(ctx context.Context) error
+
+	// liveAudit is the test seam for the DEFECT-2 live-state drift audit
+	// (AuditLiveDrift). nil → no audit: the no-op early return stands, and
+	// struct-literal test adapters never read the host's real /etc. ONLY
+	// NewLinuxAdapter wires the real auditLiveDriftCore; tests inject a
+	// redirecting variant so the audit's read-only logic is exercisable
+	// against a temp tree without a root Linux host.
+	liveAudit func(ctx context.Context) (bool, error)
 
 	// keypairFn is the test seam for xray.GenerateRealityKeypair (nil → the
 	// real generator). Only _test.go files inject it.
@@ -230,6 +240,10 @@ func NewLinuxAdapter(request InstallRequest, serviceExec systemd.SystemdExecutor
 		Xray:             &xray.Installer{Prefix: systemd.BinaryPrefix + "/xray"},
 		convergeStateDir: systemd.EnsureStateDir,
 	}
+	// The production live-drift audit (DEFECT-2). Struct-literal adapters
+	// leave the seam nil; only the production constructor wires the real
+	// read-only audit.
+	adapter.liveAudit = adapter.auditLiveDriftCore
 	if request.Role == RoleIran && request.Origin.Mode != origin.ModeNone {
 		provider, err := origin.New(request.Origin.Mode, origin.Deps{Prefix: systemd.BinaryPrefix, Dir: systemd.StateDir})
 		if err != nil {
@@ -568,6 +582,137 @@ func (a *LinuxAdapter) ConvergeStateDir(ctx context.Context) error {
 	return a.convergeStateDir(ctx)
 }
 
+// AuditLiveDrift implements the optional LiveAuditor capability (DEFECT-2):
+// it audits the LIVE state of the MANAGED deployment objects against the
+// committed manifest and reports whether any drifted. It is consulted ONLY
+// when a transaction's plan is a no-op, so a clean host keeps the zero-PID-
+// churn no-op while a drifted one is forced through the apply phases.
+//
+// It is a no-op (false, nil) when the liveAudit seam is nil — a struct-
+// literal test adapter, which must never read the host's real /etc.
+// NewLinuxAdapter wires the real audit.
+func (a *LinuxAdapter) AuditLiveDrift(ctx context.Context) (bool, error) {
+	if a.liveAudit == nil {
+		return false, nil
+	}
+	return a.liveAudit(ctx)
+}
+
+// MarkPairingStale implements the optional PairingStaleMarker capability
+// (DEFECT-3). It reports whether this adapter's Activate phase rotated the
+// live pairing configuration (the managed Germany Reality keypair bytes).
+// xrayConfigChanged is set by Activate exactly when the live config bytes
+// changed (a regenerated Reality keypair, or a fresh install); a byte-
+// identical re-activation leaves it false, so a convergent re-apply never
+// marks the pairing stale. Only a production commit reads this; struct-
+// literal test adapters leave the capability unimplemented, so the marker
+// stays nil and the commit is unmarked.
+func (a *LinuxAdapter) MarkPairingStale() bool {
+	return a.xrayConfigChanged
+}
+
+// auditLiveDriftCore is the production DEFECT-2 live audit. It is read-only:
+// it stats, Lstats, and reads MANAGED objects (the committed unit files and
+// the managed splitter binary / xray pointer) and compares them against the
+// committed manifest; it never writes. It reports drift (true) when any
+// managed object diverges from the committed state:
+//
+//   - a committed unit file that is absent, a non-regular object (a planted
+//     symlink is drift — the apply phase keeps its ErrUnsafeTarget refusal),
+//     or whose bytes no longer hash to the committed unit content hash
+//     (ServiceState.Hash, the sha256 of the committed render);
+//   - a managed splitter binary that is absent or not 0755 (install
+//     canonicalizes it 0755; a mode drift means the service cannot exec it
+//     the way it was committed). The self-referential env edge (source ==
+//     target) is a documented limitation the mode check cannot fully heal,
+//     but the presence check still catches a removed binary;
+//   - a committed xray binary pointer (Germany) that is absent.
+//
+// A read error (a managed object that vanished between Lstat and read, a
+// permission failure) is returned as (false, err) — the transaction treats
+// it as fail-closed rather than trusting a partial observation.
+func (a *LinuxAdapter) auditLiveDriftCore(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	previous, err := a.Store.Load()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // fresh host: nothing committed, nothing to drift from
+		}
+		return false, err
+	}
+	if previous.Generation == "" || len(previous.Services) == 0 {
+		return false, nil
+	}
+	unitFiles := previous.Paths.UnitFiles
+	for i, s := range previous.Services {
+		unit := s.Unit
+		if unit == "" {
+			continue
+		}
+		live := filepath.Join(systemd.UnitDir, unit)
+		if i < len(unitFiles) && unitFiles[i] != "" {
+			live = unitFiles[i]
+		}
+		st, lerr := os.Lstat(live)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				return true, nil // committed unit file absent → drift
+			}
+			return false, lerr
+		}
+		if !st.Mode().IsRegular() {
+			// A symlink or special file where a committed unit must be:
+			// drift. The apply phase re-converges it through T5's ApplyUnit,
+			// which keeps its ErrUnsafeTarget refusal for planted links (the
+			// fail-closed behavior the task requires).
+			return true, nil
+		}
+		if s.Hash != "" {
+			data, rerr := os.ReadFile(live)
+			if rerr != nil {
+				return false, rerr
+			}
+			sum := sha256.Sum256(data)
+			if hex.EncodeToString(sum[:]) != s.Hash {
+				return true, nil // committed unit bytes no longer match → drift
+			}
+		}
+	}
+	// Managed splitter binary: install canonicalizes it 0755.
+	bin := managedBinaryPrefix + "/" + previous.Role + "-splitter"
+	st, err := os.Lstat(bin)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o755 {
+		return true, nil
+	}
+	// Germany xray binary pointer (the <prefix>/xray/current directory the
+	// unit's "current" pointer runs through): must at least be present. A
+	// missing pointer means the unit cannot exec xray at all. It is a
+	// MANAGED object, so its absence is drift the prepare phase re-converges
+	// (EnsureBinaryPointer); we do not assert its target version, which the
+	// manifest's xray component already records.
+	if previous.Role == RoleGermany && previous.Paths.BinaryPointer != "" {
+		st, err := os.Lstat(previous.Paths.BinaryPointer)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return true, nil
+			}
+			return false, err
+		}
+		if !st.IsDir() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (a *LinuxAdapter) Transition(ctx context.Context, desired DesiredState) error {
 	result, err := a.Firewall.Apply(ctx, a.Request.Firewall)
 	if err != nil {
@@ -877,6 +1022,19 @@ func (a *LinuxAdapter) removeOwnedVersionDirs(ctx context.Context, j ArtifactJou
 // order, bounded by the journal's pre-state and previous.Services. A unit in
 // previous.Services (or j.PreUnits) is pre-existing → RollbackLast restores
 // its managed backup; otherwise it was created by the transaction → RemoveUnit.
+//
+// DEFECT-1 (stale unit backup): a successful RollbackLast restores the NEWEST
+// managed backup, but that backup can predate the latest committed re-render.
+// A convergence commit re-renders a unit without writing a fresh backup when
+// it is a byte no-op, and an earlier canonicalization's backup can survive as
+// the newest one — so the restore resurrects a pre-canonicalization ExecStart
+// (staging: /root/staging/germany-splitter) and the service 203/EXEC
+// crash-loops. The fix (option a): after each successful rollback the unit is
+// re-derived from the committed previous manifest and re-applied. The render
+// is deterministic and the re-apply is a byte no-op when the restored bytes
+// already equal the committed render, so a correct restore stays zero-churn
+// while a stale one converges to the committed content. Restored backups must
+// not survive as authoritative.
 func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previous Manifest, units []string) error {
 	prevUnits := map[string]bool{}
 	for _, s := range previous.Services {
@@ -924,8 +1082,49 @@ func (a *LinuxAdapter) revertUnits(ctx context.Context, j ArtifactJournal, previ
 			}
 			return fmt.Errorf("deploy: recovery: rollback unit %s: %w", unit, err)
 		}
+		// DEFECT-1: the restore succeeded, but the restored bytes may be a
+		// STALE backup (see the method doc). Re-derive the unit from the
+		// committed manifest and re-apply so the live unit converges to the
+		// committed render. Byte no-op when the restore was already correct.
+		if err := a.rederiveRestoredUnit(ctx, previous, unit); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// rederiveRestoredUnit re-renders a just-rolled-back unit from the committed
+// previous manifest and re-applies it. This is the DEFECT-1 convergence: a
+// RollbackLast restore can resurrect a stale backup (one that predates the
+// latest committed re-render), which leaves the unit pointing at a
+// pre-canonicalization binary path and crash-loops (203/EXEC). Re-deriving
+// from the manifest — the authoritative committed state — and re-applying
+// makes the render deterministic and the restore non-authoritative: when the
+// restored bytes already equal the committed render the re-apply is a byte
+// no-op (zero churn, no restart); when they diverge it converges the live
+// unit to the committed content with a single validated swap.
+//
+// It fails closed when the unit is not recorded in the committed manifest's
+// services — recovery must never silently re-derive a unit it cannot account
+// for. (BuildJournal makes j.PreUnits a subset of previous.Services, so this
+// branch is defensive against a corrupted manifest.)
+func (a *LinuxAdapter) rederiveRestoredUnit(ctx context.Context, previous Manifest, unit string) error {
+	specs, err := a.targetUnitSpecs(previous)
+	if err != nil {
+		return err
+	}
+	for _, spec := range specs {
+		spec = applyReadySpec(spec)
+		spec.UnitName = unitName(spec)
+		if spec.UnitName != unit {
+			continue
+		}
+		if err := a.ops().ReapplyUnit(ctx, a.Services, spec); err != nil {
+			return fmt.Errorf("deploy: recovery: re-derive unit %s after restore: %w", unit, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: recovery: restored unit %s is not recorded in the committed manifest; cannot re-derive", ErrTransaction, unit)
 }
 
 // unitSpecFor reconstructs a minimal T5 spec for a unit NAME recorded in the

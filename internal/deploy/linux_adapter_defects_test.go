@@ -692,3 +692,597 @@ func TestStateDirCheckIsReadOnly(t *testing.T) {
 		t.Log("linux non-root: t.TempDir facts vary by umask; reporting a finding is informational")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DEFECT 2 (live drift) — install must heal a managed object that drifted
+// since the last commit, while a clean host keeps the zero-PID-churn no-op
+// ---------------------------------------------------------------------------
+
+// liveAuditFake is an Adapter fake that implements the optional LiveAuditor
+// capability: it reports a scripted drift verdict (or a scripted read error)
+// and counts the audit calls, so the transaction-level policy (drift → full
+// apply, clean → no-op, error → fail closed) is pinned without a host.
+type liveAuditFake struct {
+	adapterFake
+	drift bool
+	err   error
+	calls int
+}
+
+func (f *liveAuditFake) AuditLiveDrift(context.Context) (bool, error) {
+	f.calls++
+	return f.drift, f.err
+}
+
+// manifestFromDesired builds a committed manifest that is field-identical to
+// the desired state except for the generation, so PlanDesired plans a genuine
+// no-op and the ONLY thing that can drive a mutation is the live audit.
+func manifestFromDesired(d DesiredState, generation string) Manifest {
+	return Manifest{
+		Schema: SchemaVersion, Role: d.Role, Generation: generation,
+		Components: d.Components, Paths: d.Paths,
+		Pairing: d.Pairing, Services: d.Services,
+		Firewall: d.Firewall, ConfigFingerprint: d.ConfigFingerprint,
+	}
+}
+
+// TestNoOpInstallAuditsLiveDrift is the transaction-level DEFECT-2
+// regression: a plan that converges to a no-op is NOT trusted until the
+// adapter's live audit has said the managed objects match the commit. The
+// staging defect was the opposite trust direction — the commit alone was
+// trusted, so a live unit file edited out-of-band (or a removed binary)
+// survived `install germany` as "already converged (no changes)" rc=0.
+func TestNoOpInstallAuditsLiveDrift(t *testing.T) {
+	newCase := func() (*Store, DesiredState, Manifest) {
+		store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := requestIn(t, store, validGermanyRequest())
+		desired, err := request.Desired()
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous := manifestFromDesired(desired, "g1")
+		if _, err := store.Commit(previous, "install"); err != nil {
+			t.Fatal(err)
+		}
+		return store, desired, previous
+	}
+
+	t.Run("drifted live state forces the full apply", func(t *testing.T) {
+		store, desired, previous := newCase()
+		fake := &liveAuditFake{drift: true}
+		result, err := ApplyDesired(context.Background(), store, previous, desired, fake)
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		if !result.Changed || !result.Plan.Unchanged {
+			t.Fatalf("result = %+v, want a committed drift-heal on an unchanged plan", result)
+		}
+		if result.Manifest.Generation == "g1" {
+			t.Fatal("drift-heal must commit a new generation (the healed state is recorded)")
+		}
+		if fake.calls != 1 {
+			t.Fatalf("audit calls = %d, want exactly 1 (the audit runs only on the no-op plan)", fake.calls)
+		}
+		if strings.Join(fake.adapterFake.calls, ",") != "prepare,validate,backup,activate,transition,health" {
+			t.Fatalf("drifted no-op ran phases %v, want the full apply sequence", fake.adapterFake.calls)
+		}
+		if _, err := store.ReadJournal(); !os.IsNotExist(err) {
+			t.Fatalf("journal after successful heal = %v, want cleared", err)
+		}
+	})
+
+	t.Run("clean live state keeps the zero-churn no-op", func(t *testing.T) {
+		store, desired, previous := newCase()
+		fake := &liveAuditFake{drift: false}
+		result, err := ApplyDesired(context.Background(), store, previous, desired, fake)
+		if err != nil {
+			t.Fatalf("no-op apply: %v", err)
+		}
+		if result.Changed || !result.Plan.Unchanged {
+			t.Fatalf("result = %+v, want an uncommitted no-op", result)
+		}
+		if result.Manifest.Generation != "g1" {
+			t.Fatalf("no-op committed generation %q, want g1 untouched", result.Manifest.Generation)
+		}
+		if fake.calls != 1 {
+			t.Fatalf("audit calls = %d, want exactly 1 (the no-op path must still audit)", fake.calls)
+		}
+		if len(fake.adapterFake.calls) != 0 {
+			t.Fatalf("clean no-op ran adapter phases: %v, want zero (the af86f12 guarantee)", fake.adapterFake.calls)
+		}
+		if _, err := store.ReadJournal(); !os.IsNotExist(err) {
+			t.Fatalf("journal after clean no-op = %v, want none written", err)
+		}
+	})
+
+	t.Run("audit error fails closed before any mutation", func(t *testing.T) {
+		store, desired, previous := newCase()
+		fake := &liveAuditFake{err: errors.New("audit: stat failed")}
+		_, err := ApplyDesired(context.Background(), store, previous, desired, fake)
+		if err == nil || !strings.Contains(err.Error(), "audit live drift") {
+			t.Fatalf("error = %v, want the fail-closed audit wrap", err)
+		}
+		if len(fake.adapterFake.calls) != 0 {
+			t.Fatalf("audit failure ran adapter phases: %v, want zero", fake.adapterFake.calls)
+		}
+		if _, jerr := store.ReadJournal(); !os.IsNotExist(jerr) {
+			t.Fatalf("journal after audit failure = %v, want none written (fail before the journal)", jerr)
+		}
+	})
+
+	t.Run("adapter without the audit capability keeps the plain no-op", func(t *testing.T) {
+		store, desired, previous := newCase()
+		fake := &adapterFake{}
+		result, err := ApplyDesired(context.Background(), store, previous, desired, fake)
+		if err != nil {
+			t.Fatalf("no-op apply: %v", err)
+		}
+		if result.Changed || len(fake.calls) != 0 {
+			t.Fatalf("result = %+v calls = %v, want the unchallenged no-op (nil seam)", result, fake.calls)
+		}
+	})
+}
+
+// auditCoreFixture wires the real auditLiveDriftCore against a temp tree: a
+// committed Germany manifest whose unit files, managed binary, and xray
+// pointer all live under temp paths. The manifest's recorded paths are the
+// test redirects — exactly the trust boundary the audit uses (it stats the
+// paths the COMMIT recorded, not the canonical constants).
+type auditCoreFixture struct {
+	inner       *LinuxAdapter
+	store       *Store
+	unitDir     string
+	binDir      string
+	pointer     string
+	liveXray    string
+	liveSplit   string
+	renderXray  []byte
+	renderSplit []byte
+}
+
+func newAuditCoreFixture(t *testing.T) *auditCoreFixture {
+	t.Helper()
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx := &auditCoreFixture{store: store}
+	fx.unitDir = t.TempDir()
+	fx.binDir = t.TempDir()
+	fx.pointer = filepath.Join(t.TempDir(), "xray", "current")
+	withManagedPrefix(t, fx.binDir)
+
+	request := requestIn(t, store, renderSafeRequest(validGermanyRequest()))
+	desired, err := request.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildSystemdPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// plan.Specs is [xray, splitter] for Germany; the rendered bytes of the
+	// apply-ready spec are exactly the bytes the committed hash covers.
+	data, err := systemd.RenderUnit(applyReadySpec(plan.Specs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.renderXray = data
+	data, err = systemd.RenderUnit(applyReadySpec(plan.Specs[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.renderSplit = data
+	fx.liveXray = filepath.Join(fx.unitDir, "xray-germany.service")
+	fx.liveSplit = filepath.Join(fx.unitDir, "germany-splitter.service")
+
+	previous := manifestFromDesired(desired, "g1")
+	previous.Paths.UnitFiles = []string{fx.liveXray, fx.liveSplit}
+	previous.Paths.BinaryPointer = fx.pointer
+	if _, err := store.Commit(previous, "install"); err != nil {
+		t.Fatal(err)
+	}
+
+	inner := &LinuxAdapter{Store: store}
+	inner.liveAudit = inner.auditLiveDriftCore
+	fx.inner = inner
+	return fx
+}
+
+// writeClean makes every managed object match the commit: unit bytes equal
+// the committed render, the managed binary is regular 0755, the xray pointer
+// is a directory.
+func (fx *auditCoreFixture) writeClean(t *testing.T) {
+	t.Helper()
+	if err := os.WriteFile(fx.liveXray, fx.renderXray, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fx.liveSplit, fx.renderSplit, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fx.binDir, "germany-splitter"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fx.pointer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (fx *auditCoreFixture) audit(t *testing.T) (bool, error) {
+	t.Helper()
+	drifted, err := fx.inner.AuditLiveDrift(context.Background())
+	if err != nil {
+		t.Fatalf("AuditLiveDrift: %v", err)
+	}
+	return drifted, nil
+}
+
+// TestAuditLiveDriftCoreClassifiesManagedDrift pins the production audit's
+// read-only classification of the MANAGED objects only: committed unit bytes
+// vs the committed render, managed binary presence/mode, and (Germany) the
+// xray pointer. Non-managed paths are never consulted.
+func TestAuditLiveDriftCoreClassifiesManagedDrift(t *testing.T) {
+	t.Run("no committed manifest reports no drift", func(t *testing.T) {
+		store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner := &LinuxAdapter{Store: store}
+		inner.liveAudit = inner.auditLiveDriftCore
+		drifted, err := inner.AuditLiveDrift(context.Background())
+		if err != nil || drifted {
+			t.Fatalf("fresh host audit = (%v, %v), want (false, nil)", drifted, err)
+		}
+	})
+
+	t.Run("manifest without services reports no drift", func(t *testing.T) {
+		store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := Manifest{Schema: SchemaVersion, Role: RoleGermany, Generation: "g1", Paths: Paths{StateRoot: store.Root}}
+		if _, err := store.Commit(m, "install"); err != nil {
+			t.Fatal(err)
+		}
+		inner := &LinuxAdapter{Store: store}
+		inner.liveAudit = inner.auditLiveDriftCore
+		drifted, err := inner.AuditLiveDrift(context.Background())
+		if err != nil || drifted {
+			t.Fatalf("serviceless manifest audit = (%v, %v), want (false, nil)", drifted, err)
+		}
+	})
+
+	fx := newAuditCoreFixture(t)
+
+	t.Run("clean managed objects report no drift", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix mode bits not observable on this host (the binary 0755 check)")
+		}
+		fx.writeClean(t)
+		drifted, _ := fx.audit(t)
+		if drifted {
+			t.Fatal("clean tree classified as drifted")
+		}
+	})
+
+	t.Run("drifted unit bytes are drift", func(t *testing.T) {
+		fx.writeClean(t)
+		tampered := append(append([]byte{}, fx.renderSplit...), []byte("# tampered out-of-band\n")...)
+		if err := os.WriteFile(fx.liveSplit, tampered, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Read-only proof: the audit must not touch the tree it reads.
+		snap := func() string {
+			var b strings.Builder
+			for _, dir := range []string{fx.unitDir, fx.binDir} {
+				entries, err := os.ReadDir(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, e := range entries {
+					p := filepath.Join(dir, e.Name())
+					st, err := os.Lstat(p)
+					if err != nil {
+						t.Fatal(err)
+					}
+					h := ""
+					if st.Mode().IsRegular() {
+						data, err := os.ReadFile(p)
+						if err != nil {
+							t.Fatal(err)
+						}
+						sum := sha256.Sum256(data)
+						h = hex.EncodeToString(sum[:])
+					}
+					fmt.Fprintf(&b, "%s|%v|%s\n", p, st.Mode(), h)
+				}
+			}
+			return b.String()
+		}
+		before := snap()
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("tampered unit bytes not classified as drift")
+		}
+		if after := snap(); after != before {
+			t.Fatal("the audit MUTATED the managed tree it reads")
+		}
+	})
+
+	t.Run("absent committed unit is drift", func(t *testing.T) {
+		fx.writeClean(t)
+		if err := os.Remove(fx.liveXray); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("absent committed unit not classified as drift")
+		}
+	})
+
+	t.Run("symlinked unit is drift", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink creation requires developer mode; Linux CI is authoritative")
+		}
+		fx.writeClean(t)
+		if err := os.Remove(fx.liveSplit); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(fx.unitDir, "nowhere"), fx.liveSplit); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("planted symlink where a committed unit must be not classified as drift")
+		}
+	})
+
+	t.Run("absent managed binary is drift", func(t *testing.T) {
+		fx.writeClean(t)
+		if err := os.Remove(filepath.Join(fx.binDir, "germany-splitter")); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("absent managed binary not classified as drift")
+		}
+	})
+
+	t.Run("mode-drifted managed binary is drift", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix mode bits not observable on this host")
+		}
+		fx.writeClean(t)
+		if err := os.Chmod(filepath.Join(fx.binDir, "germany-splitter"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("0700 managed binary not classified as drift")
+		}
+	})
+
+	t.Run("absent xray pointer is drift", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix mode bits not observable on this host (the binary 0755 check would mask the pointer case)")
+		}
+		fx.writeClean(t)
+		if err := os.Remove(fx.pointer); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("absent xray pointer not classified as drift")
+		}
+	})
+
+	t.Run("non-directory xray pointer is drift", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix mode bits not observable on this host (the binary 0755 check would mask the pointer case)")
+		}
+		fx.writeClean(t)
+		if err := os.Remove(fx.pointer); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fx.pointer, []byte("not a dir"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		drifted, _ := fx.audit(t)
+		if !drifted {
+			t.Fatal("regular-file xray pointer not classified as drift")
+		}
+	})
+}
+
+// writingUnitApplyFake is the activate-phase ApplyUnit seam for the heal
+// test: it records the applied unit and WRITES the rendered spec bytes to
+// the fixture's live unit path, so the test can assert the heal actually
+// landed on disk. It reports Unchanged (the adapter-level extra-restart
+// channel stays off; a real T5 swap restarts inside ApplyUnit, which this
+// fake stands in for).
+type writingUnitApplyFake struct {
+	calls []string
+	live  map[string]string
+}
+
+func (f *writingUnitApplyFake) ApplyUnit(_ context.Context, _ *systemd.ServiceManager, s systemd.Spec) (systemd.Result, error) {
+	name := unitName(s)
+	f.calls = append(f.calls, name)
+	data, err := systemd.RenderUnit(s)
+	if err != nil {
+		return systemd.Result{}, err
+	}
+	if path, ok := f.live[name]; ok {
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			return systemd.Result{}, err
+		}
+	}
+	return systemd.Result{Unit: name, Unchanged: true}, nil
+}
+
+// healAuditAdapter is the activateOnlyAdapter plus the LiveAuditor
+// capability, so the REAL audit seam (wired to auditLiveDriftCore on the
+// inner adapter) is what the transaction consults — the production wiring,
+// not a scripted verdict.
+type healAuditAdapter struct {
+	activateOnlyAdapter
+}
+
+func (a *healAuditAdapter) AuditLiveDrift(ctx context.Context) (bool, error) {
+	return a.inner.AuditLiveDrift(ctx)
+}
+
+// TestInstallHealsDriftedLiveUnit is the end-to-end staging regression: the
+// committed state is a no-op against the request, but the LIVE unit file
+// diverges (the post-crash / out-of-band-edit shape). The transaction must
+// detect the drift through the live audit, fall through to the full apply,
+// re-write the drifted unit to the committed render, and commit a new
+// generation — instead of reporting "already converged" rc=0.
+func TestInstallHealsDriftedLiveUnit(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	withManagedPrefix(t, binDir)
+
+	request := requestIn(t, store, renderSafeRequest(validGermanyRequest()))
+	desired, err := request.Desired()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildSystemdPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderXray, err := systemd.RenderUnit(applyReadySpec(plan.Specs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderSplit, err := systemd.RenderUnit(applyReadySpec(plan.Specs[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitDir := t.TempDir()
+	liveXray := filepath.Join(unitDir, "xray-germany.service")
+	liveSplit := filepath.Join(unitDir, "germany-splitter.service")
+	pointer := filepath.Join(t.TempDir(), "xray", "current")
+
+	// The committed state: identical to the request (a no-op plan) with its
+	// recorded unit/pointer paths redirected at the temp tree, and the live
+	// objects in place — with the SPLITTER unit drifted out-of-band. Both
+	// desired and the commit are redirected so the plan stays a genuine
+	// no-op while the audit core reaches the planted tree through the
+	// committed (recorded) paths.
+	desired.Paths.UnitFiles = []string{liveXray, liveSplit}
+	desired.Paths.BinaryPointer = pointer
+	previous := manifestFromDesired(desired, "g1")
+	if _, err := store.Commit(previous, "install"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(liveXray, renderXray, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tampered := append(append([]byte{}, renderSplit...), []byte("# tampered out-of-band\n")...)
+	if err := os.WriteFile(liveSplit, tampered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "germany-splitter"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pointer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &recordingSystemdExec{}
+	applyFake := &writingUnitApplyFake{live: map[string]string{
+		"xray-germany.service":     liveXray,
+		"germany-splitter.service": liveSplit,
+	}}
+	inner := &LinuxAdapter{
+		Request:          request,
+		Store:            store,
+		Services:         systemd.NewServiceManager(exec),
+		Firewall:         &firewallFake{},
+		convergeStateDir: func(context.Context) error { return nil },
+		keypairFn: func(xray.Executor, string) (*xray.Keypair, error) {
+			return &xray.Keypair{PrivateRaw: strings.Repeat("Q", 43), PublicRaw: strings.Repeat("W", 43)}, nil
+		},
+		activateConfigFn: func(xray.ActivateParams) (xray.ActivationResult, error) {
+			// No keypair rotation: the heal is driven by the unit drift alone.
+			return xray.ActivationResult{LivePath: "unused", Changed: false}, nil
+		},
+		unitApply: applyFake,
+	}
+	inner.units = plan.Specs
+	inner.liveAudit = inner.auditLiveDriftCore
+	adapter := &healAuditAdapter{activateOnlyAdapter{inner: inner}}
+
+	tx := Transaction{
+		Store: store,
+		Journal: ArtifactJournal{
+			Role:       RoleGermany,
+			Generation: "pending-heal",
+			Units:      []string{"germany-splitter.service", "xray-germany.service"},
+			PreUnits:   []string{"germany-splitter.service", "xray-germany.service"},
+		},
+		Previous:  previous,
+		Desired:   desired,
+		AuditLive: adapter.AuditLiveDrift,
+		Recover:   func(ctx context.Context, old Manifest) error { return adapter.Restore(ctx, old) },
+		Steps: []Step{
+			{Phase: PhasePreflight, Name: "prepare", Run: func(context.Context) error { return nil }},
+			{Phase: PhaseValidate, Name: "validate", Run: func(context.Context) error { return nil }},
+			{Phase: PhaseBackup, Name: "backup", Run: func(context.Context) error { return nil }},
+			{Phase: PhaseActivate, Name: "activate", Run: func(stepCtx context.Context) error {
+				return adapter.Activate(stepCtx, desired)
+			}},
+			{Phase: PhaseTransition, Name: "transition", Run: func(context.Context) error { return nil }},
+			{Phase: PhaseHealth, Name: "health", Run: func(context.Context) error { return nil }},
+		},
+	}
+
+	result, err := tx.Apply(context.Background())
+	if err != nil {
+		t.Fatalf("drift-heal apply: %v", err)
+	}
+	if !result.Changed || !result.Plan.Unchanged {
+		t.Fatalf("result = %+v, want a committed heal of an unchanged plan", result)
+	}
+	if result.Manifest.Generation == "g1" {
+		t.Fatal("heal must commit a new generation")
+	}
+	if strings.Join(applyFake.calls, ",") != "xray-germany.service,germany-splitter.service" {
+		t.Fatalf("applied units = %v, want both units through the normal apply semantics", applyFake.calls)
+	}
+	// The heal landed on disk: the drifted unit now equals the committed
+	// render, and the already-clean unit is byte-identical.
+	got, err := os.ReadFile(liveSplit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(renderSplit) {
+		t.Fatal("drifted unit was not re-written to the committed render")
+	}
+	got, err = os.ReadFile(liveXray)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(renderXray) {
+		t.Fatal("clean unit bytes changed during the heal")
+	}
+	// The journal is cleared only by the commit.
+	if _, err := store.ReadJournal(); !os.IsNotExist(err) {
+		t.Fatalf("journal after successful heal = %v, want cleared", err)
+	}
+	// The adapter-level extra-restart channel stayed off (no config change,
+	// no keypair rotation): zero systemctl calls reach the executor. The
+	// swap-internal restart of a changed unit lives inside T5's ApplyUnit,
+	// which this test fakes by design.
+	if len(exec.lines) != 0 {
+		t.Fatalf("heal issued systemctl calls %v, want none at the adapter level", exec.lines)
+	}
+}

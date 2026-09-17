@@ -64,6 +64,56 @@ func convergeStateDir(adapter Adapter) func(context.Context) error {
 	return nil
 }
 
+// LiveAuditor is the OPTIONAL adapter capability for the live-state drift
+// audit of MANAGED deployment objects (DEFECT-2). The planner diffs
+// manifest-desired against manifest-current and never sees the live
+// filesystem, so a host whose managed unit files (or managed binaries) have
+// drifted since the last commit converges to a reported no-op ("already
+// converged") while the live state stays broken. ApplyDesired runs the audit
+// ONLY when the plan is a no-op: it compares the live unit bytes against the
+// committed render and checks the managed binary path/mode, and reports drift
+// (or a read error, which the transaction treats as fail-closed). On drift the
+// transaction falls through to the full apply so the objects re-converge
+// through the normal apply semantics; a clean audit returns the same zero-
+// PID-churn no-op as before (the af86f12 guarantee). Implementations must be
+// read-only: the audit observes, it never writes.
+type LiveAuditor interface {
+	AuditLiveDrift(context.Context) (bool, error)
+}
+
+// auditLiveDrift resolves the optional LiveAuditor capability of an adapter
+// (nil when the adapter does not implement it — the documented host fakes).
+func auditLiveDrift(adapter Adapter) func(context.Context) (bool, error) {
+	if a, ok := adapter.(LiveAuditor); ok {
+		return a.AuditLiveDrift
+	}
+	return nil
+}
+
+// PairingStaleMarker is the OPTIONAL adapter capability that reports whether
+// the just-executed transaction rotated the live pairing configuration
+// (DEFECT-3). When a config-rotating activate changed the managed Reality
+// keypair, the committed pairing B-fingerprint is now stale — the live
+// inbound is serving a keypair the on-disk pairing blob no longer matches, so
+// `pair apply` must re-emit Blob B before the exchange can authenticate. The
+// transaction consults this ONLY on a successful commit: a true value marks
+// the committed manifest's pairing state with an explicit pairingStale flag
+// that doctor surfaces and `pair apply` clears. nil means the adapter offers
+// no pairing marker (the documented host fakes), so the commit stays
+// unmarked.
+type PairingStaleMarker interface {
+	MarkPairingStale() bool
+}
+
+// markPairingStale resolves the optional PairingStaleMarker capability of an
+// adapter (nil when the adapter does not implement it).
+func markPairingStale(adapter Adapter) func() bool {
+	if a, ok := adapter.(PairingStaleMarker); ok {
+		return a.MarkPairingStale
+	}
+	return nil
+}
+
 // ApplyDesired executes a desired-state transaction through one injected host
 // adapter. Planning and manifest commit remain owned by Transaction; this
 // helper only maps the adapter lifecycle to the transaction phases.
@@ -85,6 +135,14 @@ func ApplyDesired(ctx context.Context, store *Store, previous Manifest, desired 
 		// no adapter phase ever runs. The controller still performs no host
 		// mutation itself — the mutation is the adapter's EnsureStateDir.
 		Converge: convergeStateDir(adapter),
+		// Live drift audit (DEFECT-2): consulted only on a no-op plan, so a
+		// drifted managed object still re-converges while a clean host keeps
+		// the zero-PID-churn no-op.
+		AuditLive: auditLiveDrift(adapter),
+		// Pairing staleness marker (DEFECT-3): consulted on commit so a config-
+		// rotating activate records that the committed B-fingerprint is now
+		// stale and `pair apply` must re-emit Blob B.
+		MarkPairingStale: markPairingStale(adapter),
 		Recover: func(recoveryCtx context.Context, old Manifest) error {
 			if old.Generation == "" {
 				return adapter.CleanupFresh(recoveryCtx, desired)

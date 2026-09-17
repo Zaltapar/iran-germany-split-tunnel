@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
 type Severity string
@@ -150,4 +152,119 @@ func StateFinding(err error) Finding {
 		action = "do not mutate the host; restore state from a trusted revision"
 	}
 	return Finding{ID: "state.integrity", Severity: severity, Summary: fmt.Sprintf("deployment state unavailable: %T", err), Action: action, Redacted: true}
+}
+
+// PairingStalenessCheck returns the read-only doctor check for pairing
+// staleness (DEFECT-3). It compares the committed pairing identity against a
+// re-derivation of the installed Reality config's PUBLIC parameters, and
+// surfaces the explicit pairingStale marker a config-rotating transaction
+// leaves on the committed manifest.
+//
+// Two independent signals both mean "the emitted pairing blob no longer
+// authenticates the live inbound, run `pair apply` to re-emit":
+//
+//   - the explicit marker: a config-rotating Activate regenerated the Reality
+//     keypair, which is INVISIBLE to the public-params fingerprint (SNI/
+//     shortID/UUID-hash), so only the marker records it.
+//   - public-param drift: the installed config's SNI/shortID/UUID re-derive to
+//     a fingerprint different from the committed Components.Xray.
+//     RealityFingerprint (the config was edited out-of-band).
+//
+// It is a WARN (remediation = re-emit, not repair) whenever either signal
+// fires, and a FAIL when the installed config is unreadable or mis-shaped
+// (the re-derivation itself is impossible). It is PASS when not applicable
+// (no committed Germany Reality config: a fresh host, an Iran manifest, or a
+// Germany manifest with no config path) or when both signals are clean. It is
+// READ-ONLY: it stats/reads the committed config and never writes. It echoes
+// no key material — only the public-parameter verdict and the sentinel
+// classification of a read failure.
+func PairingStalenessCheck(store *Store) Check {
+	return Check{ID: PairingStalenessCheckID, Run: func(context.Context) Finding {
+		m, err := store.Load()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return buildPairingStalenessFinding(pairingStalenessFacts{applicable: false}, nil)
+			}
+			return buildPairingStalenessFinding(pairingStalenessFacts{applicable: true, configErr: err}, nil)
+		}
+		if m.Role != RoleGermany || m.Paths.Config == "" {
+			return buildPairingStalenessFinding(pairingStalenessFacts{applicable: false}, nil)
+		}
+		facts := pairingStalenessFacts{
+			applicable:          true,
+			marker:              m.Pairing.PairingStale,
+			recordedFingerprint: m.Components.Xray.RealityFingerprint,
+		}
+		installed, ierr := xray.ReadInstalledRealityParams(m.Paths.Config)
+		if ierr != nil {
+			facts.configErr = ierr
+			return buildPairingStalenessFinding(facts, nil)
+		}
+		facts.installedFingerprint = realityFingerprint(xray.RealityParams{SNI: installed.SNI, ShortID: installed.ShortID, UUID: installed.UUID})
+		facts.paramDrift = facts.recordedFingerprint != "" && facts.recordedFingerprint != facts.installedFingerprint
+		return buildPairingStalenessFinding(facts, nil)
+	}}
+}
+
+// PairingStalenessCheckID is the doctor check id for pairing staleness.
+const PairingStalenessCheckID = "pairing.staleness"
+
+// pairingStalenessFacts is the host-observed input to the pure pairing-
+// staleness verdict renderer. It carries only public, secret-free facts.
+type pairingStalenessFacts struct {
+	applicable           bool
+	marker               bool
+	recordedFingerprint  string
+	installedFingerprint string
+	paramDrift           bool
+	configErr            error
+}
+
+// buildPairingStalenessFinding renders the observed facts as a Finding. It
+// is PURE (no I/O) so the verdict logic is assertable on any host.
+func buildPairingStalenessFinding(f pairingStalenessFacts, err error) Finding {
+	if err != nil {
+		return Finding{ID: PairingStalenessCheckID, Severity: SeverityFail,
+			Summary: "pairing staleness check failed: " + err.Error(),
+			Action:  "re-run doctor"}
+	}
+	if !f.applicable {
+		return Finding{ID: PairingStalenessCheckID, Severity: SeverityPass,
+			Summary: "pairing staleness not applicable (no committed Germany Reality config)"}
+	}
+	if f.configErr != nil {
+		return Finding{ID: PairingStalenessCheckID, Severity: SeverityFail,
+			Summary: "installed Germany Reality config cannot be re-derived (" + pairingConfigErrClass(f.configErr) + "); the pairing B-fingerprint cannot be verified",
+			Action:  "inspect the committed config path; run install or upgrade to re-converge it, then run pair apply to re-emit"}
+	}
+	if !f.marker && !f.paramDrift {
+		return Finding{ID: PairingStalenessCheckID, Severity: SeverityPass,
+			Summary: "pairing B-fingerprint matches the installed Reality config"}
+	}
+	var reasons []string
+	if f.marker {
+		reasons = append(reasons, "a config-rotating transaction marked the pairing stale (regenerated Reality keypair)")
+	}
+	if f.paramDrift {
+		reasons = append(reasons, "the installed Reality public params drifted from the committed fingerprint")
+	}
+	return Finding{ID: PairingStalenessCheckID, Severity: SeverityWarn,
+		Summary: "pairing B-fingerprint is stale: " + strings.Join(reasons, "; "),
+		Action:  "run pair apply to re-emit the pairing blob, then pair finalize; doctor is read-only and changes nothing"}
+}
+
+// pairingConfigErrClass maps a ReadInstalledRealityParams failure to a
+// secret-free, sentinel-based class (never echoing config bytes or key
+// material).
+func pairingConfigErrClass(err error) string {
+	switch {
+	case errors.Is(err, xray.ErrInstalledConfigRead):
+		return "config path unreadable"
+	case errors.Is(err, xray.ErrInstalledConfig):
+		return "config shape invalid"
+	case errors.Is(err, xray.ErrInstalledKey):
+		return "installed Reality key failed validation"
+	default:
+		return "config read failed"
+	}
 }

@@ -82,6 +82,7 @@ func TestRunMutationParsersRejectMalformedArguments(t *testing.T) {
 	cases := [][]string{
 		{"install"}, {"install", "france"},
 		{"pair"}, {"pair", "exchange"},
+		{"pair", "generate", "--bogus"}, {"pair", "generate", "--force", "extra"}, {"pair", "apply", "--force"},
 		{"upgrade", "--unknown"}, {"upgrade", "--xray", "--origin"},
 		{"rollback"}, {"rollback", "--to"}, {"rollback", "--to", "../escape"},
 		{"uninstall", "--force"}, {"recover", "--bogus"},
@@ -761,6 +762,7 @@ func TestPairRoleAndStateGates(t *testing.T) {
 		{"iran rejects apply", deploy.RoleIran, []string{"pair", "apply"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "Iran accepts only pair finalize"},
 		{"germany rejects finalize", deploy.RoleGermany, []string{"pair", "finalize"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "Germany accepts only pair apply"},
 		{"germany rejects generate", deploy.RoleGermany, []string{"pair", "generate"}, deploy.PairingState{State: deploy.PairingStateNone}, "", "generate is currently supported on Iran"},
+		{"iran generate after finalized refuses without --force", deploy.RoleIran, []string{"pair", "generate"}, deploy.PairingState{PeerRole: deploy.RoleGermany, State: "finalized", Fingerprints: []string{"final-fp"}}, "", "pairing state is finalized"},
 		{"apply after finalized rejected", deploy.RoleGermany, []string{"pair", "apply"}, deploy.PairingState{PeerRole: deploy.RoleIran, State: "finalized"}, blobA, "only valid before or after a-applied"},
 		{"apply without config path", deploy.RoleGermany, []string{"pair", "apply"}, deploy.PairingState{State: deploy.PairingStateNone}, blobA, "records no Xray config path"},
 	}
@@ -807,6 +809,69 @@ func TestPairRoleAndStateGates(t *testing.T) {
 	}
 	if s, _ := store.Load(); s.Pairing.State != "a-generated" {
 		t.Fatalf("state = %+v", s.Pairing)
+	}
+}
+
+// TestPairGenerateForceRestartsFinalized is the DEFECT-4 positive regression:
+// with the exchange FINALIZED, plain `pair generate` is refused (staging
+// surprise: it silently reset the state to a-generated and the carried-over
+// Blob A was orphaned), but `pair generate --force` deliberately restarts it
+// — one atomic commit to a-generated, a fresh parseable Blob A, and the
+// committed manifest carrying the new fingerprint. Determinism of the
+// (nonce-free) Blob A makes a second --force re-emit the identical blob.
+func TestPairGenerateForceRestartsFinalized(t *testing.T) {
+	secret := strings.Repeat("g", 64)
+	domain := "upload.example.org"
+	store := commitPairingManifest(t, deploy.RoleIran, "", deploy.PairingState{
+		PeerRole: deploy.RoleGermany, State: "finalized", Fingerprints: []string{"finalized-fp"},
+	})
+	secretPath := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secretPath, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPLITTERCTL_SECRET_FILE", secretPath)
+	t.Setenv("SPLITTERCTL_UPLOAD_DOMAIN", domain)
+
+	// Plain generate on a finalized state refuses and commits nothing.
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"pair", "generate"}, &out, &out)
+	if err == nil || !strings.Contains(err.Error(), "pairing state is finalized") {
+		t.Fatalf("plain generate: error = %v, want the finalized refusal", err)
+	}
+	if s, _ := store.Load(); s.Pairing.State != "finalized" {
+		t.Fatalf("refused generate mutated the state: %+v", s.Pairing)
+	}
+	if strings.Contains(out.String(), "splat-v1.") {
+		t.Fatalf("refused generate must not emit a blob: %q", out.String())
+	}
+
+	// --force restarts the exchange: a-generated with one fresh fingerprint.
+	out.Reset()
+	if err := run(context.Background(), []string{"pair", "generate", "--force"}, &out, &out); err != nil {
+		t.Fatalf("pair generate --force: %v", err)
+	}
+	blobA := lastLine(t, out.String())
+	if _, err := pairing.ParseBlobA(blobA); err != nil {
+		t.Fatalf("forced blob A must parse: %v", err)
+	}
+	s, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Pairing.State != "a-generated" || s.Pairing.PeerRole != deploy.RoleGermany || len(s.Pairing.Fingerprints) != 1 {
+		t.Fatalf("state after --force = %+v, want a-generated with one fingerprint", s.Pairing)
+	}
+	// A second --force with the same inputs re-emits the IDENTICAL blob
+	// (NewBlobA is nonce-free and deterministic) and the state converges.
+	out.Reset()
+	if err := run(context.Background(), []string{"pair", "generate", "--force"}, &out, &out); err != nil {
+		t.Fatalf("second pair generate --force: %v", err)
+	}
+	if again := lastLine(t, out.String()); again != blobA {
+		t.Fatal("deterministic re-generate must emit the identical blob")
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatal("generate leaked the raw secret outside the blob")
 	}
 }
 
@@ -1499,7 +1564,8 @@ func TestUpgradeRequiresLinuxAndInstalledState(t *testing.T) {
 
 // TestUpgradeRefusesUnsupportedTargets covers the documented component
 // restrictions: Iran has no managed Xray, --origin requires a configured
-// origin, and --splitter must be driven by a real environment change.
+// origin, and a --xray/--origin environment pin that conflicts with the pinned
+// managed version is refused rather than silently overridden.
 func TestUpgradeRefusesUnsupportedTargets(t *testing.T) {
 	withLinux(t)
 	root := withMutationEnv(t, deploy.RoleIran)
@@ -1521,7 +1587,6 @@ func TestUpgradeRefusesUnsupportedTargets(t *testing.T) {
 		wantMsg string
 	}{
 		{"xray on Iran", []string{"upgrade", "--xray"}, "uses an external Xray"},
-		{"splitter with no environment change", []string{"upgrade", "--splitter"}, "no splitter change"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1557,6 +1622,53 @@ func TestUpgradeRefusesUnsupportedTargets(t *testing.T) {
 	}
 	if len(germanyFake.calls) != 0 {
 		t.Fatalf("refused --origin mutated the host: %#v", germanyFake.calls)
+	}
+}
+
+// TestUpgradeSameVersionSplitterConverges is the DEFECT-5 semantics: a
+// same-version `upgrade --splitter` on an unchanged environment is the
+// documented no-op (not a refusal) for both roles — it reports "already
+// converged", commits nothing, runs no transaction, and writes no journal.
+// A live host that drifted away from its committed deployment is healed by
+// the controller's live audit instead of being refused up front.
+func TestUpgradeSameVersionSplitterConverges(t *testing.T) {
+	withLinux(t)
+	for _, role := range []string{deploy.RoleIran, deploy.RoleGermany} {
+		t.Run(role, func(t *testing.T) {
+			root := withMutationEnv(t, role)
+			store, err := deploy.NewStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := installRequestFromEnv(role)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := installForTest(t, store, request)
+			fake := &mutationFake{}
+			defer stubMutationController(store, fake)()
+
+			var out bytes.Buffer
+			if err := run(context.Background(), []string{"upgrade", "--splitter"}, &out, &out); err != nil {
+				t.Fatalf("upgrade --splitter (same version): %v", err)
+			}
+			if !strings.Contains(out.String(), "upgrade: already converged") || !strings.Contains(out.String(), "splitter v1.0.0") {
+				t.Fatalf("output = %q", out.String())
+			}
+			if len(fake.calls) != 0 {
+				t.Fatalf("same-version upgrade mutated the host: %#v", fake.calls)
+			}
+			committed, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if committed.Generation != before.Generation {
+				t.Fatalf("same-version upgrade committed a new generation %q (was %q)", committed.Generation, before.Generation)
+			}
+			if _, err := store.ReadJournal(); !os.IsNotExist(err) {
+				t.Fatalf("same-version upgrade wrote a journal: %v", err)
+			}
+		})
 	}
 }
 
