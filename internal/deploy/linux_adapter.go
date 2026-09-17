@@ -692,14 +692,27 @@ func (a *LinuxAdapter) auditLiveDriftCore(ctx context.Context) (bool, error) {
 	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o755 {
 		return true, nil
 	}
-	// Germany xray binary pointer (the <prefix>/xray/current directory the
-	// unit's "current" pointer runs through): must at least be present. A
-	// missing pointer means the unit cannot exec xray at all. It is a
-	// MANAGED object, so its absence is drift the prepare phase re-converges
-	// (EnsureBinaryPointer); we do not assert its target version, which the
-	// manifest's xray component already records.
+	// Germany xray binary pointer (the <prefix>/xray/current SYMLINK that
+	// T5 implements as a version-pointer link into a pinned version
+	// directory, e.g. current → /opt/split-tunnel/xray/v26.3.27).
+	//
+	// We os.Stat (which FOLLOWS symlinks) to verify the resolved target is
+	// a regular directory. The check is fail-closed:
+	//   - missing pointer           → os.Stat ENOENT  → os.IsNotExist → drift
+	//   - dangling/broken symlink   → os.Stat ENOENT   → os.IsNotExist → drift
+	//   - symlink to a regular file → os.Stat succeeds but !IsDir      → drift
+	//   - valid symlink to a dir    → os.Stat succeeds and  IsDir      → no drift
+	//
+	// Do NOT use os.Lstat here: Lstat does not follow symlinks, so a
+	// healthy version-pointer link (which IS a symlink, not a directory)
+	// would always classify as drift, causing every install/upgrade/config
+	// set/rollback on a converged Germany host to commit a spurious new
+	// generation and rotate the Reality keypair.
+	//
+	// The prepare phase's EnsureBinaryPointer re-converges a broken pointer
+	// in a real transaction; this audit only reports it.
 	if previous.Role == RoleGermany && previous.Paths.BinaryPointer != "" {
-		st, err := os.Lstat(previous.Paths.BinaryPointer)
+		st, err := os.Stat(previous.Paths.BinaryPointer)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return true, nil
