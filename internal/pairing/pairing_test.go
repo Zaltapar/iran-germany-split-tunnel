@@ -1,6 +1,7 @@
 package pairing
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -228,7 +229,15 @@ func TestNewBlobBCanonicalizesLegacyPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(wire, "realityPublicKey\\\":\\\""+want) {
+	parts := strings.Split(wire, ".")
+	if len(parts) != 3 {
+		t.Fatalf("encoded Blob B has %d wire parts, want 3", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode encoded Blob B payload: %v", err)
+	}
+	if !bytes.Contains(payload, []byte(`"realityPublicKey":"`+want+`"`)) {
 		t.Fatal("encoded Blob B does not contain the canonical RawURL key")
 	}
 }
