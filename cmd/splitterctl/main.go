@@ -1437,13 +1437,10 @@ func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
 				return deploy.Finding{ID: "service.active", Severity: deploy.SeverityWarn, Summary: "managed service active/settled state is not measurable on this non-Linux host", Action: "operator must run splitterctl doctor on the Linux deployment host"}
 			}})
 		}
-		checks = append(checks, deploy.Check{ID: "listener.binds", Run: func(context.Context) deploy.Finding {
-			return deploy.Finding{ID: "listener.binds", Severity: deploy.SeverityWarn, Summary: "expected listener binds are not probed by this doctor build", Action: "operator must verify the recorded service listeners with ss -ltnp and the deployment configuration"}
-		}})
+		expected := expectedListenerBinds(manifest.Role)
+		checks = append(checks, deploy.ListenerBindsCheck(systemd.OSExecutor{}, expected))
 		if manifest.Role == deploy.RoleGermany {
-			checks = append(checks, deploy.Check{ID: "xray.config", Run: func(context.Context) deploy.Finding {
-				return deploy.Finding{ID: "xray.config", Severity: deploy.SeverityWarn, Summary: "Xray config validation/version execution is not performed by doctor", Action: "operator must run the pinned Xray binary's version and run -test checks on the Germany host"}
-			}})
+			checks = append(checks, deploy.XrayConfigCheck(xray.OSExecutor{}, manifest.Components.Xray.Path, manifest.Paths.Config, manifest.Components.Xray.Version))
 		}
 		checks = append(checks, deploy.Check{ID: "network.external", Run: func(context.Context) deploy.Finding {
 			return deploy.Finding{ID: "network.external", Severity: deploy.SeverityWarn, Summary: "DNS, CDN, NAT, TLS/WebSocket, and public reachability are external checks", Action: "operator must run the documented preflight commands from the deployment runbook"}
@@ -1469,6 +1466,23 @@ func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
 		return errors.New("doctor: one or more checks failed")
 	}
 	return nil
+}
+
+func expectedListenerBinds(role string) []string {
+	cfg, err := config.Load(role)
+	if err != nil {
+		return nil
+	}
+	var expected []string
+	if role == deploy.RoleIran {
+		expected = append(expected, cfg.SocksListen, cfg.WsListen)
+	} else {
+		expected = append(expected, cfg.DownListen)
+	}
+	if cfg.MetricsPort > 0 {
+		expected = append(expected, "127.0.0.1:"+strconv.Itoa(cfg.MetricsPort))
+	}
+	return expected
 }
 
 func configShow(_ context.Context, store *deploy.Store, out io.Writer) error {

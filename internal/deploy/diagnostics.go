@@ -303,10 +303,74 @@ func FirewallAuditCheck(manager firewall.Manager, plan firewall.Plan) Check {
 		if plan.Backend == firewall.BackendNone {
 			return Finding{ID: "firewall.audit", Severity: SeverityPass, Summary: "firewall management is explicitly disabled by the deployment plan"}
 		}
+		if manager == nil {
+			return Finding{ID: "firewall.audit", Severity: SeverityWarn, Summary: "firewall ownership audit provider is unavailable", Action: "operator must inspect only project-marked rules with the selected firewall backend"}
+		}
 		if _, err := manager.Inspect(ctx, plan); err != nil {
-			return Finding{ID: "firewall.audit", Severity: SeverityWarn, Summary: "firewall ownership audit was unavailable", Action: "operator must inspect the selected firewall backend and project marker"}
+			return Finding{ID: "firewall.audit", Severity: SeverityWarn, Summary: "firewall ownership audit was unavailable", Action: "operator must inspect only project-marked rules with the selected firewall backend"}
 		}
 		return Finding{ID: "firewall.audit", Severity: SeverityPass, Summary: "selected firewall backend was audited read-only for project-owned rules"}
+	}}
+}
+
+// ListenerBindsCheck compares expected local TCP listeners with the read-only
+// `ss` snapshot. It never probes by binding a socket and never changes the
+// host. The caller supplies normalized host:port values from validated config.
+func ListenerBindsCheck(ex systemd.SystemdExecutor, expected []string) Check {
+	return Check{ID: "listener.binds", Run: func(ctx context.Context) Finding {
+		if len(expected) == 0 {
+			return Finding{ID: "listener.binds", Severity: SeverityWarn, Summary: "no expected managed listener binds are available", Action: "operator must verify listeners from the committed role configuration"}
+		}
+		if ex == nil {
+			ex = systemd.OSExecutor{}
+		}
+		out, err := ex.Run(ctx, "ss", "-ltnH")
+		if err != nil {
+			return Finding{ID: "listener.binds", Severity: SeverityWarn, Summary: "local listener snapshot is unavailable", Action: "operator must run ss -ltnp and compare listeners with the committed configuration"}
+		}
+		missing := make([]string, 0)
+		for _, want := range expected {
+			if !listenerSnapshotContains(out, want) {
+				missing = append(missing, want)
+			}
+		}
+		if len(missing) > 0 {
+			return Finding{ID: "listener.binds", Severity: SeverityFail, Summary: "expected managed listener bind is missing: " + strings.Join(missing, ", "), Action: "inspect the corresponding service and configuration; doctor is read-only"}
+		}
+		return Finding{ID: "listener.binds", Severity: SeverityPass, Summary: "expected managed TCP listener binds are present in the local socket snapshot"}
+	}}
+}
+
+func listenerSnapshotContains(snapshot, expected string) bool {
+	for _, line := range strings.Split(snapshot, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		local := fields[3]
+		if local == expected || strings.HasSuffix(local, ":"+strings.TrimPrefix(expected, ":")) {
+			return true
+		}
+	}
+	return false
+}
+
+// XrayConfigCheck runs only the pinned binary's read-only version and config
+// test gates. Output is deliberately discarded so diagnostics cannot echo
+// config or key material. A nil executor is unavailable, not a claim of pass.
+func XrayConfigCheck(ex xray.Executor, binaryPath, configPath, expectedVersion string) Check {
+	return Check{ID: "xray.config", Run: func(context.Context) Finding {
+		if ex == nil || binaryPath == "" || configPath == "" || !filepath.IsAbs(binaryPath) || !filepath.IsAbs(configPath) {
+			return Finding{ID: "xray.config", Severity: SeverityWarn, Summary: "Xray version/config test is unavailable", Action: "operator must run the pinned Xray binary's version and run -test checks on the Germany host"}
+		}
+		version, err := ex.VersionOutput(binaryPath)
+		if err != nil || (expectedVersion != "" && !strings.Contains(version, expectedVersion)) {
+			return Finding{ID: "xray.config", Severity: SeverityFail, Summary: "installed Xray version check failed", Action: "restore the recorded pinned Xray artifact before restarting services"}
+		}
+		if _, err := ex.RunTest(binaryPath, configPath); err != nil {
+			return Finding{ID: "xray.config", Severity: SeverityFail, Summary: "installed Xray rejected its generated configuration", Action: "inspect the generated Germany config and re-converge it through splitterctl"}
+		}
+		return Finding{ID: "xray.config", Severity: SeverityPass, Summary: "installed Xray version and generated configuration passed read-only checks"}
 	}}
 }
 
