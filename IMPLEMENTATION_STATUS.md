@@ -5,6 +5,40 @@ Latest recorded commit: `2927f847` (T8-B M5: `config set` + `upgrade` wired
 through `Controller.ApplyRequest`; full local tests green, Linux staging
 pending)
 
+## Final repository reconciliation — 2026-09-18
+
+- **Verified remote `main` tip:** `fb5dc932802254345d31c7dfdb69960d7df608fe`,
+  parent `2da337e463ce0fd8a8375a23c637581e1ffa3b3e`.
+- **Batch remediation commits:** Batch 1/3 is recorded at
+  `34b4b64b809df58c742c2a556def0e05f685d17b` (H-2, H-3, M-2, M-3); Batch 2
+  is recorded at `2da337e463ce0fd8a8375a23c637581e1ffa3b3e`, with the
+  read-only doctor completion at the current tip `fb5dc932802254345d31c7dfdb69960d7df608fe`.
+- **CI evidence:** Batch 2 CI is **UNVERIFIED** in this reconciliation;
+  no Actions result is claimed where lookup was unavailable. Local/documentary
+  evidence must not be treated as Linux CI or staging evidence.
+- **Staging evidence (dated historical evidence only):** observations from
+  deployed commits `be0a2e4`, `0fff2b3`, and `af86f12` are retained as
+  historical evidence and do **not** verify the current remote tip. The
+  verified staging endpoints are Iran `188.121.111.122` and Germany
+  `91.107.152.1`; domain `arvan.zaltii.ir`; L5 matrix result `200/200/200`.
+  Pairing evidence is Iran **finalized** and Germany **a-applied**.
+  Iran Xray/3x-ui and the Germany external **xray-consumer** remain unmanaged
+  ownership boundaries; these observations do not change that ownership.
+- **Remaining external blocker:** the external upload probe timeout remains
+  unresolved. It is not converted into a code or staging success claim.
+- **Open issues — no false closures:** [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19),
+  [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20),
+  [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21),
+  [#10](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/10),
+  [#11](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/11), and
+  [#12](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/12)
+  remain open unless independently resolved and recorded; this reconciliation
+  does not close or imply closure of any issue.
+- **Production readiness:** prohibited pending Linux verification of Batch 2
+  and disposition of the adversarial gate. T8/L5 production readiness is not
+  claimed from the historical staging observations or the current-tip
+  documentation alone.
+
 ## Current state
 
 ### Batch 2 remediation — implemented in this worktree
