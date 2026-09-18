@@ -36,13 +36,14 @@ type InstallRequest struct {
 	OriginVersion   string
 	OriginPath      string
 
-	// SplitterSHA256 and XraySHA256 are OPTIONAL artifact content hashes. They
-	// are intentionally not required by Validate: the current CLI contract
-	// carries only a version and a path, so no authoritative binary hash is
-	// available. When set (e.g. by an operator tool that verified a download),
-	// Desired records them as true binary hashes and the planner detects an
-	// in-place replacement that keeps the same path/version. When empty the
-	// field is left unasserted rather than fabricated.
+	// SplitterSHA256 and XraySHA256 are artifact content hashes (H-3). They
+	// are not required by Validate: the CLI computes SplitterSHA256 locally
+	// from the operator-supplied absolute artifact path when that file is
+	// present, and records it as a true binary content hash so Desired/planner
+	// detect an in-place replacement that keeps the same path/version. When
+	// the artifact is not present (or a legacy request predates the field)
+	// the value stays empty and is treated as unasserted, not fabricated.
+	// These are non-secret digests — never wire or secret material.
 	SplitterSHA256 string
 	XraySHA256     string
 

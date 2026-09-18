@@ -86,10 +86,14 @@ type Components struct {
 type ComponentState struct {
 	Version string `json:"version,omitempty"`
 	Path    string `json:"path,omitempty"`
-	// SHA256 is the SHA-256 of the installed binary. It is empty when the
-	// request does not carry an artifact hash (the CLI currently does not), in
-	// which case the planner treats it as unasserted rather than fabricating a
-	// value.
+	// SHA256 is the SHA-256 of the installed binary content. The CLI computes
+	// it locally from the operator-supplied absolute artifact path (H-3) and
+	// records it here so a byte change at an unchanged path/version is
+	// planned as convergence and failed closed on re-entry/upgrade. It is
+	// empty only when the request does not assert an artifact hash (an absent
+	// file, or a legacy request that predates the field), in which case the
+	// planner treats it as unasserted rather than fabricating a value. The
+	// digest is a non-secret content identity — never a wire or secret value.
 	SHA256 string `json:"sha256,omitempty"`
 	// RealityFingerprint is the xray-only fingerprint of the PUBLIC Reality
 	// parameters. It is preserved from the legacy overloaded sha256 field.

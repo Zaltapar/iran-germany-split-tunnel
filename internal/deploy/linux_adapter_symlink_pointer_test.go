@@ -46,11 +46,15 @@ func symlinkPointerFX(t *testing.T) *auditCoreFixture {
 		t.Fatal(err)
 	}
 
-	// Create the pinned version directory and the symlink.
-	// fx.pointer is <tmp>/xray/current; parent is <tmp>/xray.
+	// Create the pinned version directory, its regular xray binary, and the
+	// symlink. The managed shape is current → <prefix>/xray/<version> holding a
+	// regular 0755 xray binary — exactly what the M-3 pointer contract demands.
 	parent := filepath.Dir(fx.pointer)
 	pinnedDir := filepath.Join(parent, "v26.3.27")
 	if err := os.MkdirAll(pinnedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pinnedDir, "xray"), []byte("xray"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(pinnedDir, fx.pointer); err != nil {
@@ -100,6 +104,68 @@ func TestSymlinkPointerDanglingIsDrift(t *testing.T) {
 	drifted, _ := fx.audit(t)
 	if !drifted {
 		t.Fatal("dangling symlink pointer not classified as drift (fail-closed violation)")
+	}
+}
+
+// TestSymlinkPointerOutsidePrefixIsDrift (M-3)
+//
+// The xray version pointer is a healthy symlink whose target escapes the
+// managed <prefix>/xray directory (e.g. current → /etc/evil). The M-3
+// containment check must reject an out-of-prefix target as drift even when
+// the target is a real directory carrying a regular binary.
+func TestSymlinkPointerOutsidePrefixIsDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires developer mode; Linux CI is authoritative")
+	}
+	fx := symlinkPointerFX(t)
+	// Plant an out-of-prefix directory with a binary, then repoint.
+	evil := filepath.Join(t.TempDir(), "evil-xray")
+	if err := os.MkdirAll(evil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evil, "xray"), []byte("evil"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fx.pointer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(evil, fx.pointer); err != nil {
+		t.Fatal(err)
+	}
+	drifted, _ := fx.audit(t)
+	if !drifted {
+		t.Fatal("out-of-prefix symlink target not classified as drift (containment violation)")
+	}
+}
+
+// TestSymlinkPointerWrongVersionIsDrift (M-3)
+//
+// The xray version pointer resolves to a version directory INSIDE the managed
+// prefix, but a version other than the one committed in the manifest. The
+// M-3 wrong-version check must flag this as drift (the committed manifest
+// pins v26.3.27; pointing at v9.9.9 is a pointer mismatch).
+func TestSymlinkPointerWrongVersionIsDrift(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires developer mode; Linux CI is authoritative")
+	}
+	fx := symlinkPointerFX(t)
+	parent := filepath.Dir(fx.pointer)
+	wrong := filepath.Join(parent, "v9.9.9")
+	if err := os.MkdirAll(wrong, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wrong, "xray"), []byte("xray"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(fx.pointer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(wrong, fx.pointer); err != nil {
+		t.Fatal(err)
+	}
+	drifted, _ := fx.audit(t)
+	if !drifted {
+		t.Fatal("wrong-version symlink target not classified as drift")
 	}
 }
 
@@ -217,10 +283,14 @@ func TestSymlinkPointerNoOpTransaction(t *testing.T) {
 	liveXray := filepath.Join(unitDir, "xray-germany.service")
 	liveSplit := filepath.Join(unitDir, "germany-splitter.service")
 
-	// Create the pinned version directory and the symlink.
+	// Create the pinned version directory, its regular xray binary, and the
+	// symlink — the healthy managed shape the M-3 pointer contract accepts.
 	xrayParent := filepath.Join(t.TempDir(), "xray")
 	pinnedDir := filepath.Join(xrayParent, "v26.3.27")
 	if err := os.MkdirAll(pinnedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pinnedDir, "xray"), []byte("xray"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	pointer := filepath.Join(xrayParent, "current")

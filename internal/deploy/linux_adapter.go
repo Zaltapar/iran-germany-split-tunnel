@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
@@ -712,18 +713,111 @@ func (a *LinuxAdapter) auditLiveDriftCore(ctx context.Context) (bool, error) {
 	// The prepare phase's EnsureBinaryPointer re-converges a broken pointer
 	// in a real transaction; this audit only reports it.
 	if previous.Role == RoleGermany && previous.Paths.BinaryPointer != "" {
-		st, err := os.Stat(previous.Paths.BinaryPointer)
+		pointer := previous.Paths.BinaryPointer
+		committedVersion := previous.Components.Xray.Version
+
+		// Lstat the pointer object itself first. The managed pointer is a
+		// SYMLINK into a pinned version directory; a regular file planted
+		// at "current" is not the managed shape and is drift.
+		lst, lerr := os.Lstat(pointer)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				return true, nil // pointer absent → drift
+			}
+			return false, lerr
+		}
+		if lst.Mode().IsRegular() {
+			return true, nil // a regular file at the pointer → drift
+		}
+
+		// Resolve the target (follow the symlink). os.Stat failing is either
+		// a dangling link (ENOENT → drift) or a real read error (fail-closed).
+		st, err := os.Stat(pointer)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return true, nil
+				return true, nil // dangling/broken pointer → drift
 			}
 			return false, err
 		}
 		if !st.IsDir() {
-			return true, nil
+			return true, nil // target is not a directory → drift
+		}
+
+		// When the pointer is a managed symlink we can demand the full
+		// containment + version + executable contract. A plain real
+		// directory at the pointer (the defensive legacy shape some older
+		// fixtures use) is accepted as no-drift so long as it is a dir; the
+		// version/executable checks below apply to the symlink form.
+		if lst.Mode()&os.ModeSymlink != 0 {
+			parent := filepath.Dir(pointer)
+			absParent, perr := filepath.Abs(parent)
+			if perr != nil {
+				return false, perr
+			}
+			rl, rerr := os.Readlink(pointer)
+			if rerr != nil {
+				return false, rerr
+			}
+			if !filepath.IsAbs(rl) {
+				rl = filepath.Join(parent, rl)
+			}
+			absTarget, terr := filepath.Abs(rl)
+			if terr != nil {
+				return false, terr
+			}
+			// Out-of-prefix: the resolved target must live strictly inside the
+			// pointer's parent directory (<prefix>/xray).
+			if !strictlyInside(absTarget, absParent) {
+				return true, nil
+			}
+			// Wrong-version: the target must be exactly <parent>/<committed
+			// version> (the shape EnsureBinaryPointer writes). A target named
+			// by any other version is a pointer drift.
+			if committedVersion != "" {
+				expected := filepath.Join(absParent, committedVersion)
+				if absTarget != expected {
+					return true, nil
+				}
+				// The version dir must carry the regular executable xray binary
+				// the unit's ExecStart resolves through the pointer.
+				bin := filepath.Join(absTarget, "xray")
+				bst, berr := os.Stat(bin)
+				if berr != nil {
+					if os.IsNotExist(berr) {
+						return true, nil // version dir without its binary → drift
+					}
+					return false, berr
+				}
+				if !bst.Mode().IsRegular() {
+					return true, nil
+				}
+			}
 		}
 	}
 	return false, nil
+}
+
+// strictlyInside reports whether p is a strictly-inside path under d
+// (d is a proper prefix of p, with p not equal to d and no ".."
+// components that escape it). Used by auditLiveDriftCore to verify
+// the xray version-pointer target lives inside its parent directory.
+func strictlyInside(p, d string) bool {
+	if p == d {
+		return false
+	}
+	// p must start with d + "/" (or d + "\")
+	prefix := d + string(filepath.Separator)
+	if len(p) <= len(prefix) || p[:len(prefix)] != prefix {
+		return false
+	}
+	// Reject any ".." component that would escape the prefix.
+	rel := p[len(prefix):]
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *LinuxAdapter) Transition(ctx context.Context, desired DesiredState) error {

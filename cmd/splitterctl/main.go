@@ -55,6 +55,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -855,6 +857,19 @@ func installRequestFromEnv(role string) (deploy.InstallRequest, error) {
 	}
 	request.SplitterPath = splitterBin
 	request.SplitterVersion = splitterVersion
+	// H-3: record the content identity of the supplied splitter artifact at the
+	// deployment boundary. The digest is computed from the absolute binary the
+	// operator pointed us at (SPLITTERCTL_SPLITTER_BIN), NEVER a value carried
+	// on the wire or in state — it is derived locally and is a non-secret
+	// artifact hash. It is persisted in the manifest and re-asserted on
+	// re-entry/upgrade; if the bytes at the same path/version change between
+	// runs, the planner plans a convergence and the transaction fails closed
+	// rather than silently adopting different content under an unchanged
+	// version string. When the file is not present (a non-mutating validation
+	// or read-only context, or a host where the artifact has not yet been
+	// staged) the field is left unasserted ("") so legacy hosts and the
+	// planner's empty/unknown rule keep their no-drift semantics.
+	request.SplitterSHA256 = hashFileSha256Hex(splitterBin)
 
 	request.Firewall, err = firewallPlanFromEnv(role)
 	if err != nil {
@@ -1268,32 +1283,118 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, force bo
 	return nil
 }
 
-// writeEmittedBlob writes an emitted pairing blob 0600 to an operator-chosen
-// absolute path for non-display relay. It refuses symlinked targets, creates
-// with 0600, fsyncs, and re-asserts the mode on overwrite (package-level
-// os.Chmod, matching the rest of the CLI's file writes). The blob is by
-// design a one-time, human-carried artifact — this helper never logs or
-// echoes its content.
-func writeEmittedBlob(path, blob string) error {
-	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() {
-		return errors.New("target exists and is not a regular file (refusing)")
+// hashFileSha256Hex returns the hex-encoded SHA-256 of a regular file's bytes,
+// or "" when the file does not exist or is not a regular readable file. It is
+// the H-3 content-identity primitive: the digest is derived locally from the
+// operator-supplied absolute artifact path and is never a value carried on the
+// wire or persisted as a secret. Callers store the result as the artifact's
+// SplitterSHA256/XraySHA256 so a byte change at an unchanged path/version is
+// planned and failed closed, while an absent artifact stays unasserted (""),
+// preserving the planner's empty/unknown no-drift rule for legacy state.
+func hashFileSha256Hex(path string) string {
+	if !filepath.IsAbs(path) {
+		return ""
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	st, err := os.Lstat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return ""
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return ""
 	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// writeEmittedBlob writes an emitted pairing blob 0600 to an operator-chosen
+// absolute path for non-display relay. It is the no-follow-safe, atomic
+// variant required by M-2:
+//
+//   - refuses non-regular final targets (a symlink or directory planted at
+//     the path is an error, never followed);
+//   - creates a secure temp file in the destination directory via the
+//     O_EXCL-style pattern in deploy.atomicWrite (mode 0600, owner-only, no
+//     race with a concurrent replacer of the target path);
+//   - writes the blob, fsyncs, closes, and atomically renames into place —
+//     so a concurrent symlink swap against the final path between our Lstat
+//     and our write cannot redirect the write to an unmanaged location;
+//   - re-verifies descriptor ownership after the rename (the renamed inode
+//     must still be the regular 0600 file we just wrote) before returning.
+//
+// The blob is by design a one-time, human-carried artifact — this helper
+// never logs or echoes its content, and errors intentionally do not carry
+// blob bytes.
+func writeEmittedBlob(path, blob string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("pair blob out path must be absolute")
+	}
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	// Secure temp creation in the destination directory. O_EXCL is implied
+	// by O_CREATE on a fresh random name; we also verify the parent is a
+	// real directory so a symlinked parent cannot redirect the write.
+	if st, err := os.Lstat(dir); err != nil {
+		return fmt.Errorf("pair blob out dir: %w", err)
+	} else if !st.Mode().IsDir() || st.Mode()&os.ModeSymlink != 0 {
+		return errors.New("pair blob out dir is not a regular directory (refusing)")
+	}
+
+	// Pre-check on the final target: a symlink or non-regular object at the
+	// destination is refused. The atomic rename below guarantees that even
+	// if a concurrent actor plants a symlink between this check and the
+	// rename, the rename replaces the symlink itself rather than writing
+	// through it — the no-follow semantic we require.
+	if st, err := os.Lstat(path); err == nil {
+		if !st.Mode().IsRegular() {
+			return errors.New("pair blob out target exists and is not a regular file (refusing)")
+		}
+	}
+
+	tmp := filepath.Join(dir, base+".tmp-"+strconv.Itoa(os.Getpid()))
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("pair blob out create temp: %w", err)
+	}
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
 	if _, err := f.WriteString(blob + "\n"); err != nil {
-		f.Close()
-		return err
+		return fmt.Errorf("pair blob out write: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+		return fmt.Errorf("pair blob out sync: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return fmt.Errorf("pair blob out close: %w", err)
 	}
-	return os.Chmod(path, 0o600)
+	// Atomic rename into the final path. On POSIX this is a single syscall
+	// that atomically replaces whatever was at `path` (including a symlink
+	// planted by a concurrent actor); the rename itself does not follow.
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("pair blob out rename: %w", err)
+	}
+	// Post-rename descriptor-ownership verification: stat the final path
+	// through the directory (Lstat) and confirm it is a regular file we
+	// just installed. This catches a pathological case where `path` was a
+	// symlink to `tmp` before the rename (the rename would then target the
+	// symlink's destination and our tmp path would be gone).
+	if st, err := os.Lstat(path); err != nil {
+		return fmt.Errorf("pair blob out verify: %w", err)
+	} else if !st.Mode().IsRegular() {
+		_ = os.Remove(path)
+		return errors.New("pair blob out verify: final target is not a regular file (refusing)")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("pair blob out chmod: %w", err)
+	}
+	ok = true
+	return nil
 }
 
 func status(_ context.Context, store *deploy.Store, out io.Writer) error {

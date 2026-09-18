@@ -30,15 +30,29 @@
 # KEEPS the existing shared secret unless you explicitly provide
 # (or generate) a new one.
 #
+# DEPRECATED / NON-PRODUCTION
+# This is the LEGACY shell installer. The production T8 deployment path is
+# `splitterctl install` (see cmd/splitterctl). This script is kept for
+# backward compatibility only and MUST NOT be presented as the recommended
+# production path in docs or operator guides.
+#
+# The Go firewall package (internal/firewall, T6) is the authoritative
+# firewall owner. This legacy script's ufw mutation is DISABLED by default;
+# it runs only when the operator explicitly passes --legacy-firewall, which
+# signals they are accepting non-managed, marker-less firewall rules.
+#
 # Usage:
-#   Interactive (recommended):
+#   Interactive (legacy, non-production):
 #     sudo bash install.sh
 #     curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s
 #
-#   Non-interactive (values via flags):
+#   Non-interactive (legacy, non-production):
 #     sudo bash install.sh iran --yes --secret <SECRET>
 #     sudo bash install.sh germany --yes --up-ws-url wss://<cdn>/upload \
 #       --secret-file /root/.split-tunnel-secret
+#
+#   Enable legacy firewall mutation (NOT recommended; prefer splitterctl):
+#     sudo bash install.sh iran --legacy-firewall
 #
 #   Uninstall:
 #     sudo bash install.sh uninstall [iran|germany]     # no role = both
@@ -105,6 +119,11 @@ ASSUME_YES=0
 UNINSTALL=0
 INTERACTIVE=1
 TMP_WORK=""
+# Legacy firewall mutation is disabled by default (H-2). The Go T6 firewall
+# package (internal/firewall) is the authoritative owner of host firewall
+# rules in the production T8 path. This flag must be explicitly set to run
+# the legacy ufw path in this script.
+LEGACY_FIREWALL=0
 
 # ------------------------------------------------------------
 # Usage
@@ -142,6 +161,9 @@ Common options:
   --session-buffer-total BYTES   node aggregate buffer budget; 0 = 32MiB default, max 536870912
   --liveness-rounds N    blackhole detection rounds, 0 = 3 (default), 0..20
   --xray-service NAME    xray/3x-ui systemd service for ordering (default: auto-detect)
+  --legacy-firewall      LEGACY ONLY: run this script's ufw mutation. The
+                         production firewall path is internal/firewall
+                         (splitterctl). Default off; explicit opt-in.
   --yes, -y              non-interactive: never prompt, use flags/defaults
   --help                 show this help
 
@@ -535,6 +557,10 @@ parse_args() {
         require_arg "$@"; SESSION_BUF_TOTAL="$2"; shift 2 ;;
       --liveness-rounds)
         require_arg "$@"; LIVENESS_ROUNDS="$2"; shift 2 ;;
+      --legacy-firewall)
+        LEGACY_FIREWALL=1
+        shift
+        ;;
       *)
         error "Unknown option: $1"
         usage
@@ -1171,9 +1197,25 @@ EOF
 }
 
 # ------------------------------------------------------------
-# Firewall (ufw)
+# Firewall (ufw) — LEGACY PATH ONLY (H-2)
 # ------------------------------------------------------------
+# This script's ufw mutation is NOT the production firewall owner: the Go
+# T6 firewall package (internal/firewall, driven by splitterctl) is.
+# To prevent this legacy installer from silently mutating host firewall
+# state, the mutation is disabled unless the operator explicitly passes
+# --legacy-firewall. When enabled, it still refuses to remove or rewrite
+# any rule that does not carry the marker this script adds — it only
+# appends allow rules tagged for the tunnel, and it never removes
+# existing (possibly foreign) rules.
 configure_firewall() {
+  if [ "$LEGACY_FIREWALL" -ne 1 ]; then
+    info "Firewall: skipping (legacy ufw mutation disabled)."
+    info "The production firewall path is 'splitterctl' + internal/firewall."
+    info "To use this legacy path, re-run with --legacy-firewall."
+    return 0
+  fi
+  warn "Legacy firewall mutation ENABLED (--legacy-firewall). This path is"
+  warn "non-production; the authoritative owner is internal/firewall."
   if ! command -v ufw >/dev/null 2>&1; then
     return 0
   fi
