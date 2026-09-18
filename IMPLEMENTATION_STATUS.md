@@ -2,10 +2,10 @@
 
 Branch: `main`
 Current release gate baseline: remote `main` is verified at
-`2808f9893a7a54b3f91b852828c4f19f92c8b5bd` before this readiness batch. The
-batch commit and its GitHub Actions conclusion must be recorded here only
-after the commit is pushed and the exact run is queried; no CI result is
-inferred from local tests.
+`203c7809a0a2ac8b319e093d210eb4a402ea7c1f`, a plain fast-forward child of
+`2808f9893a7a54b3f91b852828c4f19f92c8b5bd`. The GitHub Actions run conclusion
+for this exact commit is **UNAVAILABLE through the available GitHub MCP
+surface**; no CI result is inferred from local tests.
 
 Supported ownership contract: `splitterctl` is supported; `install.sh` and
 `deploy.sh` are deprecated/non-production. Germany Xray/Reality is
@@ -55,14 +55,20 @@ record; not the current remote tip)
 
 ## Release gate — readiness batch from `2808f9893a7a54b3f91b852828c4f19f92c8b5bd`
 
-- **Remote tip before batch:** verified exact SHA above via GitHub; no staging
-  host was contacted or changed.
+- **Remote tip:** verified exact SHA `203c7809a0a2ac8b319e093d210eb4a402ea7c1f`
+  via GitHub; parent is the requested baseline; no staging host was contacted
+  or changed.
 - **Batch changes:** Linux CI now performs mandatory `bash -n` checks for the
-  legacy shell files that exist, optional preinstalled shellcheck, installer
-  help, and temporary-binary `--validate-config` dry-runs without root or host
+  legacy shell files that exist, runs the fake-tool `test-install.sh` harness
+  when present, uses optional preinstalled shellcheck, checks installer help,
+  and runs temporary-binary `--validate-config` dry-runs without root or host
   mutation. Existing Go/race/pinned gates and workflow triggers are preserved.
-- **CI evidence:** pending until the pushed batch commit's exact GitHub Actions
-  run conclusion is queried. Local validation is not CI evidence.
+- **CI evidence:** exact GitHub Actions conclusion is **UNAVAILABLE** through
+  the available GitHub MCP surface. Local validation is not CI evidence.
+- **Local evidence:** `go test ./...`, `go vet ./...`, `go build ./...`,
+  `gofmt -l .` (no output), and `git diff --check` passed. Bash and the Linux
+  race run were unavailable on this Windows host; the race attempt failed with
+  Windows loader status `0xc0000139`, not a Go test assertion.
 - **Known limitations/blockers:** no staging acceptance was performed; public
   DNS/CDN/TLS/NAT/WebSocket prerequisites remain external; the legacy scripts
   remain non-production; and #19/#20/#21/#10/#11/#12 remain open.
