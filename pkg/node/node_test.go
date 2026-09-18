@@ -697,9 +697,9 @@ func TestRebindUnknownSession(t *testing.T) {
 	if err := mux.WriteFrame(tp.upIr, 999, mux.FrameRebind, session.EncodeRebind(unknown, 1)); err != nil {
 		t.Fatalf("raw rebind write: %v", err)
 	}
-	before := tp.de.Metrics().Snapshot().CarrierRebindFailures
+	before := tp.de.Metrics().Snapshot()
 	eventually(t, 2*time.Second, "unknown rebind refused", func() bool {
-		return tp.de.Metrics().Snapshot().CarrierRebindFailures > before
+		return tp.de.Metrics().Snapshot().RebindUnknownPeer > before.RebindUnknownPeer
 	})
 	if tp.de.Store().Count() != 1 {
 		t.Fatalf("germany store = %d after rogue rebind, want 1 (no new session)", tp.de.Store().Count())
@@ -730,12 +730,12 @@ func TestStaleRebindRefused(t *testing.T) {
 	// whose sender generation is SMALLER than the one already accepted.
 	tp.killUp()
 	ir := tp.injectUpCarrier()
-	base := tp.de.Metrics().Snapshot().CarrierRebindFailures
+	base := tp.de.Metrics().Snapshot()
 	if err := mux.WriteFrame(ir, sc.sc.StreamIDUp, mux.FrameRebind, session.EncodeRebind(sc.sc.ID, 1)); err != nil {
 		t.Fatalf("raw rebind write: %v", err)
 	}
 	eventually(t, 2*time.Second, "stale rebind refused", func() bool {
-		return tp.de.Metrics().Snapshot().CarrierRebindFailures > base
+		return tp.de.Metrics().Snapshot().RebindStaleGeneration > base.RebindStaleGeneration
 	})
 	// The session was not rebound to the injected carrier and is not
 	// closed: its up attachment is still awaiting a (fresh) rebind.

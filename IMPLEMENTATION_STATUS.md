@@ -129,15 +129,35 @@ pending)
     performed; a clean-Ubuntu L5 acceptance run is still required (see the
     open issues below).
 
+- **Minimal safe #20/#21 remediation at detached baseline `0870a1d5052594a01720b03c07f107d8f542595f` (local, 2026-09-18):**
+  - #20: verified the existing generation-checked rebind refusal, bounded grace
+    timer, and authoritative `Session.Close` teardown seams. Added only fixed,
+    non-secret counters for unknown peer incarnation, stale generation, other
+    rebind refusal, and grace-timeout terminal close. No retry, wire protocol,
+    rebind ordering, grace bound, or close ownership was changed. The issue
+    remains OPEN because observability does not by itself prove the stranded
+    peer-incarnation behavior is resolved.
+  - #21: preserved SOCKS `0x06` for pre-establishment carrier/setup failures.
+    Added a deterministic integration regression distinguishing that reply from
+    post-`0x00` target refusal, which is asynchronous bounded EOF/cleanup. No
+    pre-success target-dial handshake was added. The issue remains OPEN because
+    the historical S16 expectation conflicts with the implemented asynchronous
+    session contract and requires separate product/acceptance disposition.
+  - Verification is local only; no staging hosts, external Xray configs, or
+    secrets were touched. See [`integration/RUNBOOK.md`](integration/RUNBOOK.md)
+    for the exact contract and bounded cleanup assertions.
+
 - **Open issues (must remain OPEN — NOT resolved by the T8-B work):**
   [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19)
   (L5 acceptance blocked: staging infra missing the required CDN/TLS +
   VLESS+Reality transports),
   [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20)
-  (session stranded when the peer-side incarnation never existed),
+  (session stranded when the peer-side incarnation never existed; local
+  observability added, issue remains open),
   [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21)
   (closed-port target returns `0x00` + bounded termination, not the
-  RUNBOOK-expected `0x06`). L5 acceptance remains blocked on #19; #20/#21
+  historical RUNBOOK-expected `0x06`; contract clarified, issue remains open).
+  L5 acceptance remains blocked on #19; #20/#21
   are product-engine prerequisites for a clean L5 verdict and are tracked
   separately. T8-B does not close them.
 

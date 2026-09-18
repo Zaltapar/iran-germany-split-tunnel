@@ -341,7 +341,12 @@ accepted before authentication completes.
    The session then registers and starts:
    - up relay: up-carrier `FrameData` → target socket
    - down relay: target socket → down-carrier `FrameData` (download only)
-3. Teardown: each session runs an explicit state machine
+3. Target refusal after SOCKS success is asynchronous: if Germany has already
+   returned SOCKS `0x00`, a later target-dial/refusal outcome is delivered as
+   bounded EOF and cleanup on the established tunnel, not as a second SOCKS
+   reply. SOCKS `0x06` is reserved for pre-establishment carrier/setup
+   failures. No pre-success target-dial handshake is implemented.
+4. Teardown: each session runs an explicit state machine
    (`Pending → Active → Closing → Closed` with per-direction half-close).
    Client EOF → Iran `FrameClose` (up) + up half-close: the target's
    in-flight response keeps flowing. Target EOF → Germany `FrameClose`
@@ -458,7 +463,13 @@ authenticate while no carrier is installed). The single-carrier `DownReady()`
 rejection and the 15 s handshake bound are unchanged.
 
 **Metrics.** The metrics endpoint binds to `127.0.0.1` only and exposes
-counts and byte totals — no secrets, tokens or destination details.
+counts and byte totals — no secrets, tokens or destination details. Rebind
+refusal and grace-timeout observability is limited to fixed, non-secret counters
+(`carrier_rebind_unknown_peer`, `carrier_rebind_stale_generation`,
+`carrier_rebind_other_refusal`, and
+`carrier_grace_timeout_terminal_close`); no session IDs or peer incarnation
+values are exported. These counters do not change the safe rebind protocol,
+bounded grace timeout, or `Session.Close` authority.
 
 **Firewall.** Only these inbound ports should be reachable, and only from
 their expected source:

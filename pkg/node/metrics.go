@@ -18,13 +18,18 @@ type Metrics struct {
 	bytesDown      int64
 	errs           int64
 
-	// Phase 5 carrier-reconnect counters
-	carrierLossEvents     int64
-	carrierReconnects     int64
-	carrierRebinds        int64
-	carrierRebindFailures int64
-	sessionsRecovered     int64
-	sessionsLostAfterCarF int64
+	// Phase 5 carrier-reconnect counters. Rebind refusal counters are fixed
+	// reason buckets: they are bounded, non-secret, and do not retain IDs.
+	carrierLossEvents         int64
+	carrierReconnects         int64
+	carrierRebinds            int64
+	carrierRebindFailures     int64
+	rebindUnknownPeer         int64
+	rebindStaleGeneration     int64
+	rebindOtherRefusal        int64
+	sessionsRecovered         int64
+	sessionsLostAfterCarF     int64
+	graceTimeoutTerminalClose int64
 
 	// Issue #6: aggregate session-buffer budget. sessionBufferReclaimed
 	// counts bytes returned to (or force-reclaimed by) the budget — a
@@ -94,10 +99,25 @@ func (m *Metrics) Rebind() {
 	m.mu.Unlock()
 }
 
-// RebindFailure counts a failed or refused rebind.
+// RebindFailure counts a failed or refused rebind without retaining a reason.
 func (m *Metrics) RebindFailure() {
+	m.RebindRefusal("other")
+}
+
+// RebindRefusal counts a bounded, non-secret rebind refusal reason.
+// Unknown/missing peer incarnation is intentionally one fixed bucket: the
+// metrics surface never exposes session IDs or peer-provided values.
+func (m *Metrics) RebindRefusal(reason string) {
 	m.mu.Lock()
 	m.carrierRebindFailures++
+	switch reason {
+	case "unknown_peer":
+		m.rebindUnknownPeer++
+	case "stale_generation":
+		m.rebindStaleGeneration++
+	default:
+		m.rebindOtherRefusal++
+	}
 	m.mu.Unlock()
 }
 
@@ -112,6 +132,7 @@ func (m *Metrics) SessionRecovered() {
 func (m *Metrics) SessionLostAfterFailure() {
 	m.mu.Lock()
 	m.sessionsLostAfterCarF++
+	m.graceTimeoutTerminalClose++
 	m.mu.Unlock()
 }
 
@@ -129,36 +150,44 @@ func (m *Metrics) AddSessionBufferReclaimed(n int64) {
 
 // Snapshot is a point-in-time copy of all counters.
 type Snapshot struct {
-	ActiveSessions         int64
-	TotalSessions          int64
-	TotalBytesUp           int64
-	TotalBytesDown         int64
-	Errors                 int64
-	CarrierLossEvents      int64
-	CarrierReconnects      int64
-	CarrierRebinds         int64
-	CarrierRebindFailures  int64
-	SessionsRecovered      int64
-	SessionsLostAfterCarF  int64
-	SessionBufferReclaimed int64
+	ActiveSessions            int64
+	TotalSessions             int64
+	TotalBytesUp              int64
+	TotalBytesDown            int64
+	Errors                    int64
+	CarrierLossEvents         int64
+	CarrierReconnects         int64
+	CarrierRebinds            int64
+	CarrierRebindFailures     int64
+	RebindUnknownPeer         int64
+	RebindStaleGeneration     int64
+	RebindOtherRefusal        int64
+	SessionsRecovered         int64
+	SessionsLostAfterCarF     int64
+	GraceTimeoutTerminalClose int64
+	SessionBufferReclaimed    int64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
-		ActiveSessions:         m.activeSessions,
-		TotalSessions:          m.totalSessions,
-		TotalBytesUp:           m.bytesUp,
-		TotalBytesDown:         m.bytesDown,
-		Errors:                 m.errs,
-		CarrierLossEvents:      m.carrierLossEvents,
-		CarrierReconnects:      m.carrierReconnects,
-		CarrierRebinds:         m.carrierRebinds,
-		CarrierRebindFailures:  m.carrierRebindFailures,
-		SessionsRecovered:      m.sessionsRecovered,
-		SessionsLostAfterCarF:  m.sessionsLostAfterCarF,
-		SessionBufferReclaimed: m.sessionBufferReclaimed,
+		ActiveSessions:            m.activeSessions,
+		TotalSessions:             m.totalSessions,
+		TotalBytesUp:              m.bytesUp,
+		TotalBytesDown:            m.bytesDown,
+		Errors:                    m.errs,
+		CarrierLossEvents:         m.carrierLossEvents,
+		CarrierReconnects:         m.carrierReconnects,
+		CarrierRebinds:            m.carrierRebinds,
+		CarrierRebindFailures:     m.carrierRebindFailures,
+		RebindUnknownPeer:         m.rebindUnknownPeer,
+		RebindStaleGeneration:     m.rebindStaleGeneration,
+		RebindOtherRefusal:        m.rebindOtherRefusal,
+		SessionsRecovered:         m.sessionsRecovered,
+		SessionsLostAfterCarF:     m.sessionsLostAfterCarF,
+		GraceTimeoutTerminalClose: m.graceTimeoutTerminalClose,
+		SessionBufferReclaimed:    m.sessionBufferReclaimed,
 	}
 }
 
@@ -175,7 +204,11 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "carrier_reconnects %d\n", s.CarrierReconnects)
 	fmt.Fprintf(&b, "carrier_rebinds %d\n", s.CarrierRebinds)
 	fmt.Fprintf(&b, "carrier_rebind_failures %d\n", s.CarrierRebindFailures)
+	fmt.Fprintf(&b, "carrier_rebind_unknown_peer %d\n", s.RebindUnknownPeer)
+	fmt.Fprintf(&b, "carrier_rebind_stale_generation %d\n", s.RebindStaleGeneration)
+	fmt.Fprintf(&b, "carrier_rebind_other_refusal %d\n", s.RebindOtherRefusal)
 	fmt.Fprintf(&b, "sessions_recovered %d\n", s.SessionsRecovered)
+	fmt.Fprintf(&b, "carrier_grace_timeout_terminal_close %d\n", s.GraceTimeoutTerminalClose)
 	fmt.Fprintf(&b, "sessions_lost_after_carrier_failure %d\n", s.SessionsLostAfterCarF)
 	fmt.Fprintf(&b, "session_buffer_reclaimed %d\n", s.SessionBufferReclaimed)
 	return b.String()

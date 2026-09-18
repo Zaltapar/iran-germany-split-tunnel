@@ -155,6 +155,71 @@ func TestDialStatus06(t *testing.T) {
 	}
 }
 
+// TestDialDistinguishesPreEstablishmentFailureFromPostEstablishmentRefusal
+// locks in the SOCKS contract: setup/carrier failure is a 0x06 reply, while a
+// target refusal discovered after a successful SOCKS reply is asynchronous
+// tunnel EOF, not a second SOCKS reply. Both paths must close their sockets.
+func TestDialDistinguishesPreEstablishmentFailureFromPostEstablishmentRefusal(t *testing.T) {
+	pre := startMock(t, 0x06, nil)
+	_, err := Dial(pre.addr(), "127.0.0.1", 1, time.Second)
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) || statusErr.Code != 0x06 {
+		t.Fatalf("pre-establishment error = %T %v, want SOCKS status 0x06", err, err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer c.Close()
+		var greeting [3]byte
+		if _, err := io.ReadFull(c, greeting[:]); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
+			serverDone <- err
+			return
+		}
+		var req [10]byte
+		if _, err := io.ReadFull(c, req[:]); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := c.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
+	}()
+	client, err := Dial(ln.Addr().String(), "127.0.0.1", 1, time.Second)
+	if err != nil {
+		t.Fatalf("post-establishment Dial: %v", err)
+	}
+	defer client.Close()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("post-establishment server: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-establishment server did not complete setup")
+	}
+	client.Conn().SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := client.Conn().Read(one[:]); err != io.EOF {
+		t.Fatalf("post-establishment target refusal read = %v, want bounded EOF", err)
+	}
+}
+
 func TestDialTimeoutSilentServer(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -674,7 +674,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 			// the rebind was in flight.
 			h.carrier.Deregister(id)
 			att.FailRebind()
-			n.metrics.RebindFailure()
+			n.metrics.RebindRefusal("other")
 			continue
 		}
 		if n.hasChannelConsumer(dir) {
@@ -699,7 +699,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 // failRebind abandons one rebind attempt (grace window keeps running).
 func (n *Node) failRebind(sess *session.Session, dir session.Direction, att *session.Attachment, why string) {
 	att.FailRebind()
-	n.metrics.RebindFailure()
+	n.metrics.RebindRefusal("other")
 	n.logger.Printf("session %s: %s rebind failed: %s", shortID(sess.ID), dirName(dir), why)
 }
 
@@ -755,7 +755,13 @@ func (n *Node) onDownNewStream(h *carrierHandle, id uint32, firstType uint8, ch 
 // refused rebind must not be mistaken for a peer half-close.
 func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, ch chan []byte) {
 	drop := func(why string) {
-		n.metrics.RebindFailure()
+		reason := "other"
+		if why == "no active session for stream" {
+			reason = "unknown_peer"
+		} else if why == "stale sender carrier generation" {
+			reason = "stale_generation"
+		}
+		n.metrics.RebindRefusal(reason)
 		n.logger.Printf("rebind refused: stream %d (%s): %s", id, dirName(dir), why)
 		h.carrier.Deregister(id)
 	}

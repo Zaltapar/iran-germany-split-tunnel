@@ -139,11 +139,26 @@ scenarios 3, 10, 17, 18 (full), 20.
 | 13 | Malformed peer | topology up | a rogue process opens the up/down path, upgrades/accepts, then sends garbage frames | the connection is terminated or the frames dropped; NO panic (process still active: `systemctl is-active` == active); no session created | 30 s |
 | 14 | Client half-close | echo target | client `CloseWrite` mid-session | target observes FIN (echo server logs EOF); the session ends cleanly; `session_count` → 0 | 30 s |
 | 15 | Target half-close | target that reads then `CloseWrite`s | download until target FIN | client observes EOF; `session_count` → 0; no `errors` | 30 s |
-| 16 | Target failure | a reachable host with a closed port | CONNECT to the closed port | SOCKS reply **0x06** — by design the relay maps every target-dial failure (refused/unreachable/timeout) to general-failure on the wire (no reason leakage, `pkg/node` StartSession error path); the round trip is BOUNDED (≤ ~15 s = 10 s target dial + bootstrap) — no hang, never 0x00; `total_sessions` +1 with immediate close | 30 s |
+| 16 | Target failure | a reachable host with a closed port | CONNECT to the closed port | **Pre-establishment carrier/setup failure** returns SOCKS **0x06** within the configured bootstrap bound. If SOCKS **0x00** was already sent, a later target refusal is asynchronous: the client observes bounded EOF/cleanup, not a second SOCKS reply. In both cases `active_sessions` and `session_count` return to 0; no leaked socket/goroutine is permitted. This distinction is covered deterministically by `integration/socks5` unit tests; no pre-success target-dial handshake is added. | 30 s |
 | 17 | Repeated flapping | as 7 | 5× {drop 3 s → restore 5 s} | after each cycle: session intact (data checksum at the end), `sessions_lost_after_carrier_failure` == 0, `carrier_loss_events` +5, no goroutine/fd growth beyond one per cycle | 10 min |
 | 18 | Resource settling | idle 5 min → 16-session burst (scenario 6) → idle 5 min | sample `ps` RSS + `ls /proc/<pid>/fd | wc -l` + metrics gauges every 10 s | RSS after settling ≤ peak + 10 MiB; fd count returns to the idle baseline ±2; `session_count` == 0; `session_buffered_bytes` == 0 | 15 min |
 | 19 | Graceful shutdown | topology up, no active sessions | `systemctl stop germany-splitter` then `systemctl stop iran-splitter` | each exits 0; journal shows `... stopped` as the last line; no zombie conns (fd count 0 before exit) | 30 s each |
 | 20 | Restart/recovery | as 19 | `systemctl start` both, then run scenario 1 | carriers re-authenticate within the backoff schedule; a new session works; metrics counters are fresh (new processes) | 90 s |
+
+### #20/#21 regression contract
+
+The local regression surface verifies the safe existing protocol without touching
+staging or external Xray configuration. Rebind refusal is generation-checked and
+never creates a session; the grace timer is bounded and terminal teardown remains
+owned by `Session.Close`. Metrics expose only fixed-cardinality, non-secret
+counters for unknown peer incarnation, stale generation, other rebind failure,
+and grace-timeout terminal close. These counters are observability only and do
+not alter retry, rebind, grace, or close authority.
+
+For #21, SOCKS **0x06** is reserved for failures before establishment (carrier
+or setup). After **0x00**, target refusal is an asynchronous stream outcome:
+bounded EOF and cleanup. The project intentionally does not implement a
+pre-success target-dial handshake.
 
 **"No unresolved CRITICAL/HIGH finding"** gate: any scenario failure is
 either fixed (new commit, re-run the FULL matrix) or filed as its own issue
