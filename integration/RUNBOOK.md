@@ -82,21 +82,37 @@ production servers. Do not run the matrix against production.**
 
 ### 2.3 Provisioning (one-time, per host)
 
+Use the supported `splitterctl` workflow for any real deployment. The legacy
+`install.sh` path is deprecated and non-production; it is retained only for
+historical/development fallback and is not acceptance evidence.
+
 ```
 Iran:
-  sudo bash install.sh iran   (guided; or non-interactive with flags)
-  + nginx/CDN origin for /upload → 127.0.0.1:9001
-  + (optional) Xray configured per README "Xray Config (Iran)"
+  splitterctl install iran   (supported transactional path)
+  + operator-managed Xray/3x-ui consumer routing into the splitter SOCKS port
+  + operator-managed DNS/CDN/TLS/WebSocket origin for /upload
 Germany:
-  sudo bash install.sh germany --up-ws-url wss://<domain>/upload
-  + Xray/3x-ui inbound: VLESS+Reality on the public port, delivering the
-    tunneled TCP bytes to 127.0.0.1:9002  (operator's own Xray config;
-    this project does not manage it)
+  splitterctl install germany (supported transactional path)
+  + operator-managed Xray/3x-ui/Xray-consumer VLESS+Reality inbound delivering
+    tunneled TCP bytes to 127.0.0.1:9002 (this project does not manage it)
 ```
 
-Verify baseline before the matrix: both units active, both metrics
-endpoints up, `curl --socks5-hostname 127.0.0.1:<socks> https://example.com`
-works from the client host.
+Before the matrix, run these read-only preflights on the relevant hosts:
+
+```
+systemctl is-active iran-splitter germany-splitter
+ss -ltnp
+curl -fsS http://127.0.0.1:<metrics>/metrics
+# DNS: dig +short <upload-domain> and confirm the intended A/AAAA or CNAME
+# TLS/HTTP: curl -fsSIk https://<upload-domain>/upload
+# TCP: timeout 5 bash -c '</dev/tcp/<upload-domain>/443'
+```
+
+Acceptance requires the expected service states, listener ownership/binds,
+metrics HTTP success, DNS record correctness, TLS/WebSocket upgrade, and
+public reachability from Germany. DNS, CDN, NAT, TLS/WebSocket, firewall
+reachability, and the external Iran Xray/3x-ui/Xray-consumer configuration are
+operator responsibilities and are not claimed by `splitterctl doctor`.
 
 ## 3. Acceptance matrix (20 scenarios)
 

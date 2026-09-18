@@ -631,38 +631,52 @@ existing Xray is never touched in default mode.**
 - `--non-interactive` + flags (or a `splitterctl install --file deploy.yaml`
   desired-state file) for automation and the L4 clean-machine test.
 
-### 6.3 Bootstrap entry point
+### 6.3 Supported entry point and deprecated bootstrap
 
-```
-curl -fsSL https://<repo>/install.sh | sudo bash -s -- <role> [flags...]
-```
+`splitterctl` is the supported deployment entry point. The repository's
+`install.sh` is deprecated and non-production; it is retained for historical
+and development fallback use only and must not be presented as equivalent to
+the transactional CLI. `deploy.sh` is deprecated as well.
 
-`install.sh` (v2, small) only: parses the role, fetches the pinned
-`splitterctl` artifact for the platform, verifies its `.sha256` (the expected
-hash is embedded in the script at release time), and execs
-`splitterctl install <role> [flags]`. Nothing else.
+A future release bootstrap may fetch and verify a pinned `splitterctl` artifact
+before executing it, but that bootstrap is not evidence of production
+readiness and does not replace a clean Linux acceptance run.
 
 ### 6.4 `doctor` (Q23)
 
-`splitterctl doctor` runs a fixed, read-only check list and prints a
-pass/fail/warn table with the exact next action per failure:
+`splitterctl doctor` is strictly read-only: it never starts, restarts, enables,
+reloads, rewrites, chmods, chowns, or removes anything. Every emitted finding
+has a stable ID and is either implemented locally or explicitly marked as an
+operator/external responsibility.
 
-- state file present & versioned; services enabled+active (`systemctl is-active`);
-- ports bound as designed (§3.3) — `ss -ltnp` parsed;
-- config gate: re-run the binary's `--validate-config` (fails closed on drift);
-- `xray run -test` on the live config; Xray version == manifest version;
-- up path: `wss://<domain>/upload` reachable + WS upgrade from Germany (a
-  bounded probe with a *wrong* secret must get the challenge, proving the
-  transport works and auth is enforced);
-- down path: Reality preflight (dest TLS 1.3 reachability), then a
-  FrameAuth probe from Iran's down dial (correct secret ⇒ carrier installs);
-- carrier state from metrics endpoints (up/down ready, generations);
-- firewall rules present (ufw/nftables query) matching §3.3;
-- disk/log space for `/var/log/split-tunnel` (logrotate present);
-- clock skew (auth v1 tolerance ±300 s — warn if >120 s);
-- known-issue hints (#20 stranded-session signature: refused-rebind counter
-  climbing with a live stream; #19 blackhole signature: RTO backoff on carrier
-  conns).
+Implemented local checks in this release:
+
+- `state.integrity`: authenticated manifest read;
+- `state.dir`: read-only state-directory permission-chain audit;
+- `pairing.staleness`: read-only Germany Reality public-parameter/fingerprint
+  comparison and stale-marker reporting;
+- `artifact.integrity`: local SHA-256 comparison for asserted managed splitter
+  (and Germany Xray) artifacts; legacy/unasserted hashes warn;
+- `config.validation`: validates the current operator environment only when it
+  is available; rollback retains the current environment and never recovers
+  secret values from state;
+- `service.active`: on Linux, read-only `systemctl is-active` observation of
+  recorded units; the implementation requires exact `active`, not merely an
+  activating/restarting transient. Settling is verified by lifecycle health,
+  not by doctor mutation;
+- `listener.binds`, `xray.config`, `firewall.audit`, and `network.external`:
+  explicit warnings where this build does not claim local coverage. Operators
+  must verify listeners, safely available Xray `version`/`run -test`, firewall
+  ownership, and DNS/CDN/NAT/TLS/WebSocket/public reachability externally.
+
+M-1 is intentionally not claimed: a bounded deterministic DNS/CDN diagnostic
+would need provider-independent semantics not available here. Preflight
+acceptance criteria are: `dig +short <upload-domain>` returns the intended
+A/AAAA or CNAME; `curl --resolve <upload-domain>:443:<origin-ip> -fsSIk
+https://<upload-domain>/upload` reaches the expected TLS endpoint; a WebSocket
+client completes the `/upload` upgrade; and Germany can establish TCP to Iran's
+public origin/CDN endpoint. These are operator checks, not staging or
+production evidence.
 
 ## 7. Configuration schema
 

@@ -100,18 +100,19 @@ a journal/committed role mismatch.
 > [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) and
 > [`docs/self-contained-deployment-architecture.md`](docs/self-contained-deployment-architecture.md).
 
-### Legacy path — interactive installer (`install.sh`)
+### Deprecated path — interactive installer (`install.sh`)
 
-> **Status relative to the CLI:** `install.sh` is the LEGACY, standalone
-> deployment path (it predates `splitterctl` and duplicates part of its
-> role). It is still supported and documented below; `splitterctl` is the
-> transactional path with journaled state, revisions and rollback.
-> `deploy.sh` is DEPRECATED.
+> **Status relative to the CLI:** `splitterctl` is the supported deployment
+> path. `install.sh` is the **legacy/non-production** path: deprecated and
+> retained only as a historical/development fallback; it predates the transactional state,
+> journal, doctor, revision, and rollback semantics. Do not use it for a
+> production deployment. `deploy.sh` is also deprecated.
 
-The installer asks for every setting (role, shared secret, ports, CDN domain,
-Xray inbound tag, nginx, metrics) with sensible defaults — just press Enter to
-accept. It then installs the Go toolchain if needed, builds the binary for the
-role, runs the binary's OWN pre-install configuration gate
+The deprecated installer asks for every setting (role, shared secret, ports,
+CDN domain, Xray inbound tag, nginx, metrics) with sensible defaults. Its
+behavior is not the production support contract. For supported deployments,
+build or obtain `splitterctl`, configure the documented environment, and use
+its transactional commands. The old script's pre-install configuration gate
 (`<role>-splitter --validate-config`, the same `internal/config` validation
 the production binary uses at startup) and only writes/starts the systemd
 service if that gate passes. On the Iran role it also merges the Xray config
@@ -139,8 +140,8 @@ curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/
   -- germany --yes --up-ws-url wss://<cdn-domain>/upload --secret-file ~/.split-tunnel-secret
 ```
 
-Every question also has a flag (see `install.sh --help`), so the installer can
-run fully non-interactive with `--yes`. Re-running the installer on an
+Every question also has a flag (see `install.sh --help`), but this deprecated
+path is not production-ready. Re-running the installer on an
 existing installation is an **upgrade**: it pre-fills the current unit's
 values as prompt defaults, backs up the old unit
 (`<unit>.service.bak.<ts>`) and binary (`<role>-splitter.bak`), and keeps the

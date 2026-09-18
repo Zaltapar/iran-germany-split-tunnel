@@ -7,6 +7,32 @@ pending)
 
 ## Current state
 
+### Batch 2 remediation — implemented in this worktree
+
+- `splitterctl doctor` is supported as a strictly read-only diagnostic surface.
+  Stable IDs cover authenticated state integrity, state-directory permissions,
+  pairing staleness, asserted artifact SHA-256 integrity, and current
+  configuration validation when the operator environment is available.
+- Linux service checks observe recorded units with `systemctl is-active` only;
+  they require exact `active` and never start, restart, enable, reload, or
+  settle a service by mutation. Listener binds, Xray version/config tests,
+  firewall ownership where a desired plan cannot be reconstructed, and public
+  DNS/CDN/NAT/TLS/WebSocket reachability are explicitly reported as operator or
+  external responsibility rather than overstated as local coverage.
+- Positive, negative, and read-only regression tests cover service state and
+  artifact hash diagnostics. No staging host was contacted or changed.
+- The supported deployment path is `splitterctl`; `install.sh` is deprecated,
+  non-production fallback. Iran Xray/3x-ui/Xray-consumer configuration and
+  Germany's external Xray consumer/inbound remain unmanaged boundaries.
+- Germany pairing state `a-applied` is terminal for the local Blob-A-applied
+  step by design; re-running `pair apply` is the safe deterministic re-emission
+  path when Blob B was lost. Rollback retains the current environment and does
+  not recover or rewrite secret values. Historical staging evidence remains
+  evidence only and is not production readiness.
+- M-1 is not claimed: deterministic DNS/CDN diagnostics remain operator-owned,
+  with exact commands and acceptance criteria recorded in the architecture and
+  integration runbook.
+
 - **T8-B deployment work — RF-1..RF-4, DEFECT-1..4, M4 convergence
   identity, M5 wiring (all committed; Linux staging still pending):** the
   adversarial-audit findings recorded in `plans/t8-audit-checkpoint.md`

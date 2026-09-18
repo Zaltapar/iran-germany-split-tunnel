@@ -2,11 +2,16 @@ package deploy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
@@ -251,6 +256,117 @@ func buildPairingStalenessFinding(f pairingStalenessFacts, err error) Finding {
 	return Finding{ID: PairingStalenessCheckID, Severity: SeverityWarn,
 		Summary: "pairing B-fingerprint is stale: " + strings.Join(reasons, "; "),
 		Action:  "run pair apply to re-emit the pairing blob, then pair finalize; doctor is read-only and changes nothing"}
+}
+
+// ConfigValidationCheck validates the current operator configuration without
+// writing an env file, starting a service, or otherwise mutating the host.
+func ConfigValidationCheck(role string) Check {
+	return Check{ID: "config.validation", Run: func(context.Context) Finding {
+		if _, err := config.Load(role); err != nil {
+			return Finding{ID: "config.validation", Severity: SeverityFail,
+				Summary: "current configuration validation failed", Action: "correct the named configuration fields and re-run doctor"}
+		}
+		return Finding{ID: "config.validation", Severity: SeverityPass, Summary: "current configuration validates without host changes"}
+	}}
+}
+
+// ServiceStateCheck observes each committed unit with systemctl is-active. It
+// deliberately does not call start, restart, enable, daemon-reload, or journal
+// mutation commands. A non-Linux invocation is an external-responsibility
+// warning because systemd state cannot be measured there.
+func ServiceStateCheck(store *Store, manager *systemd.ServiceManager) Check {
+	return Check{ID: "service.active", Run: func(ctx context.Context) Finding {
+		m, err := store.Load()
+		if err != nil {
+			return Finding{ID: "service.active", Severity: SeverityFail, Summary: "managed service state cannot be checked", Action: "repair deployment state before checking services"}
+		}
+		if len(m.Services) == 0 {
+			return Finding{ID: "service.active", Severity: SeverityWarn, Summary: "no managed services are recorded; runtime service coverage is unavailable", Action: "operator must verify the intended service units"}
+		}
+		for _, service := range m.Services {
+			state, stateErr := manager.State(ctx, service.Unit)
+			if stateErr != nil || state != "active" {
+				return Finding{ID: "service.active", Severity: SeverityFail,
+					Summary: "managed service is not active: " + service.Unit + " (" + state + ")",
+					Action:  "inspect systemctl status and journalctl for the unit; doctor is read-only"}
+			}
+		}
+		return Finding{ID: "service.active", Severity: SeverityPass, Summary: "all recorded managed services report exactly active"}
+	}}
+}
+
+// FirewallAuditCheck performs the firewall provider's read-only Inspect path.
+// It reports only that the selected provider was queried; unmanaged rules are
+// never treated as project-owned and no apply/remove operation is attempted.
+func FirewallAuditCheck(manager firewall.Manager, plan firewall.Plan) Check {
+	return Check{ID: "firewall.audit", Run: func(ctx context.Context) Finding {
+		if plan.Backend == firewall.BackendNone {
+			return Finding{ID: "firewall.audit", Severity: SeverityPass, Summary: "firewall management is explicitly disabled by the deployment plan"}
+		}
+		if _, err := manager.Inspect(ctx, plan); err != nil {
+			return Finding{ID: "firewall.audit", Severity: SeverityWarn, Summary: "firewall ownership audit was unavailable", Action: "operator must inspect the selected firewall backend and project marker"}
+		}
+		return Finding{ID: "firewall.audit", Severity: SeverityPass, Summary: "selected firewall backend was audited read-only for project-owned rules"}
+	}}
+}
+
+// ArtifactIntegrityCheck hashes recorded regular files and compares them with
+// the manifest. Empty hashes remain WARN: they are legacy/unasserted state,
+// not evidence of integrity. Hashing is local and read-only.
+func ArtifactIntegrityCheck(store *Store) Check {
+	return Check{ID: "artifact.integrity", Run: func(context.Context) Finding {
+		m, err := store.Load()
+		if err != nil {
+			return Finding{ID: "artifact.integrity", Severity: SeverityFail, Summary: "artifact integrity cannot be checked because deployment state is unavailable", Action: "restore a trusted retained revision"}
+		}
+		artifacts := []struct {
+			name string
+			path string
+			hash string
+		}{
+			{"splitter", m.Components.Splitter.Path, m.Components.Splitter.SHA256},
+		}
+		if m.Role == RoleGermany {
+			artifacts = append(artifacts, struct {
+				name string
+				path string
+				hash string
+			}{"xray", m.Components.Xray.Path, m.Components.Xray.SHA256})
+		}
+		unasserted := 0
+		for _, artifact := range artifacts {
+			if artifact.path == "" || artifact.hash == "" {
+				unasserted++
+				continue
+			}
+			got, ok := fileSHA256(artifact.path)
+			if !ok || got != artifact.hash {
+				return Finding{ID: "artifact.integrity", Severity: SeverityFail,
+					Summary: "recorded " + artifact.name + " artifact hash does not match the installed file",
+					Action:  "do not start or upgrade the deployment; restore or re-stage the expected artifact"}
+			}
+		}
+		if unasserted > 0 {
+			return Finding{ID: "artifact.integrity", Severity: SeverityWarn, Summary: "some artifact hashes are unasserted by legacy or external component state", Action: "reinstall through splitterctl to record locally verifiable artifact hashes"}
+		}
+		return Finding{ID: "artifact.integrity", Severity: SeverityPass, Summary: "recorded managed artifact hashes match local files"}
+	}}
+}
+
+func fileSHA256(path string) (string, bool) {
+	if !filepath.IsAbs(path) {
+		return "", false
+	}
+	st, err := os.Lstat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), true
 }
 
 // pairingConfigErrClass maps a ReadInstalledRealityParams failure to a

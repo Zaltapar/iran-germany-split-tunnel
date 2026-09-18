@@ -1417,13 +1417,46 @@ func status(_ context.Context, store *deploy.Store, out io.Writer) error {
 // the store-integrity check included) observes state, and remediation is
 // always delegated to a lifecycle command.
 func doctor(ctx context.Context, store *deploy.Store, out io.Writer) error {
-	diags := deploy.Diagnostics{
-		Store: store,
-		Checks: []deploy.Check{
-			deploy.StateDirCheck(store.Root),
-			deploy.PairingStalenessCheck(store),
-		},
+	checks := []deploy.Check{
+		deploy.StateDirCheck(store.Root),
+		deploy.PairingStalenessCheck(store),
+		deploy.ArtifactIntegrityCheck(store),
 	}
+	if manifest, err := store.Load(); err == nil {
+		if os.Getenv("SPLIT_SECRET") != "" {
+			checks = append(checks, deploy.ConfigValidationCheck(manifest.Role))
+		} else {
+			checks = append(checks, deploy.Check{ID: "config.validation", Run: func(context.Context) deploy.Finding {
+				return deploy.Finding{ID: "config.validation", Severity: deploy.SeverityWarn, Summary: "current configuration validation was not run because the operator environment is incomplete", Action: "operator must provide the deployment environment and re-run doctor"}
+			}})
+		}
+		if runtime.GOOS == "linux" {
+			checks = append(checks, deploy.ServiceStateCheck(store, systemd.NewServiceManager(systemd.OSExecutor{})))
+		} else {
+			checks = append(checks, deploy.Check{ID: "service.active", Run: func(context.Context) deploy.Finding {
+				return deploy.Finding{ID: "service.active", Severity: deploy.SeverityWarn, Summary: "managed service active/settled state is not measurable on this non-Linux host", Action: "operator must run splitterctl doctor on the Linux deployment host"}
+			}})
+		}
+		checks = append(checks, deploy.Check{ID: "listener.binds", Run: func(context.Context) deploy.Finding {
+			return deploy.Finding{ID: "listener.binds", Severity: deploy.SeverityWarn, Summary: "expected listener binds are not probed by this doctor build", Action: "operator must verify the recorded service listeners with ss -ltnp and the deployment configuration"}
+		}})
+		if manifest.Role == deploy.RoleGermany {
+			checks = append(checks, deploy.Check{ID: "xray.config", Run: func(context.Context) deploy.Finding {
+				return deploy.Finding{ID: "xray.config", Severity: deploy.SeverityWarn, Summary: "Xray config validation/version execution is not performed by doctor", Action: "operator must run the pinned Xray binary's version and run -test checks on the Germany host"}
+			}})
+		}
+		checks = append(checks, deploy.Check{ID: "network.external", Run: func(context.Context) deploy.Finding {
+			return deploy.Finding{ID: "network.external", Severity: deploy.SeverityWarn, Summary: "DNS, CDN, NAT, TLS/WebSocket, and public reachability are external checks", Action: "operator must run the documented preflight commands from the deployment runbook"}
+		}})
+	} else {
+		checks = append(checks, deploy.Check{ID: "config.validation", Run: func(context.Context) deploy.Finding {
+			return deploy.Finding{ID: "config.validation", Severity: deploy.SeverityWarn, Summary: "configuration validation is unavailable without a committed deployment role", Action: "install or restore a committed deployment before running role-specific checks"}
+		}})
+	}
+	checks = append(checks, deploy.Check{ID: "firewall.audit", Run: func(context.Context) deploy.Finding {
+		return deploy.Finding{ID: "firewall.audit", Severity: deploy.SeverityWarn, Summary: "firewall ownership audit is not run without a reconstructed desired firewall plan", Action: "operator must audit only project-marked rules with ufw status or nft list ruleset"}
+	}})
+	diags := deploy.Diagnostics{Store: store, Checks: checks}
 	findings := diags.Run(ctx)
 	for _, f := range findings {
 		_, _ = fmt.Fprintf(out, "%s [%s] %s", f.ID, f.Severity, f.Summary)
