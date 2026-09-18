@@ -17,6 +17,30 @@ Xray config spec, H2 ACME port-80 firewall gap, H3 CDN-mode origin TLS
 ambiguity) plus 6 MEDIUM clarifications. MEDIUM/LOW items are tracked in §21
 and must be closed by the implementation tasks that own them (noted inline).
 
+## Current operational contract
+
+The following rules govern the current repository, superseding any older design
+passages below while preserving those passages as historical evidence:
+
+- `splitterctl` is the supported deployment entry point. `install.sh` and
+  `deploy.sh` are deprecated, non-production legacy scripts and are not
+  equivalent to the transactional CLI.
+- Germany's pinned Xray/Reality transport is project-managed by `splitterctl`.
+  Iran's external Xray/3x-ui or xray-consumer is operator-owned and is not
+  managed by this project.
+- Public DNS, CDN, TLS, NAT, and WebSocket configuration/reachability are
+  operator/external prerequisites. They are not asserted by local doctor or
+  shell checks.
+- Pairing state is terminal by host step: Iran is `finalized` and Germany is
+  `a-applied`; Germany may deterministically re-emit Blob B while `a-applied`.
+- Rollback does not restore or rewrite secret-bearing environment files; it
+  retains the operator's current environment and fails closed when state cannot
+  be reconstructed.
+- Issues #19, #20, #21, #10, #11, and #12 remain open unless independently
+  resolved and recorded with verified evidence.
+
+The historical design baseline follows:
+
 Repository state this was written against (historical baseline, verified from
 GitHub at the time of writing — retained for traceability, not current):
 
@@ -34,6 +58,11 @@ deployment work (T6–T8) — deployment completion does not close them.
 
 ## 0. The direction change, precisely
 
+> **Historical design record.** The following previous-model and proposed-
+> architecture passages describe earlier direction and are retained for audit
+> traceability. Where they say Iran Xray is project-managed or Germany Xray is
+> operator-owned, the current operational contract above takes precedence.
+>
 The previous model (documented in the README and RUNBOOK §2.3) was:
 
 - **Iran** — the project's `install.sh` installs the splitter, detects the
@@ -634,9 +663,12 @@ existing Xray is never touched in default mode.**
 ### 6.3 Supported entry point and deprecated bootstrap
 
 `splitterctl` is the supported deployment entry point. The repository's
-`install.sh` is deprecated and non-production; it is retained for historical
-and development fallback use only and must not be presented as equivalent to
-the transactional CLI. `deploy.sh` is deprecated as well.
+`install.sh` and `deploy.sh` are deprecated and non-production; they are
+retained for historical/development fallback use only and must not be
+presented as equivalent to the transactional CLI. Germany's Xray/Reality is
+project-managed by `splitterctl`; Iran's external Xray/3x-ui or xray-consumer
+is operator-owned and not managed. Public DNS/CDN/TLS/NAT/WebSocket checks
+remain operator/external prerequisites.
 
 A future release bootstrap may fetch and verify a pinned `splitterctl` artifact
 before executing it, but that bootstrap is not evidence of production
@@ -761,9 +793,11 @@ Two independent secrets, two different lifecycles:
   projection aborts with nothing changed.
 - **Rollback:** `splitterctl rollback [--to sN]` restores that state: binaries
   (from versioned dirs/backups), configs (from backups), units, firewall rules,
-  then restarts in dependency order + health gate. Rollback of the *pairing*
-  (new Reality pair) is by re-applying the previous return blob (kept in
-  states).
+  then restarts in dependency order + health gate. It does **not** restore or
+  rewrite secret-bearing environment files; the current operator environment
+  is retained, and the operation fails closed when the target cannot be
+  reconstructed. Rollback of the *pairing* (new Reality pair) is by re-applying
+  the previous return blob (kept in states).
 
 ## 10. Firewall / systemd design (Q12, Q13, Q15, Q16)
 

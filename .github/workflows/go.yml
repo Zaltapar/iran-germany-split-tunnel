@@ -40,6 +40,51 @@ jobs:
       - name: go test
         run: go test ./...
 
+      - name: Shell and installer safety validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scripts=(install.sh deploy.sh)
+          if [[ -f test-install.sh ]]; then
+            scripts+=(test-install.sh)
+          fi
+          bash -n "${scripts[@]}"
+
+          # shellcheck is advisory tooling for this gate: use the runner's
+          # preinstalled version when present, but never install or download
+          # it in CI. Syntax validation above remains mandatory.
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck --shell=bash --severity=warning "${scripts[@]}"
+          else
+            echo "shellcheck unavailable; bash -n remains enforced"
+          fi
+
+          # Help/config checks are deliberately read-only. Do not run the
+          # deprecated deploy path: it can invoke sudo/systemctl/firewall
+          # mutation. No production firewall, host, or mutable-main download
+          # is involved in this job.
+          bash install.sh --help >/dev/null
+
+          tmpbin="$(mktemp -d)"
+          trap 'rm -rf "$tmpbin"' EXIT
+          go build -o "$tmpbin/iran-splitter" ./cmd/iran-splitter
+          go build -o "$tmpbin/germany-splitter" ./cmd/germany-splitter
+
+          SPLIT_SECRET=ci-only-secret-material-0123456789abcdef \
+            "$tmpbin/iran-splitter" --validate-config
+          SPLIT_SECRET=ci-only-secret-material-0123456789abcdef \
+            SPLIT_UP_WS_URL=wss://ci.example.org/upload \
+            "$tmpbin/germany-splitter" --validate-config
+
+          if [[ -f test-install.sh ]]; then
+            # The harness stubs systemctl and all install paths under a temp
+            # directory; it does not require root or touch a real host.
+            bash test-install.sh
+          else
+            echo "test-install.sh not present; conditional contract satisfied"
+          fi
+
       - name: go test -race
         run: go test -race ./...
 

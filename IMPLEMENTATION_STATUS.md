@@ -1,9 +1,23 @@
 # Implementation Status — Production Hardening
 
 Branch: `main`
-Latest recorded commit: `2927f847` (T8-B M5: `config set` + `upgrade` wired
-through `Controller.ApplyRequest`; full local tests green, Linux staging
-pending)
+Current release gate baseline: remote `main` is verified at
+`2808f9893a7a54b3f91b852828c4f19f92c8b5bd` before this readiness batch. The
+batch commit and its GitHub Actions conclusion must be recorded here only
+after the commit is pushed and the exact run is queried; no CI result is
+inferred from local tests.
+
+Supported ownership contract: `splitterctl` is supported; `install.sh` and
+`deploy.sh` are deprecated/non-production. Germany Xray/Reality is
+project-managed by `splitterctl`; Iran's external Xray/3x-ui or xray-consumer
+is operator-owned and not managed. Public DNS/CDN/TLS/NAT/WebSocket checks are
+operator/external prerequisites. Pairing is terminal by host step: Iran
+`finalized`, Germany `a-applied`; rollback does not restore secret-bearing env
+files. Issues #19/#20/#21/#10/#11/#12 remain open unless independently
+resolved and recorded.
+
+Latest recorded implementation commit: `2927f847` (historical T8-B M5
+record; not the current remote tip)
 
 ## Final repository reconciliation — 2026-09-18
 
@@ -38,6 +52,20 @@ pending)
   and disposition of the adversarial gate. T8/L5 production readiness is not
   claimed from the historical staging observations or the current-tip
   documentation alone.
+
+## Release gate — readiness batch from `2808f9893a7a54b3f91b852828c4f19f92c8b5bd`
+
+- **Remote tip before batch:** verified exact SHA above via GitHub; no staging
+  host was contacted or changed.
+- **Batch changes:** Linux CI now performs mandatory `bash -n` checks for the
+  legacy shell files that exist, optional preinstalled shellcheck, installer
+  help, and temporary-binary `--validate-config` dry-runs without root or host
+  mutation. Existing Go/race/pinned gates and workflow triggers are preserved.
+- **CI evidence:** pending until the pushed batch commit's exact GitHub Actions
+  run conclusion is queried. Local validation is not CI evidence.
+- **Known limitations/blockers:** no staging acceptance was performed; public
+  DNS/CDN/TLS/NAT/WebSocket prerequisites remain external; the legacy scripts
+  remain non-production; and #19/#20/#21/#10/#11/#12 remain open.
 
 ## Current state
 

@@ -89,12 +89,15 @@ historical/development fallback and is not acceptance evidence.
 ```
 Iran:
   splitterctl install iran   (supported transactional path)
-  + operator-managed Xray/3x-ui consumer routing into the splitter SOCKS port
-  + operator-managed DNS/CDN/TLS/WebSocket origin for /upload
+  + operator-owned external Xray/3x-ui or xray-consumer routing into the
+    splitter SOCKS port (this project does not manage it)
+  + operator/external DNS/CDN/TLS/NAT/WebSocket prerequisites for /upload
 Germany:
   splitterctl install germany (supported transactional path)
-  + operator-managed Xray/3x-ui/Xray-consumer VLESS+Reality inbound delivering
-    tunneled TCP bytes to 127.0.0.1:9002 (this project does not manage it)
+  + project-managed pinned Xray/Reality inbound delivering tunneled TCP bytes
+    to 127.0.0.1:9002
+  + operator/external public DNS/CDN/TLS/NAT/WebSocket prerequisites as used
+    by the selected upload path
 ```
 
 Before the matrix, run these read-only preflights on the relevant hosts:
@@ -110,9 +113,12 @@ curl -fsS http://127.0.0.1:<metrics>/metrics
 
 Acceptance requires the expected service states, listener ownership/binds,
 metrics HTTP success, DNS record correctness, TLS/WebSocket upgrade, and
-public reachability from Germany. DNS, CDN, NAT, TLS/WebSocket, firewall
-reachability, and the external Iran Xray/3x-ui/Xray-consumer configuration are
-operator responsibilities and are not claimed by `splitterctl doctor`.
+public reachability from Germany. Public DNS, CDN, TLS, NAT, WebSocket, and
+firewall reachability are operator/external prerequisites; Iran's external
+Xray/3x-ui or xray-consumer is also operator-owned. They are not claimed by
+`splitterctl doctor`. Germany's project-managed Xray/Reality is covered by the
+supported deployment path, but its public transport still depends on those
+external prerequisites.
 
 ## 3. Acceptance matrix (20 scenarios)
 
@@ -144,6 +150,20 @@ scenarios 3, 10, 17, 18 (full), 20.
 | 18 | Resource settling | idle 5 min → 16-session burst (scenario 6) → idle 5 min | sample `ps` RSS + `ls /proc/<pid>/fd | wc -l` + metrics gauges every 10 s | RSS after settling ≤ peak + 10 MiB; fd count returns to the idle baseline ±2; `session_count` == 0; `session_buffered_bytes` == 0 | 15 min |
 | 19 | Graceful shutdown | topology up, no active sessions | `systemctl stop germany-splitter` then `systemctl stop iran-splitter` | each exits 0; journal shows `... stopped` as the last line; no zombie conns (fd count 0 before exit) | 30 s each |
 | 20 | Restart/recovery | as 19 | `systemctl start` both, then run scenario 1 | carriers re-authenticate within the backoff schedule; a new session works; metrics counters are fresh (new processes) | 90 s |
+
+### Pairing and rollback state contract
+
+Pairing is intentionally terminal by host step: Iran reaches `finalized` and
+Germany reaches `a-applied`. Re-running Germany `pair apply` while `a-applied`
+is a safe deterministic re-emission of the same return blob when Blob B was
+lost; it does not mean the host is unpaired. Rollback does not restore or
+rewrite
+secret-bearing environment files; it retains the operator's current
+environment and fails closed when the requested state cannot be reconstructed.
+
+Issues #19, #20, #21, #10, #11, and #12 remain open unless independently
+resolved with verified evidence. This runbook does not close or imply closure
+of any issue.
 
 ### #20/#21 regression contract
 
