@@ -42,6 +42,7 @@ source "$REPO/install.sh"
 # --- overrides for testing --------------------------------------------
 INSTALL_DIR="$WORK/installbin"
 SYSTEMD_DIR="$WORK/etc/systemd/system"
+# shellcheck disable=SC2034
 SECRET_STORE="$WORK/secret-store"
 check_root()   { :; }
 check_system() { :; }
@@ -70,6 +71,7 @@ read_line() {
   printf '%s' "$l"
 }
 
+# shellcheck disable=SC2034
 reset_state() {
   ROLE="" SECRET="" SOCKS_LISTEN="" WS_LISTEN="" DOWN_CARRIER_ADDR=""
   CDN_DOMAIN="" NGINX_CONFIG="ask" NGINX_PORT="" XRAY_CONFIG=""
@@ -451,6 +453,7 @@ exit 0
 EOF
 chmod +x "$WORK/fakebin/nginx"
 mkdir -p "$WORK/nginxroot/conf.d"
+# shellcheck disable=SC2034
 NGINX_ROOT="$WORK/nginxroot"
 reset_state
 if ( main iran --yes --nginx --cdn-domain cdn.test.com --nginx-port 8443 \

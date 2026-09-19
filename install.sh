@@ -933,7 +933,8 @@ Environment=SPLIT_UP_WS_URL=${UP_WS_URL}"
 
   # Back up an existing unit (upgrade path) before overwriting it.
   if [ -f "$unit" ]; then
-    local unit_bak="${unit}.bak.$(date +%s)"
+    local unit_bak
+    unit_bak="${unit}.bak.$(date +%s)"
     cp "$unit" "$unit_bak"
     info "Backed up existing unit to: ${unit_bak}"
   fi
@@ -1028,7 +1029,8 @@ merge_xray_config() {
 
   local socks_port="${SOCKS_LISTEN##*:}"
   local inbound_tag="${XRAY_INBOUND_TAG:-user-vless-reality}"
-  local bak="${XRAY_CONFIG}.bak.$(date +%s)"
+  local bak
+  bak="${XRAY_CONFIG}.bak.$(date +%s)"
   cp "$XRAY_CONFIG" "$bak"
   info "Backed up Xray config to: ${bak}"
 
