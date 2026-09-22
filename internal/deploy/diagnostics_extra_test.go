@@ -42,6 +42,70 @@ func TestListenerBindsCheckPositiveNegativeAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestListenerSnapshotContainsCanonicalBinds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		expected string
+		snapshot string
+		want     bool
+	}{
+		{
+			name:     "configured ipv4 wildcard matches ss wildcard",
+			expected: "0.0.0.0:10900",
+			snapshot: "LISTEN 0 128 *:10900 0.0.0.0:*\n",
+			want:     true,
+		},
+		{
+			name:     "configured ipv4 wildcard matches explicit ss wildcard",
+			expected: "0.0.0.0:10900",
+			snapshot: "LISTEN 0 128 0.0.0.0:10900 0.0.0.0:*\n",
+			want:     true,
+		},
+		{
+			name:     "configured loopback matches loopback",
+			expected: "127.0.0.1:10900",
+			snapshot: "LISTEN 0 128 127.0.0.1:10900 0.0.0.0:*\n",
+			want:     true,
+		},
+		{
+			name:     "configured loopback does not match wildcard",
+			expected: "127.0.0.1:10900",
+			snapshot: "LISTEN 0 128 *:10900 0.0.0.0:*\n",
+			want:     false,
+		},
+		{
+			name:     "configured wildcard does not match loopback",
+			expected: "0.0.0.0:10900",
+			snapshot: "LISTEN 0 128 127.0.0.1:10900 0.0.0.0:*\n",
+			want:     false,
+		},
+		{
+			name:     "configured wildcard matches ipv6 wildcard rendering",
+			expected: "0.0.0.0:10900",
+			snapshot: "LISTEN 0 128 [::]:10900 [::]:*\n",
+			want:     true,
+		},
+		{
+			name:     "configured ipv6 wildcard matches ss wildcard",
+			expected: "[::]:10900",
+			snapshot: "LISTEN 0 128 *:10900 [::]:*\n",
+			want:     true,
+		},
+		{
+			name:     "nothing listening does not match",
+			expected: "0.0.0.0:10900",
+			snapshot: "",
+			want:     false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := listenerSnapshotContains(tc.snapshot, tc.expected); got != tc.want {
+				t.Fatalf("listenerSnapshotContains(snapshot, %q) = %t, want %t", tc.expected, got, tc.want)
+			}
+		})
+	}
+}
+
 type diagnosticsXrayFake struct {
 	version string
 	testErr error

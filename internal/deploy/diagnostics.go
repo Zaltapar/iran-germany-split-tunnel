@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -341,14 +342,29 @@ func ListenerBindsCheck(ex systemd.SystemdExecutor, expected []string) Check {
 	}}
 }
 
+// canonicalListenerBind normalizes equivalent wildcard spellings emitted by
+// ss and accepted by the listener configuration. Specific addresses remain
+// distinct: doctor verifies the configured exposure scope rather than merely
+// accepting any listener on the same port.
+func canonicalListenerBind(bind string) string {
+	host, port, err := net.SplitHostPort(bind)
+	if err != nil {
+		return bind
+	}
+	if host == "" || host == "*" || host == "0.0.0.0" || host == "::" {
+		host = "*"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 func listenerSnapshotContains(snapshot, expected string) bool {
+	want := canonicalListenerBind(expected)
 	for _, line := range strings.Split(snapshot, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
 			continue
 		}
-		local := fields[3]
-		if local == expected || strings.HasSuffix(local, ":"+strings.TrimPrefix(expected, ":")) {
+		if canonicalListenerBind(fields[3]) == want {
 			return true
 		}
 	}
