@@ -24,6 +24,12 @@ import (
 // secret: tests assert its ABSENCE from error strings and journal echoes.
 const secretMarker = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
 
+// socksPassMarker is a policy-satisfying 40-char token used as the
+// SPLIT_SOCKS_PASS test value: tests assert its ABSENCE from error strings
+// and journal echoes (plans/socks5-auth-design.md §4.3 — a regression that
+// logs the password must fail a test, not a review).
+const socksPassMarker = "0000000000000000000000000000000000000000"
+
 // fakeExec is the test SystemdExecutor: records every call (argv joined
 // with spaces) and answers from an ordered/default table.
 type fakeExec struct {

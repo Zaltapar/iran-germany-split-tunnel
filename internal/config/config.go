@@ -46,6 +46,8 @@ const (
 // Environment variable names (single source of truth).
 const (
 	EnvSocksListen     = "SPLIT_SOCKS_LISTEN"               // Iran
+	EnvSocksUser       = "SPLIT_SOCKS_USER"                 // Iran — SOCKS5 RFC 1929 username
+	EnvSocksPass       = "SPLIT_SOCKS_PASS"                 // Iran — SOCKS5 RFC 1929 password (never logged)
 	EnvWsListen        = "SPLIT_WS_LISTEN"                  // Iran
 	EnvDownCarrier     = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
 	EnvUpWsUrl         = "SPLIT_UP_WS_URL"                  // Germany
@@ -77,7 +79,11 @@ const (
 	DefaultUpWsUrl    = "wss://cdn.example.com/upload"
 	DefaultDownListen = ":9002"
 	// Placeholder secret: rejected by the Phase 6 policy.
-	DefaultSecret       = "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING"
+	DefaultSecret = "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING"
+	// RFC 1929 SOCKS5 credentials (Iran): empty means auth disabled,
+	// preserving the pre-RFC-1929 behavior (plans/socks5-auth-design.md §1.2).
+	DefaultSocksUser    = ""
+	DefaultSocksPass    = ""
 	DefaultRelayBuf     = 32768
 	DefaultKeepAlive    = 30 * time.Second
 	ExpectedCarrierPath = "/upload" // the only path Iran's WS server serves
@@ -132,6 +138,14 @@ const (
 
 	MinPort = 1
 	MaxPort = 65535
+
+	// SOCKS5 RFC 1929 username bounds: RFC 1929 encodes the username
+	// length in one byte, so 1..255 is the representable range. The
+	// password has no separate length rule (its strength policy is
+	// §5 of plans/socks5-auth-design.md); Min/MaxSocksPassLen are
+	// NOT a config bound, only the protocol's 255-byte field cap.
+	MinSocksUserLen = 1
+	MaxSocksUserLen = 255
 )
 
 // Config is the full configuration for one splitter role. Role-irrelevant
@@ -145,6 +159,13 @@ type Config struct {
 	DownCarrierAddr string // Iran: down-carrier dial target (host:port)
 	UpWsUrl         string // Germany: up-carrier WS URL (ws:// or wss://host/upload)
 	DownListen      string // Germany: down-carrier TCP listener (host:port, host may be empty)
+
+	// Iran RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §1.2):
+	// empty = auth not configured (pre-RFC-1929 behavior); both non-empty =
+	// auth enforced. Exactly one set is a config error (fail closed). The
+	// password is never logged or echoed in errors.
+	SocksUser string
+	SocksPass string
 
 	// Shared
 	Secret               string        // never logged, never echoed in errors
@@ -173,12 +194,16 @@ type Config struct {
 // Defaults returns a Config with all built-in defaults (no env read).
 func Defaults() *Config {
 	return &Config{
-		SocksListen:       DefaultSocksListen,
-		WsListen:          DefaultWsListen,
-		DownCarrierAddr:   DefaultDownCarrier,
-		UpWsUrl:           DefaultUpWsUrl,
-		DownListen:        DefaultDownListen,
-		Secret:            DefaultSecret,
+		SocksListen:     DefaultSocksListen,
+		WsListen:        DefaultWsListen,
+		DownCarrierAddr: DefaultDownCarrier,
+		UpWsUrl:         DefaultUpWsUrl,
+		DownListen:      DefaultDownListen,
+		Secret:          DefaultSecret,
+		// Empty credentials: auth disabled, byte-for-byte pre-RFC-1929
+		// behavior (plans/socks5-auth-design.md §1.2, §8.2).
+		SocksUser:         DefaultSocksUser,
+		SocksPass:         DefaultSocksPass,
 		MetricsPort:       0,
 		RelayBufSize:      DefaultRelayBuf,
 		KeepAliveInterval: DefaultKeepAlive,
@@ -186,6 +211,12 @@ func Defaults() *Config {
 		SessionBufBytes:   DefaultSessionBuf,
 	}
 }
+
+// SocksAuthEnabled reports whether RFC 1929 authentication is configured
+// (both SocksUser and SocksPass non-empty). Iran role only; Germany's
+// fields are not Iran's and the predicate reads no role argument — callers
+// gate on the role themselves (plans/socks5-auth-design.md §5).
+func (c *Config) SocksAuthEnabled() bool { return c.SocksUser != "" && c.SocksPass != "" }
 
 // ConfigError aggregates every validation problem found, formatted as a
 // bulleted list.
@@ -218,6 +249,11 @@ func Load(role string) (*Config, error) {
 	c.UpWsUrl = envString(EnvUpWsUrl, c.UpWsUrl)
 	c.DownListen = envString(EnvDownListen, c.DownListen)
 	c.Secret = envString(EnvSecret, c.Secret)
+	// RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §1.2–§1.3):
+	// unset or empty means "not set" (the documented env convention), so a
+	// half-set state is deterministic and fails closed in Validate.
+	c.SocksUser = envString(EnvSocksUser, c.SocksUser)
+	c.SocksPass = envString(EnvSocksPass, c.SocksPass)
 	c.MetricsPort = envInt(&problems, EnvMetricsPort, 0, 0, MaxPort)
 	c.RelayBufSize = envInt(&problems, EnvRelayBuf, DefaultRelayBuf, MinRelayBuf, MaxRelayBuf)
 	c.QueueBytesPerStream = envInt(&problems, EnvQueueBytes, 0, 0, MaxQueueBytesPerStream)
@@ -272,6 +308,32 @@ func (c *Config) Validate(role string) error {
 			problems = append(problems, fmt.Sprintf(
 				"%s and %s use the same endpoint %q; the app owns both listeners",
 				EnvSocksListen, EnvWsListen, c.SocksListen))
+		}
+		// RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §1.4).
+		// These rules are Iran-only; a Germany config leaving the pair empty
+		// (or half-set, which Validate does not see because Load rejects it
+		// first) is unaffected.
+		if c.SocksUser != "" || c.SocksPass != "" {
+			if c.SocksUser == "" || c.SocksPass == "" {
+				// Exactly one set: fail closed. Field names only, never values.
+				problems = append(problems, fmt.Sprintf(
+					"%s and %s must be set together (a username without a password cannot authenticate anything); set both or neither",
+					EnvSocksUser, EnvSocksPass))
+			} else {
+				// Both set: enforce the representable-range rule on the
+				// username (RFC 1929's 1-byte ULEN field) and the password
+				// strength policy (reusing the SPLIT_SECRET bypass, §5).
+				if len(c.SocksUser) < MinSocksUserLen || len(c.SocksUser) > MaxSocksUserLen {
+					problems = append(problems, fmt.Sprintf(
+						"%s: expected 1..255 bytes (RFC 1929 encodes the username length in one byte)",
+						EnvSocksUser))
+				}
+				if err := mux.ValidateSecretMaterial(c.SocksPass, c.AllowWeakSecret); err != nil {
+					problems = append(problems, fmt.Sprintf(
+						"%s: does not satisfy the minimum security requirements (%v); generate one with: openssl rand -hex 24",
+						EnvSocksPass, err))
+				}
+			}
 		}
 	case RoleGermany:
 		checkWsUrl(&problems, c.UpWsUrl)

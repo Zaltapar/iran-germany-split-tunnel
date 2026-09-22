@@ -118,6 +118,13 @@ func (r InstallRequest) Env() (map[string]string, error) {
 		env[config.EnvSocksListen] = c.SocksListen
 		env[config.EnvWsListen] = c.WsListen
 		env[config.EnvDownCarrier] = c.DownCarrierAddr
+		// RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §6.4):
+		// emit BOTH or NEITHER so the env file can never carry the
+		// half-set state that config.Load rejects as a misconfiguration.
+		if c.SocksUser != "" && c.SocksPass != "" {
+			env[config.EnvSocksUser] = c.SocksUser
+			env[config.EnvSocksPass] = c.SocksPass
+		}
 	} else {
 		env[config.EnvUpWsUrl] = c.UpWsUrl
 		env[config.EnvDownListen] = c.DownListen
@@ -281,6 +288,8 @@ type ConfigKey struct {
 // refused (ConfigKeyRefusals) or unknown (a usage error).
 var ConfigKeys = []ConfigKey{
 	{Name: "socks.listen", EnvVar: config.EnvSocksListen, Roles: []string{RoleIran}, Kind: ConfigString},
+	{Name: "socks.user", EnvVar: config.EnvSocksUser, Roles: []string{RoleIran}, Kind: ConfigString},
+	{Name: "socks.pass", EnvVar: config.EnvSocksPass, Roles: []string{RoleIran}, Kind: ConfigString},
 	{Name: "ws.listen", EnvVar: config.EnvWsListen, Roles: []string{RoleIran}, Kind: ConfigString},
 	{Name: "down.carrier.addr", EnvVar: config.EnvDownCarrier, Roles: []string{RoleIran}, Kind: ConfigString},
 	{Name: "up.ws.url", EnvVar: config.EnvUpWsUrl, Roles: []string{RoleGermany}, Kind: ConfigString},

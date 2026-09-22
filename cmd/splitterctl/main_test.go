@@ -1461,6 +1461,41 @@ func TestConfigSetAppliesTransactionallyAndNeverEchoesValues(t *testing.T) {
 	if _, err := store.ReadJournal(); !os.IsNotExist(err) {
 		t.Fatalf("no-op config set wrote a journal: %v", err)
 	}
+
+	// --- SOCKS credential keys (design §7.5) ---
+	// socks.user and socks.pass set on an installed Iran: the key NAMES
+	// appear in the output but the VALUES do not (never-echoed contract).
+	socksPass := strings.Repeat("c", 40) // ≥32, not on the blocklist
+	third := &mutationFake{}
+	defer stubMutationController(store, third)()
+	out.Reset()
+	if err := run(context.Background(), []string{"config", "set", "socks.user=alice", "socks.pass=" + socksPass}, &out, &out); err != nil {
+		t.Fatalf("config set socks: %v", err)
+	}
+	got3 := out.String()
+	for _, want := range []string{"socks.user", "socks.pass"} {
+		if !strings.Contains(got3, want) {
+			t.Fatalf("output = %q, want key %q", got3, want)
+		}
+	}
+	for _, forbidden := range []string{"alice", socksPass} {
+		if strings.Contains(got3, forbidden) {
+			t.Fatalf("output leaked %q: %q", forbidden, got3)
+		}
+	}
+	// Repeat: fingerprint unchanged → no-op.
+	fourth := &mutationFake{}
+	defer stubMutationController(store, fourth)()
+	out.Reset()
+	if err := run(context.Background(), []string{"config", "set", "socks.user=alice", "socks.pass=" + socksPass}, &out, &out); err != nil {
+		t.Fatalf("repeat socks config set: %v", err)
+	}
+	if !strings.Contains(out.String(), "already converged") {
+		t.Fatalf("repeat socks output = %q", out.String())
+	}
+	if len(fourth.calls) != 0 {
+		t.Fatalf("repeat socks config set mutated the host: %#v", fourth.calls)
+	}
 }
 
 // TestConfigSetSecretIsNeverEchoed pins secret hygiene for the one key whose
@@ -1924,6 +1959,30 @@ func TestConfigSetKeepsConfigShowUnchanged(t *testing.T) {
 	for _, forbidden := range []string{"9100", "configFingerprint", "manifestHash"} {
 		if strings.Contains(after.String(), forbidden) {
 			t.Fatalf("config show leaked %q: %q", forbidden, after.String())
+		}
+	}
+
+	// --- SOCKS credential keys must not add a leak surface (§7.5) ---
+	// A commit that sets socks.user/socks.pass must keep the config show
+	// surface value-free: the keys are visible (they are part of the key
+	// listing), the VALUES are not.
+	socksPass := strings.Repeat("d", 40)
+	var setOut bytes.Buffer
+	if err := run(context.Background(), []string{"config", "set", "socks.user=alice", "socks.pass=" + socksPass}, &setOut, &setOut); err != nil {
+		t.Fatalf("config set socks: %v", err)
+	}
+	var after2 bytes.Buffer
+	if err := run(context.Background(), []string{"config", "show"}, &after2, &after2); err != nil {
+		t.Fatalf("config show after socks set: %v", err)
+	}
+	for _, want := range []string{"role: iran"} {
+		if !strings.Contains(after2.String(), want) {
+			t.Fatalf("config show after socks set %q does not contain %q", after2.String(), want)
+		}
+	}
+	for _, forbidden := range []string{socksPass, "alice"} {
+		if strings.Contains(after2.String(), forbidden) {
+			t.Fatalf("config show leaked the SOCKS credential %q: %q", forbidden, after2.String())
 		}
 	}
 }

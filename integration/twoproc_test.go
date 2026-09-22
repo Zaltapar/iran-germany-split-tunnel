@@ -348,7 +348,7 @@ func (p *proc) stopGraceful(t *testing.T, d time.Duration) {
 // p.reaped is true when the exit was observed (the exit channel is a
 // one-shot: whatever drained it first owns the value).
 func (p *proc) kill() {
-	if p.cmd.Process == nil {
+	if p.cmd.Process == nil || p.reaped {
 		return
 	}
 	select {
@@ -741,11 +741,11 @@ func wsWriteBinary(c net.Conn, payload []byte) error {
 
 // runTransfer is the non-`t`-coupled transfer (safe to call from worker
 // goroutines): SOCKS5 CONNECT, write payload, read the echo, checksum.
-func runTransfer(socksAddr, dest string, port int, size int, d time.Duration) error {
+func runTransfer(socksAddr, dest string, port int, size int, d time.Duration, creds *socks5.Credentials) error {
 	payload := make([]byte, size)
 	rand.Read(payload)
 	sum := sha256.Sum256(payload)
-	c, err := socks5.Dial(socksAddr, dest, port, d)
+	c, err := socks5.DialWithAuth(socksAddr, dest, port, d, creds)
 	if err != nil {
 		return fmt.Errorf("SOCKS5 CONNECT %s:%d: %w", dest, port, err)
 	}
@@ -768,10 +768,10 @@ func runTransfer(socksAddr, dest string, port int, size int, d time.Duration) er
 // transfer opens a SOCKS5 session, writes payload, reads the echo, and
 // verifies the checksum. Returns the client for further assertions.
 // MUST be called from the test goroutine (it calls t.Fatalf).
-func transfer(t *testing.T, socksAddr, dest string, port int, payload []byte, d time.Duration) *socks5.Client {
+func transfer(t *testing.T, socksAddr, dest string, port int, payload []byte, d time.Duration, creds *socks5.Credentials) *socks5.Client {
 	t.Helper()
 	sum := sha256.Sum256(payload)
-	c, err := socks5.Dial(socksAddr, dest, port, d)
+	c, err := socks5.DialWithAuth(socksAddr, dest, port, d, creds)
 	if err != nil {
 		t.Fatalf("SOCKS5 CONNECT %s:%d: %v", dest, port, err)
 	}
@@ -841,6 +841,10 @@ func TestTwoProcessLocal(t *testing.T) {
 		"SPLIT_METRICS_PORT":      strconv.Itoa(mIran),
 		"SPLIT_BOOTSTRAP_WAIT_MS": "2000",
 		"SPLIT_CARRIER_GRACE":     "15000",
+		// S0a restarts Iran WITH these (absent here = auth disabled, the
+		// byte-for-byte backward-compat L4 gate; §6.8).
+		"SPLIT_SOCKS_USER": "",
+		"SPLIT_SOCKS_PASS": "",
 	})
 
 	// Test tuning (documented): the carrier-loss grace is widened to
@@ -871,12 +875,154 @@ func TestTwoProcessLocal(t *testing.T) {
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	const big = 256 << 10
 
+	// ---------- S0a: SOCKS5 username/password auth (RFC 1929) ----------
+	// design §6.8/§7.6: restart Iran WITH SPLIT_SOCKS_USER/PASS, then prove
+	//  (i)   wrong credentials fail BEFORE any CONNECT,
+	//  (ii)  correct credentials give a full CONNECT + echo + checksum,
+	//  (iii) a raw 05 01 00 no-auth greeting is answered 05 FF (no bypass
+	//         on a gated port).
+	// The subtest ends by restoring the no-auth Iran so S1-S11 run
+	// unchanged — that is the byte-for-byte backward-compat L4 gate.
+	t.Run("S0a_socks_auth", func(t *testing.T) {
+		const socksUser = "alice"
+		// 40 chars, not on the blocklist: satisfies the min-32 secret
+		// policy without a SPLIT_ALLOW_WEAK_SECRET bypass (mirrors the
+		// internal/systemd socksPassMarker constant).
+		const socksPass = "0000000000000000000000000000000000000000"
+
+		// Capture Germany's current log position BEFORE the restart. The
+		// post-restart "Down-carrier authenticated from" marker must be
+		// observed after this offset; capturing it after Iran has reconnected
+		// would exclude the event and make the wait time out.
+		deOff := de.logLen()
+
+		// Drop the no-auth Iran; the surviving Germany re-binds when the
+		// restarted Iran re-listens its carriers (the rebind machinery S7/S8
+		// exercise; 15 s grace + 2 s bootstrap).
+		iran.kill()
+		if !iran.reaped {
+			t.Fatalf("S0a: no-auth Iran did not exit within 5s after kill\nlog:\n%s", iran.log.String())
+		}
+
+		// cleanupT = root (the top-level test), NOT the S0a subtest: a
+		// subtest-registered kill would SIGKILL this process the moment the
+		// subtest returns (the exact bug the S10c Germany restart hit).
+		iranNoAuth := map[string]string{
+			"SPLIT_SECRET":            secretHex,
+			"SPLIT_SOCKS_LISTEN":      fmt.Sprintf("127.0.0.1:%d", socksPort),
+			"SPLIT_WS_LISTEN":         fmt.Sprintf("127.0.0.1:%d", iranWsPort),
+			"SPLIT_DOWN_CARRIER_ADDR": downProxy.Addr(),
+			"SPLIT_METRICS_PORT":      strconv.Itoa(mIran),
+			"SPLIT_BOOTSTRAP_WAIT_MS": "2000",
+			"SPLIT_CARRIER_GRACE":     "15000",
+			"SPLIT_SOCKS_USER":        "",
+			"SPLIT_SOCKS_PASS":        "",
+		}
+		var authIran *proc
+		restored := false
+		restoreNoAuth := func() {
+			if restored {
+				return
+			}
+			restored = true
+			restOff := de.logLen()
+			if authIran != nil {
+				authIran.kill()
+				if !authIran.reaped {
+					t.Errorf("S0a: auth Iran did not exit within 5s after kill\\nlog:\\n%s", authIran.log.String())
+					return
+				}
+			}
+			iran = startProc(t, root, "iran", iranBin, iranNoAuth)
+			iran.waitForLog(t, "iran-splitter started", 15*time.Second)
+			iran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
+			iran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
+			de.waitForLogAfter(t, "Down-carrier authenticated from", restOff, 25*time.Second)
+		}
+		// t.Fatal/t.Fatalf exits the subtest immediately, so ensure S1-S11
+		// still receive a no-auth Iran even when an S0a assertion fails.
+		defer restoreNoAuth()
+
+		// Reuse the base Iran env, but set the two auth vars.
+		iranAuth := map[string]string{
+			"SPLIT_SECRET":            secretHex,
+			"SPLIT_SOCKS_LISTEN":      fmt.Sprintf("127.0.0.1:%d", socksPort),
+			"SPLIT_WS_LISTEN":         fmt.Sprintf("127.0.0.1:%d", iranWsPort),
+			"SPLIT_DOWN_CARRIER_ADDR": downProxy.Addr(),
+			"SPLIT_METRICS_PORT":      strconv.Itoa(mIran),
+			"SPLIT_BOOTSTRAP_WAIT_MS": "2000",
+			"SPLIT_CARRIER_GRACE":     "15000",
+			"SPLIT_SOCKS_USER":        socksUser,
+			"SPLIT_SOCKS_PASS":        socksPass,
+		}
+		authIran = startProc(t, root, "iran", iranBin, iranAuth)
+		// Fresh log on the restarted proc: plain waits. Germany survives, so
+		// its re-handoff of Iran's down-carrier is offset-scoped.
+		authIran.waitForLog(t, "iran-splitter started", 15*time.Second)
+		authIran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
+		authIran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
+		de.waitForLogAfter(t, "Down-carrier authenticated from", deOff, 25*time.Second)
+
+		// (i) wrong credentials must fail BEFORE any CONNECT, as a distinct
+		// *socks5.AuthError (never a silent success, never a CONNECT-stage
+		// error). One attempt, no retry, in both wrong-user and
+		// wrong-password forms.
+		_, err := socks5.DialWithAuth(socksAddr, "127.0.0.1", target.Port(), 10*time.Second,
+			&socks5.Credentials{User: socksUser, Pass: "0000000000000000000000000000000000000001"})
+		if err == nil {
+			t.Fatal("S0a(i): wrong password must be rejected, got success")
+		}
+		var ae *socks5.AuthError
+		if !errors.As(err, &ae) {
+			t.Fatalf("S0a(i): expected *socks5.AuthError, got %T: %v", err, err)
+		}
+		if _, werr := socks5.DialWithAuth(socksAddr, "127.0.0.1", target.Port(), 10*time.Second,
+			&socks5.Credentials{User: "mallory", Pass: socksPass}); werr == nil {
+			t.Fatal("S0a(i): wrong username must be rejected, got success")
+		}
+
+		// (ii) correct credentials: full CONNECT + echo + checksum transfer.
+		payload := make([]byte, 4096)
+		rand.Read(payload)
+		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second,
+			&socks5.Credentials{User: socksUser, Pass: socksPass})
+		c.Close()
+		_ = waitMetric(t, mIran, 10*time.Second, "S0a settled", func(m metrics) bool {
+			return m.ActiveSessions == 0 && m.SessionCount == 0
+		})
+
+		// (iii) a raw no-auth greeting to the same gated listener must be
+		// answered 05 FF at the method stage — no no-auth bypass.
+		raw, err := net.DialTimeout("tcp", socksAddr, 10*time.Second)
+		if err != nil {
+			t.Fatalf("S0a(iii): raw dial: %v", err)
+		}
+		defer raw.Close()
+		if _, err := raw.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+			t.Fatalf("S0a(iii): write no-auth greeting: %v", err)
+		}
+		rep := make([]byte, 2)
+		raw.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, err := io.ReadFull(raw, rep); err != nil {
+			t.Fatalf("S0a(iii): read method reply: %v", err)
+		}
+		if rep[0] != 0x05 || rep[1] != 0xff {
+			t.Fatalf("S0a(iii): raw 05 01 00 answered % x, want 05 ff (no bypass on a gated port)", rep)
+		}
+
+		// Restore the no-auth Iran so S1-S11 run unchanged. The deferred
+		// call above is a failure-path safety net; this explicit call restores
+		// it before the next sibling subtest.
+		restoreNoAuth()
+		t.Log("S0a ok: wrong creds rejected pre-CONNECT; correct creds tunnel; raw 05 01 00 -> 05 FF; no-auth Iran restored")
+	})
+
 	// ---------- S1: CONNECT (IPv4) + sustained upload/download ----------
 	t.Run("S1_connect_sustained", func(t *testing.T) {
 		m0 := fetchMetrics(t, mIran)
 		payload := make([]byte, big)
 		rand.Read(payload)
-		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 20*time.Second)
+		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 20*time.Second, nil)
 
 		// Metric deltas: exactly the payload bytes in both directions
 		// (the relays count payload bytes), at least one session.
@@ -904,7 +1050,7 @@ func TestTwoProcessLocal(t *testing.T) {
 	t.Run("S2_domain", func(t *testing.T) {
 		payload := make([]byte, 1024)
 		rand.Read(payload)
-		c := transfer(t, socksAddr, "localhost", target.Port(), payload, 10*time.Second)
+		c := transfer(t, socksAddr, "localhost", target.Port(), payload, 10*time.Second, nil)
 		c.Close()
 		settleBoth(t, mIran, mDe, 10*time.Second, "S2")
 		t.Log("S2 ok: domain destination through the real resolver path")
@@ -917,7 +1063,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		}
 		payload := make([]byte, 1024)
 		rand.Read(payload)
-		c := transfer(t, socksAddr, "::1", v6Port, payload, 10*time.Second)
+		c := transfer(t, socksAddr, "::1", v6Port, payload, 10*time.Second, nil)
 		c.Close()
 		settleBoth(t, mIran, mDe, 10*time.Second, "S3")
 		t.Log("S3 ok: IPv6 destination")
@@ -936,7 +1082,7 @@ func TestTwoProcessLocal(t *testing.T) {
 				defer wg.Done()
 				// runTransfer, not transfer: the worker must never call
 				// t.Fatalf from a non-test goroutine.
-				errs <- runTransfer(socksAddr, "127.0.0.1", target.Port(), size, 20*time.Second)
+				errs <- runTransfer(socksAddr, "127.0.0.1", target.Port(), size, 20*time.Second, nil)
 			}(i)
 		}
 		wg.Wait()
@@ -1136,7 +1282,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		// The real carrier is unaffected: a fresh session works.
 		payload := make([]byte, 128)
 		rand.Read(payload)
-		cc := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second)
+		cc := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second, nil)
 		cc.Close()
 		settleBoth(t, mIran, mDe, 10*time.Second, "S9")
 		t.Log("S9 ok: duplicate up-carrier rejected 409; tunnel unaffected")
@@ -1237,7 +1383,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 25*time.Second)
 		payload := make([]byte, 128)
 		rand.Read(payload)
-		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second)
+		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second, nil)
 		c.Close()
 		settleBoth(t, mIran, mDe, 10*time.Second, "S10c")
 		t.Log("S10c ok: Germany restart → carriers re-established → sessions flow again")

@@ -27,6 +27,12 @@ func validIranRequest() InstallRequest {
 	c.WsListen = "127.0.0.1:9001"
 	c.DownCarrierAddr = "127.0.0.1:10802"
 	c.Secret = strings.Repeat("a", 64)
+	// RFC 1929 SOCKS credentials (plans/socks5-auth-design.md §7.3):
+	// extend the fixture so every projection/planner/golden test
+	// exercises the new keys for free. The password is a
+	// policy-satisfying 40-char value.
+	c.SocksUser = "alice"
+	c.SocksPass = strings.Repeat("z", 40)
 	return InstallRequest{
 		Role:            RoleIran,
 		Config:          c,
@@ -96,12 +102,24 @@ func TestInstallRequestEnvProjectionKeepsSecretOutOfDesiredState(t *testing.T) {
 	if env[config.EnvSecret] != r.Config.Secret {
 		t.Fatal("env projection omitted the secret")
 	}
+	// RFC 1929: both credentials are projected into the env map (the
+	// fixture now carries them), so the env projection must include them
+	// but the desired state must not.
+	if env[config.EnvSocksUser] != r.Config.SocksUser || env[config.EnvSocksPass] != r.Config.SocksPass {
+		t.Fatalf("env projection omitted the RFC 1929 credentials: user=%q pass=%q", env[config.EnvSocksUser], env[config.EnvSocksPass])
+	}
 	desired, err := r.Desired()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(strings.Join([]string{desired.Components.Splitter.Path, desired.Paths.Env, desired.Paths.Config}, "\n"), r.Config.Secret) {
+	joined := strings.Join([]string{desired.Components.Splitter.Path, desired.Paths.Env, desired.Paths.Config}, "\n")
+	if strings.Contains(joined, r.Config.Secret) {
 		t.Fatal("desired state contains the tunnel secret")
+	}
+	// The SOCKS password must not appear in any desired-state field either
+	// (same non-invertible-fingerprint guarantee as SPLIT_SECRET).
+	if strings.Contains(desired.ConfigFingerprint, r.Config.SocksPass) {
+		t.Fatal("config fingerprint contains the SOCKS password")
 	}
 }
 
@@ -347,5 +365,69 @@ func TestInstallRequestRejectsUnsafeOrIncompleteInput(t *testing.T) {
 				t.Fatal("Desired unexpectedly succeeded")
 			}
 		})
+	}
+}
+
+// TestConfigFingerprintChangesWhenSocksPassChanges mirrors
+// TestConfigFingerprintTracksEveryProjectedValue for the RFC 1929 keys
+// (plans/socks5-auth-design.md §7.3): changing the password changes the
+// fingerprint, an identical request yields an equal fingerprint, and the
+// digest never contains either credential.
+func TestConfigFingerprintChangesWhenSocksPassChanges(t *testing.T) {
+	base := validIranRequest()
+	baseFp, err := base.ConfigFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(baseFp, base.Config.SocksPass) || strings.Contains(baseFp, base.Config.SocksUser) {
+		t.Fatal("config fingerprint contains an RFC 1929 credential")
+	}
+	// Deterministic: identical request → identical digest.
+	again, err := base.ConfigFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != baseFp {
+		t.Fatalf("fingerprint not deterministic: %q != %q", again, baseFp)
+	}
+	// A changed password is a different configuration.
+	mut := base
+	mut.Config.SocksPass = strings.Repeat("y", 40)
+	mutFp, err := mut.ConfigFingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutFp == baseFp {
+		t.Fatal("fingerprint did not change when the SOCKS password changed")
+	}
+}
+
+// TestLookupConfigKeySocksUserPass proves the CLI key table resolves the
+// new keys in every accepted spelling and refuses the rejected combined
+// form (plans/socks5-auth-design.md §7.3).
+func TestLookupConfigKeySocksUserPass(t *testing.T) {
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"socks.user", config.EnvSocksUser},
+		{"SOCKS_USER", config.EnvSocksUser},
+		{"socks-user", config.EnvSocksUser},
+		{"socks.pass", config.EnvSocksPass},
+		{"SOCKS_PASS", config.EnvSocksPass},
+		{"socks-pass", config.EnvSocksPass},
+	}
+	for _, tc := range cases {
+		k, ok := LookupConfigKey(tc.key)
+		if !ok {
+			t.Fatalf("LookupConfigKey(%q) not found", tc.key)
+		}
+		if k.EnvVar != tc.want {
+			t.Fatalf("LookupConfigKey(%q).EnvVar = %q, want %q", tc.key, k.EnvVar, tc.want)
+		}
+	}
+	// The rejected combined form must NOT be settable.
+	if k, ok := LookupConfigKey("socks.auth"); ok {
+		t.Fatalf("LookupConfigKey(socks.auth) = %+v, want not settable", k)
 	}
 }

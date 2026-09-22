@@ -1,7 +1,9 @@
 // Package socks5 is a minimal, dependency-free SOCKS5 client used ONLY by
 // the integration harness (Issue #9, L4/L5). It implements the subset of
 // RFC 1928 that the iran-splitter supports: no-authentication negotiation
-// and CONNECT to an IPv4, domain, or IPv6 destination.
+// and CONNECT to an IPv4, domain, or IPv6 destination, plus RFC 1929
+// username/password sub-negotiation for the auth-configured mode
+// (plans/socks5-auth-design.md §6.7).
 //
 // It is intentionally NOT a general-purpose SOCKS5 library, NOT production
 // code, and NOT part of the relay. The relay's own SOCKS5 server lives in
@@ -43,6 +45,21 @@ func (c *Client) HalfCloseWrite() error {
 // Close closes the tunnel connection.
 func (c *Client) Close() error { return c.conn.Close() }
 
+// Credentials is an RFC 1929 username/password pair for DialWithAuth.
+// A nil pointer is the "no auth" path (the legacy Dial behavior).
+type Credentials struct {
+	User string
+	Pass string
+}
+
+// AuthError is an RFC 1929 sub-negotiation failure (the server's 01 01
+// reply) or a rejected method selection when credentials were supplied.
+// The credentials themselves are never included in the error string
+// (plans/socks5-auth-design.md §4.2: no credential in error messages).
+type AuthError struct{ Reason string }
+
+func (e *AuthError) Error() string { return "socks5: authentication failed: " + e.Reason }
+
 // StatusError is a non-zero SOCKS5 reply status from the server.
 type StatusError struct{ Code byte }
 
@@ -72,7 +89,20 @@ var statusNames = map[byte]string{
 //
 // dest may be an IPv4 literal, an IPv6 literal, or a domain name (sent as
 // atyp 0x03, which is what the relay forwards to the target dialer).
+//
+// Dial is the no-authentication path; the existing L4 harness call sites use
+// it unchanged. Use DialWithAuth to speak RFC 1929 against an
+// auth-configured iran-splitter.
 func Dial(socksAddr, dest string, port int, timeout time.Duration) (*Client, error) {
+	return DialWithAuth(socksAddr, dest, port, timeout, nil)
+}
+
+// DialWithAuth is Dial plus an optional RFC 1929 username/password pair
+// (plans/socks5-auth-design.md §6.7). When creds is nil the client offers
+// only the 0x00 method (byte-for-byte today's behavior); otherwise it
+// offers 0x02 and performs the sub-negotiation, treating a non-0x02 method
+// selection as an error and the 01 01 reply as an *AuthError.
+func DialWithAuth(socksAddr, dest string, port int, timeout time.Duration, creds *Credentials) (*Client, error) {
 	conn, err := net.DialTimeout("tcp", socksAddr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial %s: %w", socksAddr, err)
@@ -82,8 +112,12 @@ func Dial(socksAddr, dest string, port int, timeout time.Duration) (*Client, err
 		return nil, err
 	}
 
-	// --- Greeting: [0x05, 1, 0x00] (no authentication) ---
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+	// --- Greeting: no-auth {0x05, 0x01, 0x00} or RFC 1929 {0x05, 0x01, 0x02} ---
+	var method byte
+	if creds != nil {
+		method = 0x02
+	}
+	if _, err := conn.Write([]byte{0x05, 0x01, method}); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("socks5: greeting: %w", err)
 	}
@@ -96,9 +130,53 @@ func Dial(socksAddr, dest string, port int, timeout time.Duration) (*Client, err
 		conn.Close()
 		return nil, fmt.Errorf("socks5: bad greeting reply version 0x%02x", greet[0])
 	}
-	if greet[1] != 0x00 {
+	switch greet[1] {
+	case 0x00:
+		if creds != nil {
+			// Credentials were supplied but the server did not require
+			// them: per the spec, a non-0x02 selection is an error, not a
+			// silent downgrade to no-auth.
+			conn.Close()
+			return nil, &AuthError{Reason: "server selected method 0x00; 0x02 expected"}
+		}
+		// no-auth selected (the nil-credentials path, byte-for-byte today)
+	case 0x02:
+		// RFC 1929 sub-negotiation: VER=01, ULEN, UNAME, PLEN, PASSWD.
+		if creds == nil {
+			// Today's client has no credentials: the old hard error.
+			conn.Close()
+			return nil, fmt.Errorf("socks5: server requires auth method 0x02 (only no-auth is supported)")
+		}
+		// The sub-negotiation frame is a single write: VER, ULEN, UNAME,
+		// PLEN, PASSWD. Each length field is one byte, so names/passwords
+		// are bounded to 255 bytes by the protocol.
+		frame := append([]byte{0x01, byte(len(creds.User))}, []byte(creds.User)...)
+		frame = append(frame, byte(len(creds.Pass)))
+		frame = append(frame, []byte(creds.Pass)...)
+		if _, werr := conn.Write(frame); werr != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5: rfc1929 request: %w", werr)
+		}
+		var sub [2]byte
+		if _, rerr := io.ReadFull(conn, sub[:]); rerr != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5: rfc1929 reply: %w", rerr)
+		}
+		if sub[0] != 0x01 {
+			conn.Close()
+			return nil, &AuthError{Reason: fmt.Sprintf("bad sub-negotiation version 0x%02x", sub[0])}
+		}
+		if sub[1] != 0x00 {
+			conn.Close()
+			// 01 01 is the only RFC 1929 failure status: one attempt, the
+			// server closes, and the client reports it without echoing the
+			// supplied credentials.
+			return nil, &AuthError{Reason: "credentials rejected (status 0x01)"}
+		}
+	default:
+		// Any other method byte: the server rejected the offered set.
 		conn.Close()
-		return nil, fmt.Errorf("socks5: server requires auth method 0x%02x (only no-auth is supported)", greet[1])
+		return nil, &AuthError{Reason: fmt.Sprintf("server requires auth method 0x%02x (not offered)", greet[1])}
 	}
 
 	// --- CONNECT request ---

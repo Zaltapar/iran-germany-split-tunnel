@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -84,6 +85,12 @@ type Splitter struct {
 	node   *node.Node
 	logger *log.Logger
 
+	// socksCreds is the immutable RFC 1929 credential view for the SOCKS
+	// server (plans/socks5-auth-design.md §6.3): built once in main()
+	// before any goroutine starts, then read-only, so no new
+	// synchronization is introduced (race-safe by construction, §7.7).
+	socksCreds socksCredentials
+
 	lnMu    sync.Mutex
 	socksLn net.Listener
 	upLn    net.Listener
@@ -149,9 +156,10 @@ func main() {
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
 	s := &Splitter{
-		config: cfg,
-		node:   n,
-		logger: logger,
+		config:     cfg,
+		node:       n,
+		logger:     logger,
+		socksCreds: newSocksCredentials(cfg),
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -429,7 +437,11 @@ func (s *Splitter) runSocksServer() {
 	s.socksLn = ln
 	s.lnMu.Unlock()
 	defer ln.Close()
-	s.logger.Printf("SOCKS5 listening on %s", s.config.SocksListen)
+	if s.socksCreds.enabled {
+		s.logger.Printf("SOCKS5 listening on %s (auth: enabled)", s.config.SocksListen)
+	} else {
+		s.logger.Printf("SOCKS5 listening on %s (auth: disabled)", s.config.SocksListen)
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -447,9 +459,17 @@ func socksReply(w io.Writer, status byte) {
 func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 	_ = clientConn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	dest, err := socksNegotiate(clientConn)
+	dest, err := socksNegotiate(clientConn, &s.socksCreds)
 	if err != nil {
-		s.logger.Printf("SOCKS5 negotiation: %v (from %s)", err, clientConn.RemoteAddr())
+		if errors.Is(err, errSocksAuthFailed) {
+			// Uniform credential-free log line (plans/socks5-auth-design.md §4.1):
+			// the remote address only — no username, no password, no
+			// "wrong user vs wrong password" distinction. This is exactly
+			// what fail2ban anchors on (§10.2).
+			s.logger.Printf("SOCKS5 auth failed from %s", clientConn.RemoteAddr())
+		} else {
+			s.logger.Printf("SOCKS5 negotiation: %v (from %s)", err, clientConn.RemoteAddr())
+		}
 		clientConn.Close()
 		return
 	}

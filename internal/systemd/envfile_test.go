@@ -287,3 +287,115 @@ func TestWriteEnvFileRoleCheck(t *testing.T) {
 		t.Fatalf("want ErrSpec for unknown role, got %v", err)
 	}
 }
+
+// TestWriteEnvFileSocksCredentials pins the RFC 1929 env-file behavior
+// (plans/socks5-auth-design.md §7.4):
+//   - user without pass → ErrSpec (the pairing rule is enforced at the
+//     env-file boundary too, via the config fold);
+//   - both keys render in the optional block, sorted, LF, single trailing
+//     newline; the password appears exactly once and no error leaks it;
+//   - a request that leaves both empty is a byte-identical legacy file
+//     (backward-compat pin at the env-file layer).
+func TestWriteEnvFileSocksCredentials(t *testing.T) {
+	redirectPaths(t)
+	ctx := context.Background()
+
+	t.Run("user without pass -> ConfigError (pairing rule)", func(t *testing.T) {
+		kv := validEnvKV(t, RoleIran)
+		kv[config.EnvSocksUser] = "alice" // half-set: must be refused
+		_, _, err := WriteEnvFile(ctx, RoleIran, kv)
+		var ce *config.ConfigError
+		if !errors.As(err, &ce) {
+			t.Fatalf("want *config.ConfigError for half-set credentials, got %v", err)
+		}
+	})
+
+	t.Run("both keys render, password never in error, rollback works", func(t *testing.T) {
+		// Write #1: the credentials file (fresh, no backup yet).
+		kv := validEnvKV(t, RoleIran)
+		kv[config.EnvSocksUser] = "alice"
+		kv[config.EnvSocksPass] = socksPassMarker
+		if _, _, err := WriteEnvFile(ctx, RoleIran, kv); err != nil {
+			t.Fatalf("WriteEnvFile #1: %v", err)
+		}
+		path := filepath.Join(stateDir, "iran.env")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read env file: %v", err)
+		}
+		// Both keys present, rendered in the sorted optional block.
+		if !strings.Contains(string(data), config.EnvSocksUser+"=alice\n") {
+			t.Fatalf("env file missing %s=alice:\n%s", config.EnvSocksUser, data)
+		}
+		if !strings.Contains(string(data), config.EnvSocksPass+"="+socksPassMarker+"\n") {
+			t.Fatalf("env file missing %s line:\n%s", config.EnvSocksPass, data)
+		}
+		// LF endings + exactly one trailing newline.
+		if !strings.HasSuffix(string(data), "\n") || strings.Contains(string(data), "\r\n") {
+			t.Fatalf("env file must be LF with a single trailing newline:\n%s", data)
+		}
+		// The password appears exactly once (never duplicated).
+		if n := strings.Count(string(data), socksPassMarker); n != 1 {
+			t.Fatalf("password marker appears %d times, want 1", n)
+		}
+		// Write #2 (a different, credential-free state) backs up write #1.
+		legacy := validEnvKV(t, RoleIran)
+		if _, _, err := WriteEnvFile(ctx, RoleIran, legacy); err != nil {
+			t.Fatalf("WriteEnvFile #2: %v", err)
+		}
+		// Rollback restores the credentials file (the password round-trips).
+		if err := RollbackEnvFile(ctx, RoleIran); err != nil {
+			t.Fatalf("RollbackEnvFile: %v", err)
+		}
+		restored, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read restored env file: %v", err)
+		}
+		if !strings.Contains(string(restored), config.EnvSocksPass+"="+socksPassMarker+"\n") {
+			t.Fatalf("rollback did not restore the credentials:\n%s", restored)
+		}
+	})
+
+	t.Run("absent keys: legacy byte-identical file (backward compat)", func(t *testing.T) {
+		legacy := validEnvKV(t, RoleIran)
+		if _, _, err := WriteEnvFile(ctx, RoleIran, legacy); err != nil {
+			t.Fatalf("legacy write: %v", err)
+		}
+		path := filepath.Join(stateDir, "iran.env")
+		legacyBytes, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read legacy env file: %v", err)
+		}
+		// Neither credential key may appear at all (backward-compat pin).
+		if strings.Contains(string(legacyBytes), config.EnvSocksUser) || strings.Contains(string(legacyBytes), config.EnvSocksPass) {
+			t.Fatalf("legacy env file contains the new keys:\n%s", legacyBytes)
+		}
+		// An identical write is a proven no-op: applied=false, same bytes.
+		applied, _, err := WriteEnvFile(ctx, RoleIran, legacy)
+		if err != nil {
+			t.Fatalf("second legacy write: %v", err)
+		}
+		if applied {
+			t.Fatalf("identical legacy kv: want applied=false")
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read legacy env file: %v", err)
+		}
+		if string(got) != string(legacyBytes) {
+			t.Fatalf("legacy env bytes changed:\n got: %s\nwant: %s", got, legacyBytes)
+		}
+	})
+
+	t.Run("half-set error never leaks the password", func(t *testing.T) {
+		kv := validEnvKV(t, RoleIran)
+		kv[config.EnvSocksPass] = socksPassMarker // pass without user
+		_, _, err := WriteEnvFile(ctx, RoleIran, kv)
+		if err == nil {
+			t.Fatalf("half-set (pass only) did not fail")
+		}
+		if strings.Contains(err.Error(), socksPassMarker) {
+			t.Fatalf("error leaked the socksPassMarker: %v", err)
+		}
+	})
+}

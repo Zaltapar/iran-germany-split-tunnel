@@ -31,6 +31,9 @@ func isolatedEnv(t *testing.T) {
 		EnvQueueBytes, EnvQueueFrames, EnvQueueTotal, EnvOverflowMs,
 		EnvSessionBufTotal,
 		EnvBootstrapWait,
+		// RFC 1929 SOCKS credentials: pinning them makes "unset or empty"
+		// deterministic (plans/socks5-auth-design.md §7.2).
+		EnvSocksUser, EnvSocksPass,
 	} {
 		t.Setenv(name, "")
 	}
@@ -61,6 +64,11 @@ func validGermany() *Config {
 
 func TestDefaults(t *testing.T) {
 	c := Defaults()
+	// RFC 1929 backward-compat default: both credentials empty → auth
+	// disabled (plans/socks5-auth-design.md §7.2, pinned).
+	if c.SocksUser != "" || c.SocksPass != "" || c.SocksAuthEnabled() {
+		t.Fatalf("credential defaults drifted: user=%q pass=%q enabled=%v", c.SocksUser, c.SocksPass, c.SocksAuthEnabled())
+	}
 	if c.SocksListen != DefaultSocksListen || c.WsListen != DefaultWsListen ||
 		c.DownCarrierAddr != DefaultDownCarrier || c.UpWsUrl != DefaultUpWsUrl ||
 		c.DownListen != DefaultDownListen || c.Secret != DefaultSecret {
@@ -607,6 +615,195 @@ func TestEnvString(t *testing.T) {
 	t.Setenv(name, "val")
 	if got := envString(name, "def"); got != "val" {
 		t.Fatalf("set value must win: %q", got)
+	}
+}
+
+// strongSocksPass is a 40-char value that satisfies the secret material
+// policy (min length 32) without being blocklisted — used for the
+// "both set, strong password" tests (plans/socks5-auth-design.md §7.2).
+const strongSocksPass = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+
+func TestValidateSocksAuthPairing(t *testing.T) {
+	// Pure Validate(RoleIran) table: the pairing rule + username length
+	// rule + password policy, no env involved.
+	cases := []struct {
+		name      string
+		user      string
+		pass      string
+		allowWeak bool
+		wantNil   bool
+	}{
+		{"both empty", "", "", false, true},
+		{"both set strong pass", "alice", strongSocksPass, false, true},
+		{"user only", "alice", "", false, false},
+		{"pass only", "", strongSocksPass, false, false},
+		{"both set weak pass no bypass", "alice", "weakpass", false, false},
+		{"both set weak pass with bypass", "alice", "weakpass", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validIran()
+			c.SocksUser = tc.user
+			c.SocksPass = tc.pass
+			c.AllowWeakSecret = tc.allowWeak
+			err := c.Validate(RoleIran)
+			if tc.wantNil {
+				if err != nil {
+					t.Fatalf("Validate = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate = nil, want a pairing/policy problem")
+			}
+			var ce *ConfigError
+			if !errors.As(err, &ce) {
+				t.Fatalf("err = %T, want *ConfigError", err)
+			}
+			joined := strings.Join(ce.Problems, "\n")
+			// No problem line may echo a credential value.
+			for _, v := range []string{tc.user, tc.pass} {
+				if v != "" && strings.Contains(joined, v) {
+					t.Fatalf("problem names the credential value: %q", joined)
+				}
+			}
+		})
+	}
+	// Username length boundary: 300 chars exceeds the 1..255 RFC rule.
+	t.Run("user too long", func(t *testing.T) {
+		c := validIran()
+		c.SocksUser = strings.Repeat("u", 300)
+		c.SocksPass = strongSocksPass
+		err := c.Validate(RoleIran)
+		if err == nil {
+			t.Fatal("Validate accepted a 300-char username")
+		}
+		var ce *ConfigError
+		if !errors.As(err, &ce) {
+			t.Fatalf("err = %T, want *ConfigError", err)
+		}
+		if !strings.Contains(strings.Join(ce.Problems, "\n"), "1..255") {
+			t.Fatalf("problem did not name the 1..255 rule: %v", ce.Problems)
+		}
+	})
+}
+
+func TestValidateSocksAuthIgnoredForGermany(t *testing.T) {
+	// The pairing rule is Iran-only: a Germany config with a half-set pair
+	// still passes Validate (the fields are not Germany's to enforce).
+	c := validGermany()
+	c.SocksUser = "alice" // one field set, the other empty
+	c.SocksPass = ""
+	if err := c.Validate(RoleGermany); err != nil {
+		t.Fatalf("Validate(RoleGermany) rejected a half-set Iranian pair: %v", err)
+	}
+	// And the fully-empty case is the pre-change Germany behavior.
+	c2 := validGermany()
+	if err := c2.Validate(RoleGermany); err != nil {
+		t.Fatalf("Validate(RoleGermany) with empty credentials: %v", err)
+	}
+}
+
+func TestLoadSocksAuthFromEnv(t *testing.T) {
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	// Both set + strong pass: round-trips and enables auth.
+	t.Setenv(EnvSocksUser, "alice")
+	t.Setenv(EnvSocksPass, strongSocksPass)
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.SocksAuthEnabled() || cfg.SocksUser != "alice" || cfg.SocksPass != strongSocksPass {
+		t.Fatalf("loaded creds = %+v", cfg)
+	}
+}
+
+func TestLoadSocksAuthBackwardCompatibleUnset(t *testing.T) {
+	// Both unset → disabled (byte-for-byte pre-change behavior, pinned).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SocksAuthEnabled() {
+		t.Fatalf("unset credentials enabled auth: %+v", cfg)
+	}
+	// Both explicitly empty is the same as unset (the envString contract).
+	t.Setenv(EnvSocksUser, "")
+	t.Setenv(EnvSocksPass, "")
+	cfg2, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(empty): %v", err)
+	}
+	if cfg2.SocksAuthEnabled() {
+		t.Fatalf("empty credentials enabled auth: %+v", cfg2)
+	}
+}
+
+func TestLoadSocksAuthHalfSetFailsClosed(t *testing.T) {
+	// User only → Load fails, naming SPLIT_SOCKS_PASS, never the value.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksUser, "alice")
+	_, err := Load(RoleIran)
+	if err == nil {
+		t.Fatal("half-set (user only) did not fail closed")
+	}
+	if !strings.Contains(err.Error(), EnvSocksPass) {
+		t.Fatalf("error did not name %s: %v", EnvSocksPass, err)
+	}
+	// Pass only → Load fails, naming SPLIT_SOCKS_USER.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksPass, strongSocksPass)
+	_, err = Load(RoleIran)
+	if err == nil {
+		t.Fatal("half-set (pass only) did not fail closed")
+	}
+	if !strings.Contains(err.Error(), EnvSocksUser) {
+		t.Fatalf("error did not name %s: %v", EnvSocksUser, err)
+	}
+}
+
+func TestLoadSocksAuthBlocklistAlwaysEnforced(t *testing.T) {
+	// A blocklisted password ("password") fails even with the weak bypass on,
+	// because the blocklist is unconditional (§5). The error never contains
+	// the credential value.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksUser, "alice")
+	t.Setenv(EnvSocksPass, "password")
+	t.Setenv(EnvAllowWeak, "1")
+	_, err := Load(RoleIran)
+	if err == nil {
+		t.Fatal("blocklisted password accepted despite the bypass")
+	}
+	if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "alice") {
+		// "password" appears only as the blocklisted value; ensure neither
+		// credential value is echoed in the problem text.
+		t.Fatalf("error leaked a credential value: %v", err)
+	}
+}
+
+func TestLoadAggregatesSocksAuthProblems(t *testing.T) {
+	// user-only + a short SPLIT_SECRET → 2+ problems, *ConfigError, no value
+	// in any line (plans/socks5-auth-design.md §7.2).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, "short")
+	t.Setenv(EnvSocksUser, "alice")
+	_, err := Load(RoleIran)
+	var ce *ConfigError
+	if !errors.As(err, &ce) {
+		t.Fatalf("err = %T, want *ConfigError", err)
+	}
+	if len(ce.Problems) < 2 {
+		t.Fatalf("want >=2 problems, got %d: %v", len(ce.Problems), ce.Problems)
+	}
+	joined := strings.Join(ce.Problems, "\n")
+	if strings.Contains(joined, "alice") {
+		t.Fatalf("problem leaked the username value: %v", ce.Problems)
 	}
 }
 

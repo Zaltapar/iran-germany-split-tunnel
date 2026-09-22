@@ -13,7 +13,10 @@
 // secret and Reality key material are never echoed):
 //
 //	SPLIT_* (internal/config)        role splitter configuration, incl. the
-//	                                 shared secret (64-hex; SPLIT_SECRET)
+//	                                 shared secret (64-hex; SPLIT_SECRET) and
+//	                                 the optional RFC 1929 SOCKS credentials
+//	                                 (SPLIT_SOCKS_USER + SPLIT_SOCKS_PASS,
+//	                                 Iran only; the password is never echoed)
 //	SPLITTERCTL_SPLITTER_BIN         absolute path of the splitter binary
 //	SPLITTERCTL_SPLITTER_VERSION     splitter version
 //	Germany:
@@ -449,6 +452,10 @@ func setConfigField(request *deploy.InstallRequest, field deploy.ConfigKey, valu
 		switch field.Name {
 		case "socks.listen":
 			c.SocksListen = value
+		case "socks.user":
+			c.SocksUser = value
+		case "socks.pass":
+			c.SocksPass = value
 		case "ws.listen":
 			c.WsListen = value
 		case "down.carrier.addr":

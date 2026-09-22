@@ -58,6 +58,10 @@ var optionalEnvKeys = []string{
 	config.EnvSessionBuf,
 	config.EnvSessionBufTotal,
 	config.EnvLivenessRounds,
+	// RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §6.6):
+	// both or neither; the pairing rule is enforced by the fold below.
+	config.EnvSocksUser,
+	config.EnvSocksPass,
 }
 
 // knownEnvKeys is the full accepted key set (required ∪ optional).
@@ -295,6 +299,10 @@ func validateEnvKV(role Role, kv map[string]string) error {
 			c.SessionBufTotal = atoi64(v)
 		case config.EnvLivenessRounds:
 			c.LivenessRounds = atoi64(v)
+		case config.EnvSocksUser:
+			c.SocksUser = v
+		case config.EnvSocksPass:
+			c.SocksPass = v
 		}
 	}
 	if err := c.Validate(string(role)); err != nil {

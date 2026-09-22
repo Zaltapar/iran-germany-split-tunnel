@@ -752,8 +752,9 @@ Two independent secrets, two different lifecycles:
 | Secret | Generated on | Travels? | Stored (value) | Used by |
 |---|---|---|---|---|
 | Tunnel secret (`SPLIT_SECRET`) | Iran (existing behavior) | yes — pairing blob A → Germany | 0600 role env file + systemd `EnvironmentFile=` | both splitters (auth v1) |
+| SOCKS5 credential pair (`SPLIT_SOCKS_USER` + `SPLIT_SOCKS_PASS`) | Iran (operator; optional, pair-or-neither) | no (Iran-local; the pair never crosses the tunnel) | 0600 role env file + systemd `EnvironmentFile=` | iran-splitter SOCKS listener (RFC 1929) |
 | Reality private key | Germany | **never** | 0600 file + embedded in Xray config (0600) | xray-germany inbound |
-| Reality public key + SNI + shortId + UUID | Germany | yes — return blob B → Iran | Iran state (not secret-grade but paired) | iran-xray outbound |
+| Reality public key + SNI + shortId + UUID | Germany | yes — return blob B → Iran | Iran state (not secret-grade but paired) | xray-germany inbound |
 
 - Generation: `crypto/rand` (Go) everywhere; 256-bit hex for the tunnel secret
   (satisfies the existing `mux.ValidateSecretMaterial` policy — the deploy

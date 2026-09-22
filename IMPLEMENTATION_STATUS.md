@@ -19,6 +19,321 @@ resolved and recorded.
 Latest recorded implementation commit: `2927f847` (historical T8-B M5
 record; not the current remote tip)
 
+## Staging deployment, lifecycle rehearsal, L5 evidence, and ArvanCloud CDN cutover — 2026-09-22
+
+Sanitized evidence record of the staging deployment of release `bfc013d7`,
+the lifecycle/rollback rehearsal, the L5 acceptance work, and the
+ArvanCloud CDN cutover to `arvan.ctoplace.ir`. All remote exit codes and
+probes are verified; no Go source, shell script, or any file other than
+this document was modified by the recorded work. No commit was made and
+no source code was changed as part of this record.
+
+### Release and CI
+
+- **Release:** `bfc013d7192d1b70b22c461a3741c11d2ceb6415`, GitHub
+  Actions CI run #117 green: gofmt, go vet, `go test ./...`,
+  `go test -race ./...`, ShellCheck / shell installer validation, pinned
+  Xray v26.3.27 gate, pinned Caddy v2.11.4 gate, and the linux/amd64
+  build step.
+
+### Artifacts (deployed)
+
+Deployed through the supported `splitterctl upgrade --splitter` path on
+both staging hosts. The staging build was produced locally with Go
+1.27.0 on Windows 11 (`CGO_ENABLED=0`, `-trimpath`), cross-compiled to
+linux/amd64. Local Go 1.27.0 output SHA-256 values therefore differ
+from a Go 1.27.1 Linux build; SHA-256 equality against a Go 1.27.1 CI
+build is NOT the verified identity. The verified binary identity of both
+deployed role binaries is `go version -m` `vcs.revision =
+bfc013d7192d1b70b22c461a3741c11d2ceb6415`, confirmed on both hosts
+after deployment.
+
+**Deployed SHA-256 (Go 1.27.0 Windows 11 local build, verified on both
+hosts):**
+- Iran `/opt/split-tunnel/iran-splitter`:
+  `b70fd62dde06b56cc4254a511de8fb5453f68526a1c6aae4e88790b94062f7a1`
+- Germany `/opt/split-tunnel/germany-splitter`:
+  `28aaac9173dae3c78e0e3865c4d6d520209fa3b19fdabb584db965c9569a49d2`
+- `/root/staging/splitterctl` (both hosts):
+  `3cdc75034cd5362c60986f7c9e15052b75c21c69404081e0aaed3901a431add1`
+
+Staging records: [`staging-bfc013d7/MANIFEST.txt`](staging-bfc013d7/MANIFEST.txt:1)
+and [`staging-bfc013d7/build.txt`](staging-bfc013d7/build.txt:1).
+
+**Earlier attested target SHA-256 (Go 1.27.1 Linux build):** the
+operator-attested target SHA-256 values were computed against a Go 1.27.1
+Linux CI build and differ from the Go 1.27.0 Windows 11 local outputs
+by toolchain. The exact Go 1.27.1 target digests are referenced in the
+operator's attestation log and are not reproduced in this document.
+Neither set of hashes is the verified identity of the deployed binary —
+`go version -m` `vcs.revision` is.
+
+### Host state (final, sanitized)
+
+- Iran `188.121.111.122` (role `iran`); Germany `91.107.152.1` (role
+  `germany`).
+- Committed state root `/etc/split-tunnel` on both hosts; no in-flight
+  journal at the final recorded state.
+- Active services:
+  - Iran: `iran-splitter.service`, `iran-origin.service`,
+    `xray-consumer.service`.
+  - Germany: `xray-germany.service`, `germany-splitter.service`.
+- Listeners:
+  - Iran: `127.0.0.1:10900` (SOCKS), `127.0.0.1:9001` (WS up-carrier),
+    `127.0.0.1:10802` (external consumer), Caddy `:80` / `:443`.
+  - Germany: `*:443` (Xray / Reality down-carrier), `*:9002` (down
+    listener).
+
+### Lifecycle / rollback rehearsal
+
+One controlled same-generation rollback per host via the supported
+`splitterctl rollback --to <state-id>` path, each immediately followed
+by target restoration via `splitterctl upgrade --splitter` (result:
+"already converged"). Both rollback and both restoration exits were 0;
+the target was re-verified by both SHA-256 and `go version -m`
+vcs.revision after each restoration.
+
+- Iran rollback candidate: `s-1789990254465503430-1789990254465503430`.
+- Germany rollback candidate:
+  `s-1789991302160547697-1789991302160547697`.
+
+The earlier pre-upgrade rollback targets were pruned by revision
+retention and are not usable:
+- Iran: `s-1789672841203863975-1789686132289805158`.
+- Germany: `s-1789676124385467786-1789686002512033757`.
+
+### Pairing
+
+Multiple documented re-exchanges were performed, each using the
+supported A → Germany `pair apply` / B → Iran `pair finalize` flow with
+mode-600 host-to-host relays:
+- After the Germany upgrade (Reality keypair rotation).
+- After the lifecycle / rollback rehearsal.
+- After the upload-domain cutover to `arvan.ctoplace.ir`.
+
+No pairing material (tunnel secret, UUID, ShortID, keypair, or blob)
+was printed or committed at any step; all temporary 0600 relay blobs
+were cleaned.
+
+Final recorded pairing state: Iran `finalized`, Germany `a-applied`, no
+stale pairing marker.
+
+Design verification: the public-params fingerprint (SNI + ShortID +
+UUID) is structurally blind to Reality keypair rotation; the explicit
+`pairingStale` marker is the authoritative signal that a re-exchange is
+required.
+
+### ArvanCloud CDN cutover (major workstream, completed)
+
+All steps via supported `splitterctl` paths and operator-protected env
+files; no DNS mutation was performed.
+
+**Investigation — upload domain is config-transacted, not DNS-mutated:**
+the upload domain is controlled by
+[`SPLITTERCTL_UPLOAD_DOMAIN`](cmd/splitterctl/main.go:819), rendered
+into the Iran Caddyfile at
+[`RenderCaddyfile`](internal/origin/caddyfile.go:64), and carried to
+Germany as Blob A's `uploadDomain` field
+([`pairing.go`](internal/pairing/pairing.go:281)) so it reaches
+Germany's `SPLIT_UP_WS_URL`. Changing the domain therefore requires BOTH
+a config transaction AND a new pairing exchange.
+
+**DNS state (verified via ArvanCloud API, base
+`https://napi.arvancloud.ir/cdn/4.0`, auth `Authorization: apikey
+<key>`):** zone `ctoplace.ir` is active on the ArvanCloud NS; record
+`A arvan → 188.121.111.122` at TTL 120 with `cloud=true` and
+`upstream_https=default`. No DNS mutation was needed or performed.
+
+**Root cause of the initial 502:** the Iran origin Caddyfile held a
+site block and ACME certificate only for `arvan.zaltii.ir`; the CDN
+edge→origin TLS handshake with SNI `arvan.ctoplace.ir` was refused at
+the Caddy SSL layer (alert 80) and surfaced as an edge 502. This was
+classified as an **origin-hostname gap**, not a CDN or DNS defect.
+
+**Fix (all via supported paths, exit 0):**
+- Updated `SPLITTERCTL_UPLOAD_DOMAIN=arvan.ctoplace.ir` in
+  `/root/iran-ops.env` (a backup of the pre-change env file is
+  retained on the host under
+  `/root/iran-ops.env.bak-uploaddomain-*`).
+- Ran the supported `splitterctl upgrade --origin`; the transaction
+  produced a new generation and exit 0.
+- Reloaded `iran-origin.service` (see the activation-gap note in the
+  known-defects section below).
+- ACME http-01 issued a Let's Encrypt certificate for
+  `arvan.ctoplace.ir`.
+
+**External verification:**
+- `https://arvan.ctoplace.ir/upload` → HTTP 400 (a healthy
+  WebSocket-endpoint answer for a non-WS GET), in place of the
+  previous 502.
+- `http://` → 308 redirect to `https://`.
+
+**Germany re-point (all via supported paths, exit 0):**
+- `splitterctl config set up.ws.url=wss://arvan.ctoplace.ir/upload`
+  produced a new generation on the Germany host and exit 0; a
+  `systemctl restart germany-splitter.service` followed.
+- Germany journal confirms `Up-carrier WS connected (HTTP 101 Switching
+  Protocols)` + `Up-carrier authenticated` + `carrier up ready`
+  against the new domain through the CDN edge at
+  `185.143.235.245:443`, with zero re-dials after the initial
+  connection.
+
+**Stale residue removal:** the project-owned
+`/etc/split-tunnel/cdn-origin.state` had recorded `mode=tlsOrigin`
+while the live mode is `caddy`; it was removed with a 0600 timestamped
+copy retained on the host under
+`/root/staging/cdn-origin.state.removed-*`.
+
+**Rollback evidence retained on the hosts:**
+- `/root/iran-ops.env.bak-uploaddomain-*`
+- `/root/splitterctl-germany.env.bak-upwsurl-*`
+
+### External-consumer repair (twice, both reversible)
+
+The operator-owned Iran `xray-consumer` (unit `xray-consumer.service`,
+listener `127.0.0.1:10802`, config `/etc/xray-consumer/config.json`)
+embeds a Reality public key that must match the Germany node's
+currently installed Reality keypair. After each Germany keypair
+rotation the consumer was re-pointed by:
+- deriving the authoritative public key on the Germany host using the
+  same method as
+  [`internal/xray/realitypub.go`](internal/xray/realitypub.go),
+- patching **only** the `publicKey` field in the consumer config,
+- validating with the consumer's own `xray run -test` (exit 0,
+  "Configuration OK"),
+- restarting only the `xray-consumer` unit.
+
+Three root-only 0600 backups of the consumer config are retained on the
+host:
+- `/root/xray-consumer-config.json.bak-20260921T200515.953835Z`
+- `/root/xray-consumer-config.json.bak-20260921T222055.663278562Z`
+- `/root/xray-consumer-config.json.bak-20260922T071220.886467523Z`
+
+Post-repair Iran journal shows `Down-carrier authenticated to
+127.0.0.1:10802` with the previous EOF loop stopped.
+
+### L5 acceptance evidence (through the final `arvan.ctoplace.ir` route)
+
+Real-host L5 probes on the sanitized topology; status and latency only.
+
+**Proven in this workstream:**
+- **Direct-reachable target:** 3/3 HTTP 200 (~283–307 ms).
+- **Upload / CDN path:** HTTP 409 on success (CDN edge reachable,
+  route traversable). Occasional plain-GET probe timeouts against the
+  WebSocket-only `/upload` endpoint are attributed to CDN-edge latency
+  and are NOT evidence of a broken route; the genuine up-carrier was
+  confirmed healthy in the Germany journal (continuous `up carrier
+  stream → arvan.ctoplace.ir:443`, zero carrier-loss events in the
+  observed window).
+- **Down-carrier / Reality:** 3/3 HTTP 404 (valid tunnel response,
+  ~280–529 ms).
+- **IPv6 anycast target:** HTTP 200 (~505–654 ms).
+- **16-session concurrency:** 16/16 ok.
+- **Closed-port target refusal:** bounded EOF matching the documented
+  issue #21 post-`0x00` behavior (see the #21 record in the issue
+  status section below).
+
+**Retained earlier proven classes (from prior L5 runs, still valid):**
+- Byte-identical payload integrity through the down-carrier.
+- IPv6 data-level proof via a byte-identical 216 B payload compared
+  against a direct `curl -6` on the same target.
+- 48/48 HTTP 200 across a 3 × 16-session burst.
+- Resource burst→settle **partial** evidence: fd count returned to
+  baseline; RSS stayed within the 10 MiB threshold. (Full 10 MiB
+  sustained-throughput runs were not executed; see the #19 unproven
+  list below.)
+
+### L4 integration harness (POSIX)
+
+The L4 two-process matrix passed twice on a POSIX host:
+- Standard pass: 11/11 subtests + 6 socks5 tests.
+- Race pass: 11/11 subtests with zero data-race warnings.
+
+On the Windows development host the same harness skips S5 and S11 as
+POSIX-only, consistent with the L4 execution record earlier in this
+document.
+
+### Known defects / notes (open items, 2026-09-22)
+
+The following are recorded as of 2026-09-22 and remain OPEN unless
+independently resolved and re-recorded:
+
+- **Germany doctor `xray.config` false negative:** the doctor's
+  version matcher expects `v26.3.27` while the pinned Xray binary
+  reports `26.3.27`. An independent `xray run -test -config
+  /etc/split-tunnel/xray-germany.json` exits 0 with "Configuration
+  OK". Diagnostic bug only; no impact on the deployed Xray runtime.
+- **Germany `artifact.integrity` warning:** the committed manifest
+  lacks an Xray SHA-256 entry for the legacy / externally-installed
+  Xray binary; the splitter hash is asserted and matches. The missing
+  Xray entry is a legacy-install boundary.
+- **`SPLIT_METRICS_PORT` unset on both hosts:** the `/metrics`
+  counters are not available; carrier health is evidenced by sanitized
+  journal markers plus live probes instead of the Prometheus surface.
+- **STANDING SAFETY RULE (from a real incident):** the
+  `internal/deploy` and `internal/systemd` test suites are NOT
+  hermetic when run as root on a live host — `go test ./...` in
+  those packages executes real `systemctl` mutations. One incident
+  occurred on the live Germany host: both managed units were stopped,
+  disabled, and removed by a test; the state was fully reversed from
+  `/etc/split-tunnel/units-backup/` and independently verified clean.
+  Rule: **never run Go tests outside `./integration/...` on a live
+  host.**
+- **External `xray-consumer` keypair-boundary:** the operator-owned
+  `xray-consumer` requires a manual public-key re-point after every
+  Germany Reality keypair rotation. This is an operator-boundary task
+  outside the project's automated flow and is the most likely source
+  of future down-carrier outages.
+- **`upgrade --origin` activation gap:**
+  `splitterctl upgrade --origin` did not activate the new config in
+  the running Caddy process because the `iran-origin.service` unit
+  has no `ExecReload=`; a
+  `systemctl reload-or-restart iran-origin.service` was required to
+  pick up the change. Recorded as a potential unit-definition gap.
+
+### Issue status (evidence as of 2026-09-22)
+
+The following issues remain OPEN with the recorded evidence state
+below. This entry does **not** close or imply closure of any of them.
+
+- [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19)
+  — L5 acceptance. **Proven through the final `arvan.ctoplace.ir`
+  route:** direct-reachable, upload / CDN, down-carrier / Reality,
+  IPv6 anycast, 16-session concurrency, closed-port target refusal,
+  and the retained earlier classes (byte-identical down-carrier
+  payload, IPv6 data-level proof, 48 / 48 HTTP 200 across a 3 × 16
+  burst). **Remain UNPROVEN, each with a named blocker:**
+  - #11 (liveness / blackhole carrier): a real blackhole probe
+    requires a live iptables mutation on the staging host, which is
+    forbidden under the no-mutation constraints of this workstream.
+  - #17 (full 5× flapping): a real 5× flapping probe also requires
+    live iptables mutation (same no-mutation constraint).
+  - #18 (full 15-minute soak): not executed; only the partial
+    resource burst→settle evidence recorded above is available.
+  - #10 (operator boundary): the operator-side checks are outside the
+    recorded scope of this workstream.
+  - #4 / #5 (full 10 MiB sustained throughput) and #15 (target
+    half-close at full spec): not run at full spec.
+  **Issue #19 stays OPEN.**
+- [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20)
+  — stranded-session observability. Sanitized journal markers and the
+  L4 matrix evidence are the current record; the issue remains OPEN.
+- [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21)
+  — SOCKS closed-port target refusal. The final-route L5 probe
+  produced a bounded EOF matching the documented post-`0x00`
+  behavior; the contract clarification from the earlier record remains
+  the current state. Issue remains OPEN.
+- [#10](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/10)
+  — liveness. Operator-boundary checks remain outside this
+  workstream's recorded scope; issue remains OPEN.
+- [#11](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/11)
+  — keepalive / blackhole detection. Real-blackhole evidence requires
+  live iptables mutation, which is forbidden under the no-mutation
+  constraints of this workstream; issue remains OPEN.
+- [#12](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/12)
+  — installer CI. No change in this workstream; issue remains OPEN
+  unless independently resolved and recorded.
+
 ## Final repository reconciliation — 2026-09-18
 
 - **Verified remote `main` tip:** `fb5dc932802254345d31c7dfdb69960d7df608fe`,
@@ -74,6 +389,26 @@ record; not the current remote tip)
   remain non-production; and #19/#20/#21/#10/#11/#12 remain open.
 
 ## Current state
+
+### SOCKS5 username/password auth (RFC 1929) — implemented in this worktree
+
+- `cmd/iran-splitter` now enforces RFC 1929 SOCKS5 authentication when the two
+  separate env vars `SPLIT_SOCKS_USER` + `SPLIT_SOCKS_PASS` are both set on the
+  Iran role; when both are empty the listener is byte-for-byte the legacy
+  no-auth path (the L4 backward-compat gate, `S1`–`S11` unchanged, plus the new
+  gated `S0a_socks_auth` scenario in `integration/twoproc_test.go`). Exactly
+  one set is a fail-closed `ConfigError` (pair-or-neither). Method selection
+  advertises `{0x00,0x02}` but only `0x02` may be chosen on a gated port; a raw
+  no-auth `05 01 00` is answered `05 FF`. The sub-negotiation compares username
+  and password in constant time (`crypto/subtle.ConstantTimeCompare`, no
+  short-circuit), runs one attempt with no retry, and on failure logs a uniform
+  `SOCKS5 auth failed from <remote>` line that never carries a credential byte.
+  The password reuses the existing `SPLIT_ALLOW_WEAK_SECRET` bypass and the
+  blocklist for its strength policy; the username is exempt (RFC 1929's 1-byte
+  length rule, 1..255). The new keys are projected through
+  `InstallRequest.Env()`, `deploy.ConfigKeys` (`socks.user`/`socks.pass`, Iran
+  only), and the `config set`/`config show` surfaces; `config show` still prints
+  no values, and state carries only the non-invertible env fingerprint.
 
 ### Batch 2 remediation — implemented in this worktree
 

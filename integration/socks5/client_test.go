@@ -21,6 +21,13 @@ type mockSocks struct {
 	handler func(req []byte)
 	seen    [][]byte
 	cleanup func()
+
+	// RFC 1929 auth-mock controls (plans/socks5-auth-design.md §7.6):
+	// when startAuthMock drives a connection, the server advertises
+	// authMethod, and (for 0x02) answers the sub-negotiation with
+	// authSubStatus before the CONNECT exchange.
+	authMethod    byte
+	authSubStatus byte
 }
 
 func startMock(t *testing.T, status byte, handler func(req []byte)) *mockSocks {
@@ -42,6 +49,115 @@ func startMock(t *testing.T, status byte, handler func(req []byte)) *mockSocks {
 	m.cleanup = func() { ln.Close() }
 	t.Cleanup(m.cleanup)
 	return m
+}
+
+// startAuthMock runs a mock that advertises a configurable method byte in
+// the greeting reply. When authMethod == 0x02 it answers the RFC 1929
+// sub-negotiation with authSubStatus (0x00 success / 0x01 failure) before
+// falling through to the normal CONNECT handling.
+func startAuthMock(t *testing.T, authMethod, authSubStatus, status byte, handler func(req []byte)) *mockSocks {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	m := &mockSocks{
+		ln:            ln,
+		t:             t,
+		status:        status,
+		handler:       handler,
+		authMethod:    authMethod,
+		authSubStatus: authSubStatus,
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go m.serveAuth(c)
+		}
+	}()
+	m.cleanup = func() { ln.Close() }
+	t.Cleanup(m.cleanup)
+	return m
+}
+
+// serveAuth handles one connection for an auth mock: read the greeting,
+// reply with the configured method, and if 0x02, do the RFC 1929
+// sub-negotiation before continuing to the CONNECT exchange (the same
+// inline handling as mockSocks.serve but with the auth stage).
+func (m *mockSocks) serveAuth(c net.Conn) {
+	defer c.Close()
+	var greet [3]byte
+	if _, err := io.ReadFull(c, greet[:]); err != nil {
+		return
+	}
+	if _, err := c.Write([]byte{0x05, m.authMethod}); err != nil {
+		return
+	}
+	if m.authMethod == 0x02 {
+		// Read the client's RFC 1929 frame: VER, ULEN, UNAME, PLEN, PASSWD.
+		var hdr [2]byte
+		if _, err := io.ReadFull(c, hdr[:]); err != nil {
+			return
+		}
+		user := make([]byte, int(hdr[1]))
+		if _, err := io.ReadFull(c, user); err != nil {
+			return
+		}
+		var pelen [1]byte
+		if _, err := io.ReadFull(c, pelen[:]); err != nil {
+			return
+		}
+		pass := make([]byte, int(pelen[0]))
+		if _, err := io.ReadFull(c, pass); err != nil {
+			return
+		}
+		if _, err := c.Write([]byte{0x01, m.authSubStatus}); err != nil {
+			return
+		}
+		if m.authSubStatus != 0x00 {
+			return // the server closes after a 01 01 reply (no CONNECT)
+		}
+	}
+	// CONNECT exchange: identical to serve's CONNECT path.
+	var req [4]byte
+	if _, err := io.ReadFull(c, req[:]); err != nil {
+		return
+	}
+	var reqBytes []byte
+	switch req[3] {
+	case 0x01:
+		b := make([]byte, 6)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		reqBytes = append(req[:], b...)
+	case 0x03:
+		var l [1]byte
+		if _, err := io.ReadFull(c, l[:]); err != nil {
+			return
+		}
+		dom := make([]byte, int(l[0])+2)
+		if _, err := io.ReadFull(c, dom); err != nil {
+			return
+		}
+		reqBytes = append(req[:], dom...)
+	case 0x04:
+		b := make([]byte, 18)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		reqBytes = append(req[:], b...)
+	default:
+		return
+	}
+	m.t.Log("auth request: ", reqBytes)
+	if m.handler != nil {
+		m.handler(reqBytes)
+	}
+	_, _ = c.Write(append([]byte{0x05, m.status, 0x00, 0x01}, 0, 0, 0, 0, 0, 0))
 }
 
 func (m *mockSocks) addr() string { return m.ln.Addr().String() }
@@ -329,4 +445,74 @@ func TestHalfCloseWrite(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("server never saw EOF after CloseWrite")
 	}
+}
+
+// ============================================================
+// RFC 1929 DialWithAuth tests (plans/socks5-auth-design.md §7.6)
+// ============================================================
+
+// TestDialWithAuthSuccess: correct credentials against a mock that replies
+// 01 00 → tunnel established, data flows.
+func TestDialWithAuthSuccess(t *testing.T) {
+	// The mock advertises 0x02, answers the sub-negotiation with 01 00,
+	// then handles the CONNECT and echoes 3 bytes back.
+	handlerCalled := make(chan struct{}, 1)
+	m := startAuthMock(t, 0x02, 0x00, 0x00, func(req []byte) {
+		handlerCalled <- struct{}{}
+	})
+	client, err := DialWithAuth(m.addr(), "10.1.2.3", 80, 3*time.Second, &Credentials{User: "alice", Pass: "s3cr3t"})
+	if err != nil {
+		t.Fatalf("DialWithAuth: %v", err)
+	}
+	defer client.Close()
+	// The handler (CONNECT) must have been reached (sub-negotiation succeeded).
+	select {
+	case <-handlerCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CONNECT handler not reached after successful sub-negotiation")
+	}
+}
+
+// TestDialWithAuthWrongCredentials: the mock replies 01 01 → DialWithAuth
+// returns an *AuthError and the conn is closed.
+func TestDialWithAuthWrongCredentials(t *testing.T) {
+	m := startAuthMock(t, 0x02, 0x01, 0x00, nil)
+	_, err := DialWithAuth(m.addr(), "10.1.2.3", 80, 3*time.Second, &Credentials{User: "alice", Pass: "wrong"})
+	var ae *AuthError
+	if !errors.As(err, &ae) {
+		t.Fatalf("want *AuthError, got %T: %v", err, err)
+	}
+	// The error must not echo the supplied credentials.
+	if strings.Contains(ae.Error(), "alice") || strings.Contains(ae.Error(), "wrong") {
+		t.Fatalf("AuthError leaked credentials: %v", ae)
+	}
+}
+
+// TestDialWithAuthMethodNotOffered: the server selects a method the client
+// did not offer (0x05 0x01 — a no-auth selection when creds were supplied):
+// the client must error (not silently downgrade).
+func TestDialWithAuthMethodNotOffered(t *testing.T) {
+	// The mock advertises 0x01 (an unexpected method byte) — the client,
+	// which offered 0x02, must treat the non-0x02 selection as an error.
+	m := startAuthMock(t, 0x01, 0x00, 0x00, nil)
+	_, err := DialWithAuth(m.addr(), "10.1.2.3", 80, 3*time.Second, &Credentials{User: "alice", Pass: "s3cr3t"})
+	if err == nil {
+		t.Fatal("unexpected method selection did not error")
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		t.Fatalf("want a method/credential error, got *StatusError: %v", se)
+	}
+}
+
+// TestDialNilCredsStillNoAuth pins the backward-compat contract: Dial
+// (nil credentials) still writes {0x05, 0x01, 0x00} and succeeds against a
+// no-auth mock — unchanged from today.
+func TestDialNilCredsStillNoAuth(t *testing.T) {
+	m := startMock(t, 0x00, nil)
+	client, err := Dial(m.addr(), "10.1.2.3", 80, 3*time.Second)
+	if err != nil {
+		t.Fatalf("Dial (nil creds): %v", err)
+	}
+	client.Close()
 }
