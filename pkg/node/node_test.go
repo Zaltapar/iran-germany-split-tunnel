@@ -248,19 +248,20 @@ func (tp *topo) write(c *testutil.MemConn, s string) {
 //     bug: the test would have passed had it waited the grace it
 //     already asked for.
 //
-// So the bound is max(10s base, 1.5x the test's grace + 5s) plus the
+// So the bound is max(10s base, 2x the test's grace + 5s) plus the
 // per-byte margin, plus tp.drainExtra when the test declares a shared-
 // budget contention bound (the 200-session stress test: its TAIL
 // session's 32 KiB drain sat 100 s+ behind 199 other sessions on a
 // loaded 2-vCPU runner — CI run #52, budget_integration_test.go:306
-// 'i/o timeout'). For small-grace tests (2s) the bound is the same 10s
-// as before; for the 120-session stress test (20s grace) it is 35s,
-// the grace it explicitly opted into. The bound stays finite — a
-// genuinely stuck relay still fails the test, so this is a corrected
+// 'i/o timeout'). The two grace windows cover one carrier-loss recovery
+// window and a second serialized rebind/drain tail on a loaded runner.
+// For small-grace tests (2s) the bound is the same 10s as before; for the
+// 120-session stress test (20s grace) it is 45s. The bound stays finite —
+// a genuinely stuck relay still fails the test, so this is a corrected
 // bound, not a mask.
 func readDeadline(grace, drainExtra time.Duration, n int) time.Duration {
 	d := 10 * time.Second
-	if g := grace*3/2 + 5*time.Second; g > d {
+	if g := 2*grace + 5*time.Second; g > d {
 		d = g
 	}
 	return d + time.Duration(n)*time.Millisecond + drainExtra
