@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
 )
 
@@ -168,7 +170,7 @@ func main() {
 
 	if cfg.MetricsPort > 0 {
 		wg.Add(1)
-		go func() { defer wg.Done(); s.runMetrics(fmt.Sprintf("127.0.0.1:%d", cfg.MetricsPort)) }()
+		go func() { defer wg.Done(); s.runMetrics(metricsListenAddr(cfg.MetricsPort)) }()
 	}
 
 	// Up-Carrier: WS server (behind CDN / nginx on :9001)
@@ -502,6 +504,12 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 // Metrics
 // ============================================================
 
+const metricsListenHost = "127.0.0.1"
+
+func metricsListenAddr(port int) string {
+	return net.JoinHostPort(metricsListenHost, strconv.Itoa(port))
+}
+
 func (s *Splitter) runMetrics(addr string) error {
 	mhttp := http.NewServeMux()
 	mhttp.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -510,10 +518,16 @@ func (s *Splitter) runMetrics(addr string) error {
 		// Issue #6: current node-level aggregate usage of the shape-A
 		// reconnect buffers (gauge).
 		fmt.Fprintf(w, "session_buffered_bytes %d\n", s.node.SessionBufferAccounted())
+		fmt.Fprint(w, s.node.QueueStats(session.DirUp).Render("mux_up_"))
+		fmt.Fprint(w, s.node.QueueStats(session.DirDown).Render("mux_down_"))
 	})
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); !ok || !tcpAddr.IP.IsLoopback() {
+		_ = ln.Close()
+		return errors.New("metrics listener is not loopback")
 	}
 	s.lnMu.Lock()
 	s.mLn = ln

@@ -76,6 +76,11 @@ type CarrierConn struct {
 	mu      sync.Mutex
 	streams map[uint32]*streamRec
 	closing bool
+	// stats is optional fixed-cardinality queue telemetry for this carrier.
+	stats *QueueStats
+	// queuedItems mirrors the number of items currently held by all
+	// mailboxes. StreamQueue updates it under its existing mailbox lock.
+	queuedItems int64
 	// live counts the carrier-owned goroutines still running.
 	live int
 	// limits bounds the per-stream mailboxes (see StreamLimits). Set via
@@ -131,6 +136,11 @@ type CarrierConn struct {
 	// c.mu after each round.
 	livenessRounds int
 	sawPong        bool
+
+	// OnStreamTerminated, if non-nil, is called once when a stream is
+	// terminated by overflow pressure. The callback is keyed only by the
+	// stream ID and must not block.
+	OnStreamTerminated func(streamID uint32)
 
 	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
 	// goroutine) when the first frame for a previously unknown stream
@@ -211,6 +221,7 @@ func (c *CarrierConn) readLoop() {
 		if err != nil {
 			c.mu.Lock()
 			c.readErr = err
+			c.stats.readFailure(errors.Is(err, io.EOF))
 			c.mu.Unlock()
 			return
 		}
@@ -220,8 +231,8 @@ func (c *CarrierConn) readLoop() {
 		//     protocol violation (v0 peer or attacker).
 		//  2. Stream 0 is reserved for control frames (Ping/Pong).
 		//     Application frames on stream 0 would otherwise create a
-		//     phantom stream via OnNewStream or hit Deregister(0); they
-		//     are rejected.
+		//     phantom stream via OnNewStream or hit Deregister(0);
+		//     they are rejected.
 		// Both are connection-level failures: the carrier is terminated.
 		if f.Type == FrameAuth ||
 			(f.StreamID == 0 && f.Type != FramePing && f.Type != FramePong) {
@@ -251,6 +262,12 @@ func (c *CarrierConn) writeLoop() {
 			return
 		case req := <-c.writeCh:
 			_, err := c.rwc.Write(req.data)
+			if err != nil {
+				c.mu.Lock()
+				stats := c.stats
+				c.mu.Unlock()
+				stats.writeFailure()
+			}
 			select {
 			case <-c.closed:
 				// Close has started: report the shutdown error so a
@@ -392,6 +409,30 @@ func SanitizeLimits(l StreamLimits) StreamLimits {
 // sanitized (see SanitizeLimits). Call it before starting Dispatch or
 // calling Register, like SetReadBuffer. Changing MaxBytesTotal also
 // re-syncs the aggregate limit of every already-created mailbox.
+// SetQueueStats installs the optional queue telemetry surface. It is
+// intended to be called before Dispatch starts. Existing mailboxes are
+// updated without changing their bounds or queue state.
+func (c *CarrierConn) SetQueueStats(s *QueueStats) {
+	c.mu.Lock()
+	c.stats = s
+	qs := make([]*StreamQueue, 0, len(c.allStreams))
+	for _, rec := range c.allStreams {
+		qs = append(qs, rec.q)
+	}
+	c.mu.Unlock()
+	for _, q := range qs {
+		q.SetStats(s)
+		q.setQueuedItems(&c.queuedItems)
+	}
+}
+
+// QueueStats returns this carrier's optional queue telemetry surface.
+func (c *CarrierConn) QueueStats() *QueueStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stats
+}
+
 func (c *CarrierConn) SetStreamLimits(l StreamLimits) {
 	c.mu.Lock()
 	c.limits = SanitizeLimits(l)
@@ -446,6 +487,8 @@ func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
 		ch:       make(chan []byte, 1),
 		callback: callback,
 	}
+	s.q.SetStats(c.stats)
+	s.q.setQueuedItems(&c.queuedItems)
 	c.streams[id] = s
 	c.allStreams = append(c.allStreams, s)
 	c.live++
@@ -569,6 +612,10 @@ func (c *CarrierConn) liveness(interval time.Duration) {
 			if dead {
 				// Blackhole detected: standard teardown. Close is
 				// idempotent and safe from any goroutine.
+				c.mu.Lock()
+				stats := c.stats
+				c.mu.Unlock()
+				stats.blackholeDeath()
 				c.Close()
 			}
 		case <-c.closed:
@@ -760,6 +807,11 @@ func (c *CarrierConn) applyPressure(s *streamRec) {
 		return
 	}
 	if time.Since(s.pressureStart) >= c.limitsLocked().OverflowWait {
+		wait := time.Since(s.pressureStart)
+		c.mu.Lock()
+		stats := c.stats
+		c.mu.Unlock()
+		stats.overflowTerminated(wait)
 		c.terminateStream(s, true)
 	}
 }
@@ -784,6 +836,9 @@ func (c *CarrierConn) applyPressure(s *streamRec) {
 func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 	s.stopOnce.Do(func() {
 		s.terminated.Store(true)
+		if c.OnStreamTerminated != nil {
+			c.OnStreamTerminated(s.id)
+		}
 		// Closing the mailbox discards what is still queued; the bytes
 		// come back to the aggregate budget inside q.Close (under
 		// q.mu, so a concurrent Pop cannot reclaim them again).
@@ -832,7 +887,14 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 			case s.ch <- nil:
 			case <-c.closed:
 			case <-time.After(c.limitsLocked().OverflowWait):
+				c.mu.Lock()
+				stats := c.stats
+				c.mu.Unlock()
+				stats.overflowTerminatedWorker()
 				s.terminated.Store(true)
+				if c.OnStreamTerminated != nil {
+					c.OnStreamTerminated(s.id)
+				}
 			}
 			return
 		}
@@ -845,6 +907,10 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 			return
 		case <-time.After(c.limitsLocked().OverflowWait):
 			// consumer stopped reading: end this stream, not the carrier.
+			c.mu.Lock()
+			stats := c.stats
+			c.mu.Unlock()
+			stats.overflowTerminatedWorker()
 			c.terminateStream(s, false)
 			return
 		}

@@ -65,6 +65,14 @@ type StreamQueue struct {
 	// callback that would take another lock while q.mu is held — is what
 	// keeps the lock ordering q.mu-only on the hot path.
 	budgetLimitLocked int64
+
+	// stats is optional instrumentation. It is assigned before a queue is
+	// exposed to a dispatcher/worker and is always read while q.mu is held.
+	stats *QueueStats
+	// queuedItems points at the carrier-wide queued item counter. It is
+	// separate from budget because tests may use a queue without an aggregate
+	// byte budget.
+	queuedItems *int64
 }
 
 // NewStreamQueue creates an empty mailbox with the given bounds. budget
@@ -73,6 +81,49 @@ type StreamQueue struct {
 // budgetLimit is the current aggregate limit for pushes.
 func NewStreamQueue(maxFrames, maxBytes int, budget *int64, budgetLimit int64) *StreamQueue {
 	return &StreamQueue{maxFrames: maxFrames, maxBytes: maxBytes, budget: budget, budgetLimitLocked: budgetLimit}
+}
+
+// SetStats installs the optional queue telemetry surface. The queue mutex
+// keeps assignment ordered with TryPush, Pop, and Close.
+func (q *StreamQueue) SetStats(s *QueueStats) {
+	q.mu.Lock()
+	q.stats = s
+	q.mu.Unlock()
+}
+
+// setQueuedItems installs the carrier-wide queued-item counter. Caller may
+// invoke it before the queue is exposed to any producer or consumer.
+func (q *StreamQueue) setQueuedItems(items *int64) {
+	q.mu.Lock()
+	q.queuedItems = items
+	q.mu.Unlock()
+}
+
+// adjustAggregateLocked applies one mailbox occupancy delta to the existing
+// aggregate byte/item accounting and returns both post-update totals. Caller
+// must hold q.mu. The carrier-owned counters remain authoritative; when a
+// queue is used standalone, the stats gauges provide the aggregate mirror.
+func (q *StreamQueue) adjustAggregateLocked(bytesDelta, itemsDelta int64) (int64, int64) {
+	var totalBytes, totalItems int64
+	if q.budget != nil {
+		totalBytes = atomic.AddInt64(q.budget, bytesDelta)
+	}
+	if q.queuedItems != nil {
+		totalItems = atomic.AddInt64(q.queuedItems, itemsDelta)
+	}
+	if q.stats != nil {
+		if q.budget == nil {
+			totalBytes = atomic.AddInt64(&q.stats.QueuedBytesNow, bytesDelta)
+		} else {
+			atomic.AddInt64(&q.stats.QueuedBytesNow, bytesDelta)
+		}
+		if q.queuedItems == nil {
+			totalItems = atomic.AddInt64(&q.stats.QueuedFramesNow, itemsDelta)
+		} else {
+			atomic.AddInt64(&q.stats.QueuedFramesNow, itemsDelta)
+		}
+	}
+	return totalBytes, totalItems
 }
 
 // SetBudgetLimit updates the aggregate limit for TryPush's check.
@@ -89,6 +140,21 @@ func (q *StreamQueue) SetBudgetLimit(n int64) {
 func (q *StreamQueue) fullLocked(it queueItem) bool {
 	return len(q.items) >= q.maxFrames ||
 		q.nBytes+len(it.payload) > q.maxBytes
+}
+
+// rejectReasonLocked classifies the mutually-exclusive TryPush rejection
+// predicates. Caller must hold q.mu.
+func (q *StreamQueue) rejectReasonLocked(it queueItem) rejectReason {
+	switch {
+	case q.closed:
+		return rejectClosed
+	case len(q.items) >= q.maxFrames:
+		return rejectStreamFrames
+	case q.nBytes+len(it.payload) > q.maxBytes:
+		return rejectStreamBytes
+	default:
+		return rejectAggregate
+	}
 }
 
 // wakeLocked signals a parked Pop (if any) that the queue state changed.
@@ -113,16 +179,25 @@ func (q *StreamQueue) TryPush(it queueItem) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed || q.fullLocked(it) {
+		if q.stats != nil {
+			q.stats.reject(q.rejectReasonLocked(it))
+		}
 		return false
 	}
 	if q.budget != nil &&
 		atomic.LoadInt64(q.budget)+int64(len(it.payload)) > q.budgetLimitLocked {
+		if q.stats != nil {
+			q.stats.reject(rejectAggregate)
+		}
 		return false
 	}
 	q.items = append(q.items, it)
 	q.nBytes += len(it.payload)
-	if q.budget != nil {
-		atomic.AddInt64(q.budget, int64(len(it.payload)))
+	totalBytes, totalItems := q.adjustAggregateLocked(int64(len(it.payload)), 1)
+	if q.stats != nil {
+		q.stats.push(len(it.payload))
+		q.stats.observeHighStream(int64(q.nBytes), int64(len(q.items)))
+		q.stats.observeHighQueued(totalBytes, totalItems)
 	}
 	q.wakeLocked()
 	return true
@@ -141,10 +216,13 @@ func (q *StreamQueue) Pop() (it queueItem, ok bool) {
 		q.mu.Lock()
 		if len(q.items) > 0 {
 			it = q.items[0]
+			highBytes, highFrames := int64(q.nBytes), int64(len(q.items))
 			q.items = q.items[1:]
 			q.nBytes -= len(it.payload)
-			if q.budget != nil && len(it.payload) > 0 {
-				atomic.AddInt64(q.budget, -int64(len(it.payload)))
+			totalBytes, totalItems := q.adjustAggregateLocked(-int64(len(it.payload)), -1)
+			if q.stats != nil {
+				q.stats.observeHighStream(highBytes, highFrames)
+				q.stats.observeHighQueued(totalBytes, totalItems)
 			}
 			q.mu.Unlock()
 			return it, true
@@ -180,10 +258,15 @@ func (q *StreamQueue) Close() int {
 	}
 	q.closed = true
 	discarded := q.nBytes
+	discardedItems := len(q.items)
+	if q.stats != nil {
+		q.stats.discard(int64(discarded), int64(discardedItems))
+	}
 	q.items = nil
 	q.nBytes = 0
-	if q.budget != nil && discarded > 0 {
-		atomic.AddInt64(q.budget, -int64(discarded))
+	totalBytes, totalItems := q.adjustAggregateLocked(-int64(discarded), -int64(discardedItems))
+	if q.stats != nil {
+		q.stats.observeHighQueued(totalBytes, totalItems)
 	}
 	q.wakeLocked()
 	return discarded

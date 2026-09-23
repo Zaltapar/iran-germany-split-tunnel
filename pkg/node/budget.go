@@ -126,10 +126,29 @@ type sessionBufferBudget struct {
 	// request sizes differ.
 	waiters []*budgetWaiter
 	closed  bool
+	metrics *Metrics
 }
 
 func newSessionBufferBudget(limit int) *sessionBufferBudget {
 	return &sessionBufferBudget{limit: int64(limit), active: make(map[bufKey]int64)}
+}
+
+func (b *sessionBufferBudget) setMetrics(m *Metrics) {
+	b.mu.Lock()
+	b.metrics = m
+	current := b.accounted
+	b.mu.Unlock()
+	if m != nil {
+		m.RelayBufferHigh(current)
+	}
+}
+
+// observeHighLocked folds the already-serialized aggregate occupancy into
+// the node metric. Caller must hold b.mu.
+func (b *sessionBufferBudget) observeHighLocked() {
+	if b.metrics != nil {
+		b.metrics.RelayBufferHigh(b.accounted)
+	}
 }
 
 // begin registers a relay. Called once, from the relay's own goroutine,
@@ -215,6 +234,7 @@ func (b *sessionBufferBudget) grantWaitersLocked() {
 		}
 		b.accounted += int64(w.n)
 		b.active[w.key] += int64(w.n)
+		b.observeHighLocked()
 		w.admitted = true
 		close(w.ready)
 		b.waiters = append(b.waiters[:i], b.waiters[i+1:]...)
@@ -249,6 +269,7 @@ func (b *sessionBufferBudget) refund(k bufKey, n int) int64 {
 	}
 	b.accounted -= int64(n)
 	b.active[k] = cur - int64(n)
+	b.observeHighLocked()
 	b.grantWaitersLocked()
 	return int64(n)
 }
@@ -266,6 +287,7 @@ func (b *sessionBufferBudget) end(k bufKey) int64 {
 	}
 	if b.limit > 0 && !b.closed && cur > 0 {
 		b.accounted -= cur
+		b.observeHighLocked()
 	}
 	delete(b.active, k)
 	if cur > 0 {
@@ -313,5 +335,6 @@ func (b *sessionBufferBudget) Close() int64 {
 		close(w.ready)
 	}
 	b.waiters = nil
+	b.observeHighLocked()
 	return reclaimed
 }

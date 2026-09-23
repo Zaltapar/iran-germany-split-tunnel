@@ -192,11 +192,13 @@ const defaultBootstrapWait = 30 * time.Second
 
 // Node is the per-side engine.
 type Node struct {
-	cfg     Config
-	store   *session.SessionStore
-	metrics *Metrics
-	logger  *log.Logger
-	secret  []byte
+	cfg          Config
+	store        *session.SessionStore
+	metrics      *Metrics
+	logger       *log.Logger
+	muxUpStats   *mux.QueueStats
+	muxDownStats *mux.QueueStats
+	secret       []byte
 
 	// buf is the node-level aggregate budget for shape-A reconnect
 	// buffers (Issue #6). It is immutable after NewNode (created with
@@ -243,15 +245,20 @@ type Node struct {
 func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 	cfg.Sanitize()
 	ctx, cancel := context.WithCancel(context.Background())
+	metrics := NewMetrics()
+	buf := newSessionBufferBudget(cfg.SessionBufferTotalBytes)
+	buf.setMetrics(metrics)
 	return &Node{
-		cfg:     cfg,
-		store:   session.NewSessionStore(),
-		metrics: NewMetrics(),
-		logger:  logger,
-		secret:  secret,
-		ctx:     ctx,
-		cancel:  cancel,
-		buf:     newSessionBufferBudget(cfg.SessionBufferTotalBytes),
+		cfg:          cfg,
+		store:        session.NewSessionStore(),
+		metrics:      metrics,
+		logger:       logger,
+		muxUpStats:   &mux.QueueStats{},
+		muxDownStats: &mux.QueueStats{},
+		secret:       secret,
+		ctx:          ctx,
+		cancel:       cancel,
+		buf:          buf,
 		// No carrier installed yet: both directions start NOT ready
 		// (open ready channels) — the bootstrap waits must block until
 		// a carrier is actually installed (Issue #7).
@@ -271,6 +278,14 @@ func (n *Node) Secret() []byte { return n.secret }
 
 // Metrics is the metrics set (used by the /metrics handler).
 func (n *Node) Metrics() *Metrics { return n.metrics }
+
+// QueueStats returns the fixed queue telemetry surface for one direction.
+func (n *Node) QueueStats(dir session.Direction) *mux.QueueStats {
+	if dir == session.DirUp {
+		return n.muxUpStats
+	}
+	return n.muxDownStats
+}
 
 // Context is cancelled by Close — every wait/park in the node selects on
 // it so shutdown unblocks immediately.
@@ -446,8 +461,14 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		c = mux.NewCarrierConn(conn, n.cfg.KeepAliveInterval)
 	}
 	c.SetStreamLimits(n.cfg.StreamLimits)
+	c.SetQueueStats(n.QueueStats(dir))
 	if n.cfg.LivenessRounds > 0 {
 		c.SetLivenessRounds(n.cfg.LivenessRounds)
+	}
+	c.OnStreamTerminated = func(streamID uint32) {
+		if sess, ok := n.store.ByStream(streamID); ok {
+			sess.Stats.MarkTerminated()
+		}
 	}
 
 	n.mu.Lock()
@@ -933,6 +954,21 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 	}
 	n.mu.RUnlock()
 	n.store.Remove(sess.ID)
+	reason := closeReasonClass(sess)
+	if sess.Stats.Terminated.Load() {
+		sess.SetOverflowReason()
+	}
+	n.metrics.SessionClosed(reason)
+	clean := (reason == ReasonClientEOF || reason == ReasonTargetEOF) &&
+		sess.Stats.CleanHalfClose.Load() && !sess.Stats.Terminated.Load() &&
+		sess.DirClosed(session.DirUp) && sess.DirClosed(session.DirDown)
+	if clean {
+		n.metrics.SessionCleanComplete()
+	} else if sess.Stats.FirstByte.Load() {
+		n.metrics.SessionMidTransfer()
+	} else {
+		n.metrics.SessionClosedBeforeFirstByte()
+	}
 	n.metrics.SessionEnded()
 	n.logger.Printf("session %s closed: %s", shortID(sess.ID), sess.Reason())
 }
@@ -1052,9 +1088,11 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 
 	targetConn, err := n.cfg.TargetDial(net.JoinHostPort(dest.Addr, strconv.Itoa(int(dest.Port))))
 	if err != nil {
+		n.metrics.TargetDialFailure()
 		drop(fmt.Errorf("target %s dial failed: %w", dest.Addr, err))
 		return
 	}
+	n.metrics.TargetDialSuccess()
 
 	// Bounded bootstrap wait for the down carrier (Issue #7): if it is
 	// down at FrameHeader arrival but reconnects within BootstrapWait

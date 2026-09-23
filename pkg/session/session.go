@@ -294,6 +294,9 @@ func (d Direction) String() string {
 type Session struct {
 	ID   SessionID
 	Dest *Destination
+	// Stats contains the fixed, atomic lifecycle flags consumed by node
+	// telemetry. It carries no session identity or peer-provided data.
+	Stats SessionStats
 	// ClientConn is the local client socket (SOCKS5 client on the Iran
 	// side); nil on the Germany side. Owned by this session: Close is
 	// the only closer.
@@ -629,6 +632,21 @@ func (ss *SessionStore) GetByStream(streamID uint32) (*Session, bool) {
 	defer ss.mu.RUnlock()
 	s, ok := ss.streams[streamID]
 	return s, ok
+}
+
+// ByStream resolves a session by its carrier StreamID. It is the read-side
+// name used by the non-blocking carrier termination hook.
+func (ss *SessionStore) ByStream(streamID uint32) (*Session, bool) {
+	return ss.GetByStream(streamID)
+}
+
+// SetOverflowReason records the node-owned overflow reason after telemetry
+// classification. Carrier code never calls this method, so it cannot race
+// the session's first-reason semantics from a carrier callback.
+func (s *Session) SetOverflowReason() {
+	s.mu.Lock()
+	s.reason = "stream overflow terminated"
+	s.mu.Unlock()
 }
 
 // RemoveStream unindexes a session's StreamIDs (without closing anything).

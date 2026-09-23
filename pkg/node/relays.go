@@ -105,12 +105,17 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 		if len(pending) >= capacity {
 			// Backpressure: the bounded reconnect buffer is full; stop
 			// reading the socket until the carrier can absorb data.
+			n.metrics.RelayBufferFull()
 			n.waitAttach(sess, att)
 			continue
 		}
 
 		nread, rerr := sock.Read(buf)
 		if nread > 0 {
+			n.metrics.AddRelayBytesRead(int64(nread))
+			if sess.Stats.MarkFirstByte() {
+				n.metrics.SessionFirstByteSeen()
+			}
 			if dir == session.DirUp {
 				n.metrics.AddUp(int64(nread))
 			} else {
@@ -134,12 +139,14 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 				return
 			}
 			pending = append(pending, buf[:nread]...)
+			n.metrics.RelayPendingHigh(int64(len(pending)))
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				socketEOF = true
 			} else {
 				n.metrics.Error()
+				n.metrics.RelaySocketReadError()
 				sess.Close(sockReadErr(dir))
 				return
 			}
@@ -155,9 +162,9 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 // direction, Germany).
 func sockReadErr(dir session.Direction) string {
 	if dir == session.DirUp {
-		return "client read error"
+		return "client socket read error"
 	}
-	return "target read error"
+	return "target socket read error"
 }
 
 // flushPending writes all buffered bytes to the attached carrier. It
@@ -186,6 +193,7 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 			chunk = chunk[:mux.MaxPayload]
 		}
 		if err := h.carrier.WriteFrame(streamIDOf(sess, dir), mux.FrameData, chunk); err != nil {
+			n.metrics.RelayWriteFailure()
 			if att.Detach(gen) {
 				n.logger.Printf("session %s: %s carrier died mid-write; %d buffered bytes, grace %s",
 					shortID(sess.ID), dirName(dir), len(*pending), n.cfg.Grace)
@@ -193,6 +201,7 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 			return false
 		}
 		*pending = (*pending)[len(chunk):]
+		n.metrics.AddRelayBytesWritten(int64(len(chunk)))
 		if r := n.buf.refund(bk, len(chunk)); r > 0 {
 			n.metrics.AddSessionBufferReclaimed(r)
 		}
@@ -357,6 +366,9 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 					return
 				}
 				if frame == nil {
+					if st, g := att.State(); st == session.AttAttached && g == h.gen {
+						sess.Stats.MarkCleanHalfClose()
+					}
 					n.peerEOF(sess, dir)
 					return
 				}
@@ -367,6 +379,7 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 				}
 				if _, err := sock.Write(frame); err != nil {
 					n.metrics.Error()
+					n.metrics.RelaySocketWriteError()
 					sess.Close(sockWriteErr(dir))
 					return
 				}
@@ -379,7 +392,7 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 // (Germany: target; Iran: client).
 func sockWriteErr(dir session.Direction) string {
 	if dir == session.DirUp {
-		return "target write failed"
+		return "target socket write error"
 	}
-	return "client write failed"
+	return "client socket write error"
 }
