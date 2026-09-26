@@ -113,6 +113,7 @@ Metric names rendered at `/metrics` (exact, snake_case, prefixed with the direct
 | `mux_<dir>_push_rejected_stream` | counter | refused: stream frames/bytes bound |
 | `mux_<dir>_push_rejected_total` | counter | refused: 32 MiB aggregate budget |
 | `mux_<dir>_push_rejected_closed` | counter | refused: mailbox closed |
+| `mux_<dir>_dropped_data_frames` | counter | DATA frame undeliverable to a live stream; the stream is then cleanly terminated (deliver-or-fail: an in-order DATA frame is delivered or the stream is failed — never silently dropped, which would leave an undetectable byte hole in every byte stream, e.g. TLS) |
 | `mux_<dir>_overflow_terminations` | counter | stream killed by dispatcher pressure |
 | `mux_<dir>_overflow_terminations_worker` | counter | stream killed by its own slow consumer |
 | `mux_<dir>_overflow_wait_count` | counter | overflow waits observed |
@@ -159,6 +160,7 @@ closeReasonTargetEOF   int64
 closeReasonCarrier     int64
 closeReasonOverflow    int64
 closeReasonTimeout     int64
+closeReasonDataUndeliverable int64 // deliver-or-fail stream termination (in-stream data gap)
 closeReasonOther       int64
 ```
 
@@ -179,12 +181,15 @@ relay_write_failures
 relay_buffer_full
 relay_socket_read_errors
 relay_socket_write_errors
-session_close_reason{reason="client_eof|target_eof|carrier|overflow|timeout|other"}
+session_close_reason{reason="client_eof|target_eof|carrier|overflow|timeout|data_undeliverable|other"}
 ```
 
-`session_close_reason` is a **fixed six-value label set** — the only label in the whole
+`session_close_reason` is a **fixed seven-value label set** — the only label in the whole
 surface, its values are compile-time constants of a private type, and no caller can supply a
-string (§4).
+string (§4). The additive `data_undeliverable` bucket records streams ended by the
+deliver-or-fail policy (a DATA frame that could not be queued for a live stream); it is
+classified BEFORE overflow, so a data-gap close is never mislabelled `overflow` or
+`other`.
 
 **Exact render order.** [`Metrics.Render`](pkg/node/metrics.go:195) appends the new lines
 after the existing Issue #6 block (`session_buffer_reclaimed`, `:213`), in this order, then
@@ -215,6 +220,7 @@ session_close_reason{reason="target_eof"} <int>
 session_close_reason{reason="carrier"} <int>
 session_close_reason{reason="overflow"} <int>
 session_close_reason{reason="timeout"} <int>
+session_close_reason{reason="data_undeliverable"} <int>
 session_close_reason{reason="other"} <int>
 mux_up_push_accepted <int>
 mux_up_push_rejected_stream <int>
@@ -231,11 +237,12 @@ mux_up_overflow_terminations_worker <int>
 mux_up_overflow_wait_count <int>
 mux_up_overflow_wait_sum_seconds <float>
 mux_up_overflow_wait_max_seconds <float>
+mux_up_dropped_data_frames <int>
 mux_up_carrier_write_failures <int>
 mux_up_carrier_read_failures <int>
 mux_up_carrier_read_eof <int>
 mux_up_blackhole_deaths <int>
-... the identical 20 lines with mux_down_ ...
+... the identical 21 lines with mux_down_ ...
 ```
 
 `mux_<dir>_queued_bytes` / `mux_<dir>_queued_frames` are the *current* gauges (the `Now`
@@ -929,8 +936,11 @@ systemctl restart iran-splitter
 ### 9.2 Structural enforcement
 
 1. **No label sets at all except one fixed enum.** The only label in the entire surface is
-   `session_close_reason{reason=…}` with six compile-time constants of a private
-   `CloseReason` type. The `Metrics` method that consumes it
+   `session_close_reason{reason=…}` with seven compile-time constants of a private
+   `CloseReason` type (six, plus the additive `data_undeliverable` — a deliver-or-fail
+   stream termination for an undeliverable in-stream DATA frame, checked before the
+   overflow class so a data gap is never mislabelled `overflow` or `other`). The
+   `Metrics` method that consumes it
    (`SessionClosed(r CloseReason)`) cannot be called with a string.
 2. **The renderer is a fixed line list.** [`Metrics.Render`](pkg/node/metrics.go:195) is a
    hand-rolled `strings.Builder` over an explicit field list. There is no map iteration, no

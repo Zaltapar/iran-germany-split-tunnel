@@ -14,6 +14,46 @@ import (
 	"strings"
 )
 
+// allowUnitRemoval is the explicit opt-in seam for the close-out T1 safety
+// guard. It reports whether SPLIT_ALLOW_UNIT_REMOVAL=1 is set. Production
+// code initializes it to readUnitRemovalOptIn and NEVER reassigns it; only
+// _test.go files may substitute it. When false - the default - RemoveUnit
+// refuses to delete any managed unit.
+var allowUnitRemoval = readUnitRemovalOptIn
+
+// readUnitRemovalOptIn is the unambiguous opt-in: the env var must equal
+// "1". Absent or any other value (0/true/yes/...) is a refusal. Mirrors the
+// SPLIT_ALLOW_WEAK_SECRET bypass convention (internal/config).
+func readUnitRemovalOptIn() bool {
+	return os.Getenv("SPLIT_ALLOW_UNIT_REMOVAL") == "1"
+}
+
+// protectedUnitNames is the project managed production service set - the
+// units the safety guard must at minimum protect. A named set (not a single
+// hardcoded name) so the guard stays actionable as the service set grows.
+var protectedUnitNames = map[string]bool{
+	"germany-splitter.service": true,
+	"xray-germany.service":     true,
+	"iran-splitter.service":    true,
+	"iran-origin.service":      true,
+	"xray-consumer.service":    true,
+}
+
+// unitRemovalGate enforces the T1 safety guard. It MUST run before
+// RemoveUnit performs any mutation so a refusal never leaves a unit
+// half-disabled (no stop/disable/removal is issued on the refuse path).
+// Default (no opt-in): refuse ErrUnitRemovalRefused. With
+// SPLIT_ALLOW_UNIT_REMOVAL=1: allow.
+func unitRemovalGate(unit string) error {
+	if allowUnitRemoval() {
+		return nil
+	}
+	if protectedUnitNames[unit] {
+		return fmt.Errorf("%w: %s is a production unit; set SPLIT_ALLOW_UNIT_REMOVAL=1 to allow removal", ErrUnitRemovalRefused, unit)
+	}
+	return fmt.Errorf("%w: set SPLIT_ALLOW_UNIT_REMOVAL=1 to allow removal of %s", ErrUnitRemovalRefused, unit)
+}
+
 // DisableUnit stops the unit (when active/transitioning) and disables it.
 // Sequence per design §4.11: stop (if active) → disable → remove the wants
 // symlink (belt-and-braces: systemctl disable usually removes it; the
@@ -162,6 +202,11 @@ func RemoveUnit(ctx context.Context, m *ServiceManager, s Spec) error {
 	}
 	unit, err := s.unitName()
 	if err != nil {
+		return err
+	}
+	// Safety guard (close-out T1): refuse unattended removal of a managed
+	// unit. Runs BEFORE any stop/disable so a refusal leaves no partial state.
+	if err := unitRemovalGate(unit); err != nil {
 		return err
 	}
 	if err := DisableUnit(ctx, m, s); err != nil {

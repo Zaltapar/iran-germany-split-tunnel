@@ -19,25 +19,35 @@ const (
 	ReasonCarrier
 	ReasonOverflow
 	ReasonTimeout
+	ReasonDataUndeliverable
 )
 
 var closeReasonNames = [...]string{
 	ReasonOther: "other", ReasonClientEOF: "client_eof", ReasonTargetEOF: "target_eof",
 	ReasonCarrier: "carrier", ReasonOverflow: "overflow", ReasonTimeout: "timeout",
+	ReasonDataUndeliverable: "data_undeliverable",
 }
 
 // closeReasonClass maps the session's fixed, code-owned reason strings and
-// atomic termination flag to one of exactly six classes. The order is
-// intentional: overflow wins over a later target EOF, then timeout wins over
-// carrier wording, followed by carrier, EOF classes, and other.
+// atomic flags to one of exactly seven classes. The order is intentional:
+// a deliver-or-fail data gap wins (so an undeliverable frame is never
+// mislabelled as overflow), then overflow wins over a later target EOF, then
+// timeout wins over carrier wording, followed by carrier, EOF classes, and
+// other.
 func closeReasonClass(s *session.Session) CloseReason {
 	if s == nil {
 		return ReasonOther
 	}
+	// Deliver-or-fail termination is checked first: an in-order DATA frame
+	// that could not be queued forces a clean stream close, and that close
+	// must keep its own bucket rather than being swallowed by overflow.
+	reason := s.Reason()
+	if s.Stats.DataUndeliverable.Load() || strings.Contains(reason, "undeliverable") {
+		return ReasonDataUndeliverable
+	}
 	if s.Stats.Terminated.Load() {
 		return ReasonOverflow
 	}
-	reason := s.Reason()
 	if strings.Contains(reason, "overflow") {
 		return ReasonOverflow
 	}
@@ -111,13 +121,32 @@ type Metrics struct {
 	relaySocketReadErr   int64
 	relaySocketWriteErr  int64
 
-	// Fixed six-class close-reason accounting.
+	// D4 hybrid credit (Increment 2): per-stream backpressure observability.
+	// relayCreditBlock: a credit-gated down-relay parked because its window
+	// was exhausted (the actual behavioural gate, §E.2).
+	// relayCreditUnlatched: the gate was consulted while the stream was
+	// credit-eligible but not yet latched — i.e. running unlimited
+	// (pre-fix behaviour, A4).
+	// relayCreditEstablishTimeout: an un-latched stream's establishment
+	// window (CreditEstablishTimeout) expired without a first valid credit
+	// frame → reverted to unlimited (A3).
+	// relayCreditFloorDrain: a credit-parked down-relay drained the target
+	// up to the A2 credit floor (§F.2) before parking.
+	relayCreditBlock            int64
+	relayCreditUnlatched        int64
+	relayCreditEstablishTimeout int64
+	relayCreditFloorDrain       int64
+
+	// Fixed close-reason accounting.
 	closeReasonClientEOF int64
 	closeReasonTargetEOF int64
 	closeReasonCarrier   int64
 	closeReasonOverflow  int64
 	closeReasonTimeout   int64
 	closeReasonOther     int64
+	// data_undeliverable: a stream ended by the deliver-or-fail policy (an
+	// in-order DATA frame could not be queued for a live stream).
+	closeReasonDataUndeliverable int64
 }
 
 // NewMetrics creates a zeroed metrics set.
@@ -339,10 +368,52 @@ func (m *Metrics) RelaySocketWriteError() {
 	m.mu.Unlock()
 }
 
+// D4 credit counters (Increment 2). All are cumulative totals, fixed-cardinality.
+
+// RelayCreditBlock counts a credit-gated down-relay park (window exhausted).
+func (m *Metrics) RelayCreditBlock() {
+	m.mu.Lock()
+	m.relayCreditBlock++
+	m.mu.Unlock()
+}
+
+// RelayCreditUnlatched counts a gate consultation on a credit-eligible but
+// un-latched (unlimited) stream.
+func (m *Metrics) RelayCreditUnlatched() {
+	m.mu.Lock()
+	m.relayCreditUnlatched++
+	m.mu.Unlock()
+}
+
+// RelayCreditEstablishTimeout counts an establishment-window expiry that
+// reverted an un-latched stream to unlimited.
+func (m *Metrics) RelayCreditEstablishTimeout() {
+	m.mu.Lock()
+	m.relayCreditEstablishTimeout++
+	m.mu.Unlock()
+}
+
+// RelayCreditFloorDrain counts a credit-parked down-relay draining the
+// target up to the A2 credit floor before parking.
+func (m *Metrics) RelayCreditFloorDrain() {
+	m.mu.Lock()
+	m.relayCreditFloorDrain++
+	m.mu.Unlock()
+}
+
+// RelayCreditLatch records that a stream latched to credit-gated mode on the
+// first valid credit frame (observation only; not a /metrics line).
+func (m *Metrics) RelayCreditLatch() {
+	// Intentionally no persistent counter: latching is the normal, expected
+	// transition (not a failure), so it is exposed through the stream's own
+	// lifecycle metrics rather than a dedicated series. The call site keeps
+	// the hook so tests can wire it.
+}
+
 // SessionClosed records exactly one fixed close-reason class. Values outside
 // the enum are deliberately collapsed into other.
 func (m *Metrics) SessionClosed(r CloseReason) {
-	if r < ReasonClientEOF || r > ReasonTimeout {
+	if r < ReasonClientEOF || r > ReasonDataUndeliverable {
 		r = ReasonOther
 	}
 	m.mu.Lock()
@@ -357,6 +428,8 @@ func (m *Metrics) SessionClosed(r CloseReason) {
 		m.closeReasonOverflow++
 	case ReasonTimeout:
 		m.closeReasonTimeout++
+	case ReasonDataUndeliverable:
+		m.closeReasonDataUndeliverable++
 	default:
 		m.closeReasonOther++
 	}
@@ -396,11 +469,16 @@ type Snapshot struct {
 	RelayBufferFull               int64
 	RelaySocketReadErrors         int64
 	RelaySocketWriteErrors        int64
+	RelayCreditBlock              int64
+	RelayCreditUnlatched          int64
+	RelayCreditEstablishTimeout   int64
+	RelayCreditFloorDrain         int64
 	CloseReasonClientEOF          int64
 	CloseReasonTargetEOF          int64
 	CloseReasonCarrier            int64
 	CloseReasonOverflow           int64
 	CloseReasonTimeout            int64
+	CloseReasonDataUndeliverable  int64
 	CloseReasonOther              int64
 }
 
@@ -438,11 +516,16 @@ func (m *Metrics) Snapshot() Snapshot {
 		RelayBufferFull:               m.relayBufferFull,
 		RelaySocketReadErrors:         m.relaySocketReadErr,
 		RelaySocketWriteErrors:        m.relaySocketWriteErr,
+		RelayCreditBlock:              m.relayCreditBlock,
+		RelayCreditUnlatched:          m.relayCreditUnlatched,
+		RelayCreditEstablishTimeout:   m.relayCreditEstablishTimeout,
+		RelayCreditFloorDrain:         m.relayCreditFloorDrain,
 		CloseReasonClientEOF:          m.closeReasonClientEOF,
 		CloseReasonTargetEOF:          m.closeReasonTargetEOF,
 		CloseReasonCarrier:            m.closeReasonCarrier,
 		CloseReasonOverflow:           m.closeReasonOverflow,
 		CloseReasonTimeout:            m.closeReasonTimeout,
+		CloseReasonDataUndeliverable:  m.closeReasonDataUndeliverable,
 		CloseReasonOther:              m.closeReasonOther,
 	}
 }
@@ -483,11 +566,16 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "relay_buffer_full %d\n", s.RelayBufferFull)
 	fmt.Fprintf(&b, "relay_socket_read_errors %d\n", s.RelaySocketReadErrors)
 	fmt.Fprintf(&b, "relay_socket_write_errors %d\n", s.RelaySocketWriteErrors)
+	fmt.Fprintf(&b, "relay_credit_block %d\n", s.RelayCreditBlock)
+	fmt.Fprintf(&b, "relay_credit_unlatched %d\n", s.RelayCreditUnlatched)
+	fmt.Fprintf(&b, "relay_credit_establish_timeout %d\n", s.RelayCreditEstablishTimeout)
+	fmt.Fprintf(&b, "relay_credit_floor_drain %d\n", s.RelayCreditFloorDrain)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"client_eof\"} %d\n", s.CloseReasonClientEOF)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"target_eof\"} %d\n", s.CloseReasonTargetEOF)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"carrier\"} %d\n", s.CloseReasonCarrier)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"overflow\"} %d\n", s.CloseReasonOverflow)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"timeout\"} %d\n", s.CloseReasonTimeout)
+	fmt.Fprintf(&b, "session_close_reason{reason=\"data_undeliverable\"} %d\n", s.CloseReasonDataUndeliverable)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"other\"} %d\n", s.CloseReasonOther)
 	return b.String()
 }

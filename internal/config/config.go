@@ -65,6 +65,10 @@ const (
 	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
 	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
 	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
+	// D4 hybrid credit (Increment 2) — new credit-specific knobs only.
+	EnvCreditEstablishMs = "SPLIT_CREDIT_ESTABLISH_TIMEOUT" // both (ms) — A3 (0 = library default 2s)
+	EnvCreditThreshold   = "SPLIT_CREDIT_THRESHOLD"         // both (bytes) — emission hysteresis (§E.1)
+	EnvCreditFloorDrain  = "SPLIT_CREDIT_FLOOR_DRAIN"       // both (bytes) — A2 two-way guard (§F.2)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -136,6 +140,13 @@ const (
 	MinLivenessRounds     = 0
 	MaxLivenessRounds     = 20
 
+	// D4 hybrid credit (Increment 2). 0 = the node library default in every
+	// case (CreditEstablishTimeout 2s, CreditThreshold/CreditFloorDrain
+	// 32 KiB); these maxima keep a misconfiguration from disabling the
+	// credit mechanism or reserving absurd buffers.
+	MaxCreditEstablishMs = 600000   // 10 min
+	MaxCreditBytes       = 64 << 20 // 64 MiB
+
 	MinPort = 1
 	MaxPort = 65535
 
@@ -189,6 +200,13 @@ type Config struct {
 	// keepalive pings before the carrier is torn down through the normal
 	// loss/rebind machinery. 0 = library default (mux.DefaultLivenessRounds).
 	LivenessRounds int // SPLIT_LIVENESS_ROUNDS
+
+	// D4 hybrid credit (Increment 2). All three are 0 = node library
+	// default (CreditEstablishTimeout 2s; CreditThreshold/CreditFloorDrain
+	// 32 KiB). New credit-specific knobs; they change no existing default.
+	CreditEstablishMs int // SPLIT_CREDIT_ESTABLISH_TIMEOUT: establishment window (ms; 0 = default 2s)
+	CreditThreshold   int // SPLIT_CREDIT_THRESHOLD: emission hysteresis (bytes; 0 = default 32 KiB)
+	CreditFloorDrain  int // SPLIT_CREDIT_FLOOR_DRAIN: A2 floor-drain bound (bytes; 0 = default 32 KiB)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -265,6 +283,9 @@ func Load(role string) (*Config, error) {
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
+	c.CreditEstablishMs = envInt(&problems, EnvCreditEstablishMs, 0, 0, MaxCreditEstablishMs)                            // 0 = library default (2s)
+	c.CreditThreshold = envInt(&problems, EnvCreditThreshold, 0, 0, MaxCreditBytes)                                      // 0 = library default (32 KiB)
+	c.CreditFloorDrain = envInt(&problems, EnvCreditFloorDrain, 0, 0, MaxCreditBytes)                                    // 0 = library default (32 KiB)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)

@@ -162,6 +162,11 @@ var (
 	// errors.Is on it to CONVERGE (re-apply from the committed manifest)
 	// instead of deadlocking on a crashed upgrade.
 	ErrNoUnitBackup = errors.New("systemd: no unit backup exists")
+	// ErrUnitRemovalRefused: RemoveUnit was called on a protected
+	// production unit without the SPLIT_ALLOW_UNIT_REMOVAL=1 explicit
+	// opt-in. The refusal is strictly pre-mutation: no stop/disable/removal
+	// is performed, so the unit is never left half-disabled.
+	ErrUnitRemovalRefused = errors.New("systemd: refusing to remove protected production unit (set SPLIT_ALLOW_UNIT_REMOVAL=1 to override)")
 )
 
 // Step names used in structured error context.

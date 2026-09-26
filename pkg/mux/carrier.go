@@ -93,6 +93,12 @@ type CarrierConn struct {
 	// equals the sum over mailboxes; the per-mailbox budget check in
 	// TryPush enforces limits.MaxBytesTotal (aggregate memory budget).
 	queuedBytes int64
+	// dispatched is latched true at Dispatch entry; false if this carrier
+	// never started Dispatch.
+	dispatched atomic.Bool
+	// dispatchDone is closed by Dispatch on return (after draining c.frames);
+	// Close waits on it.
+	dispatchDone chan struct{}
 	// workerWait counts stream workers that have started but not yet
 	// exited. Close's step 5 (a) closes EVERY mailbox (allStreams, which
 	// Deregister does not shrink), which is the only thing that can
@@ -142,6 +148,14 @@ type CarrierConn struct {
 	// stream ID and must not block.
 	OnStreamTerminated func(streamID uint32)
 
+	// OnStreamDataUndeliverable, if non-nil, is called once when a stream
+	// is terminated because an in-order DATA frame could not be delivered
+	// (the deliver-or-fail policy; see failUndeliverableData). It is
+	// distinct from OnStreamTerminated (a sustained-overflow / worker-stall
+	// termination) so the node can classify the close as data_undeliverable
+	// rather than overflow. Keyed by stream ID; must not block.
+	OnStreamDataUndeliverable func(streamID uint32)
+
 	// OnNewStream, if non-nil, is called (synchronously, in the dispatch
 	// goroutine) when the first frame for a previously unknown stream
 	// arrives. The dispatcher creates and registers the stream channel and
@@ -152,6 +166,24 @@ type CarrierConn struct {
 	// first item delivered on ch. The callback must return quickly (spawn
 	// a goroutine for slow work such as a target dial).
 	OnNewStream func(streamID uint32, firstType uint8, ch chan []byte)
+
+	// OnStreamPopped, if non-nil, is called from the stream's worker
+	// goroutine after every DATA-item Pop, with the stream's cumulative
+	// poppedBytesTotal. Lock invariant (R2-1): it is invoked ONLY after
+	// q.mu has been released — the Pop path mutates the plain counter
+	// under q.mu and acquires nothing else; the callback may trigger a
+	// blocking carrier write (the FrameCredit emission, Increment 2),
+	// which must never run while q.mu is held, or it would invert the
+	// documented c.mu → q.mu lock order. It is safe when nil.
+	OnStreamPopped func(streamID uint32, poppedBytesTotal uint64)
+
+	// OnStreamCredit, if non-nil, is called in the dispatch goroutine for
+	// every VALID received FrameCredit (version 1, exact 18-byte
+	// payload). Malformed frames are dropped before the callback — same
+	// as unknown types, with no state change and no effect on DATA.
+	// Increment 2 latches per-stream credit state from it; Increment 1
+	// only routes and notifies. Must not block.
+	OnStreamCredit func(streamID uint32, info CreditFrameInfo)
 }
 
 // newCarrierConn constructs a CarrierConn and starts its loops. If br is
@@ -167,6 +199,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 		readDone:     make(chan struct{}),
 		closed:       make(chan struct{}),
 		shutdownDone: make(chan struct{}),
+		dispatchDone: make(chan struct{}),
 		streams:      make(map[uint32]*streamRec),
 		limits:       DefaultStreamLimits,
 		buf:          br, // bound before readLoop starts (see NewCarrierConnWithReader)
@@ -464,6 +497,14 @@ type streamRec struct {
 	// when this stream first started rejecting data.
 	pressureStart time.Time
 	stopOnce      sync.Once
+	// poppedBytesTotal counts the payload bytes popped from this stream's
+	// mailbox since the stream was created. It is a plain, count-only
+	// uint64: mutated ONLY under q.mu by the worker's Pop path (alongside
+	// Pop's own accounting) and read ONLY while q.mu is held — no atomic,
+	// no second lock, no callback while q.mu is held (R2-1). The running
+	// total is captured and handed to OnStreamPopped after q.mu is
+	// released; Increment 2 turns it into FrameCredit emission.
+	poppedBytesTotal uint64
 }
 
 // createStreamLocked creates and registers a stream. Caller holds c.mu.
@@ -714,6 +755,8 @@ func (c *CarrierConn) StreamCount() int {
 // FrameClose, and a best-effort FrameClose goes back to the peer).
 // Dispatch returns when the read loop terminates.
 func (c *CarrierConn) Dispatch() {
+	c.dispatched.Store(true)
+	defer close(c.dispatchDone)
 	for f := range c.frames {
 		switch f.Type {
 		case FrameData, FrameHeader, FrameRebind, FrameClose:
@@ -750,6 +793,22 @@ func (c *CarrierConn) Dispatch() {
 			c.mu.Lock()
 			c.sawPong = true
 			c.mu.Unlock()
+		case FrameCredit:
+			// D4 backpressure (receiver half): validate FIRST — a
+			// malformed payload (wrong length or version != 1) is
+			// dropped exactly like an unknown frame: no state change,
+			// no effect on DATA handling, connection stays up. Only a
+			// VALID credit is routed, so Increment 2 can latch credit
+			// state; with no OnStreamCredit installed the frame is
+			// accepted and ignored (wire-compatible with older peers,
+			// which drop it in their default arm).
+			info, ok := parseCreditFrame(f.Payload)
+			if !ok {
+				break
+			}
+			if c.OnStreamCredit != nil {
+				c.OnStreamCredit(f.StreamID, info)
+			}
 		default:
 			// unknown frame type: drop
 		}
@@ -789,13 +848,43 @@ func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 	// TryPush atomically checks the per-stream bounds AND the carrier-wide
 	// aggregate byte budget (all under the mailbox lock — see
 	// StreamQueue), adds the accepted bytes to the aggregate, and reports
-	// false if the push was refused for any reason. Pressure applies to
-	// THIS stream only; other streams are never affected.
+	// false if the push was refused for any reason. A refused DATA (or
+	// HEADER/REBIND) frame is handled by the deliver-or-fail policy below;
+	// a refused FrameClose still uses the pressure rule (the isClose
+	// branch above).
 	if s.q.TryPush(it) {
 		s.pressureStart = time.Time{}
 		return
 	}
-	c.applyPressure(s)
+	// A DATA frame that cannot be queued would, under the old policy, be
+	// silently dropped while the stream stayed alive — leaving an in-order
+	// byte hole no receiver can detect (frames carry no sequence number)
+	// that corrupts every byte stream (e.g. TLS) downstream. The dispatcher
+	// must never block on a slow consumer (Phase 3), so it cannot retry
+	// this frame in place; the deliver-or-fail invariant applies instead:
+	// fail the stream cleanly so the consumer sees a clean stream end, not
+	// corrupted bytes.
+	c.failUndeliverableData(s)
+}
+
+// failUndeliverableData records that an in-order DATA frame is undeliverable
+// to this live stream and terminates the stream cleanly. It is the
+// dispatcher-side replacement for the old silent-drop: an in-order DATA frame
+// is either DELIVERED (queued by the TryPush above) or the STREAM IS CLEANLY
+// FAILED — never silently dropped while the stream stays healthy.
+// Dispatcher goroutine only; takes c.mu solely to read the stats pointer.
+func (c *CarrierConn) failUndeliverableData(s *streamRec) {
+	c.mu.Lock()
+	stats := c.stats
+	c.mu.Unlock()
+	stats.droppedDataFrame()
+	// terminateStream(s, true) delivers nil to the consumer and signals the
+	// peer with a best-effort FrameClose, so both ends tear the stream down
+	// deterministically (no half-alive stream, no byte hole).
+	c.terminateStream(s, true)
+	if c.OnStreamDataUndeliverable != nil {
+		c.OnStreamDataUndeliverable(s.id)
+	}
 }
 
 // applyPressure records that a stream could not accept data right now and
@@ -901,6 +990,22 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		// The popped item's payload bytes were already returned to the
 		// aggregate budget by Pop itself (under the mailbox lock) — do
 		// NOT touch queuedBytes here again.
+		//
+		// Count-only (R2-1, D4 Increment 1): add the popped payload bytes
+		// to the stream's cumulative counter, guarded by q.mu (the same
+		// lock Pop uses, keeping the counter consistent with the mailbox),
+		// and fire OnStreamPopped STRICTLY AFTER q.mu is released — the
+		// callback may do a blocking carrier write, which must never run
+		// while q.mu is held (lock order c.mu → q.mu, never the reverse).
+		// The counter itself is a plain uint64: no atomic, no second lock,
+		// no work under q.mu beyond this one addition.
+		s.q.mu.Lock()
+		s.poppedBytesTotal += uint64(len(it.payload))
+		total := s.poppedBytesTotal
+		s.q.mu.Unlock()
+		if c.OnStreamPopped != nil {
+			c.OnStreamPopped(s.id, total)
+		}
 		select {
 		case s.ch <- it.payload:
 		case <-c.closed:
@@ -992,6 +1097,20 @@ func (c *CarrierConn) Close() {
 		// bounded: every worker is either gone or will exit because its
 		// mailbox is closed and c.closed has been open since step 2.
 		c.workerWait.Wait()
+
+		// (b2) Wait for the dispatcher to finish any terminate handoff
+		// (s.ch send) before closing s.ch: the dispatcher is also a
+		// sender on s.ch (the terminateStream handoff in
+		// applyPressure/failUndeliverableData), and the worker wait in (b)
+		// does NOT cover it. The channel close/receive gives the
+		// happens-before; it is bounded because step 2/3 aborts the read
+		// loop and closReceeder lets readLoop close c.frames, so the
+		// dispatcher drains <=256 frames and returns; without this wait,
+		// step (c) could close an s.ch the dispatcher is about to send on
+		// — "send on closed channel".
+		if c.dispatched.Load() { // skip carriers that never ran Dispatch (shutdown/unit-test paths)
+			<-c.dispatchDone
+		}
 
 		// (c) Now — and only now — close every stream channel, waking
 		// the consumers. No worker can be sending when this runs.

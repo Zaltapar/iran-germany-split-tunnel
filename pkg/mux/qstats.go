@@ -46,6 +46,13 @@ type QueueStats struct {
 	OverflowWaitCount          int64
 	OverflowWaitMaxNanos       int64
 
+	// Undeliverable in-order DATA frame accounting (deliver-or-fail): a DATA
+	// frame that could not be queued for a live stream and so forced its
+	// termination. Distinct from OverflowTerminations (a sustained-overflow
+	// timeout) and from the PushRejected* counters (which count every refused
+	// push, including ones that are simply retried and succeed).
+	DroppedDataFrames int64
+
 	// Carrier transport and liveness failures.
 	WriteFailures   int64
 	ReadFailures    int64
@@ -151,6 +158,13 @@ func (s *QueueStats) overflowTerminatedWorker() {
 	atomic.AddInt64(&s.OverflowTerminationsWorker, 1)
 }
 
+func (s *QueueStats) droppedDataFrame() {
+	if s == nil {
+		return
+	}
+	atomic.AddInt64(&s.DroppedDataFrames, 1)
+}
+
 func (s *QueueStats) writeFailure() {
 	if s == nil {
 		return
@@ -206,6 +220,7 @@ func (s *QueueStats) render(prefix string) string {
 	fmt.Fprintf(&b, "%soverflow_wait_count %d\n", prefix, atomicLoad(&s.OverflowWaitCount))
 	fmt.Fprintf(&b, "%soverflow_wait_sum_seconds %.6f\n", prefix, float64(atomicLoad(&s.OverflowWaitSumNanos))/float64(time.Second))
 	fmt.Fprintf(&b, "%soverflow_wait_max_seconds %.6f\n", prefix, float64(atomicLoad(&s.OverflowWaitMaxNanos))/float64(time.Second))
+	fmt.Fprintf(&b, "%sdropped_data_frames %d\n", prefix, atomicLoad(&s.DroppedDataFrames))
 	fmt.Fprintf(&b, "%scarrier_write_failures %d\n", prefix, atomicLoad(&s.WriteFailures))
 	fmt.Fprintf(&b, "%scarrier_read_failures %d\n", prefix, atomicLoad(&s.ReadFailures))
 	fmt.Fprintf(&b, "%scarrier_read_eof %d\n", prefix, atomicLoad(&s.ReadEOF))

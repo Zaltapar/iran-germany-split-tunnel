@@ -40,9 +40,12 @@ func TestDisableUnitAndRemoveUnit(t *testing.T) {
 		}
 		return "", nil
 	}}
+	oldAllow := allowUnitRemoval
+	allowUnitRemoval = func() bool { return true }
 	if err := RemoveUnit(context.Background(), newTestManager(ex), s); err != nil {
 		t.Fatal(err)
 	}
+	allowUnitRemoval = oldAllow
 	if _, err := os.Stat(live); !os.IsNotExist(err) {
 		t.Fatalf("live remains: %v", err)
 	}
@@ -95,6 +98,12 @@ func TestRemoveUnitIfAbsentExistingUnitPreservesDisableErrors(t *testing.T) {
 	s := splitterSpec(RoleGermany)
 	live := unitLive(t, s)
 	writeRaw(t, live, []byte("unit\n"))
+	// Enable the opt-in so the gate does not block the test from reaching
+	// the DisableUnit step (the behavior under test is error propagation,
+	// not the guard itself).
+	oldAllow := allowUnitRemoval
+	allowUnitRemoval = func() bool { return true }
+	t.Cleanup(func() { allowUnitRemoval = oldAllow })
 	wantErr := errors.New("disable failed")
 	ex := &fakeExec{handler: func(args []string) (string, error) {
 		if args[0] == "systemctl" && args[1] == "disable" {
@@ -117,6 +126,103 @@ func maybeUnitBackups(t *testing.T, unit string) []string {
 		t.Fatal(err)
 	}
 	return got
+}
+
+// TestRemoveUnitRefusesByDefaultOnProductionUnit verifies the close-out T1
+// safety guard: without SPLIT_ALLOW_UNIT_REMOVAL=1, RemoveUnit refuses on a
+// production unit name and does NOT leave the unit removed or disabled.
+func TestRemoveUnitRefusesByDefaultOnProductionUnit(t *testing.T) {
+	redirectPaths(t)
+	s := splitterSpec(RoleGermany) // germany-splitter.service — in the allowlist
+	live := unitLive(t, s)
+	writeRaw(t, live, []byte("unit\n"))
+	writeRaw(t, filepath.Join(wantsDir, "germany-splitter.service"), []byte("placeholder"))
+	ex := &fakeExec{handler: func(args []string) (string, error) {
+		if args[0] == "systemctl" && args[1] == "is-active" {
+			return "active", nil
+		}
+		return "", nil
+	}}
+	// No opt-in: allowUnitRemoval is still the default (reads the env var,
+	// which is unset in the test environment).
+	m := newTestManager(ex)
+	err := RemoveUnit(context.Background(), m, s)
+	if !errors.Is(err, ErrUnitRemovalRefused) {
+		t.Fatalf("error = %v, want ErrUnitRemovalRefused", err)
+	}
+	// The unit file must still exist (not removed).
+	if _, serr := os.Stat(live); serr != nil {
+		t.Fatalf("live unit was removed despite refusal: %v", serr)
+	}
+	// No systemctl calls were made (no stop, no disable, no daemon-reload).
+	if len(ex.calls) != 0 {
+		t.Fatalf("systemctl calls = %#v, want none (pre-mutation refusal)", ex.calls)
+	}
+	// No backup was created (backup happens after the gate).
+	if backups := maybeUnitBackups(t, "germany-splitter.service"); len(backups) != 0 {
+		t.Fatalf("backups = %d, want 0 (refusal is pre-mutation)", len(backups))
+	}
+}
+
+// TestRemoveUnitRefusesByDefaultOnNonListedUnit verifies that the guard also
+// refuses a unit name that is NOT in the allowlist (defense in depth: ANY
+// managed-unit removal requires the opt-in, not just the known five).
+func TestRemoveUnitRefusesByDefaultOnNonListedUnit(t *testing.T) {
+	redirectPaths(t)
+	// Use a fake unit name not in protectedUnitNames.
+	s := Spec{Role: RoleGermany, Component: ComponentSplitter,
+		BinPath:  filepath.Join(binaryPrefix, "xray", "current", "xray"),
+		UnitName: "my-test-fixture.service"}
+	live := unitLive(t, s)
+	writeRaw(t, live, []byte("unit\n"))
+	ex := &fakeExec{}
+	err := RemoveUnit(context.Background(), newTestManager(ex), s)
+	if !errors.Is(err, ErrUnitRemovalRefused) {
+		t.Fatalf("error = %v, want ErrUnitRemovalRefused", err)
+	}
+	if _, serr := os.Stat(live); serr != nil {
+		t.Fatalf("live unit was removed despite refusal: %v", serr)
+	}
+}
+
+// TestRemoveUnitWithOptInPerformsRemovalOnFakeUnit verifies that with the
+// explicit opt-in enabled, RemoveUnit still performs the full removal
+// sequence (disable + backup + remove + daemon-reload) on a fake unit name.
+func TestRemoveUnitWithOptInPerformsRemovalOnFakeUnit(t *testing.T) {
+	redirectPaths(t)
+	s := Spec{Role: RoleGermany, Component: ComponentSplitter,
+		BinPath:  filepath.Join(binaryPrefix, "xray", "current", "xray"),
+		UnitName: "my-test-fixture.service"}
+	live := unitLive(t, s)
+	writeRaw(t, live, []byte("unit\n"))
+	ex := &fakeExec{handler: func(args []string) (string, error) {
+		if args[0] == "systemctl" && args[1] == "is-active" {
+			return "inactive", errors.New("inactive")
+		}
+		return "", nil
+	}}
+	// Enable the opt-in.
+	oldAllow := allowUnitRemoval
+	allowUnitRemoval = func() bool { return true }
+	t.Cleanup(func() { allowUnitRemoval = oldAllow })
+
+	if err := RemoveUnit(context.Background(), newTestManager(ex), s); err != nil {
+		t.Fatal(err)
+	}
+	// The unit file must be gone.
+	if _, serr := os.Stat(live); !os.IsNotExist(serr) {
+		t.Fatalf("live unit still exists after opt-in removal: %v", serr)
+	}
+	// A backup was created.
+	if backups := maybeUnitBackups(t, "my-test-fixture.service"); len(backups) != 1 {
+		t.Fatalf("backups = %d, want 1", len(backups))
+	}
+	// systemctl calls: is-active + disable + daemon-reload.
+	assertCalls(t, ex.calls, []string{
+		"systemctl is-active my-test-fixture.service",
+		"systemctl disable my-test-fixture.service",
+		"systemctl daemon-reload",
+	})
 }
 
 func TestRollbackLast(t *testing.T) {
