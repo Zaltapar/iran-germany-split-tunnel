@@ -19,25 +19,35 @@ const (
 	ReasonCarrier
 	ReasonOverflow
 	ReasonTimeout
+	ReasonDataUndeliverable
 )
 
 var closeReasonNames = [...]string{
 	ReasonOther: "other", ReasonClientEOF: "client_eof", ReasonTargetEOF: "target_eof",
 	ReasonCarrier: "carrier", ReasonOverflow: "overflow", ReasonTimeout: "timeout",
+	ReasonDataUndeliverable: "data_undeliverable",
 }
 
 // closeReasonClass maps the session's fixed, code-owned reason strings and
-// atomic termination flag to one of exactly six classes. The order is
-// intentional: overflow wins over a later target EOF, then timeout wins over
-// carrier wording, followed by carrier, EOF classes, and other.
+// atomic flags to one of exactly seven classes. The order is intentional:
+// a deliver-or-fail data gap wins (so an undeliverable frame is never
+// mislabelled as overflow), then overflow wins over a later target EOF, then
+// timeout wins over carrier wording, followed by carrier, EOF classes, and
+// other.
 func closeReasonClass(s *session.Session) CloseReason {
 	if s == nil {
 		return ReasonOther
 	}
+	// Deliver-or-fail termination is checked first: an in-order DATA frame
+	// that could not be queued forces a clean stream close, and that close
+	// must keep its own bucket rather than being swallowed by overflow.
+	reason := s.Reason()
+	if s.Stats.DataUndeliverable.Load() || strings.Contains(reason, "undeliverable") {
+		return ReasonDataUndeliverable
+	}
 	if s.Stats.Terminated.Load() {
 		return ReasonOverflow
 	}
-	reason := s.Reason()
 	if strings.Contains(reason, "overflow") {
 		return ReasonOverflow
 	}
@@ -111,13 +121,16 @@ type Metrics struct {
 	relaySocketReadErr   int64
 	relaySocketWriteErr  int64
 
-	// Fixed six-class close-reason accounting.
+	// Fixed close-reason accounting.
 	closeReasonClientEOF int64
 	closeReasonTargetEOF int64
 	closeReasonCarrier   int64
 	closeReasonOverflow  int64
 	closeReasonTimeout   int64
 	closeReasonOther     int64
+	// data_undeliverable: a stream ended by the deliver-or-fail policy (an
+	// in-order DATA frame could not be queued for a live stream).
+	closeReasonDataUndeliverable int64
 }
 
 // NewMetrics creates a zeroed metrics set.
@@ -342,7 +355,7 @@ func (m *Metrics) RelaySocketWriteError() {
 // SessionClosed records exactly one fixed close-reason class. Values outside
 // the enum are deliberately collapsed into other.
 func (m *Metrics) SessionClosed(r CloseReason) {
-	if r < ReasonClientEOF || r > ReasonTimeout {
+	if r < ReasonClientEOF || r > ReasonDataUndeliverable {
 		r = ReasonOther
 	}
 	m.mu.Lock()
@@ -357,6 +370,8 @@ func (m *Metrics) SessionClosed(r CloseReason) {
 		m.closeReasonOverflow++
 	case ReasonTimeout:
 		m.closeReasonTimeout++
+	case ReasonDataUndeliverable:
+		m.closeReasonDataUndeliverable++
 	default:
 		m.closeReasonOther++
 	}
@@ -401,6 +416,7 @@ type Snapshot struct {
 	CloseReasonCarrier            int64
 	CloseReasonOverflow           int64
 	CloseReasonTimeout            int64
+	CloseReasonDataUndeliverable  int64
 	CloseReasonOther              int64
 }
 
@@ -443,6 +459,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		CloseReasonCarrier:            m.closeReasonCarrier,
 		CloseReasonOverflow:           m.closeReasonOverflow,
 		CloseReasonTimeout:            m.closeReasonTimeout,
+		CloseReasonDataUndeliverable:  m.closeReasonDataUndeliverable,
 		CloseReasonOther:              m.closeReasonOther,
 	}
 }
@@ -488,6 +505,7 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "session_close_reason{reason=\"carrier\"} %d\n", s.CloseReasonCarrier)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"overflow\"} %d\n", s.CloseReasonOverflow)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"timeout\"} %d\n", s.CloseReasonTimeout)
+	fmt.Fprintf(&b, "session_close_reason{reason=\"data_undeliverable\"} %d\n", s.CloseReasonDataUndeliverable)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"other\"} %d\n", s.CloseReasonOther)
 	return b.String()
 }

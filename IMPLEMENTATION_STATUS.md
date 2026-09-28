@@ -19,6 +19,212 @@ resolved and recorded.
 Latest recorded implementation commit: `2927f847` (historical T8-B M5
 record; not the current remote tip)
 
+## Iran2/3xui investigation, DNS-only Reality hostname, durable TCP matrices, and nftables calibration — 2026-09-23
+
+Sanitized final operational evidence from the Iran2/3xui investigation, the
+DNS-only Reality hostname work, the durable TCP matrices, the concurrency ramp,
+and nftables limiter calibration. No credentials, passwords, API keys, UUIDs,
+Reality keys, short IDs, pair blobs, or credential-bearing URLs are reproduced.
+This documentation update modifies only this status document; no source code,
+remote host, or commit is changed by the update.
+
+### External use-case distinction
+
+- **Iran1 external endpoint:** public authenticated SOCKS endpoint
+  `188.121.111.122:10900` was validated from Germany as a real external
+  vantage. TCP connect, RFC 1929 authentication, HTTP and HTTPS requests,
+  DNS requests, and the observed Germany egress IP all passed.
+- **Iran2 boundary:** the Iran2 3xui client itself was not directly exercised.
+  Its observed peer during the live windows was `37.32.20.167`, but that peer
+  was not independently identified as Iran2.
+- **Protocol boundary:** the SOCKS implementation is TCP-only `CONNECT`.
+  `UDP ASSOCIATE`, `BIND`, ICMP, and ping are unsupported in
+  [`cmd/iran-splitter/socks.go`](cmd/iran-splitter/socks.go:73) and
+  [`cmd/iran-splitter/main.go`](cmd/iran-splitter/main.go:431). Do not claim
+  ping or UDP support from this evidence.
+
+### Current deployed public endpoint
+
+- Iran1 `iran-splitter` revision `d1fba547...` is deployed with authentication
+  enabled on `0.0.0.0:10900`; the startup marker is `(auth: enabled)`.
+  [`splitterctl doctor`](cmd/splitterctl/main.go:1) exited 0, with
+  `config.validation`, `service.active`, and `listener.binds` passing.
+- The operator-owned nftables table `inet operator_socks_rate_limit` remains
+  outside the project-managed firewall. It has a loopback allow, public
+  `tcp/10900` `limit rate 30/minute burst 16 packets` accept, and a final
+  `tcp/10900` drop. It does not affect ports `9001`, `10802`, `443`, or `80`.
+- The Iran2 source-specific allow rule could not be applied because the
+  supplied values were placeholders rather than a routable public IP.
+  Residual exposure is that arbitrary sources can reach the port, but they
+  still require the strong random credential pair and remain subject to rate
+  limiting. A future narrow source rule can use the peer line
+  `SOCKS5 CONNECT → <destination>:<port> from <peer-IP>:<peer-port>`.
+
+### DNS-only Reality hostname work
+
+- Exactly one ArvanCloud DNS-only record was created:
+  `A reality.ctoplace.ir → 91.107.152.1`, TTL `300`, `cloud=false`.
+  No existing `arvan`, apex, or `NS` record was changed, and authoritative and
+  public resolvers agreed on the result.
+- The attempted `xray-consumer` hostname migration changed only
+  `vnext.address` and passed the consumer's native configuration validation.
+  One HTTPS target timed out both with the hostname and with the bare IP, so
+  the migration was safely rolled back. The current consumer remains on the
+  bare Germany IP; all other Reality connection parameters remained unchanged.
+  No Reality key, UUID, or short ID is reproduced here.
+
+### Root-cause investigation and durable evidence
+
+- During the initial 79-second live observation, the peer was stable at
+  `37.32.20.167`; there was no resource growth or carrier error in that
+  window. Historical limiter counters were high, but there was no counter
+  delta during that exact window. The source-level protocol boundary remains
+  the TCP-only behavior documented above.
+- Durable sequential matrix against target classes A/B/C: public **15/15
+  HTTP 200**, loopback **15/15**, and direct **15/15**; no authentication,
+  `CONNECT`, or data failures occurred.
+- Durable concurrency ramp against a fixed HTTP target, with per-attempt
+  results retained:
+
+  | Stage | Result |
+  |---|---|
+  | Preflight | 3/3 |
+  | Level 1 | 1/1 |
+  | Level 4 | 4/4 |
+  | Level 8 | 8/8 |
+  | Level 16 | 15/16; one TCP timeout before authentication; nftables drops **+34 packets** |
+  | Level 32 | 15/32; 17 TCP timeouts before authentication; nftables drops **+162 packets** |
+  | Five-connection recovery after 60 seconds quiet | 5/5 |
+
+- Admitted sessions had no authentication failures, `CONNECT` rejects, carrier
+  loss/rebind, queue/backpressure, target-dial, deadline, or resource errors;
+  RSS, file-descriptor count, and CPU stayed stable. The evidence therefore
+  proves limiter-induced pre-SOCKS-admission loss under high churn, but did
+  not reproduce a persistent post-`CONNECT` data-plane failure.
+
+### nftables limiter calibration
+
+- Exactly one handle-specific nftables replacement was applied: public burst
+  `10 → 16`, while keeping rate `30/minute`, the loopback allow, and the final
+  drop. Other ports were unchanged, and no service was restarted.
+- Re-running 16 simultaneous authenticated TCP sessions produced **16/16**
+  HTTP 200 responses with identical 559-byte bodies, latencies of
+  **541.9–630.9 ms**, zero errors, and no drop-counter delta.
+- A quiet/recovery five-session batch after more than 60 seconds produced
+  **5/5** HTTP 200 responses, **534.3–614.4 ms**, zero errors, and no
+  drop-counter delta.
+- Burst `16` remains in place. Exact rollback to the prior public burst is:
+
+  ```text
+  nft replace rule inet operator_socks_rate_limit input handle 3 ct state new tcp dport 10900 limit rate 30/minute burst 10 packets counter accept comment '"operator-added NOT project-managed: public SOCKS rate limit"'
+  ```
+
+### Current health and retained state
+
+- Iran1 `iran-splitter`, `xray-consumer`, and origin are active; Germany
+  splitter and Xray are active. The listeners are public SOCKS `10900`, Iran
+  local `9001`/`10802`, and Germany `9002`/`443`. No service was restarted
+  during calibration, and no resource or queue errors were observed.
+- The current consumer remains on the bare Germany IP after the safe hostname
+  rollback.
+- Temporary diagnostics and credential copies were cleaned. Staging,
+  backups, and managed state were retained.
+
+### Remaining limitations and open issues
+
+- The exact Iran2 3xui client remains unverified. It should be configured for
+  TCP SOCKS5 `CONNECT` only, not UDP or ping, and persistent connections should
+  be kept where possible.
+- Source-IP restriction remains pending the real Iran2 public IP.
+- Burst `16` is calibrated for the observed 16-session requirement; it does
+  not guarantee 32 concurrent new connections or unlimited churn. Keep rate
+  `30/minute` unless a separate approved load requirement exists.
+- [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19),
+  [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20),
+  [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21),
+  [#10](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/10),
+  [#11](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/11), and
+  [#12](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/12)
+  remain visible and **OPEN**. This entry does not close or imply closure of
+  any issue.
+
+## SOCKS5 authentication and public-bind deployment — 2026-09-22
+
+Complete, sanitized evidence record for the RFC 1929 authentication workstream and the public-bind deployment on Iran1. This is the newest record. No credential values, passwords, keys, UUIDs, pairing blobs, or credential-bearing URLs are reproduced here. No source/code file or file other than this document was modified by the recorded work, and no commit was made.
+
+### Feature and approved design
+
+- **SOCKS5 username/password authentication (RFC 1929):** `iran-splitter` now supports a safely exposable public SOCKS endpoint. The approved design is [`plans/socks5-auth-design.md`](plans/socks5-auth-design.md:1).
+- **Configuration contract:** `SPLIT_SOCKS_USER` and `SPLIT_SOCKS_PASS` are two separate variables. In [`config.Load()`](internal/config/config.go:239), both set means authentication is enforced; both empty means authentication is disabled with byte-for-byte legacy behavior; exactly one set refuses startup with a [`*ConfigError`](internal/config/config.go:239).
+- **Protocol:** [`socksNegotiate()`](cmd/iran-splitter/socks.go:73) performs method selection and RFC 1929 sub-negotiation using `VER=0x01, ULEN, UNAME, PLEN, PASSWD`, returns `01 00` or `01 01`, rejects malformed frames without panic, and permits one authentication attempt per connection.
+- **Credential comparison:** both credential fields use [`crypto/subtle.ConstantTimeCompare`](cmd/iran-splitter/socks.go:73); username length is not short-circuited before the constant-time comparisons.
+- **Secret policy:** the password reuses [`ValidateSecretMaterial()`](internal/config/config.go:239) and the existing `SPLIT_ALLOW_WEAK_SECRET` bypass; no second bypass variable was added. The username receives only the RFC-representable length rule.
+- **Secret handling:** credentials are never logged, never shown by `config show`, and only the non-invertible environment fingerprint reaches manifest/state, mirroring the existing `SPLIT_SECRET` convention.
+- **Backward compatibility:** the legacy no-auth path is unchanged, existing [`Dial()`](integration/socks5/client.go:96) callers are unchanged, and the configuration fingerprint is unchanged when the new variables are absent, so `upgrade` and `config set` remain true no-ops on hosts without them.
+
+### Releases and CI
+
+- `190f899ec5b0cdd77fa7d33c0039530867ab87d5` — `feat(socks): add RFC 1929 username/password authentication`; CI run **#118 green**: gofmt, vet, `go test`, `go test -race`, ShellCheck, pinned Xray/Caddy gates, and the linux/amd64 build. **18 files committed.**
+- `d1fba547beae94ffde46634c0280cec815bf66a0` — listener-bind wildcard normalization fix; CI run **#119 green** with the same gates.
+
+### Implementation and test coverage
+
+- New tests cover [`cmd/iran-splitter/socks_test.go`](cmd/iran-splitter/socks_test.go:1), [`internal/config/config_test.go`](internal/config/config_test.go:1), [`internal/deploy/request_test.go`](internal/deploy/request_test.go:1), [`internal/systemd/envfile_test.go`](internal/systemd/envfile_test.go:1), and [`integration/socks5/client_test.go`](integration/socks5/client_test.go:1).
+- The L4 harness gained scenario `S0a` in [`integration/twoproc_test.go`](integration/twoproc_test.go:1), together with backward-compatible `DialWithAuth` support.
+- Local verification: **18 packages pass**. The Windows opt-in L4 gate passed **10** scenarios and skipped **2** POSIX-only scenarios.
+
+### Deployed state on Iran1
+
+Target host: Iran1 (`188.121.111.122`), deployed revision `d1fba54`.
+
+- `iran-splitter` SHA-256: `98d42ab005284a36986f4b69a435571e6d908ab008fa9bf0b6b1b42924903a7b`; `go version -m` reports `vcs.revision d1fba547beae94ffde46634c0280cec815bf66a0`.
+- `splitterctl` path: `/root/staging/splitterctl-d1fba54`; SHA-256: `66158050b46af682ac8cde87f84e7495263463230a1f1fc6a4a867e65350c`; the same `vcs.revision` is reported.
+- **Final intended state:** the SOCKS listener is publicly bound on `0.0.0.0:10900` with authentication **enabled**.
+- Credentials are stored at `/root/.splitter-socks-auth` with mode 600 and owner `root:root`; the pair is also projected into the managed role environment `/etc/split-tunnel/iran.env`, mode 600.
+- Start-up journal marker: `SOCKS5 listening on 0.0.0.0:10900 (auth: enabled)`.
+
+### External validation from the Germany vantage point
+
+All results below are real validations from Germany (`91.107.152.1`) against `188.121.111.122:10900`:
+
+- TCP connect: **PASS**, approximately 0.10 s.
+- No-auth greeting: **3/3 rejected** with `05 ff`.
+- Wrong credentials: **3/3 rejected**; method selection returned `05 02`, followed by `01 01`.
+- Authenticated HTTP CONNECT: **3/3 HTTP 200**, 0.57–0.63 s.
+- Authenticated HTTPS CONNECT: **3/3 HTTP 200**, 0.80–1.04 s.
+- DNS/hostname resolution through the SOCKS path: **3/3 pass**.
+- Observed egress IP: Germany `2a01:4f8:1c1b:252d::1` on **3/3 repeats**, proving that traffic traversed the tunnel to Germany for Internet egress.
+- Rate limit: operator-owned nftables table `operator_socks_rate_limit` with loopback allow, `30/minute burst 10`, and drop; verified not to affect ports `9001`, `10802`, `443`, or `80`.
+- [`splitterctl doctor`](cmd/splitterctl/main.go:1) exited 0 post-bind, with `config.validation`, `service.active`, and `listener.binds` all passing.
+
+### Incidents and fixes found in staging
+
+- **Credential-projection incident:** a `upgrade --splitter` invocation that sourced only `/root/iran-ops.env` (which lacks the SOCKS credential pair) caused the managed-environment rewrite to drop both keys. The restarted process came up with `(auth: disabled)` on a public bind. The external no-auth control correctly returned `05 00`, the safety gate fired, and the bind was immediately rolled back to loopback. Root cause: [`WriteEnvFile()`](internal/systemd/envfile.go:157) renders the supplied map and does not merge omitted keys from the existing file, so an optional committed key absent from the process environment is silently dropped. This is a procedural hazard, not a source defect: the source correctly projects the keys when present through [`InstallRequest.Env()`](internal/deploy/request.go:121). **Standing rule:** every mutating `splitterctl` invocation must assemble the complete environment from the protected files and assert that the credential pair is non-empty before mutation.
+- **Doctor false negative fixed:** [`ListenerBindsCheck()`](internal/deploy/diagnostics.go:320) compared configured `0.0.0.0:10900` literally against `ss` output, which renders the wildcard as `*:10900`, and therefore reported a working public bind as missing. [`canonicalListenerBind()`](internal/deploy/diagnostics.go:349) now normalizes empty, `*`, `0.0.0.0`, `::`, and `[::]` to one wildcard token while preserving exact comparison for specific addresses. The check remains deliberately strict: a configured loopback bind does not match an observed wildcard, and a configured wildcard does not match an observed loopback bind. It verifies configured exposure scope, not merely port reachability.
+
+### Remaining limitations
+
+- Iran2's public IP was never obtainable: three requests returned only placeholders, so the nftables source allow-rule could not be applied. The endpoint is therefore reachable from arbitrary Internet sources, protected by the 64-character cryptographically random password and the rate limit. Once Iran2 connects, its real source address is visible in the journal line `SOCKS5 CONNECT → <destination>:<port> from <peer-IP>:<peer-port>`, after which a narrow allow rule can be added.
+- The Iran2 3xui client itself has **not yet been exercised** against the public endpoint; the path was validated from the Germany vantage point.
+
+### Rollback documented
+
+- **Bind-only rollback:** run `config set socks.listen=127.0.0.1:10900` with the complete environment.
+- **Binary/state rollback:** use `rollback --to <state-id>` or a supported `upgrade --splitter` to a staged older artifact. Backups are retained on Iran1.
+
+### Issue status and external-client prerequisite
+
+Issues [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19), [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20), [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21), [#10](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/10), [#11](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/11), and [#12](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/12) remain **OPEN**. Their evidence state is unchanged from the preceding 2026-09-22 entry:
+
+- [#19](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/19) remains open. The final `arvan.ctoplace.ir` route has proven direct-reachable, upload/CDN, down-carrier/Reality, IPv6 anycast, 16-session concurrency, closed-port target refusal, and the retained earlier byte-identical payload, IPv6 data-level, and 48/48 burst classes. The named unproven blockers remain: #11 blackhole/liveness requires a live iptables mutation; #17 full 5× flapping requires the same; #18 full 15-minute soak was not executed; #10 operator-boundary checks are outside scope; and #4/#5 full 10 MiB sustained throughput plus #15 target half-close at full spec were not run.
+- [#20](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/20) remains open; sanitized journal markers and the L4 matrix are the current evidence for stranded-session observability.
+- [#21](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/21) remains open; the final-route closed-port probe produced a bounded EOF matching the documented post-`0x00` behavior, and the earlier contract clarification remains current.
+- [#10](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/10) remains open; operator-boundary liveness checks remain outside this workstream's recorded scope.
+- [#11](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/11) remains open; real-blackhole evidence requires live iptables mutation, which is outside the no-mutation constraints of the recorded work.
+- [#12](https://github.com/Zaltapar/iran-germany-split-tunnel/issues/12) remains open; there is no change to the installer-CI evidence in this workstream.
+
+This workstream addresses the public SOCKS exposure prerequisite for real external L5 clients; it does not close or imply closure of any issue.
+
 ## Staging deployment, lifecycle rehearsal, L5 evidence, and ArvanCloud CDN cutover — 2026-09-22
 
 Sanitized evidence record of the staging deployment of release `bfc013d7`,

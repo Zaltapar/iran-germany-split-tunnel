@@ -649,6 +649,16 @@ func (s *Session) SetOverflowReason() {
 	s.mu.Unlock()
 }
 
+// SetDataUndeliverableReason records the node-owned reason for a stream that
+// was terminated by the deliver-or-fail policy (an in-order DATA frame could
+// not be delivered, leaving a byte gap that would corrupt the stream). Called
+// from the session-close hook, never from a carrier callback.
+func (s *Session) SetDataUndeliverableReason() {
+	s.mu.Lock()
+	s.reason = "in-stream data undeliverable (byte gap)"
+	s.mu.Unlock()
+}
+
 // RemoveStream unindexes a session's StreamIDs (without closing anything).
 func (ss *SessionStore) RemoveStream(s *Session) {
 	ss.mu.Lock()

@@ -172,10 +172,9 @@ func TestAggregateBudgetEnforced(t *testing.T) {
 	}
 
 	// A 200B frame for stream 3 fits ITS mailbox (200 <= 600) but would
-	// take the carrier to 1100 > 1000: refuse and pressurize stream 3.
-	c.deliver(s3, queueItem{payload: make([]byte, 200)})
-	if s3.pressureStart.IsZero() {
-		t.Fatal("aggregate overflow did not put the stream under pressure")
+	// take the carrier to 1100 > 1000: TryPush refuses it (aggregate check).
+	if s3.q.TryPush(queueItem{payload: make([]byte, 200)}) {
+		t.Fatal("aggregate-budget push was accepted")
 	}
 	if n := atomic.LoadInt64(&c.queuedBytes); n != 900 {
 		t.Fatalf("queuedBytes = %d, want 900 (refused push must not count)", n)
@@ -183,9 +182,19 @@ func TestAggregateBudgetEnforced(t *testing.T) {
 
 	// A 100B frame landing exactly ON the budget boundary (900+100 =
 	// 1000 <= 1000) must still be accepted.
-	c.deliver(s3, queueItem{payload: make([]byte, 100)})
+	if !s3.q.TryPush(queueItem{payload: make([]byte, 100)}) {
+		t.Fatal("boundary aggregate push was refused")
+	}
 	if n := atomic.LoadInt64(&c.queuedBytes); n != 1000 {
 		t.Fatalf("queuedBytes = %d, want 1000", n)
+	}
+
+	// Now the aggregate is at its limit. Delivering one more DATA frame
+	// through the dispatcher path triggers the deliver-or-fail policy:
+	// the stream is terminated cleanly (not silently dropped).
+	c.deliver(s3, queueItem{payload: make([]byte, 1)})
+	if !s3.terminated.Load() {
+		t.Fatal("undeliverable DATA frame did not terminate stream 3")
 	}
 }
 

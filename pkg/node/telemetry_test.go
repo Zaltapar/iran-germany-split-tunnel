@@ -34,6 +34,7 @@ func TestCloseReasonClassification(t *testing.T) {
 		{"peer", "up stream closed by peer", ReasonCarrier},
 		{"timeout", "download carrier timeout", ReasonTimeout},
 		{"did not finish", "target did not finish after client EOF", ReasonTimeout},
+		{"data gap", "in-stream data undeliverable (byte gap)", ReasonDataUndeliverable},
 		{"other", "activation failed", ReasonOther},
 		{"empty", "", ReasonOther},
 	}
@@ -54,6 +55,18 @@ func TestCloseReasonCarriesOverflowFirst(t *testing.T) {
 	}
 }
 
+// TestCloseReasonDataGapWinsOverOverflow: a stream terminated by the
+// deliver-or-fail policy must keep its own bucket even though termination
+// also latched the (generic) Terminated flag — the gap reason is checked first.
+func TestCloseReasonDataGapWinsOverOverflow(t *testing.T) {
+	s := telemetrySession("target EOF")
+	s.Stats.MarkTerminated()
+	s.Stats.MarkDataUndeliverable()
+	if got := closeReasonClass(s); got != ReasonDataUndeliverable {
+		t.Fatalf("data-gap class = %d, want data_undeliverable", got)
+	}
+}
+
 func TestSessionClosedCountedExactlyOnce(t *testing.T) {
 	m := NewMetrics()
 	var wg sync.WaitGroup
@@ -67,7 +80,7 @@ func TestSessionClosedCountedExactlyOnce(t *testing.T) {
 	wg.Wait()
 	s := m.Snapshot()
 	total := s.CloseReasonClientEOF + s.CloseReasonTargetEOF + s.CloseReasonCarrier +
-		s.CloseReasonOverflow + s.CloseReasonTimeout + s.CloseReasonOther
+		s.CloseReasonOverflow + s.CloseReasonTimeout + s.CloseReasonDataUndeliverable + s.CloseReasonOther
 	if total != 50 {
 		t.Fatalf("close reason total = %d, want 50 for direct fixed-enum calls", total)
 	}
@@ -90,7 +103,7 @@ func TestSessionClosedCountedExactlyOnce(t *testing.T) {
 	wg.Wait()
 	ns := n.Metrics().Snapshot()
 	closeTotal := ns.CloseReasonClientEOF + ns.CloseReasonTargetEOF + ns.CloseReasonCarrier +
-		ns.CloseReasonOverflow + ns.CloseReasonTimeout + ns.CloseReasonOther
+		ns.CloseReasonOverflow + ns.CloseReasonTimeout + ns.CloseReasonDataUndeliverable + ns.CloseReasonOther
 	if closeTotal != 1 {
 		t.Fatalf("node close reason total = %d, want 1", closeTotal)
 	}
@@ -106,15 +119,15 @@ func TestMetricsRenderNoSecrets(t *testing.T) {
 	m.SessionClosed(ReasonClientEOF)
 	out := m.Render()
 	assertRenderPrivacy(t, out)
-	if got := strings.Count(out, "session_close_reason{"); got != 6 {
-		t.Fatalf("close reason lines = %d, want 6", got)
+	if got := strings.Count(out, "session_close_reason{"); got != 7 {
+		t.Fatalf("close reason lines = %d, want 7", got)
 	}
 }
 
 func assertRenderPrivacy(t *testing.T, out string) {
 	t.Helper()
 	plain := regexp.MustCompile(`^[a-z0-9_]+\s+[0-9]+(\.[0-9]+)?$`)
-	labelled := regexp.MustCompile(`^session_close_reason\{reason="(client_eof|target_eof|carrier|overflow|timeout|other)"\}\s+[0-9]+$`)
+	labelled := regexp.MustCompile(`^session_close_reason\{reason="(client_eof|target_eof|carrier|overflow|timeout|data_undeliverable|other)"\}\s+[0-9]+$`)
 	for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
 		if line == "" {
 			continue

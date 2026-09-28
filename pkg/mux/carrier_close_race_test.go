@@ -463,3 +463,84 @@ func TestCloseOneCarrierLeavesOtherRunning(t *testing.T) {
 		t.Fatal("carrier 2 stopped serving after carrier 1 closed")
 	}
 }
+
+// parkDispatcherInTerminateHandoff drives the DATA-refusal trigger and
+// VERIFIES the dispatcher is parked in the terminateStream handoff select
+// (state verified, not assumed — the parkWorkersInDelivery pattern): the
+// consumer stalls (never reads the channel), 8 DATA frames into the cap-4
+// mailbox fill it, the refused DATA push fires failUndeliverableData, and
+// the dispatcher's nil handoff send is then blocked by the consumer channel
+// the worker filled. That blocked send is the exact window the pre-fix
+// Close's close(s.ch) could hit.
+func parkDispatcherInTerminateHandoff(t *testing.T, b *testutil.MemConn, c *CarrierConn, ch chan []byte) {
+	t.Helper()
+	for i := 0; i < 8; i++ {
+		if err := WriteFrame(b, 1, FrameData, []byte("x")); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
+		}
+	}
+	// The terminated flag proves the DATA path fired (deliver-or-fail),
+	// NOT the pressure deadline (the mailbox fills long before it could
+	// matter).
+	waitTerminated(t, c, 1, 3*time.Second)
+	deadline := time.Now().Add(3 * time.Second)
+	for len(ch) != 1 { // worker's handoff filled the channel: the dispatcher's nil send is blocked
+		if time.Now().After(deadline) {
+			t.Fatal("dispatcher never parked in the terminate handoff (consumer channel never filled)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestCloseRacesDispatcherTerminateHandoff is the direct -race regression
+// pin for the dispatchWG (b2) Close fix — complementing
+// TestCloseRacesActiveWorkerFlood, which covers the WORKER send path, with
+// the new DISPATCHER terminate handoff: failUndeliverableData's
+// terminateStream sends nil on s.ch, and the pre-fix Close closed s.ch in
+// step 5(c) while that send could be in flight — "send on closed channel".
+// The fix (Close step 5, sub-step b2: dispatchWG.Wait BEFORE closing any
+// s.ch) is what this test pins closed.
+//
+// The race window is reached deterministically, not by timing luck: the
+// consumer stalls, a DATA-refusal trigger terminates the stream, and the
+// verified parked state (parkDispatcherInTerminateHandoff) proves the
+// dispatcher is inside the handoff select BEFORE Close starts — so
+// Close's close(closed) / dispatchWG.Wait / close(s.ch) run while that
+// handoff is still in flight.
+//
+// Run with -count=100 (or more) to multiply the attempts.
+func TestCloseRacesDispatcherTerminateHandoff(t *testing.T) {
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		a, b := testutil.NewMemPipe()
+		c := NewCarrierConn(a, 0)
+		c.SetStreamLimits(bpLimits(4, 4096, 64*4096, 200*time.Millisecond))
+		ch1 := c.Register(1) // the consumer stalls: it never reads ch1
+		go c.Dispatch()
+
+		parkDispatcherInTerminateHandoff(t, b, c, ch1)
+
+		// dropped_data_frames may be >= 0 depending on timing — it counts
+		// the refused DATA pushes between the mailbox filling and the
+		// stream aborting, i.e. at most the number of aborted frames. The
+		// pin here is the RACE, not the count: no panic while the
+		// dispatcher-side terminate handoff (nil on s.ch inside
+		// failUndeliverableData) is in flight against a concurrent Close.
+		closed := make(chan struct{})
+		go func() {
+			c.Close() // must not panic (no "send on closed channel")
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return (dispatchWG wait hung?)")
+		}
+		// assertClosedCarrier covers the rest: s.ch closed, queued bytes
+		// reclaimed, and every carrier-owned goroutine exited — i.e. the
+		// dispatcher (dispatchWG) is drained, no leaked goroutine.
+		assertClosedCarrier(t, c, map[uint32]chan []byte{1: ch1})
+		a.Close()
+		b.Close()
+	}
+}

@@ -52,7 +52,7 @@ func TestProductionSourceGuards(t *testing.T) {
 
 func isTestOnlySeam(name string) bool {
 	switch name {
-	case "unitDir", "wantsDir", "stateDir", "logDir", "dataDir", "binaryPrefix", "unitsBackupDir", "nowUnixNano", "waitPollInterval", "rootCheck":
+	case "unitDir", "wantsDir", "stateDir", "logDir", "dataDir", "binaryPrefix", "unitsBackupDir", "nowUnixNano", "waitPollInterval", "rootCheck", "allowUnitRemoval":
 		return true
 	default:
 		return false
