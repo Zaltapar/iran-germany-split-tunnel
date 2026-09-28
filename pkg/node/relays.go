@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
@@ -145,6 +146,50 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			if errors.Is(rerr, io.EOF) {
 				socketEOF = true
 			} else {
+				// Non-EOF socket read error.
+				//
+				// The Iran client leg (DirUp, relayShapeA on the client
+				// socket) is special: on a long-haul GET download the up
+				// reader is legitimately blocked in sock.Read with nothing
+				// left to send, so a single transient non-EOF error there
+				// (a RST, a "use of closed network connection" from a
+				// concurrent teardown, or a teardown artifact under load)
+				// must NOT tear down the whole session — that would kill
+				// the in-flight DOWN download. We instead classify it
+				// (suppressed benign artifact vs. tolerated up half-close).
+				// Every other direction stays fatal below.
+				if dir == session.DirUp {
+					switch upReadErrorPolicy(sess, rerr) {
+					case upReadSuppressed:
+						// (a)/(b) Benign teardown artifact (session already
+						// Closing/Closed, or os.ErrClosed/net.ErrClosed):
+						// not a client abort. No counter, no re-close
+						// (teardown already owns it); just log and exit.
+						n.logger.Printf("session %s: up read closed (benign, session %s): %v",
+							shortID(sess.ID), sess.State().String(), rerr)
+						return
+					case upReadHalfClose:
+						// (c) A genuine non-EOF client-socket error (e.g. a
+						// RST): keep the metric truthful but do NOT make it
+						// fatal for the whole session. Downgrade to a
+						// tolerated up-direction half-close so the pending
+						// up bytes flush and the up FrameClose goes out
+						// through the existing peerEOF / MarkDirClosed
+						// machinery; the DOWN download is allowed to finish
+						// (it ends via the down completion + finalizeDrain
+						// bound, node.go). Log the underlying error so the
+						// live journal records RST-vs-teardown-artifact.
+						n.metrics.Error()
+						n.metrics.RelaySocketReadError()
+						n.logger.Printf("session %s: up read non-EOF error (tolerated as up half-close): %v",
+							shortID(sess.ID), rerr)
+						socketEOF = true // run the uncapped flush + FrameClose path
+						continue
+					}
+				}
+				// Down (target, Germany) and any other direction: a non-EOF
+				// read error is fatal — it can never mask a real target
+				// failure. Keep the counter and the close.
 				n.metrics.Error()
 				n.metrics.RelaySocketReadError()
 				sess.Close(sockReadErr(dir))
@@ -165,6 +210,48 @@ func sockReadErr(dir session.Direction) string {
 		return "client socket read error"
 	}
 	return "target socket read error"
+}
+
+// upReadPolicy is the disposition of a non-EOF read error on the up (client)
+// socket of an Iran session.
+type upReadPolicy int
+
+const (
+	// upReadSuppressed: a benign artifact — the session is already
+	// Closing/Closed (a concurrent teardown closed the ClientConn under
+	// us) or the error is a closed-connection error. The counter and the
+	// close are BOTH suppressed; the relay just exits.
+	upReadSuppressed upReadPolicy = iota
+	// upReadHalfClose: a genuine non-EOF client error (e.g. a RST). The
+	// RelaySocketReadError counter is kept truthful, but the error is
+	// downgraded from a fatal session close to a tolerated up-direction
+	// half-close so the in-flight DOWN download can finish.
+	upReadHalfClose
+)
+
+// upReadErrorPolicy classifies a non-EOF up-socket read error for the
+// relayShapeA up-direction branch. It is the single decision point so the
+// benign-artifact suppression and the half-close downgrade can be tested in
+// isolation. It uses only the session's EXISTING state accessors (State,
+// never inventing new state) and errors.Is for the closed-connection
+// sentinels. It is NOT credited/paced: it only ever suppresses (artifact)
+// or half-closes (genuine error); it never drops DATA or force-terminates.
+func upReadErrorPolicy(sess *session.Session, rerr error) upReadPolicy {
+	// (a) Benign teardown artifact: a concurrent goroutine's teardown
+	// already moved the session to Closing/Closed and closed the
+	// ClientConn, so our blocked sock.Read returned "use of closed
+	// network connection". This is not a client abort.
+	if st := sess.State(); st == session.StateClosing || st == session.StateClosed {
+		return upReadSuppressed
+	}
+	// (b) Benign closed-connection error: os.ErrClosed / net.ErrClosed
+	// ("use of closed network connection"). Same reasoning as (a).
+	if errors.Is(rerr, os.ErrClosed) || errors.Is(rerr, net.ErrClosed) {
+		return upReadSuppressed
+	}
+	// (c) A genuine non-EOF client-socket error (RST, reset, etc.):
+	// tolerated as an up-direction half-close, never a fatal session close.
+	return upReadHalfClose
 }
 
 // flushPending writes all buffered bytes to the attached carrier. It

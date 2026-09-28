@@ -470,6 +470,11 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 			sess.Stats.MarkTerminated()
 		}
 	}
+	c.OnStreamDataUndeliverable = func(streamID uint32) {
+		if sess, ok := n.store.ByStream(streamID); ok {
+			sess.Stats.MarkDataUndeliverable()
+		}
+	}
 
 	n.mu.Lock()
 	n.genSeq++
@@ -955,7 +960,9 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 	n.mu.RUnlock()
 	n.store.Remove(sess.ID)
 	reason := closeReasonClass(sess)
-	if sess.Stats.Terminated.Load() {
+	if sess.Stats.DataUndeliverable.Load() {
+		sess.SetDataUndeliverableReason()
+	} else if sess.Stats.Terminated.Load() {
 		sess.SetOverflowReason()
 	}
 	n.metrics.SessionClosed(reason)
