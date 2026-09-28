@@ -161,10 +161,6 @@ func main() {
 		KeepAliveInterval:       cfg.KeepAliveInterval,
 		LivenessRounds:          cfg.LivenessRounds,
 		StreamLimits:            streamLimits(cfg),
-		// D4 hybrid credit (Increment 2; 0 = node library default).
-		CreditEstablishTimeout: time.Duration(cfg.CreditEstablishMs) * time.Millisecond,
-		CreditThreshold:        cfg.CreditThreshold,
-		CreditFloorDrain:       cfg.CreditFloorDrain,
 	}, logger, mux.DeriveSecret(cfg.Secret))
 
 	s := &Splitter{

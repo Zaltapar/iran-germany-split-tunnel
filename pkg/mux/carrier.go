@@ -166,24 +166,6 @@ type CarrierConn struct {
 	// first item delivered on ch. The callback must return quickly (spawn
 	// a goroutine for slow work such as a target dial).
 	OnNewStream func(streamID uint32, firstType uint8, ch chan []byte)
-
-	// OnStreamPopped, if non-nil, is called from the stream's worker
-	// goroutine after every DATA-item Pop, with the stream's cumulative
-	// poppedBytesTotal. Lock invariant (R2-1): it is invoked ONLY after
-	// q.mu has been released — the Pop path mutates the plain counter
-	// under q.mu and acquires nothing else; the callback may trigger a
-	// blocking carrier write (the FrameCredit emission, Increment 2),
-	// which must never run while q.mu is held, or it would invert the
-	// documented c.mu → q.mu lock order. It is safe when nil.
-	OnStreamPopped func(streamID uint32, poppedBytesTotal uint64)
-
-	// OnStreamCredit, if non-nil, is called in the dispatch goroutine for
-	// every VALID received FrameCredit (version 1, exact 18-byte
-	// payload). Malformed frames are dropped before the callback — same
-	// as unknown types, with no state change and no effect on DATA.
-	// Increment 2 latches per-stream credit state from it; Increment 1
-	// only routes and notifies. Must not block.
-	OnStreamCredit func(streamID uint32, info CreditFrameInfo)
 }
 
 // newCarrierConn constructs a CarrierConn and starts its loops. If br is
@@ -497,14 +479,6 @@ type streamRec struct {
 	// when this stream first started rejecting data.
 	pressureStart time.Time
 	stopOnce      sync.Once
-	// poppedBytesTotal counts the payload bytes popped from this stream's
-	// mailbox since the stream was created. It is a plain, count-only
-	// uint64: mutated ONLY under q.mu by the worker's Pop path (alongside
-	// Pop's own accounting) and read ONLY while q.mu is held — no atomic,
-	// no second lock, no callback while q.mu is held (R2-1). The running
-	// total is captured and handed to OnStreamPopped after q.mu is
-	// released; Increment 2 turns it into FrameCredit emission.
-	poppedBytesTotal uint64
 }
 
 // createStreamLocked creates and registers a stream. Caller holds c.mu.
@@ -793,22 +767,6 @@ func (c *CarrierConn) Dispatch() {
 			c.mu.Lock()
 			c.sawPong = true
 			c.mu.Unlock()
-		case FrameCredit:
-			// D4 backpressure (receiver half): validate FIRST — a
-			// malformed payload (wrong length or version != 1) is
-			// dropped exactly like an unknown frame: no state change,
-			// no effect on DATA handling, connection stays up. Only a
-			// VALID credit is routed, so Increment 2 can latch credit
-			// state; with no OnStreamCredit installed the frame is
-			// accepted and ignored (wire-compatible with older peers,
-			// which drop it in their default arm).
-			info, ok := parseCreditFrame(f.Payload)
-			if !ok {
-				break
-			}
-			if c.OnStreamCredit != nil {
-				c.OnStreamCredit(f.StreamID, info)
-			}
 		default:
 			// unknown frame type: drop
 		}
@@ -990,22 +948,6 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		// The popped item's payload bytes were already returned to the
 		// aggregate budget by Pop itself (under the mailbox lock) — do
 		// NOT touch queuedBytes here again.
-		//
-		// Count-only (R2-1, D4 Increment 1): add the popped payload bytes
-		// to the stream's cumulative counter, guarded by q.mu (the same
-		// lock Pop uses, keeping the counter consistent with the mailbox),
-		// and fire OnStreamPopped STRICTLY AFTER q.mu is released — the
-		// callback may do a blocking carrier write, which must never run
-		// while q.mu is held (lock order c.mu → q.mu, never the reverse).
-		// The counter itself is a plain uint64: no atomic, no second lock,
-		// no work under q.mu beyond this one addition.
-		s.q.mu.Lock()
-		s.poppedBytesTotal += uint64(len(it.payload))
-		total := s.poppedBytesTotal
-		s.q.mu.Unlock()
-		if c.OnStreamPopped != nil {
-			c.OnStreamPopped(s.id, total)
-		}
 		select {
 		case s.ch <- it.payload:
 		case <-c.closed:

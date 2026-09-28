@@ -117,27 +117,6 @@ type Config struct {
 	// TargetDial dials a logical destination (RoleGermany only).
 	// Default: 10s TCP dial.
 	TargetDial func(addr string) (net.Conn, error)
-	// Credit knobs (D4 hybrid backpressure, Increment 2). Only these NEW
-	// credit-specific levers are introduced; no existing default, socket
-	// buffer or queue size is touched.
-	//
-	// CreditThreshold is the emission hysteresis (bytes): the receiver emits
-	// a FrameCredit only when a stream's cumulative popped total has
-	// advanced by at least this much since the last emitted credit (§E.1) —
-	// NOT a resident-bytes figure. Default = defaultCreditThreshold (32 KiB,
-	// the CreditFloorDrain default); <=0 lifts to the default.
-	CreditThreshold int
-	// CreditFloorDrain is the A2 credit-floor guard (bytes): a credit-parked
-	// down-relay still drains the target socket into its pending buffer up
-	// to this bound so the two-way exhaustion cycle cannot hold (§F.2).
-	// Default = defaultCreditThreshold (32 KiB); <=0 lifts to the default.
-	CreditFloorDrain int
-	// CreditEstablishTimeout bounds how long an un-latched stream waits for
-	// its first valid FrameCredit after (re)bind-attach / bootstrap (§I
-	// Step 1, A3; SPLIT_CREDIT_ESTABLISH_TIMEOUT); on expiry it reverts to
-	// unlimited (current behaviour) — never terminates, never parks forever.
-	// Default = defaultCreditEstablishTimeout (2s); <=0 lifts to the default.
-	CreditEstablishTimeout time.Duration
 }
 
 // Sanitize replaces zero/negative values with defaults.
@@ -159,16 +138,6 @@ func (c *Config) Sanitize() {
 	}
 	if c.BootstrapWait <= 0 {
 		c.BootstrapWait = defaultBootstrapWait
-	}
-	// D4 credit knobs (Increment 2): only new levers; defaults lifted here.
-	if c.CreditThreshold <= 0 {
-		c.CreditThreshold = defaultCreditThreshold
-	}
-	if c.CreditFloorDrain <= 0 {
-		c.CreditFloorDrain = defaultCreditFloorDrain
-	}
-	if c.CreditEstablishTimeout <= 0 {
-		c.CreditEstablishTimeout = defaultCreditEstablishTimeout
 	}
 	c.StreamLimits = mux.SanitizeLimits(c.StreamLimits)
 	if c.TargetDial == nil {
@@ -221,18 +190,6 @@ const defaultSessionBufferTotal = 32 << 20 // 32 MiB
 // (bounded, cancelable — never an infinite wait).
 const defaultBootstrapWait = 30 * time.Second
 
-// D4 hybrid credit defaults (Increment 2). These are NEW credit-specific
-// knobs; they do not alter any pre-existing default, socket buffer or queue
-// size. CreditThreshold (emission hysteresis, §E.1) and CreditFloorDrain
-// (the A2 two-way exhaustion guard, §F.2) share the 32 KiB default; the
-// CreditFloorDrain floor is enforced against PENDING BYTES, not a one-shot
-// allowance, so a parked relay holds at most this much (zero past it).
-const (
-	defaultCreditThreshold        = 32 << 10 // 32 KiB
-	defaultCreditFloorDrain       = 32 << 10 // 32 KiB
-	defaultCreditEstablishTimeout = 2 * time.Second
-)
-
 // Node is the per-side engine.
 type Node struct {
 	cfg          Config
@@ -280,14 +237,6 @@ type Node struct {
 	// session.Attachment.readyClosed.
 	upReadyClosed   bool
 	downReadyClosed bool
-
-	// D4 hybrid credit (Increment 2): the sender-side per-stream credit
-	// ledger (Germany) and the receiver's emission hysteresis (Iran).
-	// Both are per-Node, not per-carrier, so they survive a rebind; the
-	// ledger re-anchors to the new generation on (re)bind-attach.
-	creditLedger   *creditLedger
-	creditEmitMu   sync.Mutex
-	creditEmitLast map[uint32]uint64
 }
 
 // NewNode creates a Node with the given role, config (sanitized),
@@ -299,7 +248,7 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 	metrics := NewMetrics()
 	buf := newSessionBufferBudget(cfg.SessionBufferTotalBytes)
 	buf.setMetrics(metrics)
-	n := &Node{
+	return &Node{
 		cfg:          cfg,
 		store:        session.NewSessionStore(),
 		metrics:      metrics,
@@ -315,24 +264,7 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
 		// a carrier is actually installed (Issue #7).
 		upReady:   make(chan struct{}),
 		downReady: make(chan struct{}),
-		// D4 credit (Increment 2): the sender ledger (Germany) and the
-		// emission hysteresis map (Iran) start empty.
-		creditEmitLast: make(map[uint32]uint64),
 	}
-	// The ledger's timers report D4 fallback / latch events to the
-	// metrics surface (the fallback counter is relay_credit_
-	// establish_timeout; the latch clears the un-latched observation).
-	n.creditLedger = newCreditLedger(
-		func(streamID uint32) { n.metrics.RelayCreditEstablishTimeout() },
-		func(streamID uint32) { n.metrics.RelayCreditLatch() },
-	)
-	// INCREMENT 3: seed the ledger's initial credit window from the carrier's
-	// per-stream mailbox byte bound (MaxBytesPerStream) so the on-attach anchor
-	// credit (popped = 0) latches a BOUNDED sender instead of an unlimited one.
-	// This is not a new knob: it is derived from the existing StreamLimits and
-	// falls back to mux.DefaultStreamLimits when unavailable.
-	n.creditLedger.setInitialWindow(uint64(n.cfg.StreamLimits.MaxBytesPerStream))
-	return n
 }
 
 // Store is the session store.
@@ -537,18 +469,6 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		if sess, ok := n.store.ByStream(streamID); ok {
 			sess.Stats.MarkTerminated()
 		}
-		if n.cfg.Role == RoleGermany {
-			// D4 (Increment 2): the stream is over — drop its sender-side
-			// credit entry (and armed establishment timer) so the ledger
-			// does not outlive the session's stream (bounded, fixed
-			// cardinality).
-			n.creditLedger.clearStream(streamID)
-		}
-	}
-	c.OnStreamDataUndeliverable = func(streamID uint32) {
-		if sess, ok := n.store.ByStream(streamID); ok {
-			sess.Stats.MarkDataUndeliverable()
-		}
 	}
 
 	n.mu.Lock()
@@ -635,27 +555,6 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 			c.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
 				n.onDownNewStream(h, id, firstType, ch)
 			}
-		}
-	}
-
-	// D4 credit (Increment 2), installed BEFORE Dispatch like OnNewStream.
-	// The pop callback (Iran) fires in the streamWorker goroutine STRICTLY
-	// after the pop path released q.mu, so the credit emission here (a
-	// blocking carrier handoff) never runs while q.mu is held (R2-1). It
-	// is down-carrier only: credit rides the down carrier (IR→DE). The
-	// credit callback (Germany) latches per-stream credit state for this
-	// carrier's generation (R2-2: a superseded carrier's dispatcher has
-	// exited, so its credit frames are never delivered to this carrier).
-	// Terminated/undeliverable streams drop their credit + hysteresis
-	// state so the ledger and the emission map do not leak across streams.
-	if n.cfg.Role == RoleIran && dir == session.DirDown {
-		c.OnStreamPopped = func(streamID uint32, poppedTotal uint64) {
-			n.emitCreditPopped(streamID, poppedTotal)
-		}
-	}
-	if n.cfg.Role == RoleGermany && dir == session.DirDown {
-		c.OnStreamCredit = func(streamID uint32, info mux.CreditFrameInfo) {
-			n.onCredit(streamID, info, h.gen)
 		}
 	}
 
@@ -799,11 +698,6 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 			n.metrics.RebindRefusal("other")
 			continue
 		}
-		if dir == session.DirDown {
-			// D4 credit (§I Step 2): rebind-attach re-anchors both sides
-			// to 0 on the new down-carrier generation (role-handled).
-			n.creditRebindAttach(id, h.gen)
-		}
 		if n.hasChannelConsumer(dir) {
 			// Wait (bounded) for the previous carrier's consumer to
 			// fully exit so two consumers never write the same
@@ -939,12 +833,6 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 		drop("attach failed (state " + st.String() + ")")
 		return
 	}
-	if dir == session.DirDown {
-		// D4 credit (§I Step 2): rebind-attach on Germany re-anchors the
-		// sender's cumulativeSent to 0 (via the ledger) and re-arms the
-		// establishment timer on the new down-carrier generation.
-		n.creditRebindAttach(id, h.gen)
-	}
 	if n.hasChannelConsumer(dir) {
 		// Wait (bounded) for the previous carrier's consumer to fully
 		// exit so two consumers never write the same socket. Now that
@@ -1042,14 +930,6 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	sess.UpAtt.Attach(upH.gen)
 	sess.DownAtt.Attach(downH.gen)
 
-	// D4 credit (Increment 2, §I Step 2): bootstrap-attach anchors BOTH
-	// sides to 0. Iran emits the initial down-credit (popped=0, including
-	// for a stream that has not yet popped) on the newly-attached down
-	// carrier and baselines its emission hysteresis; the Germany sender
-	// re-arms its establishment timer so an un-latched stream reverts to
-	// unlimited after CreditEstablishTimeout.
-	n.creditRebindAttach(id, downH.gen)
-
 	// client → up: buffered upload relay (shape A, session-lifetime)
 	go n.relayShapeA(sess, session.DirUp, clientConn)
 	// down → client: per-carrier data relay (shape B)
@@ -1073,15 +953,9 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 		h.carrier.Deregister(sess.StreamIDDown)
 	}
 	n.mu.RUnlock()
-	// D4 credit (Increment 2): drop the stream's node-side credit state
-	// (ledger entry + armed timer + emission hysteresis) so no structure
-	// outlives the session.
-	n.clearCreditState(sess.StreamIDDown)
 	n.store.Remove(sess.ID)
 	reason := closeReasonClass(sess)
-	if sess.Stats.DataUndeliverable.Load() {
-		sess.SetDataUndeliverableReason()
-	} else if sess.Stats.Terminated.Load() {
+	if sess.Stats.Terminated.Load() {
 		sess.SetOverflowReason()
 	}
 	n.metrics.SessionClosed(reason)
@@ -1264,13 +1138,6 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 
 	sess.UpAtt.Attach(h.gen)
 	sess.DownAtt.Attach(downH.gen)
-
-	// D4 credit (§I Step 1/2): bootstrap-attach arms the establishment
-	// window on the Germany side (an un-latched stream reverts to
-	// unlimited after CreditEstablishTimeout) and anchors the counters to
-	// 0 on the attached down generation. The emission half is Iran-only
-	// (role-guarded), so this call is a no-op on the Iran node.
-	n.creditRebindAttach(id, downH.gen)
 
 	// up → target: per-carrier data relay (shape B)
 	n.startChannelConsumer(sess, session.DirUp, h, ch)

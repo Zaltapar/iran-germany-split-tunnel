@@ -62,33 +62,7 @@ const (
 	// it cannot validate is dropped (never a FrameClose — a refused
 	// rebind must not be mistaken for a peer half-close).
 	FrameRebind uint8 = 0x06
-	// FrameCredit (D4 hybrid backpressure, receiver half — Increment 1):
-	// per-stream credit frame carried on the down carrier (IR→DE), whose
-	// payload reports the receiver's cumulative bytes popped from that
-	// stream's mailbox. This increment adds the frame type and its
-	// payload codec/validation only; no credit state is latched yet
-	// (that is Increment 2). A peer that does not know this type simply
-	// drops it via the dispatcher's default arm — wire-compatible.
-	FrameCredit uint8 = 0x07
 )
-
-// CreditVersion1 is the only credit-payload version the receiver accepts.
-// Any other value is IGNORED (no state change, no panic, connection stays
-// up) so that a peer that has not adopted credit (or that predates this
-// frame type) can be mixed-generation on the same wire.
-const CreditVersion1 = 1
-
-// creditVersion1 is the private codec alias Increment 1 uses; it is the
-// single source of truth for the version byte and stays in lockstep with
-// the exported constant above.
-const creditVersion1 = CreditVersion1
-
-// creditPayloadSize is the exact byte length of a FrameCredit payload:
-// 1 (creditVersion uint8) + 8 (cumulativeBytesPopped uint64, big-endian) +
-// 4 (creditWindow uint32 on the wire, big-endian) + 1 (flags uint8, 0) +
-// 4 (reserved, 0). All multi-byte fields use binary.BigEndian, matching
-// every other wire field in this package (FrameHeader, carrier WriteFrame).
-const creditPayloadSize = 18
 
 // Frame is a single decoded frame.
 type Frame struct {
@@ -134,60 +108,4 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 		}
 	}
 	return f, nil
-}
-
-// CreditFrameInfo is the decoded content of one FrameCredit payload.
-type CreditFrameInfo struct {
-	// CreditVersion is the payload's version byte (must be creditVersion1).
-	CreditVersion uint8
-	// CumulativeBytesPopped is the receiver's running count of payload
-	// bytes popped from the stream's mailbox since (re)bind-attach.
-	// Absolute, not a delta — the sender (Increment 2) derives the window
-	// as CumulativeBytesPopped - cumulativeSent, clamped at 0.
-	CumulativeBytesPopped uint64
-	// CreditWindow is the informational uint32 window value carried on the
-	// wire (D1-Q6's min(MaxBytesPerStream, creditGranted)); the receiver
-	// of Increment 1 does not consume it.
-	CreditWindow uint32
-}
-
-// WriteCreditFrame encodes a FrameCredit frame (header + 18-byte payload,
-// every field binary.BigEndian) for w.
-func WriteCreditFrame(w io.Writer, streamID uint32, info CreditFrameInfo) error {
-	payload := make([]byte, creditPayloadSize)
-	payload[0] = info.CreditVersion
-	binary.BigEndian.PutUint64(payload[1:9], info.CumulativeBytesPopped)
-	binary.BigEndian.PutUint32(payload[9:13], info.CreditWindow)
-	// payload[13] (flags) and payload[14:18] (reserved) stay zero.
-	return WriteFrame(w, streamID, FrameCredit, payload)
-}
-
-// CreditPayload encodes one FrameCredit payload (the 18-byte body,
-// binary.BigEndian; §E.4) for an emitter that writes through the
-// carrier's serialized write path (Increment 2). creditWindow is the
-// informational D1-Q6 window min(MaxBytesPerStream, creditGranted); the
-// flags and reserved bytes stay zero (A6: no FINAL_CREDIT bit).
-func CreditPayload(info CreditFrameInfo) []byte {
-	payload := make([]byte, creditPayloadSize)
-	payload[0] = info.CreditVersion
-	binary.BigEndian.PutUint64(payload[1:9], info.CumulativeBytesPopped)
-	binary.BigEndian.PutUint32(payload[9:13], info.CreditWindow)
-	return payload
-}
-
-// parseCreditFrame validates and decodes a FrameCredit payload. It is
-// pure: it reports ok=false for any malformed input (wrong length or
-// version != 1) and never panics; the caller drops the frame.
-func parseCreditFrame(payload []byte) (info CreditFrameInfo, ok bool) {
-	if len(payload) != creditPayloadSize {
-		return CreditFrameInfo{}, false
-	}
-	if payload[0] != creditVersion1 {
-		return CreditFrameInfo{}, false
-	}
-	return CreditFrameInfo{
-		CreditVersion:         payload[0],
-		CumulativeBytesPopped: binary.BigEndian.Uint64(payload[1:9]),
-		CreditWindow:          binary.BigEndian.Uint32(payload[9:13]),
-	}, true
 }

@@ -102,43 +102,6 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			}
 		}
 
-		// D4 credit gate (§E.2, A1) — the SINGLE gate site, reached ONLY in
-		// the !socketEOF fall-through, AFTER the ungated flush step and
-		// BEFORE the socket read. The socketEOF branch (above) is never
-		// credit-gated: a target that EOFs must always be able to flush
-		// pending and send FrameClose (half-close safety, A6 / §E.3). This
-		// gate only ever PARKS the producer (stopping the read); it never
-		// drops or terminates DATA — the refused-DATA safety net stays armed.
-		if !socketEOF && dir == session.DirDown && n.cfg.Role == RoleGermany {
-			if _, g := att.State(); g != 0 {
-				gated, floor, unlatched := n.creditGate(streamIDOf(sess, dir), g)
-				if unlatched {
-					n.metrics.RelayCreditUnlatched()
-				}
-				if gated {
-					// A2 credit-floor guard (§F.2): even while parked on
-					// credit, keep draining the target into `pending` up to
-					// the floor (enforced against PENDING BYTES, not a
-					// one-shot allowance), so the two-way target-exhaustion
-					// cycle cannot hold. Park only once the floor is reached.
-					if len(pending) >= floor {
-						n.metrics.RelayCreditFloorDrain()
-						n.metrics.RelayCreditBlock()
-						// Bounded: unparks on the next valid credit frame
-						// (window refill) or, if the carrier is lost, hands
-						// off to the grace path (creditPark → waitAttach).
-						n.creditPark(sess, dir, att)
-						continue
-					}
-					// Below the floor: read one more target chunk (bounded
-					// below the buffer cap) to feed the receiver's mailbox;
-					// the credit-park engages on the next loop once the
-					// floor holds. The read is gated-open here precisely
-					// because len(pending) < floor.
-				}
-			}
-		}
-
 		if len(pending) >= capacity {
 			// Backpressure: the bounded reconnect buffer is full; stop
 			// reading the socket until the carrier can absorb data.
@@ -239,12 +202,6 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 		}
 		*pending = (*pending)[len(chunk):]
 		n.metrics.AddRelayBytesWritten(int64(len(chunk)))
-		// D4 credit (Increment 2): advance the sender's cumulative-sent
-		// counter (Germany DirDown only; §E.4.1) — the value a received
-		// FrameCredit is subtracted against to derive the window. It is
-		// anchored to this attachment's generation, so a rebind re-anchors
-		// both counters to 0 (§I Step 2).
-		n.addSent(dir, streamIDOf(sess, dir), len(chunk), gen)
 		if r := n.buf.refund(bk, len(chunk)); r > 0 {
 			n.metrics.AddSessionBufferReclaimed(r)
 		}
