@@ -54,14 +54,18 @@ func newTopoBoot(t *testing.T, grace, bootWait time.Duration, bufBytes int) *top
 	deLog := log.New(baseLog.Writer(), "DE   ", baseLog.Flags())
 	tp := &topo{t: t, secret: secret}
 
-	tp.iran = node.NewNode(node.Config{
+	var err error
+	tp.iran, err = node.NewNode(node.Config{
 		Role: node.RoleIran, Grace: grace,
 		RelayBufSize: 4096, BufferBytes: bufBytes,
 		BootstrapWait:     bootWait,
 		KeepAliveInterval: time.Hour,
 	}, logger, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	tp.de = node.NewNode(node.Config{
+	tp.de, err = node.NewNode(node.Config{
 		Role: node.RoleGermany, Grace: grace,
 		RelayBufSize: 4096, BufferBytes: bufBytes,
 		BootstrapWait:     bootWait,
@@ -77,6 +81,9 @@ func newTopoBoot(t *testing.T, grace, bootWait time.Duration, bufBytes int) *top
 			return c, nil
 		},
 	}, deLog, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Cleanup(func() {
 		tp.iran.Close()

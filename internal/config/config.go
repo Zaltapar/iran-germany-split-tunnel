@@ -45,26 +45,39 @@ const (
 
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen     = "SPLIT_SOCKS_LISTEN"               // Iran
-	EnvSocksUser       = "SPLIT_SOCKS_USER"                 // Iran — SOCKS5 RFC 1929 username
-	EnvSocksPass       = "SPLIT_SOCKS_PASS"                 // Iran — SOCKS5 RFC 1929 password (never logged)
-	EnvWsListen        = "SPLIT_WS_LISTEN"                  // Iran
-	EnvDownCarrier     = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
-	EnvUpWsUrl         = "SPLIT_UP_WS_URL"                  // Germany
-	EnvDownListen      = "SPLIT_DOWN_LISTEN"                // Germany
-	EnvSecret          = "SPLIT_SECRET"                     // both
-	EnvAllowWeak       = "SPLIT_ALLOW_WEAK_SECRET"          // both (bool)
-	EnvMetricsPort     = "SPLIT_METRICS_PORT"               // both
-	EnvRelayBuf        = "SPLIT_RELAY_BUF"                  // both
-	EnvQueueBytes      = "SPLIT_STREAM_QUEUE_BYTES"         // both
-	EnvQueueFrames     = "SPLIT_STREAM_QUEUE_FRAMES"        // both
-	EnvQueueTotal      = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
-	EnvOverflowMs      = "SPLIT_STREAM_OVERFLOW_MS"         // both
-	EnvCarrierGrace    = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
-	EnvBootstrapWait   = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
-	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
-	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
-	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
+	EnvSocksListen         = "SPLIT_SOCKS_LISTEN"               // Iran
+	EnvSocksUser           = "SPLIT_SOCKS_USER"                 // Iran — SOCKS5 RFC 1929 username
+	EnvSocksPass           = "SPLIT_SOCKS_PASS"                 // Iran — SOCKS5 RFC 1929 password (never logged)
+	EnvSocksAllowedSources = "SPLIT_SOCKS_ALLOWED_SOURCES"      // Iran — SOCKS5 source-IP allowlist (unset/empty = allow all)
+	EnvWsListen            = "SPLIT_WS_LISTEN"                  // Iran
+	EnvDownCarrier         = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
+	EnvUpWsUrl             = "SPLIT_UP_WS_URL"                  // Germany
+	EnvDownListen          = "SPLIT_DOWN_LISTEN"                // Germany
+	EnvSecret              = "SPLIT_SECRET"                     // both
+	EnvAllowWeak           = "SPLIT_ALLOW_WEAK_SECRET"          // both (bool)
+	EnvMetricsPort         = "SPLIT_METRICS_PORT"               // both
+	EnvRelayBuf            = "SPLIT_RELAY_BUF"                  // both
+	EnvQueueBytes          = "SPLIT_STREAM_QUEUE_BYTES"         // both
+	EnvQueueFrames         = "SPLIT_STREAM_QUEUE_FRAMES"        // both
+	EnvQueueTotal          = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
+	EnvOverflowMs          = "SPLIT_STREAM_OVERFLOW_MS"         // both
+	EnvCarrierGrace        = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
+	EnvBootstrapWait       = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
+	EnvSessionBuf          = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
+	EnvSessionBufTotal     = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
+	EnvLivenessRounds      = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
+	// Phase B credit flow-control (Slices 4-8):
+	//
+	// SPLIT_CREDITS_ENABLED is the master on/off for the whole credit plane.
+	// The three sub-knobs that were here (SPLIT_CREDIT_WINDOW_MAX,
+	// SPLIT_CREDIT_SAFE_TIMEOUT_MS, SPLIT_CREDIT_BATCH_BYTES) have been
+	// removed: their values are fixed by the design §5/§14 invariants
+	// (creditWindowMax = 512 KiB, CreditSafeTimeout = 2 s,
+	// creditBatchBytes = MaxPayload) and are NOT per-operator tunable —
+	// changing creditWindowMax would break the B2 memory-bound guarantee
+	// (creditPreLatchBound < MaxBytesPerStream) that the whole credit plane
+	// relies on. The pkg/node constants are the single source of truth.
+	EnvCreditsEnabled = "SPLIT_CREDITS_ENABLED" // both (bool, default false) — credit plane master on/off
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -136,6 +149,14 @@ const (
 	MinLivenessRounds     = 0
 	MaxLivenessRounds     = 20
 
+	// Phase B credit flow-control (Slices 6-7). Credits are OFF by default;
+	// the whole plane is inert until SPLIT_CREDITS_ENABLED is set true. The
+	// credit-plane sub-constants (window, timeout, batch) are fixed by the
+	// design §5/§14 invariants in pkg/node/credit.go and are NOT exposed as
+	// operator env vars (setting one would break the B2 memory-bound
+	// guarantee creditPreLatchBound < MaxBytesPerStream).
+	DefaultCreditsEnabled = false
+
 	MinPort = 1
 	MaxPort = 65535
 
@@ -159,7 +180,6 @@ type Config struct {
 	DownCarrierAddr string // Iran: down-carrier dial target (host:port)
 	UpWsUrl         string // Germany: up-carrier WS URL (ws:// or wss://host/upload)
 	DownListen      string // Germany: down-carrier TCP listener (host:port, host may be empty)
-
 	// Iran RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §1.2):
 	// empty = auth not configured (pre-RFC-1929 behavior); both non-empty =
 	// auth enforced. Exactly one set is a config error (fail closed). The
@@ -167,6 +187,13 @@ type Config struct {
 	SocksUser string
 	SocksPass string
 
+	// Iran SOCKS5 source-IP allowlist (opt-in; comma-separated CIDRs and/or
+	// bare IPv4/IPv6 addresses). Empty = unset = allow all sources
+	// (backward-compatible default). When set, a non-empty entry list is
+	// validated at config load: every entry must be a well-formed CIDR or
+	// single address, or the config fails (a typo'd allowlist must NOT
+	// silently allow everyone). Independent of the RFC 1929 credential pair.
+	SocksAllowedSources string
 	// Shared
 	Secret               string        // never logged, never echoed in errors
 	AllowWeakSecret      bool          // SPLIT_ALLOW_WEAK_SECRET (Phase 6 bypass)
@@ -184,11 +211,17 @@ type Config struct {
 	BootstrapWaitMs int // SPLIT_BOOTSTRAP_WAIT_MS: bounded bootstrap wait for a down carrier (ms; 0 = library default)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
 	SessionBufTotal int // SPLIT_SESSION_BUFFER_TOTAL_BYTES: node-level aggregate (0 = library default)
-
 	// Carrier liveness (blackhole detection): consecutive unanswered
 	// keepalive pings before the carrier is torn down through the normal
 	// loss/rebind machinery. 0 = library default (mux.DefaultLivenessRounds).
 	LivenessRounds int // SPLIT_LIVENESS_ROUNDS
+
+	// Phase B credit flow-control (Slices 6-7). CreditsEnabled is the
+	// master on/off (default false → the whole credit plane is inert).
+	// The credit-plane sub-constants (window, timeout, batch) are fixed
+	// by design §5/§14 invariants in pkg/node/credit.go and are NOT
+	// per-operator env vars.
+	CreditsEnabled bool // SPLIT_CREDITS_ENABLED
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -209,6 +242,8 @@ func Defaults() *Config {
 		KeepAliveInterval: DefaultKeepAlive,
 		CarrierGraceMs:    5000,
 		SessionBufBytes:   DefaultSessionBuf,
+		// Phase B credit flow-control default (Slices 6-7): credits off.
+		CreditsEnabled: DefaultCreditsEnabled,
 	}
 }
 
@@ -254,6 +289,10 @@ func Load(role string) (*Config, error) {
 	// half-set state is deterministic and fails closed in Validate.
 	c.SocksUser = envString(EnvSocksUser, c.SocksUser)
 	c.SocksPass = envString(EnvSocksPass, c.SocksPass)
+	// SOCKS5 source-IP allowlist (opt-in): unset or empty means "allow all"
+	// (the backward-compatible default; a restrictive default would break a
+	// user who runs the SOCKS5 proxy from an unknown IP).
+	c.SocksAllowedSources = envString(EnvSocksAllowedSources, "")
 	c.MetricsPort = envInt(&problems, EnvMetricsPort, 0, 0, MaxPort)
 	c.RelayBufSize = envInt(&problems, EnvRelayBuf, DefaultRelayBuf, MinRelayBuf, MaxRelayBuf)
 	c.QueueBytesPerStream = envInt(&problems, EnvQueueBytes, 0, 0, MaxQueueBytesPerStream)
@@ -265,6 +304,11 @@ func Load(role string) (*Config, error) {
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
+	// Phase B credit flow-control (Slices 6-7): master flag. The three
+	// sub-knobs (window/timeout/batch) are fixed by pkg/node/credit.go
+	// constants and are NOT operator env vars (removing them prevents
+	// SPLIT_CREDIT_* from silently doing nothing).
+	c.CreditsEnabled = envBool(&problems, EnvCreditsEnabled, DefaultCreditsEnabled)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -335,6 +379,12 @@ func (c *Config) Validate(role string) error {
 				}
 			}
 		}
+		// SOCKS5 source-IP allowlist (opt-in; independent of the credential pair):
+		// empty = allow all (backward-compatible default). When non-empty, every
+		// comma-separated entry must be a well-formed CIDR or single IPv4/IPv6
+		// address; an invalid entry fails config load so a typo'd allowlist
+		// cannot silently allow everyone.
+		checkSocksAllowedSources(&problems, c.SocksAllowedSources)
 	case RoleGermany:
 		checkWsUrl(&problems, c.UpWsUrl)
 		checkHostPort(&problems, EnvDownListen, c.DownListen, false)
@@ -448,6 +498,95 @@ func roleOwnedEndpoints(role string, c *Config) [][2]string {
 		}
 	}
 	return [][2]string{{EnvDownListen, c.DownListen}}
+}
+
+// checkSocksAllowedSources validates the optional SOCKS5 source-IP allowlist
+// (SPLIT_SOCKS_ALLOWED_SOURCES). The empty string means "allow all sources"
+// (the backward-compatible default) and is accepted without further checks.
+// When non-empty, the value must be a comma-separated list where every entry
+// is either a single IPv4/IPv6 address or a CIDR block ("10.0.0.0/8",
+// "fe80::/64"); any entry that parses to neither is a config problem, so a
+// typo'd allowlist fails fast at config load instead of silently allowing
+// everyone.
+func checkSocksAllowedSources(problems *[]string, raw string) {
+	if _, err := ParseAllowedSources(raw); err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s: %v; each entry must be a single IPv4/IPv6 address or a CIDR block",
+			EnvSocksAllowedSources, err))
+	}
+}
+
+// ParseAllowedSources parses a comma-separated allowlist of single IPs or
+// CIDR blocks into a slice of *net.IPNet. A bare address is wrapped in its
+// host network (a /32 for IPv4, /128 for IPv6) so membership is a single
+// uniform Contains() check. The empty or all-whitespace string is the
+// "allow all sources" sentinel and returns a NIL slice (a nil result means
+// no restriction). Any empty entry inside a non-empty list (a stray comma)
+// or any entry that is neither an address nor a CIDR is a parse error, so a
+// typo'd allowlist cannot be silently dropped.
+func ParseAllowedSources(raw string) ([]*net.IPNet, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil // allow-all sentinel
+	}
+	parts := strings.Split(trimmed, ",")
+	out := make([]*net.IPNet, 0, len(parts))
+	for _, p := range parts {
+		entry := strings.TrimSpace(p)
+		if entry == "" {
+			// A stray comma ("10.0.0.0/8,,1.2.3.4") is not representable as
+			// "allow all"; dropping it would widen the allowlist, so fail.
+			return nil, fmt.Errorf("entry list contains an empty entry (stray comma)")
+		}
+		var n *net.IPNet
+		if ip := net.ParseIP(entry); ip != nil {
+			// A bare address: a single /32 (v4) or /128 (v6) host network.
+			var mask net.IPMask
+			if ip.To4() != nil {
+				mask = net.CIDRMask(32, 32)
+			} else {
+				mask = net.CIDRMask(128, 128)
+			}
+			n = &net.IPNet{IP: ip, Mask: mask}
+		} else if _, cidr, err := net.ParseCIDR(entry); err == nil {
+			n = cidr
+		} else {
+			return nil, fmt.Errorf("entry %q is not a valid IPv4/IPv6 address or CIDR block", entry)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// AllowedSourcesMatch reports whether the client source IP (the host part of
+// the client's RemoteAddr, which the caller must strip the port from) is
+// permitted by a raw allowlist string (the form stored on
+// Config.SocksAllowedSources). The empty string permits every source
+// (allow-all default). A clientIP that cannot be parsed as an IP address is
+// rejected when an allowlist is set; under the allow-all default the parse
+// is never consulted. The source IP is a non-secret value, safe to log
+// (matching the existing "from <RemoteAddr>" lines); the allowlist entries
+// are operator configuration, not secret material.
+func AllowedSourcesMatch(raw, clientIP string) bool {
+	nets, err := ParseAllowedSources(raw)
+	if err != nil {
+		// Unreachable in production (Load validates before storing).
+		// Fail closed rather than open if it ever happens.
+		return false
+	}
+	if len(nets) == 0 {
+		return true // allow-all sentinel
+	}
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkHostPort validates a host:port endpoint. requireHost applies to
@@ -575,4 +714,22 @@ func envInt(problems *[]string, name string, def, min, max int) int {
 		return def
 	}
 	return n
+}
+
+// envBool parses a boolean env variable (1/0/t/f/true/false, case-insensitive
+// via strconv.ParseBool). Unset/empty returns def. An invalid value is
+// aggregated as a precise problem (mirroring the EnvAllowWeak convention in
+// Load) and def is returned.
+func envBool(problems *[]string, name string, def bool) bool {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected a boolean (true/false, 1/0)", name, v))
+		return def
+	}
+	return b
 }

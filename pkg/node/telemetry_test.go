@@ -87,7 +87,10 @@ func TestSessionClosedCountedExactlyOnce(t *testing.T) {
 
 	// The node teardown hook is registered once and Session's lifecycle makes
 	// concurrent Close calls execute that hook exactly once.
-	n := NewNode(Config{Role: RoleIran}, log.New(io.Discard, "", 0), nil)
+	n, err := NewNode(Config{Role: RoleIran}, log.New(io.Discard, "", 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var id session.SessionID
 	sess := session.NewSession(id, nil, nil, nil, n.Context())
 	sess.OnClose(func() { n.onSessionClosed(sess) })

@@ -114,13 +114,26 @@ type Config struct {
 	BootstrapWait time.Duration
 	// StreamLimits is the carrier backpressure policy (Phase 3).
 	StreamLimits mux.StreamLimits
+	// CreditsEnabled is the Phase B master on/off for credit flow-control
+	// (design §15, SPLIT_CREDITS_ENABLED; default OFF). When false the whole
+	// credit plane is inert: the sender gate is bypassed, the receiver
+	// emitter is a no-op, and recordPeerGen is a no-op — behaviour is
+	// byte-identical to the pre-credit build (the pending >= 256 KiB gate
+	// plus the mailbox caps remain the sole enforcement). The ctrlCh control
+	// plane stays in the binary but idle (carrying only Ping/Pong/Close).
+	// This slice ships the flag as a package-level default-off Config field;
+	// env-var plumbing lives in Slice 7.
+	CreditsEnabled bool
 	// TargetDial dials a logical destination (RoleGermany only).
 	// Default: 10s TCP dial.
 	TargetDial func(addr string) (net.Conn, error)
 }
 
-// Sanitize replaces zero/negative values with defaults.
-func (c *Config) Sanitize() {
+// Sanitize replaces zero/negative values with defaults. It returns a loud
+// error when the stream limits are inconsistent (MaxBytesTotal <
+// MaxBytesPerStream; Phase B B5 amendment) — a misconfiguration that would
+// otherwise mask a per-stream admission defect.
+func (c *Config) Sanitize() error {
 	if c.Grace <= 0 {
 		c.Grace = 5 * time.Second
 	}
@@ -139,12 +152,17 @@ func (c *Config) Sanitize() {
 	if c.BootstrapWait <= 0 {
 		c.BootstrapWait = defaultBootstrapWait
 	}
-	c.StreamLimits = mux.SanitizeLimits(c.StreamLimits)
+	sl, err := mux.SanitizeLimits(c.StreamLimits)
+	if err != nil {
+		return err
+	}
+	c.StreamLimits = sl
 	if c.TargetDial == nil {
 		c.TargetDial = func(addr string) (net.Conn, error) {
 			return net.DialTimeout("tcp", addr, 10*time.Second)
 		}
 	}
+	return nil
 }
 
 // carrierHandle is one installed carrier transport. Its generation is
@@ -237,34 +255,54 @@ type Node struct {
 	// session.Attachment.readyClosed.
 	upReadyClosed   bool
 	downReadyClosed bool
+
+	// creditGate is the sender-side credit ledger registry (Phase B).
+	// creditEmitter is the receiver-side per-(carrier, streamID) credit
+	// emitter (Phase B). Both are nil when CreditsEnabled is false, so
+	// every call site guards on nil and the credit plane is fully inert.
+	creditGate    *creditGateManager
+	creditEmitter *creditEmitter
 }
 
 // NewNode creates a Node with the given role, config (sanitized),
 // logger and shared secret (used by the transport layer for CarrierAuth
 // before InstallUp/InstallDown; the Node itself does not authenticate).
-func NewNode(cfg Config, logger *log.Logger, secret []byte) *Node {
-	cfg.Sanitize()
+// It returns an error when the config's stream limits are inconsistent
+// (Phase B B5 amendment: SanitizeLimits fails loud on
+// MaxBytesTotal < MaxBytesPerStream).
+func NewNode(cfg Config, logger *log.Logger, secret []byte) (*Node, error) {
+	if err := cfg.Sanitize(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	metrics := NewMetrics()
 	buf := newSessionBufferBudget(cfg.SessionBufferTotalBytes)
 	buf.setMetrics(metrics)
+	var creditGate *creditGateManager
+	var creditEmitter *creditEmitter
+	if cfg.CreditsEnabled {
+		creditGate = newCreditGateManager()
+		creditEmitter = newCreditEmitter(uint32(cfg.StreamLimits.MaxBytesPerStream))
+	}
 	return &Node{
-		cfg:          cfg,
-		store:        session.NewSessionStore(),
-		metrics:      metrics,
-		logger:       logger,
-		muxUpStats:   &mux.QueueStats{},
-		muxDownStats: &mux.QueueStats{},
-		secret:       secret,
-		ctx:          ctx,
-		cancel:       cancel,
-		buf:          buf,
+		cfg:           cfg,
+		store:         session.NewSessionStore(),
+		metrics:       metrics,
+		logger:        logger,
+		muxUpStats:    &mux.QueueStats{},
+		muxDownStats:  &mux.QueueStats{},
+		secret:        secret,
+		ctx:           ctx,
+		cancel:        cancel,
+		buf:           buf,
+		creditGate:    creditGate,
+		creditEmitter: creditEmitter,
 		// No carrier installed yet: both directions start NOT ready
 		// (open ready channels) — the bootstrap waits must block until
 		// a carrier is actually installed (Issue #7).
 		upReady:   make(chan struct{}),
 		downReady: make(chan struct{}),
-	}
+	}, nil
 }
 
 // Store is the session store.
@@ -460,7 +498,11 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 	} else {
 		c = mux.NewCarrierConn(conn, n.cfg.KeepAliveInterval)
 	}
-	c.SetStreamLimits(n.cfg.StreamLimits)
+	// The config's stream limits were sanitized (and consistency-checked) in
+	// NewNode, so SetStreamLimits cannot fail here in practice; discard the
+	// error explicitly (availability over integrity: a carrier install must
+	// never be torn down on an impossible misconfiguration case).
+	_ = c.SetStreamLimits(n.cfg.StreamLimits)
 	c.SetQueueStats(n.QueueStats(dir))
 	if n.cfg.LivenessRounds > 0 {
 		c.SetLivenessRounds(n.cfg.LivenessRounds)
@@ -559,6 +601,25 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		} else {
 			c.OnNewStream = func(id uint32, firstType uint8, ch chan []byte) {
 				n.onDownNewStream(h, id, firstType, ch)
+			}
+		}
+	}
+
+	// Phase B (Slice 5): on the Germany DOWN carrier — the carrier the
+	// DATA sender writes to — accept the receiver's credits into the
+	// ledger (design §5). The callback fires in the dispatcher goroutine
+	// OUTSIDE c.mu and must not block: the onCredit work is O(1). The
+	// incoming gen is validated (StaleCreditGeneration) and clamped to
+	// the CARRIER's live MaxBytesPerStream (Limits(), SF-4) — never the
+	// node config. Inert when credits are disabled (n.creditGate is nil).
+	if n.creditGate != nil && n.cfg.Role == RoleGermany && dir == session.DirDown {
+		c.OnStreamCredit = func(id uint32, p mux.CreditPayload) {
+			capBytes := uint64(c.Limits().MaxBytesPerStream) // SF-4
+			if n.creditGate.ledger(h.gen, id).onCredit(p, h.gen, capBytes) {
+				// A live credit was accepted: un-arm the per-stream
+				// CreditSafeTimeout fallback timer so it cannot degrade
+				// a healthy ledger (Slice 6). O(1), outside c.mu.
+				n.creditGate.cancelTimer(id)
 			}
 		}
 	}
@@ -703,6 +764,33 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 			n.metrics.RebindRefusal("other")
 			continue
 		}
+		// Phase B (Slice 6): rebind-attach resets the credit plane for the
+		// down (data) direction. The sender-side ledger re-pins to the new
+		// carrier gen (re-entering the bounded UNLATCHED state) and the
+		// receiver-side emitter record is cleared; the attach-time anchor is
+		// then emitted GO-SPAWNED (B3: never inline in this Dispatch/attach
+		// context — the spawned goroutine may outlive the carrier, and
+		// TryWriteControlFrame then returns (false, ErrCarrierClosed) and
+		// the goroutine drops silently without leaking). Inert when credits
+		// are disabled (both pointers nil).
+		if dir == session.DirDown {
+			if n.creditGate != nil {
+				n.creditGate.resetStream(h.gen, id)
+			}
+			if n.creditEmitter != nil {
+				// Reset -> stamp peerGen -> emit anchor, in that order:
+				// recordPeerGen creates/updates the record and resetStream
+				// deletes it, so the stamp must come AFTER the reset or the
+				// anchor would carry a zero (rejected) peer gen. h.gen is
+				// this node's down generation; down generations are lockstep
+				// across both nodes, so it is the peer gen the peer's gate
+				// ledger is pinned to.
+				key := carrierKey{carrier: h.carrier, streamID: id}
+				n.creditEmitter.resetStream(key)
+				n.creditEmitter.recordPeerGen(key, h.gen)
+				go n.creditEmitter.emitAnchor(key)
+			}
+		}
 		if n.hasChannelConsumer(dir) {
 			// Wait (bounded) for the previous carrier's consumer to
 			// fully exit so two consumers never write the same
@@ -829,6 +917,41 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 	}
 
 	att.SetLastRebindGen(gen)
+	// Phase B (Slice 4): learn the SENDER's carrier generation from the
+	// rebind payload and stamp it on the (carrier, streamID) credit record
+	// (recordPeerGen, S6). Emitted credits carry this peerGen so the
+	// sender can validate creditGen against the generation of the carrier
+	// the credit ARRIVED on. h is the arriving receiver-side carrier and
+	// id the logical stream, so the key is unambiguous (up/down are
+	// separate carriers). Inert when credits are disabled.
+	if n.creditEmitter != nil {
+		n.creditEmitter.recordPeerGen(carrierKey{carrier: h.carrier, streamID: id}, gen)
+	}
+	// Phase B (Slice 6): rebind-attach resets the credit plane for the down
+	// (data) direction — handleRebind is the receiver-side rebind path, and
+	// down rebinds are the data-receiver rebinds. The sender-side ledger
+	// re-pins to the new gen (bounded UNLATCHED state) and the receiver-side
+	// emitter record is cleared, then the attach-time anchor is emitted
+	// GO-SPAWNED (B3: never inline in this Dispatch/attach context — the
+	// spawned goroutine may outlive the carrier, and TryWriteControlFrame
+	// then returns (false, ErrCarrierClosed) and the goroutine drops
+	// silently without leaking). Inert when credits are disabled.
+	if dir == session.DirDown {
+		if n.creditGate != nil {
+			n.creditGate.resetStream(h.gen, id)
+		}
+		if n.creditEmitter != nil {
+			// recordPeerGen before resetStream: the reset wipes the record
+			// (and its peerGen), so the peer generation must be re-stamped
+			// AFTER the reset, otherwise the emitted anchor carries a zero
+			// (rejected) peer gen and the sender's gate times out to
+			// SAFELY_CAPPED.
+			key := carrierKey{carrier: h.carrier, streamID: id}
+			n.creditEmitter.resetStream(key)
+			n.creditEmitter.recordPeerGen(key, gen)
+			go n.creditEmitter.emitAnchor(key)
+		}
+	}
 	// Attach BEFORE starting the consumer: the consumer's strict
 	// generation guard only acts while the attachment is bound to
 	// h.gen, so attaching first removes any window in which a fresh
@@ -935,6 +1058,29 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	sess.UpAtt.Attach(upH.gen)
 	sess.DownAtt.Attach(downH.gen)
 
+	// Phase B (Slice 6, B2): stamp the record's peerGen with the CURRENT
+	// down carrier generation so every subsequent data credit carries the
+	// gen the peer's gate ledger is pinned to (the arriving carrier's
+	// h.gen) and is accepted instead of rejected as stale/pinned-mismatch.
+	//
+	// The anchor is NOT emitted here on the fresh StartSession path: the
+	// mux read loop (carrier.go:310-314) treats a FrameCredit for a
+	// stream the carrier has not yet registered as a CONNECTION-level
+	// fatal error (ErrCreditUnknownStream). At this point the peer has
+	// not registered the down stream (it registers it in bootstrapUp-
+	// Stream, triggered by the up FrameHeader written above, and the up
+	// and down carriers have no ordering guarantee). Emitting the anchor
+	// now would tear down the peer's down carrier. The 640 KiB UNLATCHED
+	// pre-latch bound prevents any stall: the first real data credit
+	// (emitted when the receiver writes to its socket) latches the gate.
+	// The anchor IS safe on the rebind path (rebindDirection / handle-
+	// Rebind) because the stream is already registered on both sides.
+	// Inert when credits are disabled (n.creditEmitter is nil).
+	if n.creditEmitter != nil {
+		n.creditEmitter.recordPeerGen(
+			carrierKey{carrier: downH.carrier, streamID: id}, downH.gen)
+	}
+
 	// client → up: buffered upload relay (shape A, session-lifetime)
 	go n.relayShapeA(sess, session.DirUp, clientConn)
 	// down → client: per-carrier data relay (shape B)
@@ -957,7 +1103,24 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 	if h := n.down; h != nil && sess.StreamIDDown != 0 {
 		h.carrier.Deregister(sess.StreamIDDown)
 	}
+	// Phase B (Slice 6): capture the current down carrier so the credit
+	// plane's per-(carrier, streamID) records are cleaned up below (timer +
+	// ledger on the gate, emitter record) — prevents a map leak of one
+	// entry per finished session. Inert when credits are disabled.
+	var downCar *mux.CarrierConn
+	if h := n.down; h != nil && sess.StreamIDDown != 0 {
+		downCar = h.carrier
+	}
 	n.mu.RUnlock()
+	// Remove the credit gate's per-stream ledger + CreditSafeTimeout timer
+	// (Sender side, Germany) and the receiver-side emitter record for the
+	// down carrier. Both are keyed by streamID / (carrier, streamID).
+	if n.creditGate != nil && sess.StreamIDDown != 0 {
+		n.creditGate.removeStream(sess.StreamIDDown)
+	}
+	if n.creditEmitter != nil && sess.StreamIDDown != 0 && downCar != nil {
+		n.creditEmitter.removeStream(carrierKey{carrier: downCar, streamID: sess.StreamIDDown})
+	}
 	n.store.Remove(sess.ID)
 	reason := closeReasonClass(sess)
 	if sess.Stats.DataUndeliverable.Load() {
@@ -1145,6 +1308,20 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 
 	sess.UpAtt.Attach(h.gen)
 	sess.DownAtt.Attach(downH.gen)
+
+	// Phase B (Slice 6, B2): emit the attach-time anchor on the down carrier
+	// so the sender's gate latches from the first carrier. This is the
+	// initial-attach (fresh session) path for Germany — complementing
+	// StartSession (Iran) and rebindDirection/handleRebind (rebinds). The
+	// record's peerGen is stamped with the down carrier generation (down
+	// generations are lockstep across both nodes) so the anchor carries a
+	// valid, non-stale gen. GO-SPAWNED (B3). Inert when credits are
+	// disabled.
+	if n.creditEmitter != nil {
+		key := carrierKey{carrier: downH.carrier, streamID: id}
+		n.creditEmitter.recordPeerGen(key, downH.gen)
+		go n.creditEmitter.emitAnchor(key)
+	}
 
 	// up → target: per-carrier data relay (shape B)
 	n.startChannelConsumer(sess, session.DirUp, h, ch)

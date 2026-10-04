@@ -131,6 +131,15 @@ type Metrics struct {
 	// data_undeliverable: a stream ended by the deliver-or-fail policy (an
 	// in-order DATA frame could not be queued for a live stream).
 	closeReasonDataUndeliverable int64
+
+	// Phase B credit flow-control (design §13) — fixed-cardinality,
+	// node-local, NO attacker-controlled labels. These are the Slice 4-5
+	// counters; later slices add the remaining §13 family.
+	relayCreditEmittedTotal       int64 // credits successfully written (emitter)
+	relayCreditDroppedTotal       int64 // TryWriteControlFrame drop-on-full (ctrlCh pressure)
+	relayCreditGateParkTotal      int64 // credit-gate PARK events (the missing D4 counter)
+	relayCreditSentBytesTotal     int64 // bytes charged via recordSent (sender gate)
+	relayCreditConsumedBytesTotal int64 // bytes credited via recordConsumed (receiver)
 }
 
 // NewMetrics creates a zeroed metrics set.
@@ -352,6 +361,47 @@ func (m *Metrics) RelaySocketWriteError() {
 	m.mu.Unlock()
 }
 
+// Credit metrics (Phase B, design §13). Unlabeled node-local counters; no
+// value may be attacker-controlled. relay_credit_gate_park_total is the
+// counter that proves the credit gate ENGAGED (the D4 blind-counter fix).
+
+// CreditEmitted records a credit successfully written by the emitter.
+func (m *Metrics) CreditEmitted() {
+	m.mu.Lock()
+	m.relayCreditEmittedTotal++
+	m.mu.Unlock()
+}
+
+// CreditDropped records a control-frame drop-on-full (ctrlCh pressure).
+func (m *Metrics) CreditDropped() {
+	m.mu.Lock()
+	m.relayCreditDroppedTotal++
+	m.mu.Unlock()
+}
+
+// CreditGatePark records one credit-gate park event (distinct from the
+// pending gate — the counter D4's relay_credit_block was blind to).
+func (m *Metrics) CreditGatePark() {
+	m.mu.Lock()
+	m.relayCreditGateParkTotal++
+	m.mu.Unlock()
+}
+
+// AddCreditSentBytes charges n bytes issued through the sender gate.
+func (m *Metrics) AddCreditSentBytes(n int64) {
+	m.mu.Lock()
+	m.relayCreditSentBytesTotal += n
+	m.mu.Unlock()
+}
+
+// AddCreditConsumedBytes charges n socket-written bytes credited on the
+// receiver side.
+func (m *Metrics) AddCreditConsumedBytes(n int64) {
+	m.mu.Lock()
+	m.relayCreditConsumedBytesTotal += n
+	m.mu.Unlock()
+}
+
 // SessionClosed records exactly one fixed close-reason class. Values outside
 // the enum are deliberately collapsed into other.
 func (m *Metrics) SessionClosed(r CloseReason) {
@@ -418,6 +468,13 @@ type Snapshot struct {
 	CloseReasonTimeout            int64
 	CloseReasonDataUndeliverable  int64
 	CloseReasonOther              int64
+
+	// Phase B credit flow-control counters (design §13, Slices 4-5).
+	RelayCreditEmittedTotal       int64
+	RelayCreditDroppedTotal       int64
+	RelayCreditGateParkTotal      int64
+	RelayCreditSentBytesTotal     int64
+	RelayCreditConsumedBytesTotal int64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
@@ -461,6 +518,11 @@ func (m *Metrics) Snapshot() Snapshot {
 		CloseReasonTimeout:            m.closeReasonTimeout,
 		CloseReasonDataUndeliverable:  m.closeReasonDataUndeliverable,
 		CloseReasonOther:              m.closeReasonOther,
+		RelayCreditEmittedTotal:       m.relayCreditEmittedTotal,
+		RelayCreditDroppedTotal:       m.relayCreditDroppedTotal,
+		RelayCreditGateParkTotal:      m.relayCreditGateParkTotal,
+		RelayCreditSentBytesTotal:     m.relayCreditSentBytesTotal,
+		RelayCreditConsumedBytesTotal: m.relayCreditConsumedBytesTotal,
 	}
 }
 
@@ -507,5 +569,10 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "session_close_reason{reason=\"timeout\"} %d\n", s.CloseReasonTimeout)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"data_undeliverable\"} %d\n", s.CloseReasonDataUndeliverable)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"other\"} %d\n", s.CloseReasonOther)
+	fmt.Fprintf(&b, "relay_credit_emitted_total %d\n", s.RelayCreditEmittedTotal)
+	fmt.Fprintf(&b, "relay_credit_dropped_total %d\n", s.RelayCreditDroppedTotal)
+	fmt.Fprintf(&b, "relay_credit_gate_park_total %d\n", s.RelayCreditGateParkTotal)
+	fmt.Fprintf(&b, "relay_credit_sent_bytes_total %d\n", s.RelayCreditSentBytesTotal)
+	fmt.Fprintf(&b, "relay_credit_consumed_bytes_total %d\n", s.RelayCreditConsumedBytesTotal)
 	return b.String()
 }

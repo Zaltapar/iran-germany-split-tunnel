@@ -147,7 +147,7 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "[germany-splitter] ", log.LstdFlags)
-	n := node.NewNode(node.Config{
+	n, err := node.NewNode(node.Config{
 		Role:  node.RoleGermany,
 		Grace: time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		// Issue #7: bounded bootstrap wait for a temporarily down carrier
@@ -161,7 +161,12 @@ func main() {
 		KeepAliveInterval:       cfg.KeepAliveInterval,
 		LivenessRounds:          cfg.LivenessRounds,
 		StreamLimits:            streamLimits(cfg),
+		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
+		CreditsEnabled: cfg.CreditsEnabled,
 	}, logger, mux.DeriveSecret(cfg.Secret))
+	if err != nil {
+		log.Fatalf("germany-splitter: node construction: %v", err)
+	}
 
 	s := &Splitter{
 		config: cfg,

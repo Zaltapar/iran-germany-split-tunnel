@@ -123,39 +123,51 @@ func TestStreamQueueCloseWakesParkedPop(t *testing.T) {
 
 // TestSanitizeLimits pins the normalization contract: zero fields fall
 // back to defaults, the frame bound is clamped to MaxFrames, and an
-// aggregate below the per-stream bound is rejected.
+// aggregate below the per-stream bound is REJECTED LOUDLY (a non-nil
+// error, Phase B B5 amendment) — the old silent-reset-to-default is gone.
 func TestSanitizeLimits(t *testing.T) {
 	d := DefaultStreamLimits
-	if l := SanitizeLimits(StreamLimits{}); l != d {
+	l, err := SanitizeLimits(StreamLimits{})
+	if err != nil {
+		t.Fatalf("SanitizeLimits(zero) errored: %v", err)
+	}
+	if l != d {
 		t.Fatalf("SanitizeLimits(zero) = %+v, want defaults %+v", l, d)
 	}
 
-	l := SanitizeLimits(StreamLimits{
+	l, err = SanitizeLimits(StreamLimits{
 		MaxFramesPerStream: MaxFrames + 1,
 		MaxBytesPerStream:  100,
 		MaxBytesTotal:      1000,
 		OverflowWait:       time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("SanitizeLimits clamped-frames case errored: %v", err)
+	}
 	if l.MaxFramesPerStream != MaxFrames {
 		t.Fatalf("MaxFramesPerStream = %d, want clamp to %d", l.MaxFramesPerStream, MaxFrames)
 	}
 
-	l = SanitizeLimits(StreamLimits{
+	// B5 amendment: an aggregate below the per-stream bound is a LOUD error,
+	// not a silent reset to the default.
+	if _, err = SanitizeLimits(StreamLimits{
 		MaxFramesPerStream: 4,
 		MaxBytesPerStream:  100,
 		MaxBytesTotal:      50, // below the per-stream bound
 		OverflowWait:       time.Millisecond,
-	})
-	if l.MaxBytesTotal != d.MaxBytesTotal {
-		t.Fatalf("MaxBytesTotal = %d, want default %d", l.MaxBytesTotal, d.MaxBytesTotal)
+	}); err == nil {
+		t.Fatal("SanitizeLimits(MaxBytesTotal < MaxBytesPerStream) returned nil error; want the loud failure")
 	}
 
-	l = SanitizeLimits(StreamLimits{
+	l, err = SanitizeLimits(StreamLimits{
 		MaxFramesPerStream: 4,
 		MaxBytesPerStream:  100,
 		MaxBytesTotal:      1000,
 		OverflowWait:       5 * time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("SanitizeLimits(valid) errored: %v", err)
+	}
 	want := StreamLimits{
 		MaxFramesPerStream: 4,
 		MaxBytesPerStream:  100,
@@ -164,5 +176,41 @@ func TestSanitizeLimits(t *testing.T) {
 	}
 	if l != want {
 		t.Fatalf("SanitizeLimits(valid) = %+v, want unchanged %+v", l, want)
+	}
+}
+
+// TestMaxBytesPerStreamReduced pins the Phase B B5 sizing: the default
+// per-stream mailbox bound dropped from 1 MiB to 704 KiB.
+func TestMaxBytesPerStreamReduced(t *testing.T) {
+	if got := DefaultStreamLimits.MaxBytesPerStream; got != 704<<10 {
+		t.Fatalf("DefaultStreamLimits.MaxBytesPerStream = %d, want %d (704 KiB)", got, 704<<10)
+	}
+}
+
+// TestMaxBytesTotalSetTo16MiB pins the Phase B B5 sizing: the default
+// aggregate carrier budget is 16 MiB (NOT the v2 doc's 8 MiB, and NOT the
+// pre-B5 32 MiB).
+func TestMaxBytesTotalSetTo16MiB(t *testing.T) {
+	if got := DefaultStreamLimits.MaxBytesTotal; got != 16<<20 {
+		t.Fatalf("DefaultStreamLimits.MaxBytesTotal = %d, want %d (16 MiB)", got, 16<<20)
+	}
+}
+
+// TestSanitizeLimitsFailsLoud proves the B5 loud-error contract: a
+// positive MaxBytesTotal that is smaller than a positive MaxBytesPerStream
+// yields a non-nil error with the documented message shape.
+func TestSanitizeLimitsFailsLoud(t *testing.T) {
+	_, err := SanitizeLimits(StreamLimits{
+		MaxFramesPerStream: 4,
+		MaxBytesPerStream:  1000,
+		MaxBytesTotal:      500, // < per-stream bound
+		OverflowWait:       time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("SanitizeLimits(MaxBytesTotal < MaxBytesPerStream) returned nil; want a loud error")
+	}
+	want := "mux: MaxBytesTotal (500) < MaxBytesPerStream (1000); raise MaxBytesTotal to >= N_max*MaxBytesPerStream"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err.Error(), want)
 	}
 }

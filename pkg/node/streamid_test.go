@@ -20,7 +20,10 @@ func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
 // nextStreamID returned atomic.AddUint32(...,1) verbatim, so the value
 // after a wrap was 0.
 func TestNextStreamIDSkipsZeroOnWrap(t *testing.T) {
-	n := NewNode(Config{}, testLogger(), []byte("0123456789abcdef0123456789abcdef"))
+	n, err := NewNode(Config{}, testLogger(), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Normal allocation: starts at 1, monotonic.
 	if id := n.nextStreamID(); id != 1 {

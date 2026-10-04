@@ -23,7 +23,7 @@ func newTestUpSplitter(t *testing.T) *Splitter {
 	t.Helper()
 	cfg := config.Defaults()
 	logger := log.New(io.Discard, "", 0)
-	n := node.NewNode(node.Config{
+	n, err := node.NewNode(node.Config{
 		Role:              node.RoleGermany,
 		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		BufferBytes:       cfg.SessionBufBytes,
@@ -31,6 +31,9 @@ func newTestUpSplitter(t *testing.T) *Splitter {
 		KeepAliveInterval: cfg.KeepAliveInterval,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret("germany-test-secret-01234567890123456789"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(n.Close)
 	return &Splitter{config: cfg, node: n, logger: logger}
 }

@@ -62,12 +62,16 @@ func newTopoBuf(t *testing.T, grace time.Duration, bufBytes int) *topo {
 	logger := log.New(baseLog.Writer(), "IRAN ", baseLog.Flags())
 	deLog := log.New(baseLog.Writer(), "DE   ", baseLog.Flags())
 	tp := &topo{t: t, secret: secret, grace: grace}
+	var err error
 
 	iranCfg := node.Config{
 		Role: node.RoleIran, Grace: grace,
 		RelayBufSize: 4096, BufferBytes: bufBytes, KeepAliveInterval: time.Hour,
 	}
-	tp.iran = node.NewNode(iranCfg, logger, secret)
+	tp.iran, err = node.NewNode(iranCfg, logger, secret)
+	if err != nil {
+		tp.t.Fatal(err)
+	}
 
 	deCfg := node.Config{
 		Role: node.RoleGermany, Grace: grace,
@@ -83,7 +87,10 @@ func newTopoBuf(t *testing.T, grace time.Duration, bufBytes int) *topo {
 			return c, nil
 		},
 	}
-	tp.de = node.NewNode(deCfg, deLog, secret)
+	tp.de, err = node.NewNode(deCfg, deLog, secret)
+	if err != nil {
+		tp.t.Fatal(err)
+	}
 
 	t.Cleanup(func() {
 		tp.iran.Close()

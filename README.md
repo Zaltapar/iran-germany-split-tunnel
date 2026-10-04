@@ -187,7 +187,8 @@ sudo systemctl enable --now germany-splitter
 
 | Variable | Iran | Germany | Default | Description |
 |----------|:----:|:-------:|---------|-------------|
-| `SPLIT_SOCKS_LISTEN` | ✓ | | `127.0.0.1:10900` | SOCKS5 listener (local Xray connects here) |
+| | `SPLIT_SOCKS_LISTEN` | ✓ | | `127.0.0.1:10900` | SOCKS5 listener (local Xray connects here) |
+| | `SPLIT_SOCKS_ALLOWED_SOURCES` | ✓ | | *(unset = allow all)* | Opt-in SOCKS5 source-IP allowlist: comma-separated single IPs / CIDRs (e.g. `10.0.0.0/8,91.107.152.1`). Unset/empty = allow all (default); when set, only listed sources may authenticate. Invalid entries fail `--validate-config` (a typo'd list cannot silently allow everyone). |
 | `SPLIT_WS_LISTEN` | ✓ | | `127.0.0.1:9001` | Up-carrier WebSocket server (path `/upload`, front with nginx → CDN) |
 | `SPLIT_DOWN_CARRIER_ADDR` | ✓ | | `127.0.0.1:10802` | Down-carrier dial target (local Xray VLESS+Reality outbound) |
 | `SPLIT_UP_WS_URL` | | ✓ | `wss://cdn.example.com/upload` | Up-carrier WebSocket URL (CDN domain) |

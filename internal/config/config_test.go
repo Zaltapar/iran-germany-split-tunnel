@@ -34,6 +34,8 @@ func isolatedEnv(t *testing.T) {
 		// RFC 1929 SOCKS credentials: pinning them makes "unset or empty"
 		// deterministic (plans/socks5-auth-design.md §7.2).
 		EnvSocksUser, EnvSocksPass,
+		// SOCKS5 source-IP allowlist: pin to empty (allow-all default).
+		EnvSocksAllowedSources,
 	} {
 		t.Setenv(name, "")
 	}
@@ -823,5 +825,168 @@ func TestConflict(t *testing.T) {
 		if got := conflict(tc.a, tc.b); got != tc.want {
 			t.Errorf("conflict(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPLIT_SOCKS_ALLOWED_SOURCES (opt-in source-IP allowlist)
+//
+// Semantics: unset or empty = allow all (backward-compatible default);
+// set = only listed sources may proceed; invalid entries fail validation.
+// ---------------------------------------------------------------------------
+
+// TestSocksAllowedSourcesParse pins ParseAllowedSources behavior for every
+// input class: empty sentinel, single IPs, CIDRs, IPv6, and the invalid
+// cases that MUST error (so a typo'd allowlist can never silently open up).
+func TestSocksAllowedSourcesParse(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantLen int // -1 = parse error expected
+	}{
+		{"empty string is allow-all sentinel", "", 0},
+		{"whitespace-only is allow-all sentinel", "   ", 0},
+		{"single IPv4", "10.0.0.1", 1},
+		{"single IPv6", "fe80::1", 1},
+		{"IPv4 CIDR", "10.0.0.0/8", 1},
+		{"IPv6 CIDR", "fe80::/64", 1},
+		{"mixed list", "10.0.0.0/8,192.168.1.0/24,203.0.113.7", 3},
+		{"whitespace around entries", " 10.0.0.0/8 , 8.8.8.8 ", 2},
+		{"invalid bare word", "not-a-cidr", -1},
+		{"stray comma produces empty entry", "10.0.0.0/8,,8.8.8.8", -1},
+		{"trailing comma produces empty entry", "10.0.0.0/8,", -1},
+		{"CIDR with bad prefix", "10.0.0.0/33", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nets, err := ParseAllowedSources(tc.raw)
+			if tc.wantLen < 0 {
+				if err == nil {
+					t.Fatalf("ParseAllowedSources(%q) = %v, want error", tc.raw, nets)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseAllowedSources(%q) error: %v", tc.raw, err)
+			}
+			if len(nets) != tc.wantLen {
+				t.Fatalf("ParseAllowedSources(%q) len = %d, want %d", tc.raw, len(nets), tc.wantLen)
+			}
+		})
+	}
+}
+
+// TestSocksAllowedSourcesMatch is the table-driven membership check: for a
+// given raw allowlist, which source IPs are admitted?
+func TestSocksAllowedSourcesMatch(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		clientIP string
+		want     bool
+	}{
+		// UNSET / EMPTY = allow all (the safety property the user requires).
+		{"unset allows all (empty)", "", "91.107.152.1", true},
+		{"unset allows all (IPv6)", "", "fe80::1", true},
+		// Single IP match / no-match.
+		{"single IP match", "91.107.152.1", "91.107.152.1", true},
+		{"single IP no-match", "91.107.152.1", "8.8.8.8", false},
+		// CIDR match / no-match.
+		{"CIDR match", "10.0.0.0/8", "10.1.2.3", true},
+		{"CIDR no-match", "10.0.0.0/8", "11.0.0.1", false},
+		// IPv6 CIDR.
+		{"IPv6 CIDR match", "fe80::/64", "fe80::1", true},
+		{"IPv6 CIDR no-match", "fe80::/64", "2001:db8::1", false},
+		// Unparseable client with a set allowlist: rejected (fail closed).
+		{"unparseable client rejected when set", "10.0.0.0/8", "garbage", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AllowedSourcesMatch(tc.raw, tc.clientIP); got != tc.want {
+				t.Fatalf("AllowedSourcesMatch(%q, %q) = %v, want %v", tc.raw, tc.clientIP, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateSocksAllowedSourcesInvalidFailsClosed pins the "invalid
+// entries fail validation, not silent allow" rule at the pure Validate
+// level (no env): Iran role with a bad entry produces a problem naming the
+// variable.
+func TestValidateSocksAllowedSourcesInvalidFailsClosed(t *testing.T) {
+	cases := []string{"not-a-cidr", "10.0.0.0/33", "10.0.0.0/8,,8.8.8.8"}
+	for _, raw := range cases {
+		t.Run("invalid:"+raw, func(t *testing.T) {
+			c := validIran()
+			c.SocksAllowedSources = raw
+			ps := problemsOf(t, c.Validate(RoleIran))
+			joined := joinedProblems(ps)
+			if !strings.Contains(joined, EnvSocksAllowedSources) {
+				t.Fatalf("want problem naming %s, got: %v", EnvSocksAllowedSources, ps)
+			}
+		})
+	}
+}
+
+// TestValidateSocksAllowedSourcesValid passes: unset, a single IP, a CIDR,
+// and an IPv6 entry all validate cleanly under the Iran role.
+func TestValidateSocksAllowedSourcesValid(t *testing.T) {
+	for _, raw := range []string{"", "91.107.152.1", "10.0.0.0/8", "fe80::1", "10.0.0.0/8,8.8.8.8"} {
+		c := validIran()
+		c.SocksAllowedSources = raw
+		if err := c.Validate(RoleIran); err != nil {
+			t.Fatalf("Validate(%q) = %v, want nil", raw, err)
+		}
+	}
+}
+
+// TestSocksAllowedSourcesGermanyIgnored: the allowlist is an Iran-only
+// field; a Germany role must not add a problem for it (the field is not
+// Germany's to enforce), mirroring the credential-pair precedent.
+func TestSocksAllowedSourcesGermanyIgnored(t *testing.T) {
+	c := validGermany()
+	c.SocksAllowedSources = "91.107.152.1"
+	if err := c.Validate(RoleGermany); err != nil {
+		t.Fatalf("Validate(RoleGermany) rejected an Iran-only allowlist: %v", err)
+	}
+}
+
+// TestLoadSocksAllowedSourcesFromEnv exercises the Load (env) path: a valid
+// value round-trips; an invalid value fails naming the variable; unset
+// round-trips to the empty (allow-all) default.
+func TestLoadSocksAllowedSourcesFromEnv(t *testing.T) {
+	// Valid value round-trips.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksAllowedSources, "10.0.0.0/8,91.107.152.1")
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(valid allowlist): %v", err)
+	}
+	if cfg.SocksAllowedSources != "10.0.0.0/8,91.107.152.1" {
+		t.Fatalf("SocksAllowedSources = %q, want round-trip", cfg.SocksAllowedSources)
+	}
+
+	// Invalid value fails, naming the variable, never silently allowing.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksAllowedSources, "not-a-cidr")
+	_, err = Load(RoleIran)
+	if err == nil {
+		t.Fatal("Load(invalid allowlist) must fail")
+	}
+	if !strings.Contains(err.Error(), EnvSocksAllowedSources) {
+		t.Fatalf("error did not name %s: %v", EnvSocksAllowedSources, err)
+	}
+
+	// Unset = allow-all default (empty), and Load succeeds.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	cfg2, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(unset allowlist): %v", err)
+	}
+	if cfg2.SocksAllowedSources != "" {
+		t.Fatalf("unset SocksAllowedSources = %q, want empty (allow all)", cfg2.SocksAllowedSources)
 	}
 }

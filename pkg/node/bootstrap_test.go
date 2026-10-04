@@ -37,7 +37,11 @@ func newSingleNode(t *testing.T, role Role, bootWait time.Duration) *Node {
 		BootstrapWait:     bootWait,
 		KeepAliveInterval: time.Hour,
 	}
-	return NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	n, err := NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 // pipePair returns a fresh in-memory pipe pair, closed on cleanup

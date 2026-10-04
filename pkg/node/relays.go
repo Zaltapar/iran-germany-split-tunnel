@@ -103,6 +103,36 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			}
 		}
 
+		// Phase B credit gate (design §5, Slice 5): an ADVISORY gate that
+		// paces how much target data may be ISSUED against the receiver's
+		// granted window, sitting ABOVE the pending >= capacity buffer gate
+		// (the two are independent: the credit gate gates issuing, the
+		// pending gate gates buffering). Enforced ONLY on the DirDown
+		// DATA-sender leg of the Germany role — the exact relayShapeA that
+		// fills the downstream mailbox. The clamp limit is the SENDER's
+		// CARRIER's live MaxBytesPerStream (S1/SF-4: c.limits, via the
+		// lock-correct Limits() accessor), NOT the node config — so it can
+		// never silently exceed the mailbox cap that SetStreamLimits moved
+		// the carrier to. The hard cap remains fullLocked/rejectAggregate
+		// in mux/queue.go; this gate merely paces ahead of it. Inert when
+		// credits are disabled (n.creditGate is nil): behaviour is
+		// byte-identical to the pending-gate-only path.
+		if n.creditGate != nil && dir == session.DirDown && n.cfg.Role == RoleGermany {
+			if h := n.current(dir); h != nil {
+				capBytes := uint64(h.carrier.Limits().MaxBytesPerStream) // SF-4
+				l := n.creditGate.ledger(h.gen, streamIDOf(sess, dir))
+				if !l.canSend(uint64(mux.MaxPayload), capBytes) {
+					// The CREDIT gate engaged (park here, not the pending
+					// gate) — the counter D4's relay_credit_block was blind
+					// to. B4: a live credit un-parks within ~µs; the 2 s
+					// CreditSafeTimeout is only the fallback.
+					n.metrics.CreditGatePark()
+					l.creditPark(sess.Ctx, uint64(mux.MaxPayload), capBytes)
+					continue
+				}
+			}
+		}
+
 		if len(pending) >= capacity {
 			// Backpressure: the bounded reconnect buffer is full; stop
 			// reading the socket until the carrier can absorb data.
@@ -165,7 +195,14 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 						// Closing/Closed, or os.ErrClosed/net.ErrClosed):
 						// not a client abort. No counter, no re-close
 						// (teardown already owns it); just log and exit.
-						n.logger.Printf("session %s: up read closed (benign, session %s): %v",
+						// The line says "suppressed artifact", NOT "closed":
+						// this read error is a byproduct of the teardown that
+						// ALREADY closed the ClientConn — it is not itself the
+						// close event. (A genuine target drop is logged
+						// separately as "up stream closed by peer" / "target ...
+						// dial failed", so a reader does not mistake this
+						// artifact for the cause of a dropped session.)
+						n.logger.Printf("session %s: up read error suppressed as benign teardown artifact (session already %s, not a client abort): %v",
 							shortID(sess.ID), sess.State().String(), rerr)
 						return
 					case upReadHalfClose:
@@ -289,6 +326,19 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 		}
 		*pending = (*pending)[len(chunk):]
 		n.metrics.AddRelayBytesWritten(int64(len(chunk)))
+		// Phase B (Slice 5, S3): charge the credit ledger PER CHUNK
+		// (n = len(chunk)), NEVER per flushPending call — a 256 KiB flush
+		// would otherwise overshoot the 64 KiB-granular gate by up to 4×.
+		// The condition mirrors the gate above exactly (DirDown DATA
+		// sender, Germany), so a ledger is only charged on the path the
+		// gate paces and credits are wired for. Inert when credits are
+		// disabled (n.creditGate is nil).
+		if n.creditGate != nil && dir == session.DirDown && n.cfg.Role == RoleGermany {
+			if l := n.creditGate.ledger(h.gen, streamIDOf(sess, dir)); l != nil {
+				l.recordSent(uint64(len(chunk)))
+				n.metrics.AddCreditSentBytes(int64(len(chunk)))
+			}
+		}
 		if r := n.buf.refund(bk, len(chunk)); r > 0 {
 			n.metrics.AddSessionBufferReclaimed(r)
 		}
@@ -456,6 +506,14 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 					if st, g := att.State(); st == session.AttAttached && g == h.gen {
 						sess.Stats.MarkCleanHalfClose()
 					}
+					// Phase B (Slice 4): on half-close, force-flush any
+					// remaining pending credit bytes with CreditFlagsFinal.
+					// A dropped finalize is safe (cumulative-absolute): the
+					// last credit carries the running total. Inert when
+					// credits are disabled (n.creditEmitter is nil).
+					if n.creditEmitter != nil && dir == session.DirDown {
+						n.creditEmitter.finalize(carrierKey{carrier: h.carrier, streamID: streamIDOf(sess, dir)})
+					}
 					n.peerEOF(sess, dir)
 					return
 				}
@@ -464,7 +522,35 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 				} else {
 					n.metrics.AddDown(int64(len(frame)))
 				}
-				if _, err := sock.Write(frame); err != nil {
+				// Phase B (Slice 4, B1): enforce the exact write/credit
+				// shape. Credit ONLY the bytes the socket actually accepted
+				// (nw), and ONLY on a full, error-free write. A partial
+				// write (nw < len(frame), err == nil) or a full failure
+				// credits NOTHING and terminates the stream — a half-
+				// written frame must never continue (the session is
+				// closing). This is the invariant that forbids over-ack:
+				// Sigma(bytesConsumed) <= Sigma(bytes actually written).
+				nw, werr := sock.Write(frame)
+				if werr == nil && nw == len(frame) {
+					// Authoritative release point: the byte is accepted by
+					// the client kernel TCP stack, so it is "consumed" and
+					// the receiver may tell the sender more may be issued.
+					// Scoped to the down receiver path; inert when credits
+					// are disabled (n.creditEmitter is nil).
+					if n.creditEmitter != nil && dir == session.DirDown {
+						key := carrierKey{carrier: h.carrier, streamID: streamIDOf(sess, dir)}
+						if n.creditEmitter.recordConsumed(key, uint64(nw)) {
+							n.metrics.AddCreditConsumedBytes(int64(nw))
+							if n.creditEmitter.emit(key, false) {
+								n.metrics.CreditEmitted()
+							} else {
+								n.metrics.CreditDropped()
+							}
+						}
+					}
+				} else {
+					// failed OR partial write: no credit; the session is
+					// closing (never continue with a half-written frame).
 					n.metrics.Error()
 					n.metrics.RelaySocketWriteError()
 					sess.Close(sockWriteErr(dir))

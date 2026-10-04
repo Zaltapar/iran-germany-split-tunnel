@@ -93,7 +93,11 @@ func newTopo() *topo {
 	logger := log.New(logWriter, "IRAN ", log.Lmicroseconds)
 	deLogger := log.New(logWriter, "DE   ", log.Lmicroseconds)
 	tp := &topo{secret: secret}
-	tp.iran = node.NewNode(iranCfg, logger, secret)
+	iran, err := node.NewNode(iranCfg, logger, secret)
+	if err != nil {
+		panic(err)
+	}
+	tp.iran = iran
 
 	deCfg := node.Config{
 		Role: node.RoleGermany, Grace: testGrace, BufferBytes: testBuffer,
@@ -109,7 +113,11 @@ func newTopo() *topo {
 			return c, nil
 		},
 	}
-	tp.de = node.NewNode(deCfg, deLogger, secret)
+	de, err := node.NewNode(deCfg, deLogger, secret)
+	if err != nil {
+		panic(err)
+	}
+	tp.de = de
 	return tp
 }
 

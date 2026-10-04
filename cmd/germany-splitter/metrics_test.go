@@ -16,7 +16,10 @@ func TestMetricsListenAddrLoopbackOnly(t *testing.T) {
 }
 
 func TestRunMetricsRefusesNonLoopback(t *testing.T) {
-	n := node.NewNode(node.Config{Role: node.RoleGermany}, log.New(io.Discard, "", 0), nil)
+	n, err := node.NewNode(node.Config{Role: node.RoleGermany}, log.New(io.Discard, "", 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer n.Close()
 	s := &Splitter{node: n}
 	if err := s.runMetrics("0.0.0.0:0"); err == nil {

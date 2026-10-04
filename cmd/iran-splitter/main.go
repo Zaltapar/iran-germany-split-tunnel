@@ -93,6 +93,12 @@ type Splitter struct {
 	// synchronization is introduced (race-safe by construction, §7.7).
 	socksCreds socksCredentials
 
+	// socksSources is the immutable source-IP allowlist view for the SOCKS
+	// server (opt-in; zero value = allow all sources). Built once in main()
+	// before any goroutine starts, read-only after (race-safe by
+	// construction, same property as socksCreds).
+	socksSources socksAllowedSources
+
 	lnMu    sync.Mutex
 	socksLn net.Listener
 	upLn    net.Listener
@@ -139,9 +145,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("iran-splitter: %v", err)
 	}
-
 	logger := log.New(os.Stderr, "[iran-splitter] ", log.LstdFlags)
-	n := node.NewNode(node.Config{
+	n, err := node.NewNode(node.Config{
 		Role:  node.RoleIran,
 		Grace: time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		// Issue #7: bounded bootstrap wait for a temporarily down carrier
@@ -155,13 +160,19 @@ func main() {
 		KeepAliveInterval:       cfg.KeepAliveInterval,
 		LivenessRounds:          cfg.LivenessRounds,
 		StreamLimits:            streamLimits(cfg),
+		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
+		CreditsEnabled: cfg.CreditsEnabled,
 	}, logger, mux.DeriveSecret(cfg.Secret))
+	if err != nil {
+		log.Fatalf("iran-splitter: node construction: %v", err)
+	}
 
 	s := &Splitter{
-		config:     cfg,
-		node:       n,
-		logger:     logger,
-		socksCreds: newSocksCredentials(cfg),
+		config:       cfg,
+		node:         n,
+		logger:       logger,
+		socksCreds:   newSocksCredentials(cfg),
+		socksSources: newSocksAllowedSources(cfg),
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -439,9 +450,14 @@ func (s *Splitter) runSocksServer() {
 	s.socksLn = ln
 	s.lnMu.Unlock()
 	defer ln.Close()
-	if s.socksCreds.enabled {
+	switch {
+	case s.socksCreds.enabled && s.socksSources.enabled:
+		s.logger.Printf("SOCKS5 listening on %s (auth: enabled, source allowlist: enabled)", s.config.SocksListen)
+	case s.socksCreds.enabled:
 		s.logger.Printf("SOCKS5 listening on %s (auth: enabled)", s.config.SocksListen)
-	} else {
+	case s.socksSources.enabled:
+		s.logger.Printf("SOCKS5 listening on %s (auth: disabled, source allowlist: enabled)", s.config.SocksListen)
+	default:
 		s.logger.Printf("SOCKS5 listening on %s (auth: disabled)", s.config.SocksListen)
 	}
 	for {
@@ -476,6 +492,20 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 		return
 	}
 	_ = clientConn.SetDeadline(time.Time{})
+
+	// Source-IP allowlist gate (opt-in, SPLIT_SOCKS_ALLOWED_SOURCES): runs
+	// AFTER method/credential negotiation so the client has identified
+	// itself, and BEFORE any CONNECT is issued or session allocated. An
+	// unset/empty allowlist (the default) makes this a no-op, preserving
+	// byte-for-byte backward compatibility. The log line matches the
+	// existing "from <RemoteAddr>" convention (the remote address only —
+	// never the requested destination, never credentials).
+	if err := socksSourceGate(s.socksSources, clientConn.RemoteAddr()); err != nil {
+		s.logger.Printf("SOCKS5 source rejected from %s", clientConn.RemoteAddr())
+		clientConn.Close()
+		return
+	}
+
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
 
 	// Hand the session to the Phase 5 engine (pkg/node): it waits for

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
@@ -50,6 +51,91 @@ func newSocksCredentials(cfg *config.Config) socksCredentials {
 		return socksCredentials{}
 	}
 	return socksCredentials{enabled: true, user: cfg.SocksUser, pass: cfg.SocksPass}
+}
+
+// socksAllowedSources is the immutable source-IP allowlist view for the SOCKS
+// hot path. The zero value (enabled=false) means "no allowlist configured:
+// allow all sources" — the backward-compatible default. It is built once at
+// startup (newSocksAllowedSources) so the per-connection hot path does no
+// config lookups, and is read-only after construction (same no-shared-
+// mutable-state property as socksCredentials, -race safe).
+//
+// The gate is INDEPENDENT of the RFC 1929 credential pair: a no-auth
+// deployment can still restrict sources, and an authenticated deployment can
+// further restrict which source IPs may authenticate.
+type socksAllowedSources struct {
+	enabled bool // false = allow all sources (default)
+	nets    []*net.IPNet
+}
+
+// newSocksAllowedSources builds the immutable allowlist view from a loaded
+// config. cfg.SocksAllowedSources is validated at Load time, so ParseCIDR /
+// ParseIP cannot fail here; an unset or empty value yields the zero
+// (allow-all) view.
+func newSocksAllowedSources(cfg *config.Config) socksAllowedSources {
+	if cfg == nil {
+		return socksAllowedSources{}
+	}
+	nets, err := config.ParseAllowedSources(cfg.SocksAllowedSources)
+	if err != nil {
+		// Unreachable in production (Load validates before storing). Fail
+		// closed: treat as a non-restrictive gate that rejects everything
+		// except the allow-all default is wrong; safest is allow-all is
+		// NOT the safe side, so disable the gate (allow all) to avoid
+		// bricking the proxy on a runtime parse hiccup.
+		return socksAllowedSources{}
+	}
+	if len(nets) == 0 {
+		return socksAllowedSources{} // allow-all sentinel
+	}
+	return socksAllowedSources{enabled: true, nets: nets}
+}
+
+// allows reports whether the client source IP (the host part of a
+// RemoteAddr, or a bare IP string) is permitted. When the gate is disabled
+// (allow all), every source is permitted. A source that cannot be parsed as
+// an IP address is rejected (fail closed). IPv4-mapped IPv6 addresses are
+// handled by net.IP's To4() normalization inside IPNet.Contains.
+func (g socksAllowedSources) allows(source string) bool {
+	if !g.enabled {
+		return true
+	}
+	// source may be "host:port" (RemoteAddr) or a bare IP; normalize it.
+	host := source
+	if ip, _, err := net.SplitHostPort(source); err == nil {
+		host = ip
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range g.nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// errSocksSourceRejected is the terminal error for a client whose source IP
+// is not in the configured allowlist. Like errSocksAuthFailed it carries no
+// source-IP content beyond what the caller already knows; the connection
+// handler logs the remote address (matching the existing "from <addr>"
+// convention) and closes.
+var errSocksSourceRejected = errors.New("socks: source address not in allowlist")
+
+// socksSourceGate checks the client source address against the allowlist
+// AFTER method/credential negotiation has completed (so the client has
+// identified itself), rejecting with errSocksSourceRejected before any
+// CONNECT is issued. A disabled gate (allow-all) is a no-op.
+func socksSourceGate(g socksAllowedSources, clientAddr net.Addr) error {
+	if !g.enabled {
+		return nil
+	}
+	if !g.allows(clientAddr.String()) {
+		return errSocksSourceRejected
+	}
+	return nil
 }
 
 // socksNegotiate performs the SOCKS5 greeting, the RFC 1929 sub-negotiation

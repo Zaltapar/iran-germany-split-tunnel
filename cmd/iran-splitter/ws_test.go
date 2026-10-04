@@ -21,7 +21,7 @@ import (
 func newTestSplitter() *Splitter {
 	cfg := config.Defaults()
 	logger := log.New(io.Discard, "", 0)
-	n := node.NewNode(node.Config{
+	n, err := node.NewNode(node.Config{
 		Role:              node.RoleIran,
 		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		BufferBytes:       cfg.SessionBufBytes,
@@ -29,6 +29,9 @@ func newTestSplitter() *Splitter {
 		KeepAliveInterval: cfg.KeepAliveInterval,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret("test-secret-must-be-long-enough-0123456789"))
+	if err != nil {
+		panic(err)
+	}
 	return &Splitter{
 		config: cfg,
 		node:   n,

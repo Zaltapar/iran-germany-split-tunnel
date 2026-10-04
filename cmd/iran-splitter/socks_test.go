@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/testutil"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 )
@@ -478,3 +479,94 @@ func TestSocksCredsMatchTimingShape(t *testing.T) {
 		}
 	}
 }
+
+// ============================================================
+// SOCKS5 source-IP allowlist (opt-in; SPLIT_SOCKS_ALLOWED_SOURCES)
+// ============================================================
+
+// gateFromRaw builds a socksAllowedSources view from a raw allowlist string,
+// mirroring the production path (newSocksAllowedSources). It returns the
+// view plus an error if the raw string is invalid (which the config layer
+// would have rejected at load time).
+func gateFromRaw(t *testing.T, raw string) socksAllowedSources {
+	t.Helper()
+	return newSocksAllowedSources(&config.Config{SocksAllowedSources: raw})
+}
+
+// TestSocksSourceGateUnsetAllowsAll pins the safety property: with no
+// allowlist configured (the default), the gate is disabled and every source
+// is permitted — byte-for-byte the pre-feature behavior.
+func TestSocksSourceGateUnsetAllowsAll(t *testing.T) {
+	g := gateFromRaw(t, "")
+	if g.enabled {
+		t.Fatal("unset allowlist must be the allow-all (disabled) gate")
+	}
+	for _, src := range []string{"91.107.152.1", "8.8.8.8", "fe80::1", "10.0.0.1:53111"} {
+		if !g.allows(src) {
+			t.Fatalf("allow-all gate rejected %q", src)
+		}
+	}
+	// The gate is a no-op: it never rejects, so a client can reach the
+	// negotiation/CONNECT stage regardless of source.
+	if err := socksSourceGate(g, staticAddr("1.2.3.4")); err != nil {
+		t.Fatalf("allow-all gate must not reject: %v", err)
+	}
+}
+
+// TestSocksSourceGateMembership is a table of raw allowlist -> source IP
+// results: single-IP match/no-match, CIDR match/no-match, and IPv6.
+func TestSocksSourceGateMembership(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		src  string
+		want bool
+	}{
+		{"single IP match", "91.107.152.1", "91.107.152.1", true},
+		{"single IP no-match", "91.107.152.1", "8.8.8.8", false},
+		{"single IP host:port form", "91.107.152.1", "91.107.152.1:53111", true},
+		{"CIDR match", "10.0.0.0/8", "10.255.1.1", true},
+		{"CIDR no-match", "10.0.0.0/8", "11.0.0.1", false},
+		{"mixed list hit on bare IP", "10.0.0.0/8,192.168.1.1", "192.168.1.1", true},
+		{"mixed list miss", "10.0.0.0/8,192.168.1.1", "8.8.4.4", false},
+		{"IPv6 CIDR match", "fe80::/64", "fe80::1", true},
+		{"IPv6 CIDR no-match", "fe80::/64", "2001:db8::1", false},
+		{"unparseable source rejected when set", "10.0.0.0/8", "garbage", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := gateFromRaw(t, tc.raw)
+			if !g.enabled {
+				t.Fatalf("gate for %q unexpectedly disabled", tc.raw)
+			}
+			if got := g.allows(tc.src); got != tc.want {
+				t.Fatalf("gate(%q).allows(%q) = %v, want %v", tc.raw, tc.src, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSocksSourceGateRejectsAuthentication proves a rejected source cannot
+// authenticate: socksSourceGate returns errSocksSourceRejected for a source
+// outside the list, and a nil error for one inside it.
+func TestSocksSourceGateRejectsAuthentication(t *testing.T) {
+	g := gateFromRaw(t, "10.0.0.0/8")
+	if !g.enabled {
+		t.Fatal("gate unexpectedly disabled")
+	}
+	// Inside the list: no error, authentication may proceed.
+	if err := socksSourceGate(g, staticAddr("10.5.6.7")); err != nil {
+		t.Fatalf("allowed source got gate error: %v", err)
+	}
+	// Outside the list: the sentinel rejection, so the handler closes the
+	// connection before any CONNECT / session is allocated.
+	if err := socksSourceGate(g, staticAddr("11.0.0.1")); !errors.Is(err, errSocksSourceRejected) {
+		t.Fatalf("gate error = %v, want errSocksSourceRejected", err)
+	}
+}
+
+// staticAddr is a minimal net.Addr for the gate's RemoteAddr string form.
+type staticAddr string
+
+func (a staticAddr) Network() string { return "tcp" }
+func (a staticAddr) String() string  { return string(a) }
