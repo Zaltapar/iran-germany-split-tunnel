@@ -10,13 +10,18 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/testutil"
 )
 
-// bpLimits builds a small, fast limit set for backpressure tests.
+// bpLimits builds a small, fast limit set for backpressure tests. ConsumerStall
+// is set to the same `wait` so tests that model a DEAD consumer (never reads
+// the channel) keep their fast termination deadlines; a SLOW-but-alive
+// consumer (the SUBTASK-30 case) is exercised separately with an explicit
+// large ConsumerStall.
 func bpLimits(frames, perStream, total int, wait time.Duration) StreamLimits {
 	return StreamLimits{
 		MaxFramesPerStream: frames,
 		MaxBytesPerStream:  perStream,
 		MaxBytesTotal:      total,
 		OverflowWait:       wait,
+		ConsumerStall:      wait,
 	}
 }
 

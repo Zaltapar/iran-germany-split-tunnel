@@ -173,14 +173,20 @@ func TestConsumerStallUnderOverflowWaitDeliversInOrderNoHole(t *testing.T) {
 	}
 }
 
-// TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable
-// proves the clean-abort + taxonomy end-to-end when the retry-grace carry
-// region is exhausted: a live stream's consumer stalls (no Pop), the sender
-// keeps pushing DATA frames that overflow into the bounded carry, and when
-// the carry cap itself is exhausted the dispatcher escalates to a clean
-// abort. The classifier half (ReasonDataUndeliverable + the single metrics
-// credit) lives in pkg/node under the same test name.
-func TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable(t *testing.T) {
+// TestDeadConsumerIsReclaimedNotDataUndeliverable pins the SUBTASK-30
+// taxonomy: a consumer that STOPS READING its channel (a relay that exited
+// or a session that closed — a DEAD consumer, not a slow-but-alive one) is
+// reclaimed by the WORKER's ConsumerStall timer and classified as an
+// OVERFLOW termination (OnStreamTerminated), NOT as a data-integrity loss
+// (OnStreamDataUndeliverable). While the dispatcher is parked waiting for
+// the (dead) consumer to drain the mailbox, the worker's clean reclaim
+// closes the mailbox, releases the parked dispatcher, and its guard
+// suppresses any data-undeliverable mislabel.
+//
+// This is the exact complement of TestCarryExhaustionParksThenDeliversIn
+// Order: a SLOW-LIVE consumer parks and completes (no termination); a DEAD
+// consumer is bounded-reclaimed (overflow, not data loss).
+func TestDeadConsumerIsReclaimedNotDataUndeliverable(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -188,87 +194,64 @@ func TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable(t *tes
 	defer c.Close()
 	stats := &QueueStats{}
 	c.SetQueueStats(stats)
-	// Primary = 2 frames; carry cap = 4 bytes (MaxBytesPerStream = 4);
-	// carry frame cap = 2*16 = 32. The carry holds at most two 2-byte
-	// DATA frames before the cap is exhausted.
-	c.SetStreamLimits(bpLimits(2, 4, 32, 50*time.Millisecond))
-	s := buildWorkerlessStream(t, c, stats, 1, 2, 4, 32)
+	// Tiny mailbox (primary 2 frames of 4 B + carry 4 B) so the dispatcher
+	// parks quickly; a small ConsumerStall so the DEAD consumer is reclaimed
+	// fast and deterministically.
+	limits := bpLimits(2, 4, 1<<20, 100*time.Millisecond)
+	limits.ConsumerStall = 300 * time.Millisecond
+	_ = c.SetStreamLimits(limits)
 
-	var undel atomic.Int32
+	var terminated, undel atomic.Int32
+	c.OnStreamTerminated = func(uint32) { terminated.Add(1) }
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
 
-	// Seed: fill the 2-frame mailbox, then pop f0 (the consumer stalls
-	// after this — no further Pop).
-	if !s.q.TryPush(queueItem{payload: []byte("f0")}) ||
-		!s.q.TryPush(queueItem{payload: []byte("f1")}) {
-		t.Fatal("seed pushes to a 2-frame mailbox refused")
-	}
-	it, ok := s.q.Pop()
-	if !ok || string(it.payload) != "f0" {
-		t.Fatal("Pop of the seeded mailbox returned unexpected value")
-	}
-	got := []string{"f0"}
+	// A registered stream has a real worker (the reclaim path). The
+	// consumer below is DEAD: it never reads ch, so ch (cap 1) fills and the
+	// worker blocks, then reclaims the stream after ConsumerStall.
+	_ = c.Register(1)
+	go c.Dispatch()
 
-	// f2 fills the mailbox to 2/2.
-	if !s.q.TryPush(queueItem{payload: []byte("f2")}) {
-		t.Fatal("f2 refused while the mailbox had room")
-	}
-
-	// f3 is refused by the full mailbox → carried (retry-grace).
-	// Carry: [f3], 2 bytes.
-	c.deliver(s, queueItem{payload: []byte("f3")})
-	// f4 is refused → carried. Carry: [f3 f4], 4 bytes = cap.
-	c.deliver(s, queueItem{payload: []byte("f4")})
-
-	// The stream is still alive: the carry cap is full but was not yet
-	// exhausted (TryCarry for f4 succeeded: 2+2 = 4, not > 4).
-	if s.terminated.Load() {
-		t.Fatal("stream terminated before the carry cap was exhausted")
-	}
-	if n := s.q.OverflowDataLen(); n != 2 {
-		t.Fatalf("overflow_data = %d, want 2 (f3 f4 carried)", n)
-	}
-
-	// f5 is refused → TryCarry fails (4+2 > 4) → escalation to clean abort.
-	c.deliver(s, queueItem{payload: []byte("f5")})
-
-	// The stream was cleanly terminated (carry cap exhausted).
-	if !s.terminated.Load() {
-		t.Fatal("carry cap exhaustion did not terminate the stream")
-	}
-
-	// Dropped frames: primary [f1 f2] (2 DATA) + carry [f3 f4] (2 DATA)
-	// + triggering f5 (1 DATA) = 5 total lost DATA frames.
-	if n := atomic.LoadInt64(&stats.DroppedDataFrames); n != 5 {
-		t.Fatalf("dropped_data_frames = %d, want 5 (f1 f2 in primary + f3 f4 carried + f5 triggering)", n)
-	}
-	// The undeliverable callback fired exactly once.
-	if n := undel.Load(); n != 1 {
-		t.Fatalf("OnStreamDataUndeliverable fired %d times, want exactly 1", n)
-	}
-	// The abort was the dispatcher's DATA path: no pressure-termination
-	// increments (worker-less stream, carry-cap exhaustion).
-	if n := atomic.LoadInt64(&stats.OverflowTerminations); n != 0 {
-		t.Fatalf("overflow_terminations = %d, want 0 (the DATA path fired)", n)
-	}
-	if n := atomic.LoadInt64(&stats.OverflowTerminationsWorker); n != 0 {
-		t.Fatalf("overflow_terminations_worker = %d, want 0 (no worker on this path)", n)
-	}
-
-	// The consumer saw ONLY a contiguous in-order prefix ([f0])
-	// before the nil end — no hole.
-	sent := []string{"f0", "f1", "f2", "f3", "f4", "f5"}
-	assertContiguousPrefix(t, got, sent)
-	select {
-	case f := <-s.ch:
-		if f != nil {
-			t.Fatalf("stream end signal = %q, want nil", f)
+	// SENDER: outpace the dead consumer so the mailbox (primary+carry)
+	// fills and the dispatcher parks in PushPark.
+	go func() {
+		for i := 0; i < 16; i++ {
+			if err := WriteFrame(b, 1, FrameData, []byte{byte(i), 0, 0, 0}); err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the consumer never saw the nil stream end")
+	}()
+
+	// Wait for the worker's ConsumerStall reclaim to terminate the stream.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		s, ok := c.streams[1]
+		c.mu.Unlock()
+		if ok && s.terminated.Load() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	// The closed mailbox can resurface no bytes.
-	if it, ok := s.q.Pop(); ok {
-		t.Fatalf("Pop after termination returned %q, want closed", it.payload)
+	c.mu.Lock()
+	s, ok := c.streams[1]
+	c.mu.Unlock()
+	if !ok || !s.terminated.Load() {
+		t.Fatalf("dead consumer was not reclaimed within 2s (terminated=%v)", ok && s.terminated.Load())
+	}
+
+	// The reclaim was the WORKER's ConsumerStall path: exactly one worker
+	// overflow termination, and the generic OnStreamTerminated fired.
+	if n := atomic.LoadInt64(&stats.OverflowTerminationsWorker); n != 1 {
+		t.Fatalf("overflow_terminations_worker = %d, want 1 (the dead-consumer reclaim)", n)
+	}
+	if n := terminated.Load(); n != 1 {
+		t.Fatalf("OnStreamTerminated fired %d times, want exactly 1", n)
+	}
+	// The KEY assertion: a dead consumer is an OVERFLOW/stall, NOT a
+	// data-integrity loss — the parked dispatcher's guard suppressed the
+	// data-undeliverable classification.
+	if n := undel.Load(); n != 0 {
+		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (a dead consumer is a stall, not lost data)", n)
 	}
 }

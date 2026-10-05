@@ -169,14 +169,17 @@ func TestSanitizeLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SanitizeLimits(valid) errored: %v", err)
 	}
+	// ConsumerStall is zero -> normalized to the default (30 s), exactly
+	// like the other zero fields fall back to their library defaults.
 	want := StreamLimits{
 		MaxFramesPerStream: 4,
 		MaxBytesPerStream:  100,
 		MaxBytesTotal:      1000,
 		OverflowWait:       5 * time.Millisecond,
+		ConsumerStall:      DefaultStreamLimits.ConsumerStall,
 	}
 	if l != want {
-		t.Fatalf("SanitizeLimits(valid) = %+v, want unchanged %+v", l, want)
+		t.Fatalf("SanitizeLimits(valid) = %+v, want %+v", l, want)
 	}
 }
 

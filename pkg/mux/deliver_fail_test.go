@@ -37,14 +37,20 @@ func buildWorkerlessStream(t *testing.T, c *CarrierConn, stats *QueueStats, id u
 	return s
 }
 
-// TestRefusedDataFrameCarriedThenCarryCapExhaustedTerminatesNoHole is the
-// integrity-seam test for the retry-grace: when the consumer stalls so the
-// mailbox is full, refused DATA frames are CARRIED into the queue's bounded
-// carry region (the stream stays alive — the ~1 MB download-truncation fix).
-// Only when the carry cap itself is exhausted does the dispatcher escalate
-// to a clean abort. Whatever the consumer has received is a contiguous,
-// in-order PREFIX of what was sent — never a silent hole.
-func TestRefusedDataFrameCarriedThenCarryCapExhaustedTerminatesNoHole(t *testing.T) {
+// TestCarryExhaustionParksThenDeliversInOrder is the integrity-seam test
+// for the SUBTASK-30 backpressure: when a consumer stalls so BOTH the
+// primary mailbox AND the bounded carry region are full, the dispatcher no
+// longer terminates the stream (the old "carry-then-abort" was the
+// ~1 MB download-truncation bug). It now PARKS the delivering goroutine in
+// PushPark until the consumer drains the mailbox (a Pop frees space and
+// wakes the parked pusher), then delivers the full sequence IN ORDER with
+// zero drops and zero terminations.
+//
+// Driven by a real dispatcher + a paced consumer over a mempipe, so the
+// "the sender outpaces the consumer, the mailbox overflows, the dispatcher
+// parks, the consumer catches up, the transfer completes" loop is exactly
+// the production slow-client shape — but bounded and deterministic.
+func TestCarryExhaustionParksThenDeliversInOrder(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -52,90 +58,93 @@ func TestRefusedDataFrameCarriedThenCarryCapExhaustedTerminatesNoHole(t *testing
 	defer c.Close()
 	stats := &QueueStats{}
 	c.SetQueueStats(stats)
-	// Primary cap = 2 frames; carry cap = 8 payload bytes = 4 frames of 2 B.
-	// This keeps the test deterministic without pushing thousands of frames.
-	c.SetStreamLimits(bpLimits(2, 8, 64, 50*time.Millisecond))
-	s := buildWorkerlessStream(t, c, stats, 1, 2, 8, 64)
+	// Primary: 2 frames of 4 B (8 B byte cap) + carry 8 B (2 frames of 4 B)
+	// = 16 B of mailbox. 24 frames of 4 B = 96 B >> 16 B: the dispatcher
+	// MUST park repeatedly. MaxBytesTotal is large so only the PER-STREAM
+	// path (the slow-consumer path) ever engages. ConsumerStall is set to a
+	// generous 30 s so the SLOW (not dead) consumer below is never
+	// reclaimed mid-transfer.
+	limits := bpLimits(2, 8, 1<<20, 100*time.Millisecond)
+	limits.ConsumerStall = 30 * time.Second
+	_ = c.SetStreamLimits(limits)
 
-	// The node wiring fires exactly one distinct callback when the data is
-	// undeliverable (this is what classifies the close as data_undeliverable
-	// instead of overflow).
+	ch := c.Register(1)
+	go c.Dispatch()
+
+	const total = 24
 	var undel atomic.Int32
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
 
-	// Fill the mailbox to capacity with f0 f1.
-	if !s.q.TryPush(queueItem{payload: []byte("f0")}) ||
-		!s.q.TryPush(queueItem{payload: []byte("f1")}) {
-		t.Fatal("seed pushes to a 2-frame mailbox refused")
-	}
+	// SENDER: stream all frames, then close.
+	go func() {
+		for i := 0; i < total; i++ {
+			buf := make([]byte, 4)
+			for j := range buf {
+				buf[j] = byte(i % 251)
+			}
+			if err := WriteFrame(b, 1, FrameData, buf); err != nil {
+				return
+			}
+		}
+		_ = WriteFrame(b, 1, FrameClose, nil)
+	}()
 
-	// f2 is refused by the full mailbox → carried (retry-grace).
-	if s.q.TryPush(queueItem{payload: []byte("f2")}) {
-		t.Fatal("f2 unexpectedly fit the full mailbox")
-	}
-	c.deliver(s, queueItem{payload: []byte("f2")})
-
-	// The first refusal must NOT terminate the stream (the ~1 MB truncation
-	// was exactly this fail-fast); f2 sits in the carry, undropped.
-	if s.terminated.Load() {
-		t.Fatal("a single refused DATA frame terminated the stream; the retry-grace must carry it")
-	}
-	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 0 {
-		t.Fatalf("dropped_data_frames = %d, want 0 (f2 is carried, not dropped)", got)
-	}
-	if got := undel.Load(); got != 0 {
-		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (no escalation yet)", got)
-	}
-
-	// f3 f4 f5: each is carried, filling the 8-byte carry cap to the brim.
-	for _, p := range []string{"f3", "f4", "f5"} {
-		c.deliver(s, queueItem{payload: []byte(p)})
-		if s.terminated.Load() {
-			t.Fatalf("frame %q terminated the stream before the carry cap was exhausted", p)
+	// CONSUMER: deliberately slow (reads a little, then pauses), always well
+	// under ConsumerStall. The pause is long enough that the dispatcher's
+	// mailbox (primary + carry) overflows and it parks; the resume drains it.
+	received := 0
+	terminated := false
+	hardCap := time.After(30 * time.Second) // runaway backstop only
+	closeSeen := false
+	for !closeSeen {
+		select {
+		case f := <-ch:
+			if f == nil {
+				terminated = true
+				closeSeen = true
+				break
+			}
+			want := byte(received % 251)
+			if len(f) != 4 || f[0] != want {
+				t.Fatalf("frame %d: corrupt payload len=%d first=%d want=%d (reorder/loss)",
+					received, len(f), f[0], want)
+			}
+			received++
+			// Slow-but-alive: a bounded pause, always < ConsumerStall.
+			time.Sleep(2 * time.Millisecond)
+		case <-hardCap:
+			t.Fatalf("consumer hung: received %d/%d frames (terminated=%v)", received, total, terminated)
+		}
+		if terminated {
+			// A real stream-end only arrives AFTER every data frame; the
+			// pre-fix signature was an EARLY nil (mid-transfer termination).
+			if received != total {
+				t.Fatalf("stream terminated after only %d/%d frames — pre-fix truncation", received, total)
+			}
 		}
 	}
-	// Carry now holds [f2 f3 f4 f5] = 8 bytes = cap.
-	if n := s.q.OverflowDataLen(); n != 4 {
-		t.Fatalf("overflow_data = %d, want 4 (f2..f5 carried)", n)
-	}
 
-	// f6 cannot be carried (8+2 > 8): the dispatcher escalates to a clean
-	// abort. The 4 carried DATA frames are the lost bytes.
-	c.deliver(s, queueItem{payload: []byte("f6")})
-
-	// INVARIANT part 1 — the stream was cleanly failed.
-	if !s.terminated.Load() {
-		t.Fatal("exhausted carry cap did not terminate the stream")
+	// (1) The FULL transfer completed in order.
+	if received != total {
+		t.Fatalf("delivered %d/%d frames: the transfer truncated (pre-fix ~1 MB signature)", received, total)
 	}
-	s.q.mu.Lock()
-	qclosed := s.q.closed
-	s.q.mu.Unlock()
-	if !qclosed {
-		t.Fatal("the escalation did not close the mailbox")
+	// (2) NO DATA frame was dropped on the down carrier.
+	if dropped := atomic.LoadInt64(&stats.DroppedDataFrames); dropped != 0 {
+		t.Fatalf("dropped_data_frames = %d, want 0 (the park released every frame in order)", dropped)
 	}
-
-	// INVARIANT part 2 — accounting: 2 primary (f0 f1) + 4 carried (f2..f5)
-	// + 1 triggering (f6) = 7 lost DATA frames.
-	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 7 {
-		t.Fatalf("dropped_data_frames = %d, want 7 (2 primary + 4 carried + 1 triggering)", got)
+	// (3) The mailbox genuinely overflowed to its ceiling — this is what
+	// makes the test a real overflow reproducer, not a trivial pass.
+	if high := atomic.LoadInt64(&stats.StreamQueuedFramesHigh); high < 2 {
+		t.Fatalf("stream_queued_frames_high = %d, want >= 2 (the mailbox must have overflowed to park)", high)
 	}
-	if got := undel.Load(); got != 1 {
-		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 1", got)
+	// (4) No data-undeliverable escalation fired (the stream stayed alive).
+	if n := undel.Load(); n != 0 {
+		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (no termination under a live slow consumer)", n)
 	}
-	// The consumer is notified of the clean stream end (nil), the same
-	// signal as a FrameClose — so the down relay closes, not corrupts.
-	select {
-	case f := <-s.ch:
-		if f != nil {
-			t.Fatalf("stream end signal = %q, want nil", f)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("consumer never received the clean stream-end signal")
-	}
-	// The closed mailbox can resurface no bytes.
-	if it, ok := s.q.Pop(); ok {
-		t.Fatalf("Pop after termination returned %q, want closed", it.payload)
-	}
+	t.Logf("carry-exhaustion park: %d/%d frames delivered in order, frames_high=%d, dropped=%d, undel=%d",
+		received, total,
+		atomic.LoadInt64(&stats.StreamQueuedFramesHigh),
+		atomic.LoadInt64(&stats.DroppedDataFrames), undel.Load())
 }
 
 // TestHealthyStreamDeliversInOrderNoDrops is the other half of the invariant:

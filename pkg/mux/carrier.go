@@ -554,8 +554,8 @@ func (c *CarrierConn) ShutdownDone() <-chan struct{} {
 // most MaxBytesPerStream payload bytes — whichever bound is hit first.
 // (With MaxFramesPerStream = MaxFrames = 16 the frame bound alone can
 // never exceed 16 × MaxPayload = 1 MiB, so the two bounds align by
-// default; raising MaxFramesPerStream without MaxBytesPerStream makes the
-// frame bound the larger ceiling.)
+// default; raising MaxFramesPerStream without MaxBytesPerStream makes
+// the frame bound the larger ceiling.)
 //
 // MaxBytesTotal is the carrier-wide aggregate budget across ALL streams'
 // mailboxes, so hundreds of slow streams cannot multiply per-stream
@@ -564,15 +564,28 @@ func (c *CarrierConn) ShutdownDone() <-chan struct{} {
 // OverflowWait is how long a stream may be unable to accept data (full
 // mailbox or a consumer that stopped reading) before the carrier
 // terminates that stream — not the carrier.
+//
+// ConsumerStall (SUBTASK 30) is the CONSUMER-side backpressure bound: how
+// long the per-stream worker may hold a popped item on its cap-1 handoff
+// channel waiting for the consumer (the node relay that writes the socket)
+// to drain it, before terminating THAT stream. It is deliberately DECOUPLED
+// from OverflowWait (the sender/dispatcher mailbox bound) because the two
+// measure different things: OverflowWait paces the SENDER against a full
+// mailbox, while ConsumerStall absorbs a SLOW but ALIVE consumer (a remote
+// client whose socket write takes far longer than 100 ms over the internet).
+// A dead consumer (relay exited, session closed) is still reclaimed, but
+// only after ConsumerStall — bounded, and never a hang (the carrier's Close
+// also releases the handoff via c.closed).
 type StreamLimits struct {
 	MaxFramesPerStream int
 	MaxBytesPerStream  int
 	MaxBytesTotal      int
 	OverflowWait       time.Duration
+	ConsumerStall      time.Duration
 }
 
 // DefaultStreamLimits: 16 frames / 704 KiB per stream, 16 MiB per carrier,
-// 100 ms overflow wait.
+// 100 ms overflow wait, 30 s consumer stall.
 //
 // The 704 KiB per-stream bound (NOT 1 MiB) and the 16 MiB aggregate are the
 // Phase B credit-plane sizing (design §5 / B5 amendment): the memory bound
@@ -580,11 +593,19 @@ type StreamLimits struct {
 // 23 full mailboxes (704 KiB × 23 ≈ 16 MiB), so the credit gate (which caps
 // a live stream at creditWindowMax ≈ 512 KiB in flight) can never drive the
 // mailbox past the aggregate budget under the pre-latch bound.
+//
+// ConsumerStall defaults to 30 s: a remote client's socket write over the
+// internet (TCP window + RTT) is far slower than the 100 ms OverflowWait,
+// so a slow-but-alive consumer must not trigger a per-item stream
+// termination mid-transfer. 30 s is generous enough to absorb a real
+// internet stall, and a dead consumer is still reclaimed (bounded, no
+// hang — Close also releases the handoff).
 var DefaultStreamLimits = StreamLimits{
 	MaxFramesPerStream: MaxFrames,
 	MaxBytesPerStream:  704 << 10, // 704 KiB
 	MaxBytesTotal:      16 << 20,  // 16 MiB
 	OverflowWait:       100 * time.Millisecond,
+	ConsumerStall:      30 * time.Second,
 }
 
 // MaxFrames is the maximum number of frames a stream mailbox can hold.
@@ -615,6 +636,9 @@ func SanitizeLimits(l StreamLimits) (StreamLimits, error) {
 	}
 	if l.OverflowWait <= 0 {
 		l.OverflowWait = d.OverflowWait
+	}
+	if l.ConsumerStall <= 0 {
+		l.ConsumerStall = d.ConsumerStall
 	}
 	if l.MaxBytesTotal < l.MaxBytesPerStream {
 		return l, fmt.Errorf(
@@ -898,6 +922,18 @@ func (c *CarrierConn) ReadErr() error {
 	return c.readErr
 }
 
+// Closing reports whether the carrier's Close has started (the closing flag
+// is latched at step 1 of Close, before closed is closed). Callers use it
+// to distinguish a PARKED PUSH that was released by a clean carrier teardown
+// (which must NOT be classified as a data-integrity failure) from one
+// released by a worker's consumer-stall reclaim (a genuine stream failure).
+// SUBTASK 30.
+func (c *CarrierConn) Closing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closing
+}
+
 // Ready reports whether the carrier read loop is still alive.
 func (c *CarrierConn) Ready() bool {
 	select {
@@ -1052,16 +1088,37 @@ func (c *CarrierConn) Limits() StreamLimits {
 	return l
 }
 
-// deliver routes one item into a stream's mailbox without ever blocking.
-// Called by the dispatcher goroutine only (it owns s.pressureStart; the
-// queue owns and synchronizes its primary and carry regions).
+// deliver routes one item into a stream's mailbox. Called by the dispatcher
+// goroutine only (it owns s.pressureStart; the queue owns and synchronizes
+// its primary and carry regions).
 //
-// Overflow policy (Phase 3 + retry-grace): a stream whose primary mailbox
-// cannot accept data may carry the refused frame in the queue's bounded FIFO
-// overflow region. The worker drains the primary first and then the carry
-// region, so a transient consumer stall no longer loses an in-order byte or
-// strands a tail at end-of-data. If both bounds are exhausted, the stream is
-// terminated cleanly (not the carrier).
+// Overflow policy (Phase 3 + retry-grace + SUBTASK 30 backpressure): a
+// stream whose primary mailbox cannot accept data may carry the refused
+// frame in the queue's bounded FIFO overflow region. The worker drains the
+// primary first and then the carry region, so a transient consumer stall
+// no longer loses an in-order byte or strands a tail at end-of-data.
+//
+// SUBTASK 30 — real backpressure: when BOTH the primary and the carry are
+// full (or the aggregate budget is exhausted), the dispatcher BLOCKS in
+// PushPark until the consumer drains the mailbox (a Pop frees space and
+// wakes the parked pusher) or the queue is closed (carrier teardown /
+// stream termination). This propagates backpressure through the entire
+// chain: dispatcher → c.frames → readLoop → TCP read → peer's WriteFrame
+// → peer's relay → target/client socket. A slow consumer paces the sender
+// instead of triggering a stream termination.
+//
+// The dispatcher never reorders anything: the mailbox is FIFO, the carry
+// region is FIFO, and the single worker serves the primary and only then
+// the carry region, so per-stream order holds end-to-end.
+//
+// Deadlock analysis: PushPark holds no locks while parked (it waits on
+// the free channel after releasing q.mu). The consumer (worker) holds no
+// locks while blocked on s.ch (a channel send). The sender (readLoop)
+// holds no locks while blocked on c.frames (a channel send). No lock is
+// held across any blocking wait, so no lock-ordering cycle can form.
+// The only external dependency is the consumer's socket write (a kernel
+// call that will complete or error), and the carrier's c.closed channel
+// (closed by Close, which also closes q, waking any parked pusher).
 func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 	if s.terminated.Load() {
 		return // stream already over: drop
@@ -1072,47 +1129,68 @@ func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 	}
 	// DATA / HEADER / REBIND — the survivable retry-grace path. A refused
 	// frame is CARRIED (in the queue's bounded carry region), not killed on
-	// the first refusal. The deliver-or-fail invariant is preserved: every
-	// byte is either queued, carried, or the stream is explicitly failed —
-	// never silently dropped while the stream stays alive.
-	//
-	// The dispatcher never reorders anything: the mailbox is FIFO, the carry
-	// region is FIFO, and the single worker serves the primary and only then
-	// the carry region, so per-stream order holds end-to-end (a carried
-	// close follows its data, a carried tail is always delivered).
+	// the first refusal.
 	ok, reason := s.q.TryPushReason(it)
 	if ok {
 		return
 	}
 	if s.terminated.Load() {
-		// A worker-stall termination raced us: the mailbox closed and the
+		// A concurrent termination raced us: the mailbox closed and the
 		// nil is on its way; this frame dies with the clean abort.
 		return
 	}
 	if reason == rejectStreamFrames || reason == rejectStreamBytes {
-		// A per-stream bound (frame count or stream byte cap): a transient
-		// consumer stall. Carry the frame — do NOT kill the stream on the
-		// first refusal. This is the ~1 MB download-truncation fix.
+		// A per-stream bound (frame count or stream byte cap): a genuine
+		// consumer STALL — the exact slow-client path (SUBTASK 30). First
+		// carry the frame in the bounded carry region (headroom), and when
+		// the carry is also full, BLOCK the dispatcher in PushPark until
+		// the consumer drains the mailbox (a Pop frees space and wakes the
+		// parked pusher). This paces the upstream sender — never a silent
+		// truncation, never a per-item termination of a live stream.
 		if ok, _ := s.q.TryCarry(it); ok {
 			return
 		}
-		// The bounded carry region or aggregate carrier budget is exhausted.
-		// The retry-grace cannot retain this in-order frame, so fail cleanly.
 		if s.terminated.Load() {
-			return // a worker-stall termination raced us
+			return // a concurrent termination raced us
 		}
+		if s.q.PushPark(it) {
+			return // accepted after the consumer drained space
+		}
+		// PushPark returned false: the queue was closed while we parked.
+		// Two distinct causes, both of which lose the in-order byte:
+		//   - a concurrent worker CONSUMER-STALL reclaim (terminateStream):
+		//     a genuine data-integrity failure -> classify it;
+		//   - a clean CARRIER teardown (Close, rebind/loss): the frame dies
+		//     with the carrier's clean abort -> do NOT classify it as
+		//     data_undeliverable (that would mislabel a normal rebind as a
+		//     data loss).
+		// terminated=true is already set on both reclaim paths, so a
+		// terminated stream never double-classifies.
+		if !s.terminated.Load() && !c.Closing() {
+			c.failUndeliverableData(s, true)
+		}
+		return
 	}
-	// An aggregate carrier-wide byte budget (or a closed mailbox) is not a
-	// transient per-stream stall. Preserve deliver-or-fail by ending only
-	// this stream, never silently dropping an in-order byte.
+	// An aggregate carrier-wide byte budget (or a closed mailbox) is NOT a
+	// per-stream consumer stall: it means the CARRIER is saturated across
+	// all its streams. Blocking the single dispatcher on it would stall
+	// every other stream on this carrier (head-of-line) with no single
+	// consumer that can drain it, so we preserve deliver-or-fail by ending
+	// only THIS stream, never silently dropping an in-order byte.
 	c.failUndeliverableData(s, true)
 }
 
-// deliverClose handles a FrameClose under retry-grace. Carry it if the
-// primary refuses: Pop drains the primary and then the carry region in FIFO
-// order, so the close follows every preceding DATA frame. If bounded carry
-// admission fails, the stream cannot preserve the ordered half-close and is
-// cleanly terminated.
+// deliverClose handles a FrameClose. A close must follow every preceding
+// DATA frame in FIFO order, so when the primary (or the carry) is full the
+// dispatcher CARRIES it behind the data (Pop drains the primary first and
+// only then the carry region).
+//
+// SUBTASK 30: if both the carry cap and the aggregate budget are exhausted,
+// BLOCK in PushPark until the consumer drains the mailbox, so the ordered
+// half-close is delivered rather than the stream being terminated. A close
+// carries no payload bytes, so it fits the carry cap by byte-count (0 B);
+// PushPark's park waits for the carry frame cap or the aggregate budget to
+// free up.
 func (c *CarrierConn) deliverClose(s *streamRec, it queueItem) {
 	if s.q.TryPush(it) {
 		s.pressureStart = time.Time{}
@@ -1127,7 +1205,19 @@ func (c *CarrierConn) deliverClose(s *streamRec, it queueItem) {
 	if s.terminated.Load() {
 		return
 	}
-	c.failUndeliverableData(s, false)
+	// Both the primary and the carry are full: block until the consumer
+	// drains the mailbox so the close can be delivered in order.
+	if s.q.PushPark(it) {
+		return
+	}
+	// Queue was closed while we parked. A clean CARRIER teardown (Close)
+	// loses the close with the abort and must NOT be classified as
+	// data_undeliverable; a worker CONSUMER-STALL reclaim (terminated
+	// already set) is. terminated=true covers the reclaim, so only a
+	// live, non-closing stream can be mislabelled — suppress it there.
+	if !s.terminated.Load() && !c.Closing() {
+		c.failUndeliverableData(s, false)
+	}
 }
 
 // failUndeliverableData records that an in-order DATA frame is undeliverable
@@ -1240,11 +1330,20 @@ func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 // s.ch. Close waits for every worker to exit (workerWait) before it
 // closes any s.ch, so a send on a closed channel is structurally
 // impossible — no select arm here can ever mask one.
-//
 // Per-stream ordering is preserved: single mailbox (FIFO) → single worker
 // → single consumer channel. A worker blocked on a full consumer channel
-// for longer than OverflowWait terminates its own stream — the slow
-// consumer's deadline.
+// for longer than ConsumerStall terminates its own stream — the slow
+// consumer's deadline (SUBTASK 30).
+//
+// SUBTASK 30: the handoff deadline is now ConsumerStall, NOT OverflowWait.
+// The old code used OverflowWait (100 ms) for the CONSUMER-side handoff,
+// which is the exact bug: a remote client whose socket write takes longer
+// than 100 ms (TCP window + RTT over the internet) caused the worker to
+// terminate the stream mid-download — the ~2–3.5 MB truncation signature.
+// ConsumerStall (default 30 s) absorbs a slow-but-alive consumer; a dead
+// consumer (relay exited / session closed) is still reclaimed after
+// ConsumerStall, so the worker never blocks forever (Close's c.closed also
+// releases the handoff, and Close closes s.ch after workerWait).
 func (c *CarrierConn) streamWorker(s *streamRec) {
 	defer c.goroutineStopped()
 	defer c.workerWait.Done()
@@ -1255,12 +1354,13 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		}
 		if it.isClose {
 			// FrameClose: hand the nil (half-close) to the consumer and
-			// exit. Bounded: a consumer that stopped reading ends the
-			// stream silently (Close closes the channel later).
+			// exit. Bounded by ConsumerStall: a consumer that stopped
+			// reading ends the stream silently (Close closes the channel
+			// later; c.closed also aborts this handoff on teardown).
 			select {
 			case s.ch <- nil:
 			case <-c.closed:
-			case <-time.After(c.limitsLocked().OverflowWait):
+			case <-time.After(c.limitsLocked().ConsumerStall):
 				c.mu.Lock()
 				stats := c.stats
 				c.mu.Unlock()
@@ -1277,10 +1377,15 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		// NOT touch queuedBytes here again.
 		select {
 		case s.ch <- it.payload:
+			// Delivered: this is the real backpressure release point. The
+			// consumer (the node relay) has taken the frame and will write
+			// it to the socket, which paces the upstream sender via the
+			// dispatcher's PushPark (deliver). Nothing to do on success.
 		case <-c.closed:
 			return
-		case <-time.After(c.limitsLocked().OverflowWait):
-			// consumer stopped reading: end this stream, not the carrier.
+		case <-time.After(c.limitsLocked().ConsumerStall):
+			// consumer stopped reading for ConsumerStall: end this stream,
+			// not the carrier. Bounded — a dead consumer is reclaimed.
 			c.mu.Lock()
 			stats := c.stats
 			c.mu.Unlock()

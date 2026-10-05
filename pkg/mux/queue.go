@@ -66,6 +66,14 @@ type StreamQueue struct {
 	closed           bool
 	wake             chan struct{} // open: a Pop is parked waiting; closed: never
 	nWaiters         int           // Pop calls currently parked on wake
+	// free is the REVERSE of wake: it wakes a PARKED PUSHER (the dispatcher's
+	// backpressure park, SUBTASK 30) when a Pop / overflowLocked / Close frees
+	// space in the mailbox (primary or carry). The single dispatcher is the
+	// only pusher that parks on a queue, so at most one free-waiter exists;
+	// signalFreeLocked (called under q.mu by any space-freeing operation)
+	// closes it and re-arms, exactly mirroring wakeLocked.
+	free         chan struct{}
+	nFreeWaiters int // PushPark calls currently parked on free
 
 	// budget, when non-nil, is the carrier-wide aggregate byte budget
 	// (see CarrierConn.queuedBytes). Byte accounting is done HERE, under
@@ -216,6 +224,21 @@ func (q *StreamQueue) wakeLocked() {
 	}
 }
 
+// signalFreeLocked wakes a PARKED PUSHER (PushPark, the dispatcher's
+// backpressure park, SUBTASK 30) that is waiting for the mailbox to drain.
+// It is called, under q.mu, by every operation that frees space in the
+// mailbox (primary or carry): the primary Pop, the carry fall-through in Pop
+// (overflowLocked), and Close. The pusher re-checks TryPush/TryCarry after
+// the wake, exactly mirroring Pop's park/re-check discipline, so a spurious
+// wake is harmless.
+func (q *StreamQueue) signalFreeLocked() {
+	if q.nFreeWaiters > 0 {
+		close(q.free)
+		q.free = nil
+		q.nFreeWaiters = 0
+	}
+}
+
 // TryPush appends it without blocking. It returns false — without
 // modifying the queue — when the queue is closed or full. The dispatcher
 // must never block in here.
@@ -306,6 +329,86 @@ func (q *StreamQueue) TryCarry(it queueItem) (bool, rejectReason) {
 	return true, 0
 }
 
+// PushPark blocks until the item is accepted into the mailbox (primary or
+// carry) or the queue is closed. It is the dispatcher's backpressure park
+// (SUBTASK 30): when the mailbox is full (both primary and carry), instead
+// of escalating to a stream termination, the dispatcher WAITS for the
+// consumer to drain the mailbox. A Pop (which frees space) wakes this park
+// via the free channel; the dispatcher then re-checks and accepts the item.
+//
+// The park is cancellable: it returns false when the queue is closed (by a
+// worker-stall termination or by the carrier's Close), at which point the
+// item is lost with the clean abort.
+//
+// Exactly one goroutine (the dispatcher) may call PushPark on a queue at a
+// time. The park re-checks under q.mu, so a concurrent Pop's
+// signalFreeLocked is correctly ordered (no lost wakeup): either the Pop
+// happens before the pusher's nFreeWaiters++ (in which case the pusher's
+// fits-check sees the freed space and accepts immediately), or it happens
+// after (in which case signalFreeLocked closes the free channel, waking
+// the pusher).
+//
+// The memory bound is preserved: PushPark accepts an item ONLY when it fits
+// both the per-stream cap and the aggregate budget, exactly like
+// TryPushReason/TryCarry. It never grows the mailbox beyond its bounds.
+func (q *StreamQueue) PushPark(it queueItem) bool {
+	for {
+		q.mu.Lock()
+		if q.closed {
+			q.mu.Unlock()
+			return false
+		}
+		// Try the primary. fullLocked returns true when the carry is
+		// non-empty (ordering barrier) OR the primary is at capacity.
+		if !q.fullLocked(it) {
+			if q.budget == nil ||
+				atomic.LoadInt64(q.budget)+int64(len(it.payload)) <= q.budgetLimitLocked {
+				q.items = append(q.items, it)
+				q.nBytes += len(it.payload)
+				totalBytes, totalItems := q.adjustAggregateLocked(int64(len(it.payload)), 1)
+				if q.stats != nil {
+					q.stats.push(len(it.payload))
+					q.stats.observeHighStream(int64(q.nBytes), int64(len(q.items)))
+					q.stats.observeHighQueued(totalBytes, totalItems)
+				}
+				q.wakeLocked()
+				q.mu.Unlock()
+				return true
+			}
+			// Aggregate budget exceeded: fall through to the carry.
+		}
+		// Try the carry.
+		if q.overflowCap > 0 &&
+			len(q.overflow) < q.overflowFrameCap &&
+			q.overflowBytes+len(it.payload) <= q.overflowCap {
+			if q.budget == nil ||
+				atomic.LoadInt64(q.budget)+int64(len(it.payload)) <= q.budgetLimitLocked {
+				q.overflow = append(q.overflow, it)
+				q.overflowBytes += len(it.payload)
+				totalBytes, totalItems := q.adjustAggregateLocked(int64(len(it.payload)), 1)
+				if q.stats != nil {
+					q.stats.observeHighQueued(totalBytes, totalItems)
+				}
+				q.wakeLocked()
+				q.mu.Unlock()
+				return true
+			}
+		}
+		// Neither primary nor carry can accept: park until a Pop frees
+		// space (or Close cancels). The park and the fits-check are under
+		// the same q.mu hold, so a concurrent Pop's signalFreeLocked is
+		// correctly ordered (no lost wakeup).
+		if q.free == nil {
+			q.free = make(chan struct{})
+		}
+		q.nFreeWaiters++
+		f := q.free
+		q.mu.Unlock()
+		<-f
+		// Loop: re-check under the lock.
+	}
+}
+
 // OverflowLen reports how many items are currently held in the carry region.
 // The dispatcher uses it to know a carry episode is in flight (and therefore
 // that a refused close must be carried behind its data rather than dropped
@@ -355,7 +458,8 @@ func (q *StreamQueue) QueueDataLen() int {
 
 // overflowLocked pops one item from the carry region. Caller must hold q.mu;
 // it returns ok=false when the region is empty. Carried bytes were charged
-// to the aggregate budget, so they are returned to it here.
+// to the aggregate budget, so they are returned to it here. Popping a carry
+// item frees space, so it also wakes a parked pusher (signalFreeLocked).
 func (q *StreamQueue) overflowLocked() (it queueItem, ok bool) {
 	if len(q.overflow) == 0 {
 		return queueItem{}, false
@@ -367,6 +471,7 @@ func (q *StreamQueue) overflowLocked() (it queueItem, ok bool) {
 	if q.stats != nil {
 		q.stats.observeHighQueued(totalBytes, totalItems)
 	}
+	q.signalFreeLocked()
 	return it, true
 }
 
@@ -397,6 +502,9 @@ func (q *StreamQueue) Pop() (it queueItem, ok bool) {
 				q.stats.observeHighStream(highBytes, highFrames)
 				q.stats.observeHighQueued(totalBytes, totalItems)
 			}
+			// Popping frees space: wake a parked pusher (backpressure park,
+			// SUBTASK 30) so the dispatcher can resume feeding this stream.
+			q.signalFreeLocked()
 			q.mu.Unlock()
 			return it, true
 		}
@@ -457,5 +565,8 @@ func (q *StreamQueue) Close() int {
 		q.stats.observeHighQueued(totalBytes, totalItems)
 	}
 	q.wakeLocked()
+	// A closed queue frees all its space at once: wake any parked pusher so
+	// it can re-check (TryPush/TryCarry now return rejectClosed) and unwind.
+	q.signalFreeLocked()
 	return discarded
 }
