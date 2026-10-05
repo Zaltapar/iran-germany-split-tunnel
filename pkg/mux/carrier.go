@@ -668,15 +668,17 @@ func (c *CarrierConn) SetStreamLimits(l StreamLimits) error {
 	c.mu.Lock()
 	c.limits = s
 	limit := int64(c.limits.MaxBytesTotal)
+	overflowCap := c.limits.MaxBytesPerStream
 	qs := make([]*StreamQueue, 0, len(c.allStreams))
 	for _, s := range c.allStreams {
 		qs = append(qs, s.q)
 	}
 	c.mu.Unlock()
-	// SetBudgetLimit takes each mailbox's own lock — never c.mu — so
-	// calling it outside c.mu keeps the lock ordering acyclic.
+	// Budget and overflow cap updates take each mailbox's own lock — never
+	// c.mu — so calling them outside c.mu keeps lock ordering acyclic.
 	for _, q := range qs {
 		q.SetBudgetLimit(limit)
+		q.SetOverflowCap(overflowCap)
 	}
 	return nil
 }
@@ -693,7 +695,9 @@ type streamRec struct {
 	// this stream (on its first frame, outside c.mu). Dispatcher-owned.
 	callback bool
 	// pressureStart is owned by the dispatcher goroutine alone: it marks
-	// when this stream first started rejecting data.
+	// when a refused FrameClose first started pressuring this stream (the
+	// legacy close pressure path; see applyPressure). DATA retry-grace is
+	// held by StreamQueue and does not add dispatcher-owned state here.
 	pressureStart time.Time
 	stopOnce      sync.Once
 }
@@ -719,6 +723,7 @@ func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
 		ch:       make(chan []byte, 1),
 		callback: callback,
 	}
+	s.q.SetOverflowCap(c.limits.MaxBytesPerStream)
 	s.q.SetStats(c.stats)
 	s.q.setQueuedItems(&c.queuedItems)
 	c.streams[id] = s
@@ -1048,60 +1053,112 @@ func (c *CarrierConn) Limits() StreamLimits {
 }
 
 // deliver routes one item into a stream's mailbox without ever blocking.
-// Called by the dispatcher goroutine only (it owns s.pressureStart).
+// Called by the dispatcher goroutine only (it owns s.pressureStart; the
+// queue owns and synchronizes its primary and carry regions).
 //
-// Overflow policy (Phase 3): a stream whose mailbox cannot accept data is
-// under pressure; the dispatcher drops its frames but keeps going — other
-// streams are never affected. If the pressure lasts longer than
-// OverflowWait, the stream is terminated (not the carrier).
+// Overflow policy (Phase 3 + retry-grace): a stream whose primary mailbox
+// cannot accept data may carry the refused frame in the queue's bounded FIFO
+// overflow region. The worker drains the primary first and then the carry
+// region, so a transient consumer stall no longer loses an in-order byte or
+// strands a tail at end-of-data. If both bounds are exhausted, the stream is
+// terminated cleanly (not the carrier).
 func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 	if s.terminated.Load() {
 		return // stream already over: drop
 	}
 	if it.isClose {
-		// FrameClose (0 bytes). If the mailbox is full the stream will
-		// be terminated by the pressure rule anyway, and termination
-		// notifies the consumer of stream end the same way.
-		if s.q.TryPush(it) {
-			s.pressureStart = time.Time{}
-		} else {
-			c.applyPressure(s)
-		}
+		c.deliverClose(s, it)
 		return
 	}
-	// TryPush atomically checks the per-stream bounds AND the carrier-wide
-	// aggregate byte budget (all under the mailbox lock — see
-	// StreamQueue), adds the accepted bytes to the aggregate, and reports
-	// false if the push was refused for any reason. A refused DATA (or
-	// HEADER/REBIND) frame is handled by the deliver-or-fail policy below;
-	// a refused FrameClose still uses the pressure rule (the isClose
-	// branch above).
+	// DATA / HEADER / REBIND — the survivable retry-grace path. A refused
+	// frame is CARRIED (in the queue's bounded carry region), not killed on
+	// the first refusal. The deliver-or-fail invariant is preserved: every
+	// byte is either queued, carried, or the stream is explicitly failed —
+	// never silently dropped while the stream stays alive.
+	//
+	// The dispatcher never reorders anything: the mailbox is FIFO, the carry
+	// region is FIFO, and the single worker serves the primary and only then
+	// the carry region, so per-stream order holds end-to-end (a carried
+	// close follows its data, a carried tail is always delivered).
+	ok, reason := s.q.TryPushReason(it)
+	if ok {
+		return
+	}
+	if s.terminated.Load() {
+		// A worker-stall termination raced us: the mailbox closed and the
+		// nil is on its way; this frame dies with the clean abort.
+		return
+	}
+	if reason == rejectStreamFrames || reason == rejectStreamBytes {
+		// A per-stream bound (frame count or stream byte cap): a transient
+		// consumer stall. Carry the frame — do NOT kill the stream on the
+		// first refusal. This is the ~1 MB download-truncation fix.
+		if ok, _ := s.q.TryCarry(it); ok {
+			return
+		}
+		// The bounded carry region or aggregate carrier budget is exhausted.
+		// The retry-grace cannot retain this in-order frame, so fail cleanly.
+		if s.terminated.Load() {
+			return // a worker-stall termination raced us
+		}
+	}
+	// An aggregate carrier-wide byte budget (or a closed mailbox) is not a
+	// transient per-stream stall. Preserve deliver-or-fail by ending only
+	// this stream, never silently dropping an in-order byte.
+	c.failUndeliverableData(s, true)
+}
+
+// deliverClose handles a FrameClose under retry-grace. Carry it if the
+// primary refuses: Pop drains the primary and then the carry region in FIFO
+// order, so the close follows every preceding DATA frame. If bounded carry
+// admission fails, the stream cannot preserve the ordered half-close and is
+// cleanly terminated.
+func (c *CarrierConn) deliverClose(s *streamRec, it queueItem) {
 	if s.q.TryPush(it) {
 		s.pressureStart = time.Time{}
 		return
 	}
-	// A DATA frame that cannot be queued would, under the old policy, be
-	// silently dropped while the stream stayed alive — leaving an in-order
-	// byte hole no receiver can detect (frames carry no sequence number)
-	// that corrupts every byte stream (e.g. TLS) downstream. The dispatcher
-	// must never block on a slow consumer (Phase 3), so it cannot retry
-	// this frame in place; the deliver-or-fail invariant applies instead:
-	// fail the stream cleanly so the consumer sees a clean stream end, not
-	// corrupted bytes.
-	c.failUndeliverableData(s)
+	if s.terminated.Load() {
+		return
+	}
+	if ok, _ := s.q.TryCarry(it); ok {
+		return
+	}
+	if s.terminated.Load() {
+		return
+	}
+	c.failUndeliverableData(s, false)
 }
 
 // failUndeliverableData records that an in-order DATA frame is undeliverable
 // to this live stream and terminates the stream cleanly. It is the
-// dispatcher-side replacement for the old silent-drop: an in-order DATA frame
-// is either DELIVERED (queued by the TryPush above) or the STREAM IS CLEANLY
-// FAILED — never silently dropped while the stream stays healthy.
+// dispatcher-side terminal of the retry-grace: a DATA byte that could not be
+// queued or carried is either DELIVERED (mailbox/carry) or the STREAM IS
+// CLEANLY FAILED — never silently dropped while the stream stays healthy.
 // Dispatcher goroutine only; takes c.mu solely to read the stats pointer.
-func (c *CarrierConn) failUndeliverableData(s *streamRec) {
+// triggerLostData reports whether the triggering frame itself is a lost DATA
+// frame (true) or a FrameClose (false — a close carries no bytes).
+func (c *CarrierConn) failUndeliverableData(s *streamRec, triggerLostData bool) {
+	// Count every DATA frame the consumer will never get: frames still in
+	// the primary mailbox, frames in the carry region, and the triggering
+	// frame if it is DATA. Close reclaims the bytes; we credit the drops.
+	if s.terminated.Load() {
+		return
+	}
+	lost := int64(s.q.QueueDataLen())
+	if triggerLostData {
+		lost++
+	}
+	if lost == 0 {
+		// No DATA bytes were actually lost (e.g. a close-only escalation on
+		// an empty queue): still terminate, but skip the drop loop.
+	}
 	c.mu.Lock()
 	stats := c.stats
 	c.mu.Unlock()
-	stats.droppedDataFrame()
+	for i := int64(0); i < lost; i++ {
+		stats.droppedDataFrame()
+	}
 	// terminateStream(s, true) delivers nil to the consumer and signals the
 	// peer with a best-effort FrameClose, so both ends tear the stream down
 	// deterministically (no half-alive stream, no byte hole).

@@ -3,12 +3,47 @@ package mux
 import (
 	"bufio"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/testutil"
 )
+
+// newPriorityTestCarrier builds a CarrierConn over rwc WITHOUT starting the
+// carrier-owned goroutines (readLoop, writeLoop, keepalive).
+//
+// Why this exists: TestControlFramePriority must observe which request the
+// writer's PRIORITY PEEK selects, so the test has to be the ONLY consumer of
+// ctrlCh and writeCh. NewCarrierConn always does `go c.writeLoop()`
+// (carrier.go: newCarrierConn), and writeLoop's very first act is the
+// non-blocking peek `select { case req := <-c.ctrlCh: ... default: }`. A live
+// writeLoop therefore races the test for the same requests: whichever wins,
+// the loser's bare `<-c.ctrlCh` / `<-c.writeCh` receive has nothing left to
+// receive and blocks forever, which is the scheduling-dependent hang this
+// helper removes.
+//
+// This mirrors the field initialisation of newCarrierConn and differs in
+// exactly one respect: no goroutine is started, so `live` stays 0 and
+// shutdownDone is never closed (no test below waits on ShutdownDone).
+// Everything the test exercises is the real production machinery — the real
+// ctrlCh/writeCh channels with their real caps, the real TryWriteControlFrame
+// enqueue path, and the real writeOne serializing writer.
+func newPriorityTestCarrier(rwc io.ReadWriteCloser) *CarrierConn {
+	return &CarrierConn{
+		rwc:          rwc,
+		frames:       make(chan Frame, 256),
+		writeCh:      make(chan writeReq, 256),
+		ctrlCh:       make(chan writeReq, 64),
+		readDone:     make(chan struct{}),
+		closed:       make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		dispatchDone: make(chan struct{}),
+		streams:      make(map[uint32]*streamRec),
+		limits:       DefaultStreamLimits,
+	}
+}
 
 // TestControlFramePriority proves the REV 2 "E" property: a READY control
 // frame is written AHEAD of a queued DATA frame. The write-loop's PRIORITY
@@ -21,11 +56,18 @@ import (
 // pull one DATA request off writeCh, and assert that writeOne writes the
 // credit to the transport FIRST. The peer must observe FrameCredit before
 // the queued DATA — a single-serializer invariant the peek guarantees.
+//
+// The carrier is built WITHOUT writeLoop (see newPriorityTestCarrier): the
+// test performs the peek itself, so a live writer competing for ctrlCh and
+// writeCh would make the plain receives below starve and hang depending on
+// goroutine scheduling. That was the pre-existing flake — it hung the whole
+// package run until the 10-minute test timeout, non-deterministically, and
+// had nothing to do with the carry-region accounting fix.
 func TestControlFramePriority(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
-	c := NewCarrierConn(a, 0)
+	c := newPriorityTestCarrier(a)
 	defer c.Close()
 
 	// Queue DATA on writeCh and a credit on the control plane.
@@ -36,9 +78,19 @@ func TestControlFramePriority(t *testing.T) {
 	if _, err := c.TryWriteControlFrame(1, FrameCredit, credit); err != nil {
 		t.Fatalf("TryWriteControlFrame: %v", err)
 	}
-	// Pull the credit off ctrlCh (the peek outcome) and one DATA off writeCh
-	// (the frame the blocking select would have taken with no credit ready).
-	creditReq := <-c.ctrlCh
+	// Perform the PRIORITY PEEK exactly as writeLoop does — a non-blocking
+	// receive on ctrlCh first — and require that it wins over the DATA that
+	// is already queued on writeCh. Both channels are ready, so this is the
+	// discriminating step; it is deterministic here because nothing else is
+	// receiving from either channel.
+	var creditReq writeReq
+	select {
+	case creditReq = <-c.ctrlCh:
+	default:
+		t.Fatal("priority peek found no control frame ready, want the credit to preempt queued DATA")
+	}
+	// Only then take one DATA off writeCh (the frame the blocking select would
+	// have taken had no credit been ready).
 	dataReq := <-c.writeCh
 	// The writer serializes both through rwc.Write; write the credit first.
 	c.writeOne(creditReq)

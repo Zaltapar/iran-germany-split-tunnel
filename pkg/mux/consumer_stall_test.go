@@ -8,13 +8,16 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/testutil"
 )
 
-// These tests pin the consumer-stall behavior of the deliver-or-fail DATA
-// path (Mechanism B) across the OverflowWait boundary. They drive
-// deliver() single-threaded (playing the dispatcher's role, exactly as
-// deliver_fail_test.go does) over a workerless stream, so the consumer
-// "stalls" by simply never calling Pop and every observation is
-// deterministic — no wall-clock race for the assertions (the bounded
-// sleeps only model the stall durations).
+// These tests pin the consumer-stall behavior of the retry-grace DATA path
+// across the OverflowWait boundary: a transient (zero-progress-bounded)
+// refusal is CARRIED (the stream survives a brief stall — the ~1 MB
+// download-truncation fix), while a SUSTAINED zero-progress stall (no
+// carried frame makes it into the mailbox for the full OverflowWait)
+// cleanly terminates the stream. They drive deliver() single-threaded
+// (playing the dispatcher's role, exactly as deliver_fail_test.go does)
+// over a workerless stream, so the consumer "stalls" by simply never
+// calling Pop and every observation is deterministic — the bounded sleeps
+// only model the stall durations.
 
 // assertContiguousPrefix fails if got is not a CONTIGUOUS IN-ORDER PREFIX
 // of sent — a hole/gap means a corrupted byte stream, the exact failure the
@@ -105,74 +108,78 @@ func TestConsumerStallUnderOverflowWaitDeliversInOrderNoHole(t *testing.T) {
 
 	var undel atomic.Int32
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
-
 	// STALL: the consumer keeps not popping for 0.5 x OverflowWait. The
 	// sleep is a bounded stall model, not an assertion dependency: after
 	// it, the mailbox still holds [f2 f3] and nothing has terminated.
 	time.Sleep(limits.OverflowWait / 2)
 
 	// Resume + refusal: the next DATA frames fill the mailbox, and f6 is
-	// refused by it — drive it through the dispatcher path.
+	// refused by it. Drive it through the dispatcher path: the retry-grace
+	// CARRIES f6 across the window instead of killing the stream.
 	pushToRefusal(t, c, s, payloads)
 
-	// INVARIANT (must always hold): everything the consumer received is a
-	// contiguous in-order prefix of what was sent — never a hole.
-	assertContiguousPrefix(t, got, sent)
-	// If the stream was aborted, the consumer observed the deterministic
-	// nil end (the workerless ch was empty, so terminateStream's
-	// dispatcher-side handoff succeeded synchronously inside deliver).
+	// The sub-wait refusal must LEAVE THE STREAM ALIVE and carry f6 — the
+	// retry-grace (the FUTURE follow-up this test now pins). Nothing is
+	// dropped and no undeliverable callback has fired.
 	if s.terminated.Load() {
-		select {
-		case f := <-s.ch:
-			if f != nil {
-				t.Fatalf("stream end signal = %q, want nil", f)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("stream aborted but the consumer never saw the nil end")
-		}
+		t.Fatal("a sub-OverflowWait refusal terminated the stream; the retry-grace should have carried the frame")
 	}
-	// The resumed consumer finds the closed mailbox: f2 f5 were discarded
-	// at termination, so only the contiguous prefix [f0 f1] ever reached
-	// it.
-	if it, ok := s.q.Pop(); ok {
-		t.Fatalf("resumed Pop returned %q on a closed mailbox, want closed", it.payload)
+	if n := atomic.LoadInt64(&stats.DroppedDataFrames); n != 0 {
+		t.Fatalf("dropped_data_frames = %d, want 0 (the refused frame was carried, not dropped)", n)
+	}
+	if n := undel.Load(); n != 0 {
+		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (no escalation yet)", n)
 	}
 
-	// CHARACTERIZATION (Mechanism B fail-fast): a single refused DATA
-	// frame aborts the stream rather than being dropped silently.
-	// FUTURE: the DATA-frame retry-grace follow-up (carry refusal #1
-	// through the applyPressure pressureStart window, escalate on
-	// refusal #2 or OverflowWait) would let this recover and deliver
-	// the full in-order set; when that lands, change this to require
-	// full in-order delivery with dropped_data_frames == 0.
-	if !s.terminated.Load() {
-		t.Fatal("the sub-wait refusal left the stream alive (silent byte hole)")
+	// RESUME the consumer: drain the mailbox in order (f2..f5). While the
+	// consumer is draining, the carried f6 sits in the overflow region and
+	// must be served BEFORE anything newer. Pop drains the primary first
+	// (f2..f5) and only then falls through to the carry.
+	for i := 2; i < len(sent)-1; i++ {
+		it, ok := s.q.Pop()
+		if !ok {
+			t.Fatalf("Pop %d returned closed", i)
+		}
+		if string(it.payload) != sent[i] {
+			t.Fatalf("Pop %d = %q, want %q (in order)", i, it.payload, sent[i])
+		}
+		got = append(got, string(it.payload))
 	}
-	if n := atomic.LoadInt64(&stats.DroppedDataFrames); n < 1 {
-		t.Fatalf("dropped_data_frames = %d, want >= 1 (exactly 1 in this single-threaded setup)", n)
+	// With the primary drained, Pop falls through to the carry: the
+	// carried f6 must surface NEXT — before the sender's close.
+	it, ok := s.q.Pop()
+	if !ok || string(it.payload) != sent[len(sent)-1] {
+		t.Fatalf("carry flush: Pop = %q ok=%v, want the carried last frame %q", it.payload, ok, sent[len(sent)-1])
 	}
-	if n := undel.Load(); n != 1 {
-		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 1", n)
+	got = append(got, string(it.payload))
+	// The sender's end-of-data close: both regions are now empty, so it is
+	// pushed to the (empty) primary and must surface as the final item —
+	// it can never overtake the already-drained carried f6.
+	c.deliver(s, queueItem{isClose: true})
+	it, ok = s.q.Pop()
+	if !ok || !it.isClose {
+		t.Fatalf("close flush: Pop = %+v ok=%v, want the carried close", it, ok)
 	}
-	// Assert the path that fired (per the caller's classification): this
-	// is the dispatcher's DATA path — NOT the pressure path, and there is
-	// no worker on this path — so overflow_terminations is NOT
-	// incremented here.
-	if n := atomic.LoadInt64(&stats.OverflowTerminations); n != 0 {
-		t.Fatalf("overflow_terminations = %d, want 0 (the DATA path fired, not the pressure path)", n)
+
+	// INVARIANT: everything delivered is the FULL in-order set — no hole,
+	// no loss (the retry-grace's whole point: a transient stall survives).
+	if len(got) != len(sent) {
+		t.Fatalf("delivered %d of %d frames, want the FULL in-order set", len(got), len(sent))
 	}
-	if n := atomic.LoadInt64(&stats.OverflowTerminationsWorker); n != 0 {
-		t.Fatalf("overflow_terminations_worker = %d, want 0 (no worker on this path)", n)
+	for i, g := range got {
+		if g != sent[i] {
+			t.Fatalf("frame %d = %q, want %q (in-order delivery violated)", i, g, sent[i])
+		}
 	}
 }
 
 // TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable
-// proves the clean-abort + taxonomy end-to-end when pressure persists:
-// a LIVE stream's consumer stalls (no Pop) for more than OverflowWait
-// (1.5x) while DATA frames are pushed, so the pushes are refused by the
-// full mailbox. The DATA path then fails the stream cleanly; the
-// classifier half (ReasonDataUndeliverable + the single metrics credit)
-// lives in pkg/node under the same test name.
+// proves the clean-abort + taxonomy end-to-end when the retry-grace carry
+// region is exhausted: a live stream's consumer stalls (no Pop), the sender
+// keeps pushing DATA frames that overflow into the bounded carry, and when
+// the carry cap itself is exhausted the dispatcher escalates to a clean
+// abort. The classifier half (ReasonDataUndeliverable + the single metrics
+// credit) lives in pkg/node under the same test name.
 func TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
@@ -181,39 +188,66 @@ func TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable(t *tes
 	defer c.Close()
 	stats := &QueueStats{}
 	c.SetQueueStats(stats)
-	limits := bpLimits(4, DefaultStreamLimits.MaxBytesPerStream, DefaultStreamLimits.MaxBytesTotal, DefaultStreamLimits.OverflowWait)
-	c.SetStreamLimits(limits)
-
-	s, payloads, sent, got := seedStalledStream(t, c, stats)
+	// Primary = 2 frames; carry cap = 4 bytes (MaxBytesPerStream = 4);
+	// carry frame cap = 2*16 = 32. The carry holds at most two 2-byte
+	// DATA frames before the cap is exhausted.
+	c.SetStreamLimits(bpLimits(2, 4, 32, 50*time.Millisecond))
+	s := buildWorkerlessStream(t, c, stats, 1, 2, 4, 32)
 
 	var undel atomic.Int32
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
 
-	// STALL beyond OverflowWait: 1.5x the deadline with no Pop, so the
-	// mailbox stays full and every fresh DATA push is refused — the
-	// pressure persisted past the deadline.
-	time.Sleep(limits.OverflowWait * 3 / 2)
+	// Seed: fill the 2-frame mailbox, then pop f0 (the consumer stalls
+	// after this — no further Pop).
+	if !s.q.TryPush(queueItem{payload: []byte("f0")}) ||
+		!s.q.TryPush(queueItem{payload: []byte("f1")}) {
+		t.Fatal("seed pushes to a 2-frame mailbox refused")
+	}
+	it, ok := s.q.Pop()
+	if !ok || string(it.payload) != "f0" {
+		t.Fatal("Pop of the seeded mailbox returned unexpected value")
+	}
+	got := []string{"f0"}
 
-	// The refused DATA frame drives the clean abort on the dispatcher
-	// path (deliver-or-fail), not the pressure deadline.
-	pushToRefusal(t, c, s, payloads)
+	// f2 fills the mailbox to 2/2.
+	if !s.q.TryPush(queueItem{payload: []byte("f2")}) {
+		t.Fatal("f2 refused while the mailbox had room")
+	}
 
-	// The stream was terminated (the clean-abort end state).
+	// f3 is refused by the full mailbox → carried (retry-grace).
+	// Carry: [f3], 2 bytes.
+	c.deliver(s, queueItem{payload: []byte("f3")})
+	// f4 is refused → carried. Carry: [f3 f4], 4 bytes = cap.
+	c.deliver(s, queueItem{payload: []byte("f4")})
+
+	// The stream is still alive: the carry cap is full but was not yet
+	// exhausted (TryCarry for f4 succeeded: 2+2 = 4, not > 4).
+	if s.terminated.Load() {
+		t.Fatal("stream terminated before the carry cap was exhausted")
+	}
+	if n := s.q.OverflowDataLen(); n != 2 {
+		t.Fatalf("overflow_data = %d, want 2 (f3 f4 carried)", n)
+	}
+
+	// f5 is refused → TryCarry fails (4+2 > 4) → escalation to clean abort.
+	c.deliver(s, queueItem{payload: []byte("f5")})
+
+	// The stream was cleanly terminated (carry cap exhausted).
 	if !s.terminated.Load() {
-		t.Fatal("the stalled stream was not terminated")
+		t.Fatal("carry cap exhaustion did not terminate the stream")
 	}
-	// Exactly one refused DATA frame was recorded — the deliver-or-fail
-	// path fired once; later deliveries early-return on terminated.
-	if n := atomic.LoadInt64(&stats.DroppedDataFrames); n != 1 {
-		t.Fatalf("dropped_data_frames = %d, want exactly 1", n)
+
+	// Dropped frames: primary [f1 f2] (2 DATA) + carry [f3 f4] (2 DATA)
+	// + triggering f5 (1 DATA) = 5 total lost DATA frames.
+	if n := atomic.LoadInt64(&stats.DroppedDataFrames); n != 5 {
+		t.Fatalf("dropped_data_frames = %d, want 5 (f1 f2 in primary + f3 f4 carried + f5 triggering)", n)
 	}
-	// The undeliverable callback fired exactly once (this is what the
-	// node wiring classifies the close as data_undeliverable on).
+	// The undeliverable callback fired exactly once.
 	if n := undel.Load(); n != 1 {
 		t.Fatalf("OnStreamDataUndeliverable fired %d times, want exactly 1", n)
 	}
 	// The abort was the dispatcher's DATA path: no pressure-termination
-	// increments (worker-less stream, sub-deadline DATA fail-fast).
+	// increments (worker-less stream, carry-cap exhaustion).
 	if n := atomic.LoadInt64(&stats.OverflowTerminations); n != 0 {
 		t.Fatalf("overflow_terminations = %d, want 0 (the DATA path fired)", n)
 	}
@@ -221,9 +255,9 @@ func TestConsumerStallBeyondOverflowWaitCleansAbortsWithDataUndeliverable(t *tes
 		t.Fatalf("overflow_terminations_worker = %d, want 0 (no worker on this path)", n)
 	}
 
-	// The consumer saw ONLY a contiguous in-order prefix ([f0 f1])
-	// before the nil end — no hole: f2 f5 were discarded by the mailbox
-	// close and f6 was the refused frame.
+	// The consumer saw ONLY a contiguous in-order prefix ([f0])
+	// before the nil end — no hole.
+	sent := []string{"f0", "f1", "f2", "f3", "f4", "f5"}
 	assertContiguousPrefix(t, got, sent)
 	select {
 	case f := <-s.ch:

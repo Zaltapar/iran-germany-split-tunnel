@@ -37,12 +37,14 @@ func buildWorkerlessStream(t *testing.T, c *CarrierConn, stats *QueueStats, id u
 	return s
 }
 
-// TestRefusedDataFrameTerminatesStreamNoHole is the integrity-seam test: when
-// the consumer stalls so the mailbox is full, delivering one more DATA frame
-// must cleanly fail the stream — what the consumer has received is a
-// contiguous, in-order PREFIX of what was sent, and the stream then errors
-// (clean termination), never a silent hole.
-func TestRefusedDataFrameTerminatesStreamNoHole(t *testing.T) {
+// TestRefusedDataFrameCarriedThenCarryCapExhaustedTerminatesNoHole is the
+// integrity-seam test for the retry-grace: when the consumer stalls so the
+// mailbox is full, refused DATA frames are CARRIED into the queue's bounded
+// carry region (the stream stays alive — the ~1 MB download-truncation fix).
+// Only when the carry cap itself is exhausted does the dispatcher escalate
+// to a clean abort. Whatever the consumer has received is a contiguous,
+// in-order PREFIX of what was sent — never a silent hole.
+func TestRefusedDataFrameCarriedThenCarryCapExhaustedTerminatesNoHole(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -50,8 +52,10 @@ func TestRefusedDataFrameTerminatesStreamNoHole(t *testing.T) {
 	defer c.Close()
 	stats := &QueueStats{}
 	c.SetQueueStats(stats)
-	c.SetStreamLimits(bpLimits(2, 4096, 4096, 50*time.Millisecond))
-	s := buildWorkerlessStream(t, c, stats, 1, 2, 4096, 4096)
+	// Primary cap = 2 frames; carry cap = 8 payload bytes = 4 frames of 2 B.
+	// This keeps the test deterministic without pushing thousands of frames.
+	c.SetStreamLimits(bpLimits(2, 8, 64, 50*time.Millisecond))
+	s := buildWorkerlessStream(t, c, stats, 1, 2, 8, 64)
 
 	// The node wiring fires exactly one distinct callback when the data is
 	// undeliverable (this is what classifies the close as data_undeliverable
@@ -59,50 +63,61 @@ func TestRefusedDataFrameTerminatesStreamNoHole(t *testing.T) {
 	var undel atomic.Int32
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
 
-	// Fill the mailbox to capacity with frames 0 and 1, in order.
+	// Fill the mailbox to capacity with f0 f1.
 	if !s.q.TryPush(queueItem{payload: []byte("f0")}) ||
 		!s.q.TryPush(queueItem{payload: []byte("f1")}) {
 		t.Fatal("seed pushes to a 2-frame mailbox refused")
 	}
 
-	// The consumer stalled, so frame 2 is refused by the full mailbox. Push
-	// it through the real dispatcher path: it must hit the deliver-or-fail
-	// policy, not a silent drop.
+	// f2 is refused by the full mailbox → carried (retry-grace).
 	if s.q.TryPush(queueItem{payload: []byte("f2")}) {
 		t.Fatal("f2 unexpectedly fit the full mailbox")
 	}
 	c.deliver(s, queueItem{payload: []byte("f2")})
 
-	// INVARIANT part 1 — contiguity BEFORE the stream fails: everything that
-	// ever reached the consumer is exactly [f0 f1], a contiguous in-order
-	// prefix of the sent [f0 f1 f2] with NO hole. (Inspect the mailbox under
-	// its own lock; same-package test, the way queue_stats_test.go does.)
-	s.q.mu.Lock()
-	var queued []string
-	for _, it := range s.q.items {
-		queued = append(queued, string(it.payload))
+	// The first refusal must NOT terminate the stream (the ~1 MB truncation
+	// was exactly this fail-fast); f2 sits in the carry, undropped.
+	if s.terminated.Load() {
+		t.Fatal("a single refused DATA frame terminated the stream; the retry-grace must carry it")
 	}
-	qclosed := s.q.closed
-	s.q.mu.Unlock()
-	// f2 was refused, not queued; termination then closed the mailbox.
-	if qclosed {
-		// Mailbox was closed by terminateStream: the consumer got [f0 f1]
-		// (or is mid-drain of it) — the prefix holds by construction because
-		// the FIFO mailbox never reordered or skipped, and f2 never entered.
-		if !s.terminated.Load() {
-			t.Fatal("mailbox closed but stream not marked terminated")
-		}
-	} else if len(queued) != 2 || queued[0] != "f0" || queued[1] != "f1" {
-		t.Fatalf("queued contents = %v, want [f0 f1] (contiguous, no hole)", queued)
+	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 0 {
+		t.Fatalf("dropped_data_frames = %d, want 0 (f2 is carried, not dropped)", got)
+	}
+	if got := undel.Load(); got != 0 {
+		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (no escalation yet)", got)
 	}
 
-	// INVARIANT part 2 — the stream was CLEANLY FAILED, not left alive with
-	// the missing frame.
-	if !s.terminated.Load() {
-		t.Fatal("refused DATA frame left the stream alive (silent byte hole)")
+	// f3 f4 f5: each is carried, filling the 8-byte carry cap to the brim.
+	for _, p := range []string{"f3", "f4", "f5"} {
+		c.deliver(s, queueItem{payload: []byte(p)})
+		if s.terminated.Load() {
+			t.Fatalf("frame %q terminated the stream before the carry cap was exhausted", p)
+		}
 	}
-	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 1 {
-		t.Fatalf("dropped_data_frames = %d, want 1", got)
+	// Carry now holds [f2 f3 f4 f5] = 8 bytes = cap.
+	if n := s.q.OverflowDataLen(); n != 4 {
+		t.Fatalf("overflow_data = %d, want 4 (f2..f5 carried)", n)
+	}
+
+	// f6 cannot be carried (8+2 > 8): the dispatcher escalates to a clean
+	// abort. The 4 carried DATA frames are the lost bytes.
+	c.deliver(s, queueItem{payload: []byte("f6")})
+
+	// INVARIANT part 1 — the stream was cleanly failed.
+	if !s.terminated.Load() {
+		t.Fatal("exhausted carry cap did not terminate the stream")
+	}
+	s.q.mu.Lock()
+	qclosed := s.q.closed
+	s.q.mu.Unlock()
+	if !qclosed {
+		t.Fatal("the escalation did not close the mailbox")
+	}
+
+	// INVARIANT part 2 — accounting: 2 primary (f0 f1) + 4 carried (f2..f5)
+	// + 1 triggering (f6) = 7 lost DATA frames.
+	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 7 {
+		t.Fatalf("dropped_data_frames = %d, want 7 (2 primary + 4 carried + 1 triggering)", got)
 	}
 	if got := undel.Load(); got != 1 {
 		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 1", got)
@@ -159,11 +174,12 @@ func TestHealthyStreamDeliversInOrderNoDrops(t *testing.T) {
 	}
 }
 
-// TestStreamCloseStillUsesPressureKeepsCloseOffTheDataPath guards the one
-// behavior that must NOT have migrated to the data path: a refused FrameClose
-// still goes through the pressure rule (applyPressure), so a half-close on a
-// stalled stream ends that stream on its later push — not on the data path.
-func TestStreamCloseStillUsesPressure(t *testing.T) {
+// TestStreamCloseCarriedPreservesFIFO guards the retry-grace close path:
+// a refused FrameClose (because the primary mailbox is full) is CARRIED
+// into the queue's bounded carry region so the consumer still sees it AFTER
+// every preceding DATA frame — never overtaken, never dropped. The stream
+// stays alive and no DATA frame is counted as dropped.
+func TestStreamCloseCarriedPreservesFIFO(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -177,17 +193,30 @@ func TestStreamCloseStillUsesPressure(t *testing.T) {
 	if !s.q.TryPush(queueItem{payload: []byte("x")}) {
 		t.Fatal("seed push to a 1-frame mailbox refused")
 	}
-	// A FrameClose cannot be queued (mailbox full). It must apply the
-	// pressure rule (set pressureStart), NOT terminate via the data path,
-	// and must NOT bump the dropped-DATA counter (it is not a data frame).
+	// A FrameClose cannot be queued (mailbox full). The retry-grace CARRIES
+	// it so the consumer still sees the ordered half-close after "x".
 	c.deliver(s, queueItem{isClose: true})
-	if s.pressureStart.IsZero() {
-		t.Fatal("refused FrameClose did not apply the pressure rule")
+
+	// The carry must have accepted the close (0 payload bytes, fits any cap).
+	if n := s.q.OverflowLen(); n != 1 {
+		t.Fatalf("overflow_len = %d, want 1 (the carried close)", n)
 	}
+	// The stream must NOT be terminated: the close was carried, not lost.
 	if s.terminated.Load() {
-		t.Fatal("a refused FrameClose terminated the stream immediately; it should use pressure")
+		t.Fatal("a carried FrameClose terminated the stream; it should preserve FIFO")
 	}
+	// No DATA frame was dropped (the close carries no bytes).
 	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 0 {
-		t.Fatalf("dropped_data_frames = %d after a refused FrameClose, want 0", got)
+		t.Fatalf("dropped_data_frames = %d after a carried FrameClose, want 0", got)
+	}
+
+	// Drain in order: primary "x" first, then the carried close.
+	it, ok := s.q.Pop()
+	if !ok || it.isClose || string(it.payload) != "x" {
+		t.Fatalf("first Pop = %+v ok=%v, want primary \"x\"", it, ok)
+	}
+	it, ok = s.q.Pop()
+	if !ok || !it.isClose {
+		t.Fatalf("second Pop = %+v ok=%v, want the carried close", it, ok)
 	}
 }

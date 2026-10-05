@@ -31,31 +31,52 @@ type queueItem struct {
 // an aggregate byte budget on top of the per-stream limits.
 //
 // Concurrency contract: many producers (in practice only the dispatcher)
-// may call TryPush; exactly ONE consumer goroutine (the stream worker)
-// calls Pop.
+// may call TryPush/TryCarry; exactly ONE consumer goroutine (the stream
+// worker) calls Pop.
 type StreamQueue struct {
 	maxFrames int
 	maxBytes  int
 
 	mu sync.Mutex
-	// items is an append-only slice; removal from the front is O(n)
-	// with n bounded by maxFrames — fine, and far simpler than a ring.
-	items    []queueItem
-	nBytes   int
-	closed   bool
-	wake     chan struct{} // open: a Pop is parked waiting; closed: never
-	nWaiters int           // Pop calls currently parked on wake
+	// items is the PRIMARY mailbox: an append-only slice, removal from the
+	// front is O(n) with n bounded by maxFrames — fine, and far simpler
+	// than a ring.
+	items  []queueItem
+	nBytes int
+	// overflow is the RETRY-GRACE carry region (SUBTASK 26): when the
+	// primary is full (a transient consumer stall — the ~1 MB
+	// download-truncation signature), the dispatcher CARRIES a refused
+	// item here instead of terminating the stream. It is NOT a parallel
+	// mailbox: Pop serves the primary first and falls through to the carry
+	// region only when the primary is empty, so per-stream FIFO holds — a
+	// carried FrameClose is reached only after every older carried data
+	// frame, and a carried tail can never be stranded at end-of-data.
+	//
+	// Carried bytes ARE charged to the aggregate carrier budget (so
+	// MaxBytesTotal remains a true memory bound) and bounded per-stream by
+	// overflowCap (= MaxBytesPerStream); when the cap is exhausted the
+	// consumer is far behind and the dispatcher escalates to a clean abort
+	// (deliver-or-fail). Escalation is also time-bounded: a carry episode
+	// that has made no drain progress for the full OverflowWait escalates
+	// (see ovSince / CarrySince).
+	overflow         []queueItem
+	overflowBytes    int
+	overflowCap      int // payload-byte cap; aggregate budget is also enforced
+	overflowFrameCap int // hard item cap, including zero-length frames
+	closed           bool
+	wake             chan struct{} // open: a Pop is parked waiting; closed: never
+	nWaiters         int           // Pop calls currently parked on wake
 
 	// budget, when non-nil, is the carrier-wide aggregate byte budget
 	// (see CarrierConn.queuedBytes). Byte accounting is done HERE, under
-	// q.mu, so the dispatcher's check+add (TryPush) and the worker's
-	// pop+subtract (Pop) are serialized per stream: an item is counted
-	// in the aggregate exactly while it is in the mailbox, never before
-	// (an unpushed item) and never twice (a popped item reclaimed by
+	// q.mu, so the dispatcher's check+add (TryPush/TryCarry) and the
+	// worker's pop+subtract (Pop) are serialized per stream: an item is
+	// counted in the aggregate exactly while it is in the mailbox, never
+	// before (an unpushed item) and never twice (a popped item reclaimed by
 	// Close). A race-free check-then-add is impossible with an atomic
 	// counter outside this lock, and the old unguarded Load→TryPush→Add
-	// sequence in deliver() let a pop slip between the check and the
-	// add, over-counting the budget (and Close then re-claiming the
+	// sequence in deliver() let a pop slip between the check and the add,
+	// over-counting the budget (and Close then re-claiming the
 	// already-decremented bytes, driving the total negative).
 	budget *int64
 	// budgetLimitLocked is the carrier-wide aggregate limit
@@ -80,11 +101,22 @@ type StreamQueue struct {
 // sync (may be nil for tests that do not model the aggregate budget);
 // budgetLimit is the current aggregate limit for pushes.
 func NewStreamQueue(maxFrames, maxBytes int, budget *int64, budgetLimit int64) *StreamQueue {
-	return &StreamQueue{maxFrames: maxFrames, maxBytes: maxBytes, budget: budget, budgetLimitLocked: budgetLimit}
+	frameCap := maxFrames * 16
+	if frameCap < maxFrames {
+		frameCap = maxFrames
+	}
+	return &StreamQueue{
+		maxFrames:         maxFrames,
+		maxBytes:          maxBytes,
+		overflowCap:       maxBytes,
+		overflowFrameCap:  frameCap,
+		budget:            budget,
+		budgetLimitLocked: budgetLimit,
+	}
 }
 
 // SetStats installs the optional queue telemetry surface. The queue mutex
-// keeps assignment ordered with TryPush, Pop, and Close.
+// keeps assignment ordered with TryPush, TryCarry, Pop, and Close.
 func (q *StreamQueue) SetStats(s *QueueStats) {
 	q.mu.Lock()
 	q.stats = s
@@ -135,10 +167,25 @@ func (q *StreamQueue) SetBudgetLimit(n int64) {
 	q.mu.Unlock()
 }
 
-// fullLocked reports whether adding it would exceed either bound.
-// Caller must hold q.mu.
+// SetOverflowCap re-sizes the retry-grace carry region: when the primary is
+// full, a refused item may be carried here (up to n payload bytes) instead
+// of terminating the stream. The carrier keeps it in sync with
+// StreamLimits.MaxBytesPerStream (SetStreamLimits). n <= 0 disables the
+// region, restoring the pre-retry-grace behaviour (a refused frame
+// escalates immediately). Caller may invoke it before the queue is exposed
+// to a dispatcher/worker; q.mu keeps the assignment ordered.
+func (q *StreamQueue) SetOverflowCap(n int) {
+	q.mu.Lock()
+	q.overflowCap = n
+	q.mu.Unlock()
+}
+
+// fullLocked reports whether adding it to the primary would exceed either
+// bound. Caller must hold q.mu.
 func (q *StreamQueue) fullLocked(it queueItem) bool {
-	return len(q.items) >= q.maxFrames ||
+	// A non-empty carry region is an ordering barrier: every later frame
+	// must join its tail, never jump back into the primary ahead of it.
+	return len(q.overflow) > 0 || len(q.items) >= q.maxFrames ||
 		q.nBytes+len(it.payload) > q.maxBytes
 }
 
@@ -148,6 +195,8 @@ func (q *StreamQueue) rejectReasonLocked(it queueItem) rejectReason {
 	switch {
 	case q.closed:
 		return rejectClosed
+	case len(q.overflow) > 0:
+		return rejectStreamFrames
 	case len(q.items) >= q.maxFrames:
 		return rejectStreamFrames
 	case q.nBytes+len(it.payload) > q.maxBytes:
@@ -176,20 +225,34 @@ func (q *StreamQueue) wakeLocked() {
 // and the accounting update happen under q.mu, so the total is exactly
 // the sum of the payload bytes in all attached mailboxes at all times.
 func (q *StreamQueue) TryPush(it queueItem) bool {
+	ok, _ := q.TryPushReason(it)
+	return ok
+}
+
+// TryPushReason is TryPush but also reports, on refusal, WHY the push was
+// refused (the mutually-exclusive rejectReason). It lets the dispatcher's
+// overflow policy (the retry-grace, SUBTASK 26) distinguish a PER-STREAM
+// bound refusal (frame count or stream byte cap — a transient consumer
+// stall that the dispatcher may CARRY across the pressure window) from a
+// carrier-wide AGGREGATE refusal or a CLOSED mailbox (which are not
+// transient stalls and escalate immediately). On acceptance it returns
+// (true, 0).
+func (q *StreamQueue) TryPushReason(it queueItem) (bool, rejectReason) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed || q.fullLocked(it) {
+		r := q.rejectReasonLocked(it)
 		if q.stats != nil {
-			q.stats.reject(q.rejectReasonLocked(it))
+			q.stats.reject(r)
 		}
-		return false
+		return false, r
 	}
 	if q.budget != nil &&
 		atomic.LoadInt64(q.budget)+int64(len(it.payload)) > q.budgetLimitLocked {
 		if q.stats != nil {
 			q.stats.reject(rejectAggregate)
 		}
-		return false
+		return false, rejectAggregate
 	}
 	q.items = append(q.items, it)
 	q.nBytes += len(it.payload)
@@ -200,13 +263,123 @@ func (q *StreamQueue) TryPush(it queueItem) bool {
 		q.stats.observeHighQueued(totalBytes, totalItems)
 	}
 	q.wakeLocked()
-	return true
+	return true, 0
+}
+
+// TryCarry appends it to the carry region without blocking. It succeeds when
+// the queue is not closed, the carry region is enabled, and the item fits
+// BOTH the per-stream carry cap (overflowCap) and the carrier-wide aggregate
+// budget (carried bytes are counted there, so MaxBytesTotal stays a true
+// memory bound). On refusal it reports rejectAggregate for the cap/budget
+// (the consumer is far behind, or the carrier is saturated — the dispatcher
+// escalates) and rejectClosed for a closed mailbox. On success it wakes a
+// parked Pop (a worker waiting on an empty primary can now take the tail).
+func (q *StreamQueue) TryCarry(it queueItem) (bool, rejectReason) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		if q.stats != nil {
+			q.stats.reject(rejectClosed)
+		}
+		return false, rejectClosed
+	}
+	if q.overflowCap <= 0 || len(q.overflow) >= q.overflowFrameCap || q.overflowBytes+len(it.payload) > q.overflowCap {
+		if q.stats != nil {
+			q.stats.reject(rejectAggregate)
+		}
+		return false, rejectAggregate
+	}
+	if q.budget != nil &&
+		atomic.LoadInt64(q.budget)+int64(len(it.payload)) > q.budgetLimitLocked {
+		if q.stats != nil {
+			q.stats.reject(rejectAggregate)
+		}
+		return false, rejectAggregate
+	}
+	q.overflow = append(q.overflow, it)
+	q.overflowBytes += len(it.payload)
+	totalBytes, totalItems := q.adjustAggregateLocked(int64(len(it.payload)), 1)
+	if q.stats != nil {
+		q.stats.observeHighQueued(totalBytes, totalItems)
+	}
+	q.wakeLocked()
+	return true, 0
+}
+
+// OverflowLen reports how many items are currently held in the carry region.
+// The dispatcher uses it to know a carry episode is in flight (and therefore
+// that a refused close must be carried behind its data rather than dropped
+// through the legacy pressure path).
+func (q *StreamQueue) OverflowLen() int {
+	q.mu.Lock()
+	n := len(q.overflow)
+	q.mu.Unlock()
+	return n
+}
+
+// OverflowDataLen reports how many of the carried items are DATA frames
+// (isClose false). The dispatcher credits them to dropped_data_frames when
+// it escalates to a clean abort.
+func (q *StreamQueue) OverflowDataLen() int {
+	q.mu.Lock()
+	n := 0
+	for _, ov := range q.overflow {
+		if !ov.isClose {
+			n++
+		}
+	}
+	q.mu.Unlock()
+	return n
+}
+
+// QueueDataLen reports the total number of DATA items (isClose false)
+// sitting in BOTH the primary mailbox and the carry region. The dispatcher
+// uses it in failUndeliverableData to credit every undelivered DATA frame
+// to dropped_data_frames when a stream is cleanly aborted.
+func (q *StreamQueue) QueueDataLen() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := 0
+	for _, it := range q.items {
+		if !it.isClose {
+			n++
+		}
+	}
+	for _, it := range q.overflow {
+		if !it.isClose {
+			n++
+		}
+	}
+	return n
+}
+
+// overflowLocked pops one item from the carry region. Caller must hold q.mu;
+// it returns ok=false when the region is empty. Carried bytes were charged
+// to the aggregate budget, so they are returned to it here.
+func (q *StreamQueue) overflowLocked() (it queueItem, ok bool) {
+	if len(q.overflow) == 0 {
+		return queueItem{}, false
+	}
+	it = q.overflow[0]
+	q.overflow = q.overflow[1:]
+	q.overflowBytes -= len(it.payload)
+	totalBytes, totalItems := q.adjustAggregateLocked(-int64(len(it.payload)), -1)
+	if q.stats != nil {
+		q.stats.observeHighQueued(totalBytes, totalItems)
+	}
+	return it, true
 }
 
 // Pop blocks until an item is available or the queue is closed.
-// ok is false once the queue is closed (still-queued items are discarded
-// by Close and accounted for via its return value). Exactly one
-// goroutine may call Pop on a queue.
+// ok is false once the queue is closed AND both regions are empty
+// (still-queued items are discarded by Close and accounted for via its
+// return value). Exactly one goroutine may call Pop on a queue.
+//
+// It serves the PRIMARY mailbox first and falls through to the carry region
+// only when the primary is empty — that ordering is what keeps per-stream
+// FIFO under the retry-grace (a carried FrameClose can never overtake an
+// older carried data frame) and what prevents a carried tail from being
+// stranded at end-of-data.
 //
 // Popping returns the item's payload bytes to the aggregate budget
 // (under q.mu, serialized with TryPush's add), so the item is counted
@@ -227,11 +400,17 @@ func (q *StreamQueue) Pop() (it queueItem, ok bool) {
 			q.mu.Unlock()
 			return it, true
 		}
+		if len(q.overflow) > 0 {
+			it, _ = q.overflowLocked()
+			q.mu.Unlock()
+			return it, true
+		}
 		if q.closed {
 			q.mu.Unlock()
 			return queueItem{}, false
 		}
-		// Park until a producer adds an item or Close wakes us.
+		// Park until a producer adds an item (primary or carry) or Close
+		// wakes us.
 		if q.wake == nil {
 			q.wake = make(chan struct{})
 		}
@@ -243,13 +422,15 @@ func (q *StreamQueue) Pop() (it queueItem, ok bool) {
 }
 
 // Close terminates the queue: Pop unblocks and returns ok=false, and
-// TryPush keeps failing. Idempotent — both the carrier's Close and stream
-// termination call it.
+// TryPush/TryCarry keep failing. Idempotent — both the carrier's Close and
+// stream termination call it.
 //
-// Close discards anything still queued and RETURNS the payload bytes it
-// discarded. When an aggregate budget is attached, those bytes are
-// returned to it here (under q.mu, so a concurrently parked Pop can
-// never decrement the same bytes again). A second Close returns 0.
+// Close discards whatever is still queued — in BOTH the primary and the
+// carry region — and RETURNS the payload bytes it discarded (the caller uses
+// the value only for the stats fold; the aggregate budget is corrected here).
+// When an aggregate budget is attached, those bytes are returned to it here
+// (under q.mu, so a concurrently parked Pop can never decrement the same
+// bytes again). A second Close returns 0.
 func (q *StreamQueue) Close() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -264,6 +445,13 @@ func (q *StreamQueue) Close() int {
 	}
 	q.items = nil
 	q.nBytes = 0
+	// Carried bytes were charged to the aggregate budget too (TryCarry), so
+	// they are reclaimed here alongside the primary's: this is the clean
+	// abort, where the carried tail is deliberately lost.
+	discarded += q.overflowBytes
+	discardedItems += len(q.overflow)
+	q.overflow = nil
+	q.overflowBytes = 0
 	totalBytes, totalItems := q.adjustAggregateLocked(-int64(discarded), -int64(discardedItems))
 	if q.stats != nil {
 		q.stats.observeHighQueued(totalBytes, totalItems)

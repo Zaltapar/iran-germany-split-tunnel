@@ -778,17 +778,35 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 				n.creditGate.resetStream(h.gen, id)
 			}
 			if n.creditEmitter != nil {
-				// Reset -> stamp peerGen -> emit anchor, in that order:
-				// recordPeerGen creates/updates the record and resetStream
-				// deletes it, so the stamp must come AFTER the reset or the
-				// anchor would carry a zero (rejected) peer gen. h.gen is
+				// Reset the record, then stamp peerGen: recordPeerGen
+				// creates/updates the record and resetStream deletes it, so
+				// the stamp must come AFTER the reset or subsequent data
+				// credits would carry a zero (rejected) peer gen. h.gen is
 				// this node's down generation; down generations are lockstep
 				// across both nodes, so it is the peer gen the peer's gate
 				// ledger is pinned to.
+				//
+				// SUBTASK 25 fix: do NOT emit the attach-time anchor here.
+				// A down rebind is a CARRIER RECONNECT: the peer's new
+				// generation has an EMPTY stream map until it processes this
+				// stream's FrameRebind. A go-spawned anchor would race ahead
+				// of that rebind and arrive as a FrameCredit on an
+				// UNREGISTERED stream, which the mux read loop treats as a
+				// connection-level fatal (ErrCreditUnknownStream,
+				// carrier.go:300-314) and tears the peer's down carrier down
+				// — the production reconnect STORM (carrier_loss_events 115,
+				// gen 36->130). The sender is already bounded by the 640 KiB
+				// creditPreLatchBound (UNLATCHED) plus the per-stream
+				// CreditSafeTimeout timer armed in resetStream above, and the
+				// first real data credit (relays.go recordConsumed->emit)
+				// latches the gate — so omitting the anchor preserves the
+				// plan's "bound the sender" intent without killing the
+				// carrier. Symmetric with the fresh StartSession path
+				// (node.go:1066-1082), which deliberately omits the down
+				// anchor for the same reason.
 				key := carrierKey{carrier: h.carrier, streamID: id}
 				n.creditEmitter.resetStream(key)
 				n.creditEmitter.recordPeerGen(key, h.gen)
-				go n.creditEmitter.emitAnchor(key)
 			}
 		}
 		if n.hasChannelConsumer(dir) {
@@ -941,15 +959,31 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 			n.creditGate.resetStream(h.gen, id)
 		}
 		if n.creditEmitter != nil {
-			// recordPeerGen before resetStream: the reset wipes the record
-			// (and its peerGen), so the peer generation must be re-stamped
-			// AFTER the reset, otherwise the emitted anchor carries a zero
-			// (rejected) peer gen and the sender's gate times out to
-			// SAFELY_CAPPED.
+			// Reset the record, then stamp the peer gen: recordPeerGen
+			// creates/updates the record and resetStream deletes it, so the
+			// peer generation must be re-stamped AFTER the reset, otherwise
+			// subsequent data credits carry a zero (rejected) peer gen.
+			//
+			// SUBTASK 25 fix: do NOT emit the attach-time anchor here.
+			// handleRebind is the Germany-side responder to Iran's
+			// down FrameRebind; at this moment the down stream is only
+			// registered on this node's NEW carrier, and Iran's peer-side
+			// down stream for this generation is still unregistered until
+			// it processes the rebind. A go-spawned anchor from this node
+			// would arrive as a FrameCredit on Iran's UNREGISTERED stream,
+			// which the mux read loop treats as a connection-level fatal
+			// (ErrCreditUnknownStream, carrier.go:300-314) and tears Iran's
+			// down carrier down — the production reconnect STORM
+			// (carrier_loss_events 115, gen 36->130). The sender is
+			// already bounded by the 640 KiB creditPreLatchBound (UNLATCHED)
+			// plus the per-stream CreditSafeTimeout timer armed in
+			// resetStream above, and the first real data credit latches the
+			// gate — so omitting the anchor preserves the plan's "bound the
+			// sender" intent without killing the carrier. Symmetric with
+			// the fresh StartSession path (node.go:1066-1082).
 			key := carrierKey{carrier: h.carrier, streamID: id}
 			n.creditEmitter.resetStream(key)
 			n.creditEmitter.recordPeerGen(key, gen)
-			go n.creditEmitter.emitAnchor(key)
 		}
 	}
 	// Attach BEFORE starting the consumer: the consumer's strict
@@ -1073,8 +1107,23 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	// now would tear down the peer's down carrier. The 640 KiB UNLATCHED
 	// pre-latch bound prevents any stall: the first real data credit
 	// (emitted when the receiver writes to its socket) latches the gate.
-	// The anchor IS safe on the rebind path (rebindDirection / handle-
-	// Rebind) because the stream is already registered on both sides.
+	// The anchor is NOT emitted on the rebind path either (SUBTASK 25 fix).
+	// A down rebind installs a FRESH carrier generation on both sides, on
+	// which NO stream is registered yet; the registering FrameRebind and the
+	// go-spawned anchor would both be in flight, and because the control
+	// plane (ctrlCh) is peeked ahead of the data plane (writeCh) by
+	// writeLoop, the anchor OVERTAKES the FrameRebind that registers the
+	// stream. The peer's down readLoop then sees a FrameCredit on an
+	// UNREGISTERED stream and fails it as ErrCreditUnknownStream
+	// (carrier.go:310-314), tearing the peer's down carrier down and
+	// retriggering the loss/rebind cycle — the production reconnect storm
+	// (carrier_loss_events 115, carrier gen 36->130, 09:29-09:39 UTC on
+	// 2026-10-04). The sender is already bounded by the 640 KiB UNLATCHED
+	// creditPreLatchBound plus the per-stream CreditSafeTimeout timer armed
+	// in creditGate.resetStream on every rebind, and the first real data
+	// credit (relays.go recordConsumed->emit) latches the gate, so omitting
+	// the rebind anchor preserves the plan's "bound the sender" intent
+	// without killing the carrier. Same reasoning as the fresh path above.
 	// Inert when credits are disabled (n.creditEmitter is nil).
 	if n.creditEmitter != nil {
 		n.creditEmitter.recordPeerGen(
