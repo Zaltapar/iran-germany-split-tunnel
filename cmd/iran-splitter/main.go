@@ -123,6 +123,20 @@ func (s *Splitter) closeListeners() {
 	}
 }
 
+// activeTargetAddrPolicy computes the ACTIVE egress-target address-family
+// policy for operator logging (kept symmetric with germany-splitter;
+// inert on the Iran role). The strictest of the legacy hard filter and the
+// enum wins: "ipv4-only" beats "prefer-ipv4", which beats "default".
+func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
+	if onlyIPv4 || policy == "ipv4-only" {
+		return "ipv4-only"
+	}
+	if policy == "prefer-ipv4" {
+		return "prefer-ipv4"
+	}
+	return "default"
+}
+
 func main() {
 	// Phase 8 (installer): `--validate-config` runs the Phase 7
 	// load→parse→validate→construct path and exits BEFORE any listener
@@ -139,11 +153,12 @@ func main() {
 		// Operator visibility for the opt-in egress-target address-family
 		// policy (kept symmetric with germany-splitter even though the
 		// Iran role currently never dials egress targets).
-		if vcfg.TargetOnlyIPv4 {
-			log.Printf("iran-splitter: SPLIT_TARGET_ONLY_IPV4 active (inert on this role: no egress target dial) — domains would resolve to A records only")
-		} else {
-			log.Printf("iran-splitter: SPLIT_TARGET_ONLY_IPV4 off — default dial behavior (no egress target dial on this role)")
-		}
+		// Operator visibility for the egress-target address-family policy
+		// (kept symmetric with germany-splitter even though the Iran role
+		// currently never dials egress targets — the line is informational
+		// and marks the field as inert here).
+		activePolicy := activeTargetAddrPolicy(vcfg.TargetOnlyIPv4, vcfg.TargetAddrPolicy)
+		log.Printf("iran-splitter: target dial policy = %s (inert on this role: no egress target dial)", activePolicy)
 		return
 	}
 
@@ -175,16 +190,13 @@ func main() {
 		// Set for both roles (keeps config symmetric; only the Germany
 		// role currently dials egress targets, so this is inert on Iran).
 		TargetOnlyIPv4: cfg.TargetOnlyIPv4,
+		// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+		// SUBTASK 42); inert on the Iran role (no egress target dial) but
+		// kept for config symmetry.
+		TargetAddrPolicy: cfg.TargetAddrPolicy,
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("iran-splitter: node construction: %v", err)
-	}
-	// Startup guardrail: one line making the egress-target address-family
-	// policy explicit in the operator's log. On this role the engine never
-	// dials egress targets, so the line is informational and marks the
-	// field as inert here.
-	if cfg.TargetOnlyIPv4 {
-		logger.Printf("target dial policy: IPv4-only configured (inert on Iran role — no egress target dial)")
 	}
 
 	s := &Splitter{

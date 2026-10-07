@@ -206,7 +206,8 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_SESSION_BUFFER_BYTES` | ✓ | ✓ | `262144` (256 KiB) | Per-direction reconnect buffer per session (4 KiB..16 MiB) |
 | `SPLIT_SESSION_BUFFER_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Node-level aggregate session-buffer budget (`0` = library default) |
 | `SPLIT_LIVENESS_ROUNDS` | ✓ | ✓ | `0` (3) | Blackhole detection: consecutive unanswered keepalive pings before the carrier is torn down (`0` = library default, 0..20) |
-| `SPLIT_TARGET_ONLY_IPV4` | ✓ | ✓ | `false` (off) | Opt-in only-IPv4 egress-target policy: when `true`, the node's default `TargetDial` resolves domain hosts to IPv4 (A) records only; AAAA-only domains are refused (no silent IPv6 fallback); literal IP addresses always dial as given. See `docs/target-ipv4-policy.md`. |
+| `SPLIT_TARGET_ADDR_POLICY` | ✓ | ✓ | `default` | Opt-in egress-target address-family policy: `default` (today's dual-stack dial) / `prefer-ipv4` (deterministic v4-first with v6 fallback, **recommended**) / `ipv4-only` (hard A-record filter; use with care — breaks AAAA-only endpoints). See `docs/target-ipv4-policy.md`. |
+| `SPLIT_TARGET_ONLY_IPV4` | ✓ | ✓ | `false` (off) | Opt-in **hard** only-IPv4 egress-target filter: when `true`, the node's default `TargetDial` resolves domain hosts to IPv4 (A) records only; AAAA-only domains are refused (no silent IPv6 fallback); literal IP addresses always dial as given. Use with care (breaks AAAA-only endpoints). See `docs/target-ipv4-policy.md`. |
 
 ### Configuration validation
 
@@ -220,6 +221,10 @@ at once (aggregated list) instead of one-at-a-time:
 * integers are strictly parsed (`abc`, negatives and out-of-range values
   are config errors, never silent zeros); `SPLIT_ALLOW_WEAK_SECRET` and
   `SPLIT_TARGET_ONLY_IPV4` must be real booleans (`1/0/true/false`);
+  `SPLIT_TARGET_ADDR_POLICY` must be one of `default` / `prefer-ipv4` /
+  `ipv4-only` (an unknown value is a config error naming the allowed set),
+  and `SPLIT_TARGET_ONLY_IPV4=true` combined with
+  `SPLIT_TARGET_ADDR_POLICY=prefer-ipv4` is rejected as a contradiction;
 * addresses must be `host:port` (bare `:port` allowed for listeners,
   bracketed IPv6 like `[::1]:9001`, explicit host required for dial
   targets);

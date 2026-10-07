@@ -124,15 +124,34 @@ type Config struct {
 	// This slice ships the flag as a package-level default-off Config field;
 	// env-var plumbing lives in Slice 7.
 	CreditsEnabled bool
-	// TargetOnlyIPv4 is the opt-in only-IPv4 egress-target policy
+	// TargetOnlyIPv4 is the opt-in HARD only-IPv4 egress-target filter
 	// (SPLIT_TARGET_ONLY_IPV4; default false). It only takes effect for
 	// the DEFAULT TargetDial (i.e. when TargetDial is nil at Sanitize
 	// time): domain hosts resolve to IPv4 A records only and a domain
 	// with no A record is refused — never silently dialed over IPv6.
-	// Literal IP addresses always dial as given. When a custom
-	// TargetDial is supplied it is used as-is and this field is
-	// ignored (the caller owns that dialer).
+	// Use with care: it breaks AAAA-only endpoints (the 2026-10-07
+	// WARP episode: 96 stream refusals in ~13 minutes). Prefer
+	// TargetAddrPolicy "prefer-ipv4" for general traffic. Literal IP
+	// addresses always dial as given. When a custom TargetDial is
+	// supplied it is used as-is and both policy fields are ignored
+	// (the caller owns that dialer).
 	TargetOnlyIPv4 bool
+	// TargetAddrPolicy is the egress-target address-family policy
+	// (SPLIT_TARGET_ADDR_POLICY; default "default"). Values:
+	//   - "default"     — today's byte-identical dual-stack dial
+	//     (net.DialTimeout("tcp", 10s), OS address-family preference);
+	//   - "prefer-ipv4" — dial IPv4 candidates first, fall back to
+	//     IPv6 only when no IPv4 candidate succeeds (or no IPv4 record
+	//     exists). AAAA-only domains still succeed. RECOMMENDED for
+	//     dual-homed deployments where the v6 egress leg is the
+	//     fragile one;
+	//   - "ipv4-only"   — the hard A-record filter, equivalent to
+	//     TargetOnlyIPv4=true.
+	// Unknown values are a Sanitize error naming the allowed set.
+	// Precedence: TargetOnlyIPv4=true (or "ipv4-only") is the stricter
+	// policy and wins over "prefer-ipv4"; config.Load rejects the
+	// explicit contradiction (TargetOnlyIPv4=true + "prefer-ipv4").
+	TargetAddrPolicy string
 	// TargetDial dials a logical destination (RoleGermany only).
 	// Default (nil): 10s TCP dial, address-family policy per
 	// TargetOnlyIPv4 (see target_ipv4.go).
@@ -167,8 +186,16 @@ func (c *Config) Sanitize() error {
 		return err
 	}
 	c.StreamLimits = sl
+	if c.TargetAddrPolicy != "" && !validTargetAddrPolicy(c.TargetAddrPolicy) {
+		return fmt.Errorf("unknown target address policy %q (allowed: %q, %q, %q; see SPLIT_TARGET_ADDR_POLICY)",
+			c.TargetAddrPolicy, TargetAddrPolicyDefault, TargetAddrPolicyPreferIPv4, TargetAddrPolicyIPv4Only)
+	}
+	// Merge the legacy hard-filter boolean with the enum policy: the
+	// hard filter (ipv4-only) is the stricter of the two and wins.
+	onlyIPv4 := c.TargetOnlyIPv4 || c.TargetAddrPolicy == TargetAddrPolicyIPv4Only
+	preferIPv4 := c.TargetAddrPolicy == TargetAddrPolicyPreferIPv4
 	if c.TargetDial == nil {
-		c.TargetDial = newDefaultTargetDial(c.TargetOnlyIPv4)
+		c.TargetDial = newDefaultTargetDial(onlyIPv4, preferIPv4)
 	}
 	return nil
 }

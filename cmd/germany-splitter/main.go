@@ -123,6 +123,20 @@ func (s *Splitter) closeListeners() {
 	}
 }
 
+// activeTargetAddrPolicy computes the ACTIVE egress-target address-family
+// policy for operator logging: the strictest of the legacy hard filter and
+// the enum, mirroring the precedence Config.Sanitize enforces at the
+// node. "ipv4-only" beats "prefer-ipv4", which beats "default".
+func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
+	if onlyIPv4 || policy == "ipv4-only" {
+		return "ipv4-only"
+	}
+	if policy == "prefer-ipv4" {
+		return "prefer-ipv4"
+	}
+	return "default"
+}
+
 func main() {
 	// Phase 8 (installer): `--validate-config` runs the Phase 7
 	// load→parse→validate→construct path and exits BEFORE any listener
@@ -139,10 +153,20 @@ func main() {
 		// Operator visibility for the opt-in egress-target address-family
 		// policy: surface it here so --validate-config reports the exact
 		// dial behavior the deployment will run with.
-		if vcfg.TargetOnlyIPv4 {
-			log.Printf("germany-splitter: SPLIT_TARGET_ONLY_IPV4 active — egress targets resolve to IPv4 (A) only; AAAA-only domains are refused, literal IPs dial as given")
-		} else {
-			log.Printf("germany-splitter: SPLIT_TARGET_ONLY_IPV4 off — egress targets use the default dual-stack dial (OS address-family preference)")
+		// Operator visibility for the egress-target address-family policy:
+		// surface the ACTIVE policy so --validate-config reports the exact
+		// dial behavior the deployment will run with. The active policy is
+		// the strictest set among the legacy hard filter and the enum.
+		activePolicy := activeTargetAddrPolicy(vcfg.TargetOnlyIPv4, vcfg.TargetAddrPolicy)
+		log.Printf("germany-splitter: target dial policy = %s (SPLIT_TARGET_ADDR_POLICY=%q, SPLIT_TARGET_ONLY_IPV4=%v)",
+			activePolicy, vcfg.TargetAddrPolicy, vcfg.TargetOnlyIPv4)
+		switch activePolicy {
+		case "ipv4-only":
+			log.Printf("germany-splitter: egress targets resolve to IPv4 (A) only; AAAA-only domains are refused, literal IPs dial as given (USE WITH CARE)")
+		case "prefer-ipv4":
+			log.Printf("germany-splitter: egress targets dial IPv4 first, fall back to IPv6 when no IPv4 candidate succeeds; AAAA-only domains still succeed; literal IPs dial as given")
+		default:
+			log.Printf("germany-splitter: egress targets use the default dual-stack dial (OS address-family preference)")
 		}
 		return
 	}
@@ -176,15 +200,25 @@ func main() {
 		// Set for both roles (keeps config symmetric; only the Germany
 		// role currently dials egress targets, so this is inert on Iran).
 		TargetOnlyIPv4: cfg.TargetOnlyIPv4,
+		// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+		// SUBTASK 42): "default" (today's behavior) | "prefer-ipv4" (v4-first
+		// with v6 fallback, recommended) | "ipv4-only" (hard filter).
+		TargetAddrPolicy: cfg.TargetAddrPolicy,
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("germany-splitter: node construction: %v", err)
 	}
-	// Startup guardrail: one line making the egress-target address-family
-	// policy explicit in the operator's log, matching the other startup
-	// config lines below.
-	if cfg.TargetOnlyIPv4 {
-		logger.Printf("target dial policy: IPv4-only active (SPLIT_TARGET_ONLY_IPV4=1) — domains resolve to A records; AAAA-only domains refused")
+	// Startup guardrail: one line making the ACTIVE egress-target
+	// address-family policy explicit in the operator's log, matching the
+	// other startup config lines below.
+	activePolicy := activeTargetAddrPolicy(cfg.TargetOnlyIPv4, cfg.TargetAddrPolicy)
+	switch activePolicy {
+	case "ipv4-only":
+		logger.Printf("target dial policy: IPv4-only active — domains resolve to A records; AAAA-only domains REFUSED (use with care)")
+	case "prefer-ipv4":
+		logger.Printf("target dial policy: prefer-IPv4 active — domains dial v4 first, fall back to v6 when no v4 candidate succeeds; AAAA-only domains still succeed")
+	default:
+		logger.Printf("target dial policy: default dual-stack dial (OS address-family preference)")
 	}
 
 	s := &Splitter{

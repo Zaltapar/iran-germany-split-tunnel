@@ -38,6 +38,8 @@ func isolatedEnv(t *testing.T) {
 		EnvSocksAllowedSources,
 		// Opt-in only-IPv4 target policy: pin unset (false default).
 		EnvTargetOnlyIPv4,
+		// Opt-in address-family policy (SUBTASK 42): pin unset ("default").
+		EnvTargetAddrPolicy,
 	} {
 		t.Setenv(name, "")
 	}
@@ -1071,5 +1073,99 @@ func TestLoadTargetOnlyIPv4FromEnv(t *testing.T) {
 func TestDefaultsTargetOnlyIPv4False(t *testing.T) {
 	if c := Defaults(); c.TargetOnlyIPv4 {
 		t.Fatalf("Defaults().TargetOnlyIPv4 must be false (opt-in policy, off by default)")
+	}
+}
+
+// TestLoadTargetAddrPolicyFromEnv covers the opt-in egress-target
+// address-family POLICY (SPLIT_TARGET_ADDR_POLICY, SUBTASK 42): unset =
+// "default" (byte-identical dual-stack behavior preserved), each allowed
+// value parses correctly, and an unknown value is a config error naming
+// the allowed set.
+//
+// loadGermanyForAddrPolicy builds a Germany Load with every role-required
+// field valid, then applies the policy value AFTER isolation (isolatedEnv
+// pins the variable to "", so the under-test value must be set post-isolation).
+func loadGermanyForAddrPolicy(t *testing.T, policyValue string) (*Config, error) {
+	t.Helper()
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	if policyValue != "" {
+		t.Setenv(EnvTargetAddrPolicy, policyValue)
+	}
+	return Load(RoleGermany)
+}
+
+func TestLoadTargetAddrPolicyFromEnv(t *testing.T) {
+	// Unset: default is "default" (byte-identical dual-stack behavior).
+	cfg, err := loadGermanyForAddrPolicy(t, "")
+	if err != nil {
+		t.Fatalf("Load(unset %s): %v", EnvTargetAddrPolicy, err)
+	}
+	if cfg.TargetAddrPolicy != "default" {
+		t.Fatalf("unset %s must default to %q, got %q", EnvTargetAddrPolicy, "default", cfg.TargetAddrPolicy)
+	}
+
+	// Each allowed value parses correctly.
+	for _, raw := range []string{"default", "prefer-ipv4", "ipv4-only"} {
+		cfg, err := loadGermanyForAddrPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetAddrPolicy, raw, err)
+		}
+		if cfg.TargetAddrPolicy != raw {
+			t.Fatalf("%s=%q must be stored verbatim, got %q", EnvTargetAddrPolicy, raw, cfg.TargetAddrPolicy)
+		}
+	}
+
+	// Invalid value: aggregated config error naming the variable AND the
+	// allowed set.
+	_, err = loadGermanyForAddrPolicy(t, "prefer-v6")
+	if err == nil {
+		t.Fatalf("Load(invalid %s) must fail", EnvTargetAddrPolicy)
+	}
+	if !strings.Contains(err.Error(), EnvTargetAddrPolicy) {
+		t.Fatalf("error did not name %s: %v", EnvTargetAddrPolicy, err)
+	}
+	if !strings.Contains(err.Error(), "prefer-ipv4") || !strings.Contains(err.Error(), "ipv4-only") {
+		t.Fatalf("error must name the allowed values: %v", err)
+	}
+
+	// The Iran role parses the same variable (config symmetry).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvTargetAddrPolicy, "prefer-ipv4")
+	cfg, err = Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(Iran, %s=prefer-ipv4): %v", EnvTargetAddrPolicy, err)
+	}
+	if cfg.TargetAddrPolicy != "prefer-ipv4" {
+		t.Fatalf("Iran role must parse %s too (symmetric config)", EnvTargetAddrPolicy)
+	}
+}
+
+// TestTargetAddrPolicyContradictionProves the explicit contradiction
+// (SPLIT_TARGET_ONLY_IPV4=true + SPLIT_TARGET_ADDR_POLICY=prefer-ipv4) is
+// rejected at config load so an operator cannot unknowingly mix a hard
+// filter and a soft preference.
+func TestTargetAddrPolicyContradictionRejected(t *testing.T) {
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	t.Setenv(EnvTargetOnlyIPv4, "true")
+	t.Setenv(EnvTargetAddrPolicy, "prefer-ipv4")
+	_, err := Load(RoleGermany)
+	if err == nil {
+		t.Fatal("contradictory TargetOnlyIPv4=true + TargetAddrPolicy=prefer-ipv4 must fail")
+	}
+	if !strings.Contains(err.Error(), EnvTargetOnlyIPv4) || !strings.Contains(err.Error(), EnvTargetAddrPolicy) {
+		t.Fatalf("error must name both the conflicting variables: %v", err)
+	}
+}
+
+// TestDefaultsTargetAddrPolicyPinned pins the zero-value default of the
+// new Config field so a future change cannot silently flip the policy.
+func TestDefaultsTargetAddrPolicyPinned(t *testing.T) {
+	if c := Defaults(); c.TargetAddrPolicy != "default" {
+		t.Fatalf("Defaults().TargetAddrPolicy must be %q, got %q", "default", c.TargetAddrPolicy)
 	}
 }

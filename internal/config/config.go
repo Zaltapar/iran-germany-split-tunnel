@@ -85,6 +85,14 @@ const (
 	// the Germany role currently dials egress targets, so the config
 	// stays symmetric.
 	EnvTargetOnlyIPv4 = "SPLIT_TARGET_ONLY_IPV4" // both (bool, default false)
+	// Opt-in egress-target address-family POLICY (SUBTASK 42): a single
+	// additive knob with three values that expresses every dial family
+	// behavior in one place — "default" (today's byte-identical dual-
+	// stack dial), "prefer-ipv4" (deterministic v4-first with v6
+	// fallback, the RECOMMENDED opt-in), and "ipv4-only" (the hard A-
+	// record filter, equivalent to SPLIT_TARGET_ONLY_IPV4=true). Wired
+	// on BOTH roles for symmetry.
+	EnvTargetAddrPolicy = "SPLIT_TARGET_ADDR_POLICY" // both (enum, default "default")
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -171,6 +179,22 @@ const (
 	// when no A record exists (no silent IPv6 fallback).
 	DefaultTargetOnlyIPv4 = false
 
+	// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+	// SUBTASK 42). The default "default" preserves today's byte-identical
+	// dual-stack net.DialTimeout. The three allowed values (and their
+	// semantics) are documented in docs/target-ipv4-policy.md:
+	//   - "default"     — OS dual-stack preference (today's behavior);
+	//   - "prefer-ipv4" — deterministic IPv4-first with IPv6 fallback
+	//     (RECOMMENDED for dual-homed Germany; never refuses AAAA-only);
+	//   - "ipv4-only"   — hard A-record filter (use with care — breaks
+	//     AAAA-only endpoints; 96-refusal evidence).
+	DefaultTargetAddrPolicy    = "default"
+	TargetAddrPolicyPreferIPv4 = "prefer-ipv4"
+	TargetAddrPolicyIPv4Only   = "ipv4-only"
+	// targetAddrPolicyAllowed is the valid value set, named in validation
+	// errors.
+	targetAddrPolicyAllowed = "default|prefer-ipv4|ipv4-only"
+
 	MinPort = 1
 	MaxPort = 65535
 
@@ -241,7 +265,19 @@ type Config struct {
 	// Default false preserves the existing dual-stack net.DialTimeout
 	// behavior. When true the node's default TargetDial resolves domain
 	// hosts to IPv4 only; literal IPs dial exactly as given.
-	TargetOnlyIPv4 bool // SPLIT_TARGET_ONLY_IPV4
+	TargetOnlyIPv4 bool // SPLIT_TARGET_ONLY_IPV4 (hard filter; SUBTASK-42 legacy)
+
+	// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+	// SUBTASK 42). One of "default" | "prefer-ipv4" | "ipv4-only".
+	// Default "default" preserves today's byte-identical dual-stack dial.
+	// "prefer-ipv4" is the recommended opt-in (v4-first, v6 fallback,
+	// AAAA-only still succeeds); "ipv4-only" is the hard A-record filter
+	// (equivalent to TargetOnlyIPv4=true). Unknown values are a validation
+	// error naming the allowed set. Precedence when both are set:
+	// TargetOnlyIPv4=true / "ipv4-only" is the stricter policy and wins;
+	// the explicit contradiction TargetOnlyIPv4=true + "prefer-ipv4" is a
+	// validation error.
+	TargetAddrPolicy string // SPLIT_TARGET_ADDR_POLICY
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -267,6 +303,9 @@ func Defaults() *Config {
 		// Opt-in only-IPv4 target policy default (off: preserves the
 		// existing dual-stack dial behavior).
 		TargetOnlyIPv4: DefaultTargetOnlyIPv4,
+		// Opt-in egress-target address-family policy default ("default"
+		// preserves today's byte-identical dual-stack dial; SUBTASK 42).
+		TargetAddrPolicy: DefaultTargetAddrPolicy,
 	}
 }
 
@@ -337,6 +376,12 @@ func Load(role string) (*Config, error) {
 	// EnvAllowWeak boolean convention; unset/empty keeps the default
 	// (false — current dual-stack behavior preserved).
 	c.TargetOnlyIPv4 = envBool(&problems, EnvTargetOnlyIPv4, DefaultTargetOnlyIPv4)
+	// Opt-in egress-target address-family policy (SUBTASK 42): a string
+	// enum, default "default" (today's behavior). Unset/empty keeps the
+	// default. An unknown value is rejected in Validate (naming the
+	// allowed set) rather than silently falling back to the default —
+	// a typo'd policy must not silently change dial behavior.
+	c.TargetAddrPolicy = envString(EnvTargetAddrPolicy, DefaultTargetAddrPolicy)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -494,6 +539,37 @@ func (c *Config) Validate(role string) error {
 			"%s=%d: expected 0 (library default) .. %d bytes (Issue #6 node-level aggregate session-buffer budget)",
 			EnvSessionBufTotal, c.SessionBufTotal, MaxSessionBufTotal))
 	}
+	// Opt-in egress-target address-family policy (SUBTASK 42): the value
+	// must be one of the allowed set (default|prefer-ipv4|ipv4-only); an
+	// unknown value is rejected naming the allowed set so a typo'd policy
+	// cannot silently change dial behavior.
+	// The empty string is the "unset" sentinel (a hand-constructed Config
+	// that never reads the env) and is valid — Load fills it with the
+	// default before Validate, so by the time Load's Validate runs the
+	// field is always one of the three allowed values; a directly
+	// constructed Config (tests, future non-env callers) may leave it
+	// empty and that means "default".
+	switch c.TargetAddrPolicy {
+	case "", "default", "prefer-ipv4", "ipv4-only":
+	default:
+		problems = append(problems, fmt.Sprintf(
+			"%s=%q: expected one of %s",
+			EnvTargetAddrPolicy, c.TargetAddrPolicy, targetAddrPolicyAllowed))
+	}
+	// Cross-field: the hard filter (SPLIT_TARGET_ONLY_IPV4=true) is the
+	// STRICTER policy; it is equivalent to "ipv4-only" and compatible with
+	// "default"/"ipv4-only". The explicit contradiction TargetOnlyIPv4=true
+	// + "prefer-ipv4" (hard refuse + soft fallback) is a config error, not
+	// a silent precedence, so an operator cannot unknowingly get one or
+	// the other.
+	if c.TargetOnlyIPv4 && c.TargetAddrPolicy == "prefer-ipv4" {
+		problems = append(problems, fmt.Sprintf(
+			"%s=true contradicts %s=%q: the hard IPv4-only filter refuses AAAA-only domains, while %q falls back to IPv6. Use either %s=false + %s=prefer-ipv4, or %s=true + %s=ipv4-only, not both",
+			EnvTargetOnlyIPv4, EnvTargetAddrPolicy, c.TargetAddrPolicy,
+			c.TargetAddrPolicy, EnvTargetOnlyIPv4, EnvTargetAddrPolicy,
+			EnvTargetOnlyIPv4, EnvTargetAddrPolicy))
+	}
+
 	// Cross-field: the carrier-wide budget must cover one stream's share.
 	if c.QueueBytesPerStream > 0 && c.QueueBytesTotal > 0 &&
 		c.QueueBytesTotal < c.QueueBytesPerStream {
