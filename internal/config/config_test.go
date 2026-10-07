@@ -36,6 +36,8 @@ func isolatedEnv(t *testing.T) {
 		EnvSocksUser, EnvSocksPass,
 		// SOCKS5 source-IP allowlist: pin to empty (allow-all default).
 		EnvSocksAllowedSources,
+		// Opt-in only-IPv4 target policy: pin unset (false default).
+		EnvTargetOnlyIPv4,
 	} {
 		t.Setenv(name, "")
 	}
@@ -988,5 +990,86 @@ func TestLoadSocksAllowedSourcesFromEnv(t *testing.T) {
 	}
 	if cfg2.SocksAllowedSources != "" {
 		t.Fatalf("unset SocksAllowedSources = %q, want empty (allow all)", cfg2.SocksAllowedSources)
+	}
+}
+
+// TestLoadTargetOnlyIPv4FromEnv covers the opt-in only-IPv4 target policy
+// (SPLIT_TARGET_ONLY_IPV4): unset = false (pre-policy default preserved),
+// "true"/"1" = true, "false"/"0" = false, and an invalid value is a
+// config error naming the variable (the EnvAllowWeak boolean convention).
+//
+// loadGermanyForTargetPolicy builds a Germany Load with every role-required
+// field valid, then applies the target-policy value AFTER isolation (isolatedEnv
+// pins the variable to "", so the under-test value must be set post-isolation).
+func loadGermanyForTargetPolicy(t *testing.T, targetValue string) (*Config, error) {
+	t.Helper()
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	if targetValue != "" {
+		t.Setenv(EnvTargetOnlyIPv4, targetValue)
+	}
+	return Load(RoleGermany)
+}
+
+func TestLoadTargetOnlyIPv4FromEnv(t *testing.T) {
+	// Unset: default is false (policy off, dual-stack behavior preserved).
+	cfg, err := loadGermanyForTargetPolicy(t, "")
+	if err != nil {
+		t.Fatalf("Load(unset %s): %v", EnvTargetOnlyIPv4, err)
+	}
+	if cfg.TargetOnlyIPv4 {
+		t.Fatalf("unset %s must default to false, got true", EnvTargetOnlyIPv4)
+	}
+
+	// "true" and "1" both enable the policy.
+	for _, raw := range []string{"true", "1", "TRUE", "t"} {
+		cfg, err := loadGermanyForTargetPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetOnlyIPv4, raw, err)
+		}
+		if !cfg.TargetOnlyIPv4 {
+			t.Fatalf("%s=%q must enable the policy", EnvTargetOnlyIPv4, raw)
+		}
+	}
+
+	// "false" and "0" keep it off.
+	for _, raw := range []string{"false", "0", "FALSE", "f"} {
+		cfg, err := loadGermanyForTargetPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetOnlyIPv4, raw, err)
+		}
+		if cfg.TargetOnlyIPv4 {
+			t.Fatalf("%s=%q must leave the policy off", EnvTargetOnlyIPv4, raw)
+		}
+	}
+
+	// Invalid value: aggregated config error naming the variable.
+	_, err = loadGermanyForTargetPolicy(t, "maybe")
+	if err == nil {
+		t.Fatalf("Load(invalid %s) must fail", EnvTargetOnlyIPv4)
+	}
+	if !strings.Contains(err.Error(), EnvTargetOnlyIPv4) {
+		t.Fatalf("error did not name %s: %v", EnvTargetOnlyIPv4, err)
+	}
+
+	// The Iran role parses the same variable (config symmetry).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvTargetOnlyIPv4, "true")
+	cfg, err = Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(Iran, %s=true): %v", EnvTargetOnlyIPv4, err)
+	}
+	if !cfg.TargetOnlyIPv4 {
+		t.Fatalf("Iran role must parse %s too (symmetric config)", EnvTargetOnlyIPv4)
+	}
+}
+
+// TestDefaultsTargetOnlyIPv4False pins the zero-value default of the new
+// Config field so a future change cannot silently flip the policy on.
+func TestDefaultsTargetOnlyIPv4False(t *testing.T) {
+	if c := Defaults(); c.TargetOnlyIPv4 {
+		t.Fatalf("Defaults().TargetOnlyIPv4 must be false (opt-in policy, off by default)")
 	}
 }

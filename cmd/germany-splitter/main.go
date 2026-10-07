@@ -131,10 +131,19 @@ func main() {
 	// the systemd unit is written. No other argument is interpreted;
 	// normal startup is unchanged.
 	if len(os.Args) > 1 && os.Args[1] == "--validate-config" {
-		if _, err := config.Load(config.RoleGermany); err != nil {
+		vcfg, err := config.Load(config.RoleGermany)
+		if err != nil {
 			log.Fatalf("germany-splitter: %v", err)
 		}
 		log.Printf("germany-splitter: configuration OK (role: %s)", config.RoleGermany)
+		// Operator visibility for the opt-in egress-target address-family
+		// policy: surface it here so --validate-config reports the exact
+		// dial behavior the deployment will run with.
+		if vcfg.TargetOnlyIPv4 {
+			log.Printf("germany-splitter: SPLIT_TARGET_ONLY_IPV4 active — egress targets resolve to IPv4 (A) only; AAAA-only domains are refused, literal IPs dial as given")
+		} else {
+			log.Printf("germany-splitter: SPLIT_TARGET_ONLY_IPV4 off — egress targets use the default dual-stack dial (OS address-family preference)")
+		}
 		return
 	}
 
@@ -163,9 +172,19 @@ func main() {
 		StreamLimits:            streamLimits(cfg),
 		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
 		CreditsEnabled: cfg.CreditsEnabled,
+		// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
+		// Set for both roles (keeps config symmetric; only the Germany
+		// role currently dials egress targets, so this is inert on Iran).
+		TargetOnlyIPv4: cfg.TargetOnlyIPv4,
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("germany-splitter: node construction: %v", err)
+	}
+	// Startup guardrail: one line making the egress-target address-family
+	// policy explicit in the operator's log, matching the other startup
+	// config lines below.
+	if cfg.TargetOnlyIPv4 {
+		logger.Printf("target dial policy: IPv4-only active (SPLIT_TARGET_ONLY_IPV4=1) — domains resolve to A records; AAAA-only domains refused")
 	}
 
 	s := &Splitter{

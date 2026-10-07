@@ -78,6 +78,13 @@ const (
 	// (creditPreLatchBound < MaxBytesPerStream) that the whole credit plane
 	// relies on. The pkg/node constants are the single source of truth.
 	EnvCreditsEnabled = "SPLIT_CREDITS_ENABLED" // both (bool, default false) — credit plane master on/off
+	// Opt-in only-IPv4 egress-target policy: when true, the node's
+	// default TargetDial resolves domain hosts to IPv4 (A records only)
+	// and refuses to silently fall back to IPv6; literal IP addresses
+	// bypass resolution entirely. Wired on BOTH roles even though only
+	// the Germany role currently dials egress targets, so the config
+	// stays symmetric.
+	EnvTargetOnlyIPv4 = "SPLIT_TARGET_ONLY_IPV4" // both (bool, default false)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -157,6 +164,13 @@ const (
 	// guarantee creditPreLatchBound < MaxBytesPerStream).
 	DefaultCreditsEnabled = false
 
+	// Opt-in only-IPv4 target-dial policy: false by default preserves the
+	// current net.DialTimeout("tcp") behavior for every host (dual-stack
+	// resolution, OS address-family preference). When true, domain hosts
+	// are resolved to IPv4 A records only and a clear error is returned
+	// when no A record exists (no silent IPv6 fallback).
+	DefaultTargetOnlyIPv4 = false
+
 	MinPort = 1
 	MaxPort = 65535
 
@@ -222,6 +236,12 @@ type Config struct {
 	// by design §5/§14 invariants in pkg/node/credit.go and are NOT
 	// per-operator env vars.
 	CreditsEnabled bool // SPLIT_CREDITS_ENABLED
+
+	// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
+	// Default false preserves the existing dual-stack net.DialTimeout
+	// behavior. When true the node's default TargetDial resolves domain
+	// hosts to IPv4 only; literal IPs dial exactly as given.
+	TargetOnlyIPv4 bool // SPLIT_TARGET_ONLY_IPV4
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -244,6 +264,9 @@ func Defaults() *Config {
 		SessionBufBytes:   DefaultSessionBuf,
 		// Phase B credit flow-control default (Slices 6-7): credits off.
 		CreditsEnabled: DefaultCreditsEnabled,
+		// Opt-in only-IPv4 target policy default (off: preserves the
+		// existing dual-stack dial behavior).
+		TargetOnlyIPv4: DefaultTargetOnlyIPv4,
 	}
 }
 
@@ -309,6 +332,11 @@ func Load(role string) (*Config, error) {
 	// constants and are NOT operator env vars (removing them prevents
 	// SPLIT_CREDIT_* from silently doing nothing).
 	c.CreditsEnabled = envBool(&problems, EnvCreditsEnabled, DefaultCreditsEnabled)
+	// Opt-in only-IPv4 target policy: an invalid value (anything other
+	// than 1/0/t/f/true/false) is a config error, matching the
+	// EnvAllowWeak boolean convention; unset/empty keeps the default
+	// (false — current dual-stack behavior preserved).
+	c.TargetOnlyIPv4 = envBool(&problems, EnvTargetOnlyIPv4, DefaultTargetOnlyIPv4)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)

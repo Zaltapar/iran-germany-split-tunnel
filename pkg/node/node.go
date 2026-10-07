@@ -124,8 +124,18 @@ type Config struct {
 	// This slice ships the flag as a package-level default-off Config field;
 	// env-var plumbing lives in Slice 7.
 	CreditsEnabled bool
+	// TargetOnlyIPv4 is the opt-in only-IPv4 egress-target policy
+	// (SPLIT_TARGET_ONLY_IPV4; default false). It only takes effect for
+	// the DEFAULT TargetDial (i.e. when TargetDial is nil at Sanitize
+	// time): domain hosts resolve to IPv4 A records only and a domain
+	// with no A record is refused — never silently dialed over IPv6.
+	// Literal IP addresses always dial as given. When a custom
+	// TargetDial is supplied it is used as-is and this field is
+	// ignored (the caller owns that dialer).
+	TargetOnlyIPv4 bool
 	// TargetDial dials a logical destination (RoleGermany only).
-	// Default: 10s TCP dial.
+	// Default (nil): 10s TCP dial, address-family policy per
+	// TargetOnlyIPv4 (see target_ipv4.go).
 	TargetDial func(addr string) (net.Conn, error)
 }
 
@@ -158,9 +168,7 @@ func (c *Config) Sanitize() error {
 	}
 	c.StreamLimits = sl
 	if c.TargetDial == nil {
-		c.TargetDial = func(addr string) (net.Conn, error) {
-			return net.DialTimeout("tcp", addr, 10*time.Second)
-		}
+		c.TargetDial = newDefaultTargetDial(c.TargetOnlyIPv4)
 	}
 	return nil
 }

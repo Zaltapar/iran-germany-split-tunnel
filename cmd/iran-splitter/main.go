@@ -131,10 +131,19 @@ func main() {
 	// the systemd unit is written. No other argument is interpreted;
 	// normal startup is unchanged.
 	if len(os.Args) > 1 && os.Args[1] == "--validate-config" {
-		if _, err := config.Load(config.RoleIran); err != nil {
+		vcfg, err := config.Load(config.RoleIran)
+		if err != nil {
 			log.Fatalf("iran-splitter: %v", err)
 		}
 		log.Printf("iran-splitter: configuration OK (role: %s)", config.RoleIran)
+		// Operator visibility for the opt-in egress-target address-family
+		// policy (kept symmetric with germany-splitter even though the
+		// Iran role currently never dials egress targets).
+		if vcfg.TargetOnlyIPv4 {
+			log.Printf("iran-splitter: SPLIT_TARGET_ONLY_IPV4 active (inert on this role: no egress target dial) — domains would resolve to A records only")
+		} else {
+			log.Printf("iran-splitter: SPLIT_TARGET_ONLY_IPV4 off — default dial behavior (no egress target dial on this role)")
+		}
 		return
 	}
 
@@ -162,9 +171,20 @@ func main() {
 		StreamLimits:            streamLimits(cfg),
 		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
 		CreditsEnabled: cfg.CreditsEnabled,
+		// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
+		// Set for both roles (keeps config symmetric; only the Germany
+		// role currently dials egress targets, so this is inert on Iran).
+		TargetOnlyIPv4: cfg.TargetOnlyIPv4,
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("iran-splitter: node construction: %v", err)
+	}
+	// Startup guardrail: one line making the egress-target address-family
+	// policy explicit in the operator's log. On this role the engine never
+	// dials egress targets, so the line is informational and marks the
+	// field as inert here.
+	if cfg.TargetOnlyIPv4 {
+		logger.Printf("target dial policy: IPv4-only configured (inert on Iran role — no egress target dial)")
 	}
 
 	s := &Splitter{
