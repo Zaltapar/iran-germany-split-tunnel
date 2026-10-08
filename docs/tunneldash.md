@@ -433,6 +433,39 @@ every fail-closed invariant and adds a deliberately narrow public surface.
 | Mutations stay disabled | `readOnly` defaults to `true`; `config/apply` returns 403 regardless of the token. |
 | Iran-side reachability | The dashboard is hosted on **Germany only**; it never binds a public port on Iran. Iran data is collected by the pinned-SSH collector described above. |
 
+### TLS Provisioning: Existing PEMs vs certbot DNS-01 (Arvan)
+
+The dashboard TLS cert/key live under
+`/etc/split-tunnel/dashboard/tls/{cert,key}.pem`
+(0640 `root:split-tunnel`). The installer has two ways to populate them:
+
+- **Existing** (`--cert/--key`, or `--dashboard-cert-mode existing`): the
+  operator supplies a PEM pair. This is the simplest path when you already
+  hold a valid cert for the dashboard domain (e.g. one your CDN/CDN-CDN
+  provider handed out).
+- **certbot-arvan** (`--dashboard-domain <fqdn> --dashboard-cert-mode
+  certbot-arvan`): the installer drives Let's Encrypt DNS-01 through the
+  ArvanCloud API via the reusable hook
+  [`scripts/certbot-arvan-dns.sh`](../scripts/certbot-arvan-dns.sh). This is
+  the correct choice when the dashboard is reached directly by FQDN
+  (DNS-only A record, not CDN-proxied) **and** port 443 is already owned by
+  xray — no HTTP-01 on :80 or ACME-HTTPS on :443 is needed. The hook reads
+  the Arvan API key from a 0600 env file (`ARVAN_API_KEY_FILE`, default
+  `/etc/split-tunnel/arvan/env`), creates the `_acme-challenge.<leaf>` TXT
+  record on the Arvan zone, waits for public DNS propagation, and deletes
+  the record after the challenge is verified. The key is passed to `curl`
+  via a 0600 `-K` config file and is never printed to stdout, logs, or
+  argv.
+
+After the first successful issuance the installer writes a certbot
+**deploy hook** to
+`/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh` that
+re-copies the live PEMs into the TLS dir and `systemctl restart
+tunneldash.service` on every `certbot renew` (driven by the `certbot.timer`).
+
+See [oneclick-install.md](oneclick-install.md) for the full prerequisites,
+exact commands, renewal, and rollback procedure.
+
 ### Token / BasePath / Cert Rotation
 
 1. Generate new values: `openssl rand -hex 16` (basePath),

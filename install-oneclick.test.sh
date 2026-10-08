@@ -86,6 +86,9 @@ check "parse_args: dashboard+cert+key+port" \
 check "parse_args: pairing-secret-file" \
   run_sourced 'parse_args --role iran --pairing-secret-file /tmp/b; [ "$PAIRING_SECRET_FILE" = "/tmp/b" ]'
 
+check "parse_args: dashboard-domain + certbot-arvan + arvan-api-key-file" \
+  run_sourced 'parse_args --role germany --dashboard on --dashboard-domain dash.example.com --dashboard-cert-mode certbot-arvan --arvan-api-key-file /etc/arvan.env; [ "$DASHBOARD_DOMAIN" = "dash.example.com" ]; [ "$DASHBOARD_CERT_MODE" = "certbot-arvan" ]; [ "$ARVAN_API_KEY_FILE" = "/etc/arvan.env" ]'
+
 check "parse_args: unknown flag is a hard error (exit 2)" \
   run_sourced 'rc=0; ( parse_args --bogus >/dev/null 2>&1 ) || rc=$?; [ "$rc" -eq 2 ]'
 
@@ -111,9 +114,11 @@ echo "-- end-to-end dry-runs --"
 
 IRAN_OUT="$(bash "$INSTALLER" --role iran --domain example.com --source "$HERE" --no-clone --dry-run 2>&1)"; IRAN_RC=$?
 GERMANY_OUT="$(bash "$INSTALLER" --role germany --domain example.com --source "$HERE" --no-clone --dry-run --dashboard on 2>&1)"; GERMANY_RC=$?
+GERMANY_CBT="$(bash "$INSTALLER" --role germany --domain example.com --source "$HERE" --no-clone --dry-run --dashboard on --dashboard-domain dash.example.com --dashboard-cert-mode certbot-arvan 2>&1)"; GERMANY_CBT_RC=$?
 
 check "iran dry-run exits 0" bash -c "[ $IRAN_RC -eq 0 ]"
 check "germany dry-run exits 0" bash -c "[ $GERMANY_RC -eq 0 ]"
+check "germany certbot-arvan dry-run exits 0" bash -c "[ $GERMANY_CBT_RC -eq 0 ]"
 
 contains "iran plan: bootstraps + delegates to splitterctl" "$IRAN_OUT" "[dry-run]"
 contains "iran plan: xray-consumer via install-extra (Blob B public source)" "$IRAN_OUT" "SPLITTERCTL_CONSUMER_BLOB_B"
@@ -124,6 +129,16 @@ contains "germany plan: dashboard TLS dir" "$GERMANY_OUT" "dashboard/tls"
 not_contains "dry-run output never prints the raw pairing secret" "$IRAN_OUT" "SPLITPAIRINGSECRET"
 not_contains "dry-run output never prints a 64-hex secret" \
   "$(printf '%s\n%s' "$IRAN_OUT" "$GERMANY_OUT")" "deadbeefcafe"
+
+# --- certbot-arvan dashboard cert path (dry-run, side-effect free) ---
+contains "germany certbot-arvan plan: names the dashboard domain" "$GERMANY_CBT" "dash.example.com"
+contains "germany certbot-arvan plan: runs certbot DNS-01 manual auth" "$GERMANY_CBT" "certbot-arvan-dns.sh create"
+contains "germany certbot-arvan plan: DNS-01 cleanup hook" "$GERMANY_CBT" "certbot-arvan-dns.sh delete"
+contains "germany certbot-arvan plan: deploys PEMs to the dashboard TLS dir" "$GERMANY_CBT" "dashboard/tls"
+contains "germany certbot-arvan plan: installs a renewal deploy hook" "$GERMANY_CBT" "renewal timer"
+not_contains "certbot-arvan dry-run never prints the Arvan API key" \
+  "$(printf '%s' "$GERMANY_CBT")" "ARVAN_API_KEY="
+check "arvan DNS-01 hook syntax" bash -n "$HERE/scripts/certbot-arvan-dns.sh"
 
 # Regression (defect: secret printed to stdout + 0600 log): the installer must
 # no longer echo the generated admin Bearer token value or the generated

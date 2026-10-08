@@ -63,6 +63,9 @@ OPEN_FIREWALL=0
 YES=0
 CERT_FILE=""
 KEY_FILE=""
+DASHBOARD_DOMAIN=""
+DASHBOARD_CERT_MODE=""       # existing | certbot-arvan (empty = default existing)
+ARVAN_API_KEY_FILE=""         # 0600 local file: ARVAN_API_KEY=<token>
 SPLITTER_VERSION="oneclick"
 
 # Runtime state
@@ -107,7 +110,14 @@ Options:
                               Iran Xray mode (default managed)
   --domain <upload-domain>    public upload domain (Iran + Germany up URL)
   --dashboard-port <port>     dashboard TLS port on Germany (default 8443)
-  --cert <pem> --key <pem>   Arvan/CDN cert+key for the dashboard TLS (Germany)
+  --cert <pem> --key <pem>   existing Arvan/CDN cert+key for the dashboard TLS
+  --dashboard-domain <fqdn>  dashboard public domain (Germany); enables certbot flow
+  --dashboard-cert-mode <existing|certbot-arvan>
+                              existing = use --cert/--key (default when no
+                              --dashboard-domain); certbot-arvan = obtain a TLS
+                              cert via certbot DNS-01 using the Arvan API hook
+  --arvan-api-key-file <path>
+                              0600 file with ARVAN_API_KEY=<token> (certbot-arvan)
   --pairing-secret-file <path>
                               operator-carried pairing blob (0600); securely
                               handled + deleted after use
@@ -143,6 +153,9 @@ load_env_equivalents() {
   DOMAIN="$(env_or_empty ONECLICK_DOMAIN)"
   DASHBOARD_PORT="$(env_or_empty ONECLICK_DASHBOARD_PORT)"; [ -n "$DASHBOARD_PORT" ] || DASHBOARD_PORT="8443"
   PAIRING_SECRET_FILE="$(env_or_empty ONECLICK_PAIRING_SECRET_FILE)"
+  DASHBOARD_DOMAIN="$(env_or_empty ONECLICK_DASHBOARD_DOMAIN)"
+  DASHBOARD_CERT_MODE="$(env_or_empty ONECLICK_DASHBOARD_CERT_MODE)"
+  ARVAN_API_KEY_FILE="$(env_or_empty ONECLICK_ARVAN_API_KEY_FILE)"
   if [ "$(env_or_empty ONECLICK_NO_CLONE)" = "1" ]; then NO_CLONE=1; fi
   if [ "$(env_or_empty ONECLICK_OPEN_FIREWALL)" = "1" ]; then OPEN_FIREWALL=1; fi
   if [ "$(env_or_empty ONECLICK_DRY_RUN)" = "1" ]; then DRY_RUN=1; fi
@@ -169,6 +182,9 @@ parse_args() {
       --cert) CERT_FILE="$2"; shift ;;
       --key) KEY_FILE="$2"; shift ;;
       --pairing-secret-file) PAIRING_SECRET_FILE="$2"; shift ;;
+      --dashboard-domain) DASHBOARD_DOMAIN="$2"; shift ;;
+      --dashboard-cert-mode) DASHBOARD_CERT_MODE="$2"; shift ;;
+      --arvan-api-key-file) ARVAN_API_KEY_FILE="$2"; shift ;;
       *) error "unknown argument: $1"; usage; exit 2 ;;
     esac
     shift
@@ -590,12 +606,200 @@ iran_pair_finalize() {
 readonly DASHBOARD_CONFIG="/etc/split-tunnel/dashboard/config.json"
 readonly DASHBOARD_ENV="/etc/split-tunnel/dashboard.env"
 readonly DASHBOARD_TLS_DIR="/etc/split-tunnel/dashboard/tls"
+readonly ARVAN_KEY_FILE_HOST="/etc/split-tunnel/arvan/env"
+readonly ARVAN_HOOK_DIR="/opt/split-tunnel/scripts"
+readonly ARVAN_ZONE_DEFAULT="ctoplace.ir"
+
+# ---------------------------------------------------------------------------
+# install_certbot_arvan_flow <dashboard-domain>
+#
+# Runs the full certbot DNS-01 flow via the Arvan API auth hook, places the
+# resulting PEMs at DASHBOARD_TLS_DIR (0640 root:split-tunnel), and sets up
+# auto-renewal with a deploy hook that restarts tunneldash. Fails closed on
+# ANY error. Never prints the Arvan API key or the private key.
+#
+# The hook script (scripts/certbot-arvan-dns.sh) must exist in the source
+# tree; it is copied to ARVAN_HOOK_DIR on the host. The Arvan API key is
+# read from ARVAN_API_KEY_FILE (a local 0600 file); it is copied to the
+# host at ARVAN_KEY_FILE_HOST (0600 root:root) so the certbot hook can
+# source it. The key value is never printed.
+# ---------------------------------------------------------------------------
+install_certbot_arvan_flow() {
+  local dash_domain="$1"
+  local arvan_key_src="${ARVAN_API_KEY_FILE:-}"
+  local arvan_zone="${ONECLICK_ARVAN_ZONE:-$ARVAN_ZONE_DEFAULT}"
+
+  # --- 0. Validate preconditions (fail closed) ----------------------------
+  if [ -z "$dash_domain" ]; then
+    error "certbot-arvan: --dashboard-domain is required."
+    return 1
+  fi
+  case "$dash_domain" in
+    *".${arvan_zone}") : ;;
+    *) warn "certbot-arvan: ${dash_domain} is not under the Arvan zone ${arvan_zone}; the hook must manage the correct zone." ;;
+  esac
+  if [ -z "$arvan_key_src" ] && [ ! -f "$ARVAN_KEY_FILE_HOST" ]; then
+    error "certbot-arvan: no Arvan API key file. Pass --arvan-api-key-file <path> or ensure ${ARVAN_KEY_FILE_HOST} exists on the host."
+    return 1
+  fi
+
+  # --- 1. Install certbot if missing --------------------------------------
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "installing certbot (DNS-01 via manual authenticator)..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get -y -qq install certbot
+  fi
+  _log "  [i] certbot $(certbot --version 2>/dev/null | head -1)"
+
+  # --- 2. Ensure the hook script is on the host ----------------------------
+  local hook="${ARVAN_HOOK_DIR}/certbot-arvan-dns.sh"
+  mkdir -p "$ARVAN_HOOK_DIR"
+  if [ -n "$RESOLVED_SRC" ] && [ -f "${RESOLVED_SRC}/scripts/certbot-arvan-dns.sh" ]; then
+    cp -f "${RESOLVED_SRC}/scripts/certbot-arvan-dns.sh" "$hook"
+    chmod 0755 "$hook"
+    _log "  [i] installed Arvan DNS-01 hook -> ${hook}"
+  elif [ ! -f "$hook" ]; then
+    error "certbot-arvan: hook script not found at ${hook} (copy scripts/certbot-arvan-dns.sh from the source tree)."
+    return 1
+  fi
+
+  # --- 3. Ensure the 0600 Arvan API key env file is on the host ------------
+  local key_file="$ARVAN_KEY_FILE_HOST"
+  if [ -n "$arvan_key_src" ]; then
+    # Copy the operator's local 0600 key file to the host (never print the value).
+    if [ ! -f "$key_file" ] || [ "$arvan_key_src" != "$key_file" ]; then
+      install -d -m 0700 "$(dirname "$key_file")"
+      cp -f "$arvan_key_src" "$key_file"
+      chmod 0600 "$key_file"
+      _log "  [i] Arvan API key env installed -> ${key_file} (0600; value never printed)"
+    fi
+  fi
+  [ -f "$key_file" ] || { error "certbot-arvan: ${key_file} missing; cannot proceed."; return 1; }
+
+  # --- 4. Obtain/renew the cert via DNS-01 (no :80/:443 needed) -----------
+  local leaf="${dash_domain}"
+  export ARVAN_DOMAIN="$arvan_zone"
+  export ARVAN_API_KEY_FILE="$key_file"
+
+  local auth_hook="ARVAN_DOMAIN=${arvan_zone} ARVAN_API_KEY_FILE=${key_file} ${hook} create \$CERTBOT_DOMAIN \$CERTBOT_VALIDATION"
+  local cleanup_hook="ARVAN_DOMAIN=${arvan_zone} ARVAN_API_KEY_FILE=${key_file} ${hook} delete \$CERTBOT_DOMAIN"
+
+  # Use the system ACME server (Let's Encrypt) by default; override with
+  # ONECLICK_ACME_SERVER (e.g. https://acme-staging-v02.api.letsencrypt.org/directory).
+  local acme_server="${ONECLICK_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+
+  info "obtaining TLS cert for ${dash_domain} via certbot DNS-01 (Arvan zone ${arvan_zone}, ${acme_server})..."
+  if ! certbot certificate issue \
+      --manual \
+      --preferred-challenges dns \
+      -d "$leaf" \
+      --manual-auth-hook "$auth_hook" \
+      --manual-cleanup-hook "$cleanup_hook" \
+      --server "$acme_server" \
+      --key-type ecdsa \
+      --non-interactive \
+      --agree-tos \
+      --register-unsafely-without-email \
+      2>/dev/null; then
+    # Retry once; DNS propagation may just be slow.
+    _log "  [!] first certbot attempt failed; retrying in 30s..."
+    sleep 30
+    certbot certificate issue \
+      --manual \
+      --preferred-challenges dns \
+      -d "$leaf" \
+      --manual-auth-hook "$auth_hook" \
+      --manual-cleanup-hook "$cleanup_hook" \
+      --server "$acme_server" \
+      --key-type ecdsa \
+      --non-interactive \
+      --agree-tos \
+      --register-unsafely-without-email \
+      2>/dev/null || {
+      error "certbot-arvan: failed to obtain cert for ${dash_domain} (2 attempts). Check Arvan DNS-01 propagation and the ACME server."
+      return 1
+    }
+  fi
+  _log "  [i] certbot issued/updated cert for ${dash_domain}."
+
+  # --- 5. Deploy the PEMs into the dashboard TLS dir ----------------------
+  local live_dir="/etc/letsencrypt/live/${leaf}"
+  if [ ! -f "${live_dir}/cert.pem" ] || [ ! -f "${live_dir}/privkey.pem" ]; then
+    error "certbot-arvan: expected ${live_dir}/cert.pem + privkey.pem not found."
+    return 1
+  fi
+  cp -f "${live_dir}/cert.pem" "${DASHBOARD_TLS_DIR}/cert.pem"
+  cp -f "${live_dir}/privkey.pem" "${DASHBOARD_TLS_DIR}/key.pem"
+  chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
+  chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
+  local expiry
+  expiry="$(openssl x509 -enddate -noout -in "${DASHBOARD_TLS_DIR}/cert.pem" 2>/dev/null || echo '<unknown>')"
+  _log "  [i] dashboard TLS cert installed -> ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel). cert expires: ${expiry}"
+
+  # --- 6. Set up auto-renewal with a deploy hook --------------------------
+  # The deploy hook runs on every `certbot renew` for this cert and:
+  #  (a) re-copies the live PEMs into the dashboard TLS dir;
+  #  (b) restarts tunneldash.service if it is active.
+  local deploy_hook="/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh"
+  install -d -m 0755 "$(dirname "$deploy_hook")"
+  cat > "$deploy_hook" <<DEPLOFILE
+#!/usr/bin/env bash
+# certbot deploy hook for the split-tunnel dashboard.
+# \$1 = the domain being renewed (e.g. dash.ctoplace.ir)
+set -euo pipefail
+domain="\$1"
+tls_dir="/etc/split-tunnel/dashboard/tls"
+live="/etc/letsencrypt/live/\${domain}"
+if [ -f "\${live}/cert.pem" ]; then
+  cp -f "\${live}/cert.pem" "\${tls_dir}/cert.pem"
+  cp -f "\${live}/privkey.pem" "\${tls_dir}/key.pem"
+  chown root:split-tunnel "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem" 2>/dev/null || true
+  chmod 0640 "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem"
+fi
+if systemctl is-active tunneldash.service >/dev/null 2>&1; then
+  systemctl restart tunneldash.service
+fi
+DEPLOFILE
+  chmod 0755 "$deploy_hook"
+  _log "  [i] certbot deploy hook installed -> ${deploy_hook} (restarts tunneldash on renewal)"
+
+  # certbot's own renewal timer (systemd timer: certbot.timer / apt-based
+  # /etc/cron.daily on Debian) is already enabled by `certificate issue`.
+  _log "  [i] certbot auto-renewal timer is enabled (certbot.timer)."
+  _log "  [i] certbot-arvan flow complete for ${dash_domain}."
+}
 
 generate_dashboard() {
   readonly DASHBOARD_TOKEN="/etc/split-tunnel/dashboard/token"
+  # Resolve the effective cert mode: explicit flag wins; --dashboard-domain
+  # (with no explicit mode) implies certbot-arvan.
+  local cert_mode="${DASHBOARD_CERT_MODE:-existing}"
+  if [ -n "$DASHBOARD_DOMAIN" ] && [ -z "$DASHBOARD_CERT_MODE" ]; then
+    cert_mode="certbot-arvan"
+  fi
+
   if [ "$DRY_RUN" -eq 1 ]; then
     _log "  [dry-run] generate ${DASHBOARD_CONFIG} + ${DASHBOARD_ENV} (TLS 0.0.0.0:${DASHBOARD_PORT}, random 32-hex basePath)"
-    _log "  [dry-run] copy --cert/--key into ${DASHBOARD_TLS_DIR}/ (0640 root:split-tunnel)"
+    case "$cert_mode" in
+      certbot-arvan)
+        local d="${DASHBOARD_DOMAIN:-}"
+        _log "  [dry-run] certbot-arvan: domain=$d api-key-file=${ARVAN_API_KEY_FILE:-<default>}"
+        _log "  [dry-run] install certbot if missing; ensure hook at /opt/split-tunnel/scripts/certbot-arvan-dns.sh"
+        _log "  [dry-run] certbot certificate issue --manual --preferred-challenges dns -d $d"
+        _log "             --manual-auth-hook /opt/split-tunnel/scripts/certbot-arvan-dns.sh create \$CERTBOT_DOMAIN \$CERTBOT_VALIDATION"
+        _log "             --manual-cleanup-hook /opt/split-tunnel/scripts/certbot-arvan-dns.sh delete \$CERTBOT_DOMAIN"
+        _log "  [dry-run] deploy hook: copy /etc/letsencrypt/live/$d/{cert,privkey}.pem -> ${DASHBOARD_TLS_DIR}/ + chown root:split-tunnel"
+        _log "  [dry-run] renewal timer: certbot renew with deploy hook that restarts tunneldash"
+        ;;
+      *)
+        if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+          _log "  [dry-run] copy --cert/--key into ${DASHBOARD_TLS_DIR}/ (0640 root:split-tunnel)"
+        else
+          _log "  [dry-run] warning: no --cert/--key supplied; dashboard TLS dir is ${DASHBOARD_TLS_DIR}/ (PEMs must be copied there, or use --dashboard-domain/--dashboard-cert-mode certbot-arvan)"
+        fi
+        ;;
+    esac
     _log "  [dry-run] generate admin bearer token -> ${DASHBOARD_TOKEN} (0600; value never logged)"
     _log "  [dry-run] write + enable hardened tunneldash.service (golden-pinned)"
     DASHBOARD_BASEPATH="<random-32-hex>"
@@ -606,15 +810,23 @@ generate_dashboard() {
   basepath="$(openssl rand -hex 16)"
 
   mkdir -p "$DASHBOARD_TLS_DIR"; chmod 0750 "$DASHBOARD_TLS_DIR"
-  if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
-    cp -f "$CERT_FILE" "${DASHBOARD_TLS_DIR}/cert.pem"
-    cp -f "$KEY_FILE" "${DASHBOARD_TLS_DIR}/key.pem"
-    chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
-    chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
-    _log "  [i] installed dashboard TLS cert/key into ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel)."
-  else
-    warn "no --cert/--key supplied; dashboard TLS is incomplete until PEMs are copied to ${DASHBOARD_TLS_DIR}."
-  fi
+
+  case "$cert_mode" in
+    certbot-arvan)
+      install_certbot_arvan_flow "$DASHBOARD_DOMAIN"
+      ;;
+    *)
+      if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+        cp -f "$CERT_FILE" "${DASHBOARD_TLS_DIR}/cert.pem"
+        cp -f "$KEY_FILE" "${DASHBOARD_TLS_DIR}/key.pem"
+        chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
+        chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
+        _log "  [i] installed dashboard TLS cert/key into ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel)."
+      else
+        warn "no --cert/--key supplied and --dashboard-cert-mode is not certbot-arvan; dashboard TLS is incomplete until PEMs are copied to ${DASHBOARD_TLS_DIR}."
+      fi
+      ;;
+  esac
 
   cat > "$DASHBOARD_CONFIG" <<EOF
 {
