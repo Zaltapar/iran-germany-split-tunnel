@@ -43,8 +43,17 @@ type Result struct {
 	Warnings  []string
 }
 
+// applyPrecheck is the unit-independent preflight guard for one apply: the
+// ExecStart binary must exist and be a regular file.
+func applyPrecheck(binPath string) error {
+	if st, err := os.Stat(binPath); err != nil || !st.Mode().IsRegular() {
+		return fmt.Errorf("%w: ExecStart target must exist and be a regular file (step %s)", ErrPreflight, StepPreflight)
+	}
+	return nil
+}
+
 // ApplyUnit installs (or updates) the unit described by s, transactionally.
-// It is the T8 integration contract (design §6). Root-gated; ctx-bounded;
+// It is the T8 integration contract (design §4.9). Root-gated; ctx-bounded;
 // fail-closed at every step; two-case rollback (HIGH-1).
 func ApplyUnit(ctx context.Context, m *ServiceManager, s Spec) (Result, error) {
 	if m == nil {
@@ -69,7 +78,6 @@ func ApplyUnit(ctx context.Context, m *ServiceManager, s Spec) (Result, error) {
 	}
 
 	// --- 1. preflight (nothing is modified yet) --------------------------
-	var warnings []string
 	if err := sweepCrashState(m, live); err != nil {
 		return Result{}, err
 	}
@@ -82,6 +90,70 @@ func ApplyUnit(ctx context.Context, m *ServiceManager, s Spec) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("%w: %v (step %s)", ErrSpec, err, StepRender)
 	}
+
+	return applyUnitTx(ctx, m, unit, desired)
+}
+
+// ApplyExtraUnit applies one of the installer's extra units (xray-consumer /
+// tunneldash) through the SAME transactional core as ApplyUnit: preflight →
+// render → candidate → validate → backup → atomic swap → enable → health
+// wait, with the same two-case rollback. The precheck (nil by default) adds
+// per-component filesystem assertions BEFORE any mutation (config files,
+// pointer binaries), mirroring how preflight re-asserts T8's Ensure* steps.
+// It is root-gated; ctx-bounded; fail-closed.
+func ApplyExtraUnit(ctx context.Context, m *ServiceManager, s ExtraUnitSpec, precheck func() error) (Result, error) {
+	if m == nil {
+		return Result{}, fmt.Errorf("%w: nil ServiceManager", ErrSpec)
+	}
+	if err := contextCheck(ctx); err != nil {
+		return Result{}, err
+	}
+	if err := m.rootCheck(); err != nil {
+		return Result{}, err
+	}
+	if err := s.validate(); err != nil {
+		return Result{}, err
+	}
+	unit := s.Unit
+	live, err := unitPath(unit)
+	if err != nil {
+		return Result{}, err
+	}
+
+	// --- 1. preflight (nothing is modified yet) --------------------------
+	if err := sweepCrashState(m, live); err != nil {
+		return Result{}, err
+	}
+	if err := applyPrecheck(s.BinPath); err != nil {
+		return Result{}, err
+	}
+	if precheck != nil {
+		if err := precheck(); err != nil {
+			return Result{}, err
+		}
+	}
+
+	// --- 2. desired state (pure render) ----------------------------------
+	desired, err := RenderExtraUnit(s)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %v (step %s)", ErrSpec, err, StepRender)
+	}
+
+	return applyUnitTx(ctx, m, unit, desired)
+}
+
+// applyUnitTx is the shared transactional core (steps 3–10) for every unit
+// apply path: candidate prep (byte-exact no-op), candidate validation,
+// bounded backup, atomic swap, service transition, and the exact-active
+// health gate. All pre-transaction filesystem assertions (preflight,
+// bin/pointer checks) run before this is called; nothing here mutates the
+// host until the candidate is written.
+func applyUnitTx(ctx context.Context, m *ServiceManager, unit string, desired []byte) (Result, error) {
+	live, err := unitPath(unit)
+	if err != nil {
+		return Result{}, err
+	}
+	var warnings []string
 
 	// --- 3. candidate prep / idempotent no-op ----------------------------
 	hadPrevious := false

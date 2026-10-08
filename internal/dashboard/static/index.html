@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Split-Tunnel Dashboard (local / read-only)</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<header>
+  <h1>Split-Tunnel Dashboard</h1>
+  <div class="banner" id="banner">
+    ⚠ <strong>Local fixture / read-only mode.</strong> No production hosts were contacted.
+    No secrets are displayed. The Apply button is disabled and cannot mutate any host.
+  </div>
+  <div class="toolbar">
+    <button id="refreshBtn" type="button">⟳ Refresh now</button>
+    <label class="poll"><input type="checkbox" id="pollChk" checked> Poll every <input id="pollSec" type="number" min="2" max="60" value="5"> s</label>
+    <span id="lastPoll" class="muted"></span>
+  </div>
+</header>
+
+<main>
+  <section id="overview"></section>
+
+  <section id="detail" hidden>
+    <h2><a href="#" id="detailBack">← back</a> <span id="detailTitle"></span></h2>
+    <div id="detailBody"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

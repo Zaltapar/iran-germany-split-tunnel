@@ -94,3 +94,6 @@ rollback-iran-splitter.sh
 # FINAL-SUITE: test-run evidence + the LOCAL SOCKS5 credentials file
 # (secret). NEVER commit this directory.
 final-suite/
+
+# Local backup folder (pre-deploy snapshots, unit/binary copies). Never commit.
+backups/

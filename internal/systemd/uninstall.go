@@ -37,6 +37,7 @@ var protectedUnitNames = map[string]bool{
 	"iran-splitter.service":    true,
 	"iran-origin.service":      true,
 	"xray-consumer.service":    true,
+	"tunneldash.service":       true,
 }
 
 // unitRemovalGate enforces the T1 safety guard. It MUST run before

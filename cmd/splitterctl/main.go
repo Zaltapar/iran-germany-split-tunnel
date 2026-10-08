@@ -76,6 +76,7 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/deploy"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/firewall"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/origin"
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/systemd"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
@@ -245,6 +246,11 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return fmt.Errorf("%w: install requires exactly iran or germany", errUsage)
 		}
 		return installCommand(ctx, args[1], out)
+	case "install-extra":
+		if len(args) != 2 || (args[1] != "xray-consumer" && args[1] != "tunneldash") {
+			return fmt.Errorf("%w: install-extra requires 'xray-consumer' or 'tunneldash'", errUsage)
+		}
+		return installExtraCommand(ctx, args[1], out)
 	case "pair":
 		if len(args) < 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
 			return fmt.Errorf("%w: pair requires generate, apply, or finalize", errUsage)
@@ -1186,7 +1192,7 @@ func detectGermanyHostFromInterfaces() (string, error) {
 // errors; Blob B itself contains only public Reality parameters + host/port.
 // Role gates are unchanged: Iran rejects apply/finalize mismatches, Germany
 // rejects generate/finalize.
-func pairCommand(_ context.Context, store *deploy.Store, action string, force bool, out io.Writer) error {
+func pairCommand(ctx context.Context, store *deploy.Store, action string, force bool, out io.Writer) error {
 	manifest, err := store.Load()
 	if err != nil {
 		return fmt.Errorf("pair: load deployment state: %w", err)
@@ -1201,6 +1207,7 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, force bo
 	p := deploy.Pairing{Store: store}
 	var state deploy.PairingState
 	var blob string
+	var blobB *pairing.BlobB
 	switch action {
 	case "generate":
 		if manifest.Role != deploy.RoleIran {
@@ -1260,7 +1267,7 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, force bo
 			if action != "finalize" {
 				return fmt.Errorf("pair: Iran accepts only pair finalize for Blob B")
 			}
-			_, state, err = p.ApplyB(encoded)
+			blobB, state, err = p.ApplyB(encoded)
 		}
 		if err != nil {
 			return err
@@ -1272,6 +1279,22 @@ func pairCommand(_ context.Context, store *deploy.Store, action string, force bo
 	committed, err := store.Commit(manifest, "pair-"+action)
 	if err != nil {
 		return err
+	}
+	// On Iran `pair finalize` (the exchange that supplies Blob B to Iran),
+	// the consumer config /etc/split-tunnel/xray-consumer.json is (re)written
+	// from Blob B's public parameters and the xray-consumer unit is restarted
+	// when it is active — the project-managed Iran consumer now dials Germany.
+	// This is idempotent: a re-finalize writes the byte-identical config
+	// (Blob B is deterministic from Germany's installed Reality params).
+	if action == "finalize" && blobB != nil && hasExtraUnit(committed, "xray-consumer") {
+		if err := writeConsumerConfigFromBlobB(ctx, blobB, out); err != nil {
+			// The pairing state is already committed; the consumer config
+			// write is a best-effort convergence step, not a rollback
+			// trigger. Report the failure clearly but do not fail the
+			// finalize itself (the operator can re-run pair finalize to
+			// retry, or run install-extra xray-consumer).
+			_, _ = fmt.Fprintf(out, "pair finalize: consumer config step failed: %v (re-run pair finalize or install-extra xray-consumer)\n", err)
+		}
 	}
 	// Human summary first, then the emitted blob as the LAST stdout line so a
 	// clipboard copy or `... | tail -n1` reliably captures the blob. The state
@@ -1513,10 +1536,11 @@ func configShow(_ context.Context, store *deploy.Store, out io.Writer) error {
 }
 
 func printUsage(out io.Writer) {
-	fmt.Fprintln(out, "usage: splitterctl <install|pair|status|doctor|upgrade|rollback|uninstall|recover|config>")
+	fmt.Fprintln(out, "usage: splitterctl <install|install-extra|pair|status|doctor|upgrade|rollback|uninstall|recover|config>")
 	fmt.Fprintln(out, "  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)")
 	fmt.Fprintln(out, "  doctor                              run read-only deployment checks")
 	fmt.Fprintln(out, "  install iran|germany                install a role (Linux root; env contract in package docs)")
+	fmt.Fprintln(out, "  install-extra xray-consumer|tunneldash  provision the one-click extra units (Linux root; env contract in extra.go)")
 	fmt.Fprintln(out, "  pair generate [--force]|apply|finalize  exchange pairing blobs (Germany apply also emits the return Blob B; generate refuses on finalized without --force)")
 	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")

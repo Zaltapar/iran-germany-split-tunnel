@@ -1,0 +1,27 @@
+{
+  "listenAddr": "127.0.0.1:8080",
+  "readOnly": true,
+  "refreshSec": 10,
+  "maxLogEntries": 200,
+  "maxAudit": 500,
+  "servers": [
+    {
+      "id": "iran",
+      "name": "Iran Splitter",
+      "role": "iran",
+      "address": "188.121.111.122",
+      "metricsUrl": "",
+      "sourceType": "fixture",
+      "allowMutations": false
+    },
+    {
+      "id": "germany",
+      "name": "Germany Splitter",
+      "role": "germany",
+      "address": "91.107.152.1",
+      "metricsUrl": "",
+      "sourceType": "fixture",
+      "allowMutations": false
+    }
+  ]
+}

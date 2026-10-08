@@ -73,7 +73,7 @@ func EnsureUser(ctx context.Context, ex SystemdExecutor) error {
 // READ (converged to 0640 root:split-tunnel). Rollback artifacts (.prev /
 // .tmp) are deliberately NOT here — they contain previous private keys and
 // stay 0600 root:root.
-var liveStateFiles = []string{"xray-germany.json", "Caddyfile"}
+var liveStateFiles = []string{"xray-germany.json", "Caddyfile", "xray-consumer.json"}
 
 // EnsureStateDir converges /etc/split-tunnel to 0750 root:split-tunnel and
 // the live service-readable configs to 0640 root:split-tunnel. Idempotent;
@@ -193,6 +193,36 @@ func ensureDir(dir string, perm os.FileMode, ownedByService bool) error {
 
 // isRootOwned reports whether st's owner UID is 0.
 func isRootOwned(st os.FileInfo) bool { return st.Sys() != nil && uidOf(st.Sys()) == 0 }
+
+// ConvergeRootGroup chowns a directory (or file) to root:split-tunnel and
+// converges its permission to perm. It is the exported, Linux-gated helper
+// the one-click provisioning path uses to converge the dashboard TLS
+// directory (/etc/split-tunnel/dashboard/tls, 0640 root:split-tunnel) the
+// way the checked-in tunneldash hardening expects: the non-root tunneldash
+// unit must be able to read its own TLS key, so the key is group-readable —
+// the same StateDirMode 0750 permission pattern. Refuses symlink targets.
+// On non-Linux hosts (dev) it converges permissions only (owner bits do
+// not exist), so the provisioning path remains exercisable off a Linux host.
+func ConvergeRootGroup(ctx context.Context, path string, perm os.FileMode) error {
+	if err := contextCheck(ctx); err != nil {
+		return err
+	}
+	if err := rootCheck(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		return fmt.Errorf("systemd: create %s: %w", path, err)
+	}
+	if st, lerr := os.Lstat(path); lerr == nil && st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is a symlink (refusing)", ErrUnsafeTarget, path)
+	}
+	if runtime.GOOS == "linux" {
+		if err := chownRootGroup(path); err != nil {
+			return fmt.Errorf("%w: chown %s: %v", ErrPreflight, path, err)
+		}
+	}
+	return os.Chmod(path, perm)
+}
 
 // chownRootGroup chowns path to root:split-tunnel.
 func chownRootGroup(path string) error {

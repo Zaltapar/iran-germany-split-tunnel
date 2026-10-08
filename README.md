@@ -100,6 +100,49 @@ a journal/committed role mismatch.
 > [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) and
 > [`docs/self-contained-deployment-architecture.md`](docs/self-contained-deployment-architecture.md).
 
+### One-click bootstrap — `install-oneclick.sh`
+
+`install-oneclick.sh` is the one-command bootstrap for a clean
+Ubuntu/Debian host: it installs packages, provisions a checksummed Go
+toolchain, acquires the source, builds `splitterctl` + the role splitter +
+`tunneldash`, and then **delegates every host mutation to `splitterctl`**
+(never re-implementing state or rollback — rollback is always
+`splitterctl recover`). It runs `--dry-run` safely on any dev box to print
+the full command plan without changing anything.
+
+```bash
+# Iran (bootstrap + managed xray-consumer; prints Blob A for the single
+# operator-carried pairing step):
+./install-oneclick.sh --role iran --domain ctoplace.ir --source . --no-clone
+
+# Germany (full install + TLS dashboard; consumes carried Blob A, emits
+# public Blob B back for Iran to finalize):
+./install-oneclick.sh --role germany --domain ctoplace.ir --source . --no-clone \
+    --dashboard on --dashboard-port 8443 \
+    --cert /root/dashboard.crt --key /root/dashboard.key \
+    --pairing-secret-file /root/.pairing/blob-a
+```
+
+Key properties: root + distro gated; no routing/DNS/egress touched; firewall
+changes only under `--open-firewall` (role-specific ports); **exactly one
+manual secret is ever carried** — Blob A (Iran → Germany). Blob B is public
+and is re-emitted deterministically by `pair apply`; only blob
+fingerprints reach logs. The dashboard is hosted on **Germany only**
+(TLS + random 32-hex basePath + optional admin bearer token; mutations stay
+403) and never binds a public port on Iran.
+
+Full operator guide: [`docs/oneclick-install.md`](docs/oneclick-install.md)
+(prereqs, flag/env reference, the single pairing step, dashboard access,
+uninstall, dry-run, troubleshooting, rotation, security model). Local test
+harness: [`install-oneclick.test.sh`](install-oneclick.test.sh) (sources the
+installer under `ONECLICK_TESTING=1` and asserts both `--dry-run` paths exit
+0 without creating any host path).
+
+> **Status:** implemented and exercised locally (`bash -n`, `--dry-run` for
+> both roles, `install-oneclick.test.sh`). **Not yet run on either
+> production host** — host acceptance testing is pending; no SSH, no Arvan
+> calls, and no live config changes were made during development.
+
 ### Deprecated path — interactive installer (`install.sh`)
 
 > **Status relative to the CLI:** `splitterctl` is the supported deployment

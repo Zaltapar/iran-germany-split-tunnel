@@ -70,6 +70,27 @@ type Manifest struct {
 	// (schema 1) manifest still re-marshals byte-identically.
 	ConfigFingerprint string     `json:"configFingerprint,omitempty"`
 	Revisions         []Revision `json:"revisions,omitempty"`
+	// Extra records the one-click installer's additional units (Iran
+	// xray-consumer / Germany tunneldash), which are NOT part of the core
+	// role plan (systemd_plan.go) and are provisioned by the separate
+	// `install-extra` subcommand. Each entry carries the recorded unit
+	// content hash (RenderExtraUnit bytes) and the component-specific
+	// paths. omitempty keeps legacy manifests byte-identical.
+	Extra []ExtraUnitState `json:"extra,omitempty"`
+}
+
+// ExtraUnitState is the manifest record for one extra (installer) unit. Hash
+// is the SHA-256 of the RenderExtraUnit output for that unit, so a drifted
+// unit file is detectable on re-entry. Component is "xray-consumer" or
+// "tunneldash". ConfigPath/EnvFile/BasePath are the component's owned files
+// (fingerprints only, never secret values).
+type ExtraUnitState struct {
+	Unit       string `json:"unit"`
+	Component  string `json:"component"`
+	Hash       string `json:"hash"`
+	ConfigPath string `json:"configPath,omitempty"`
+	EnvFile    string `json:"envFile,omitempty"`
+	BasePath   string `json:"basePath,omitempty"`
 }
 
 type Components struct {
