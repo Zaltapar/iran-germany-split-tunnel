@@ -13,9 +13,11 @@
 // keyFile, 32-hex basePath) the dashboard binds over TLS on its own
 // dedicated port (never 443, which Xray Reality owns), mounts the whole
 // surface under the random basePath, serves security headers, and requires
-// the admin Bearer token (SPLIT_TUNNELDASH_TOKEN or SPLIT_TUNNELDASH_TOKEN_FILE)
-// when one is configured. Non-loopback binds are refused unless the TLS
-// config is complete (fail closed).
+// browser-native HTTP Basic auth via a salted PBKDF2-HMAC-SHA256 verifier
+// file (SPLIT_TUNNELDASH_CREDENTIALS). The deprecated admin Bearer token
+// (SPLIT_TUNNELDASH_TOKEN / SPLIT_TUNNELDASH_TOKEN_FILE) remains as a
+// fallback for in-flight host builds. Non-loopback binds are refused unless
+// the TLS config is complete (fail closed).
 //
 // Usage:
 //
@@ -69,16 +71,17 @@ func main() {
 		out.WriteString("Monitoring dashboard for the Iran–Germany split-tunnel.\n")
 		out.WriteString("Safe defaults: binds to 127.0.0.1, read-only, no host access.\n")
 		out.WriteString("With a complete TLS config section it may bind a public port over TLS,\n")
-		out.WriteString("mounted under a random 32-hex basePath, with security headers and an\n")
-		out.WriteString("optional admin Bearer token (SPLIT_TUNNELDASH_TOKEN[_FILE]).\n\n")
+		out.WriteString("mounted under a random 32-hex basePath, with security headers and\n")
+		out.WriteString("browser-native HTTP Basic auth (SPLIT_TUNNELDASH_CREDENTIALS).\n\n")
 		out.WriteString("Options:\n")
 		fs.PrintDefaults()
 		out.WriteString("\nEnvironment variables:\n")
 		out.WriteString("  DASHBOARD_LISTEN               Override listen address (same as -listen)\n")
 		out.WriteString("  DASHBOARD_CONFIG               Config file path (same as -config)\n")
 		out.WriteString("  DASHBOARD_READONLY             Set to 'false' to disable read-only (requires a real mutator)\n")
-		out.WriteString("  SPLIT_TUNNELDASH_TOKEN        Admin Bearer token (secret; never logged)\n")
-		out.WriteString("  SPLIT_TUNNELDASH_TOKEN_FILE   Path to a 0600 file holding the admin token\n")
+		out.WriteString("  SPLIT_TUNNELDASH_CREDENTIALS  Path to a 0640 PBKDF2 verifier file (HTTP Basic auth; value never logged)\n")
+		out.WriteString("  SPLIT_TUNNELDASH_TOKEN        [deprecated] Admin Bearer token (fallback; never logged)\n")
+		out.WriteString("  SPLIT_TUNNELDASH_TOKEN_FILE   [deprecated] Path to a 0600 file holding the admin Bearer token\n")
 	}
 	fs.Parse(os.Args[1:])
 
@@ -142,23 +145,21 @@ func main() {
 
 	tlsMode := cfg.TLS != nil && cfg.TLS.Enabled
 
-	// Auth: when an admin Bearer token is resolvable from the environment
-	// (SPLIT_TUNNELDASH_TOKEN / _FILE) use it. The token is never logged or
-	// echoed.
-	var auth dashboard.Authenticator
-	if tok := dashboard.LoadAdminToken(); tok != "" {
-		auth = dashboard.NewBearerTokenAuthenticator(tok)
-	} else {
-		// D1b fail-closed: a server-hosted TLS build (public bind) must not run
-		// unauthenticated. If a token source was configured (env var or file
-		// path) but failed to resolve — missing file, unreadable by the service
-		// user, or empty — refuse to start rather than silently falling back
-		// to the loopback authenticator. The loopback-only local build (no TLS)
-		// keeps its documented no-token default.
-		if tlsMode && dashboard.AdminTokenConfigured() {
-			log.Fatalf("tunneldash: an admin Bearer token source is configured but the token could not be loaded; refusing to serve the public TLS build unauthenticated (check %s / %s are readable by the tunneldash user and non-empty)", dashboard.EnvAdminToken, dashboard.EnvAdminTokenFile)
+	// Resolve a usable authenticator. In tlsMode at least one credential
+	// source MUST be loadable — a public TLS listener that has no auth
+	// mechanism is refused to start (fail-closed). In loopback mode (plain
+	// HTTP on 127.0.0.1) the loopback default is safe. See
+	// resolveAuthenticator for the Basic-auth vs deprecated-Bearer ordering.
+	auth, err := resolveAuthenticator()
+	if err != nil {
+		if tlsMode {
+			// TLS build: fail closed on any unauthenticated state.
+			log.Fatalf("tunneldash: %v", err)
 		}
-		// No token configured at all: loopback-only default is safe.
+		// Non-TLS loopback build: log the misconfiguration and fall back to
+		// loopback auth (the listener itself still refuses non-loopback
+		// binds, so the "safe" default is preserved).
+		log.Printf("tunneldash: %v; falling back to loopback authenticator (listener still binds loopback-only)", err)
 		auth = dashboard.NewLoopbackAuthenticator()
 	}
 	// nil mutator = safe default (apply endpoint always refuses).
@@ -182,8 +183,11 @@ func main() {
 		log.Printf("tunneldash: listening over TLS on %s (read-only=%v, basePath=%s, servers=%d)",
 			cfg.ListenAddr, cfg.ReadOnly, bp, len(cfg.Servers))
 		log.Printf("tunneldash: UI at https://<host>:<port>%s  —  API at https://<host>:<port>%sapi/v1/", bp, bp)
-		if auth != nil && auth.Name() == "bearer" {
-			log.Println("tunneldash: admin Bearer token is active (value never logged)")
+		switch auth.Name() {
+		case "basic":
+			log.Println("tunneldash: HTTP Basic auth is active (PBKDF2 verifier; username + password never logged)")
+		case "bearer":
+			log.Println("tunneldash: deprecated admin Bearer token is active (value never logged)")
 		}
 		// The bind gate is relaxed ONLY because the TLS config is complete
 		// (validateListenAddrSecure); otherwise a public bind is refused.
@@ -202,4 +206,37 @@ func main() {
 	if err := server.ListenAndServe(ctx); err != nil {
 		log.Fatalf("tunneldash: %v", err)
 	}
+}
+
+// resolveAuthenticator selects the dashboard Authenticator. Preferred: a
+// Basic-auth PBKDF2 verifier file (SPLIT_TUNNELDASH_CREDENTIALS). Legacy
+// fallback: the deprecated Bearer token (SPLIT_TUNNELDASH_TOKEN / _FILE).
+// Returns (auth, nil) on success, or (nil, err) describing the
+// misconfiguration. The caller owns the fail-closed decision: a TLS build
+// must refuse to start when no credential source is loadable, while a
+// loopback build may fall back to the loopback authenticator.
+func resolveAuthenticator() (dashboard.Authenticator, error) {
+	if basic, _ := dashboard.LoadBasicAuthenticatorFromEnvErr(); basic != nil {
+		return basic, nil
+	}
+	if tok := dashboard.LoadAdminToken(); tok != "" {
+		log.Println("tunneldash: WARNING: using deprecated admin Bearer token; run `splitterctl rotate-dashboard-credentials` to move to HTTP Basic auth (username/password)")
+		return dashboard.NewBearerTokenAuthenticator(tok), nil
+	}
+	if dashboard.DashCredentialsConfigured() {
+		// Propagate the bounded parse/read detail (field + cause, never the
+		// verifier contents or a password) so the operator gets a diagnosable
+		// message instead of a generic "could not be loaded".
+		_, verr := dashboard.LoadBasicAuthenticatorFromEnvErr()
+		if verr != nil {
+			return nil, fmt.Errorf("a Basic-auth credential file (%s) is configured but could not be loaded: %v; refusing to start unauthenticated", dashboard.EnvDashCredentials, verr)
+		}
+		return nil, fmt.Errorf("a Basic-auth credential file (%s) is configured but could not be loaded or parsed (unreadable, empty, or not a valid PBKDF2 verifier); refusing to start unauthenticated", dashboard.EnvDashCredentials)
+	}
+	if dashboard.AdminTokenConfigured() {
+		return nil, fmt.Errorf("a deprecated Bearer-token source is configured but could not be loaded; refusing to start unauthenticated (check %s / %s, or migrate to Basic auth)", dashboard.EnvAdminToken, dashboard.EnvAdminTokenFile)
+	}
+	// No credential source at all. Safe for loopback; a misconfiguration
+	// for a TLS build (the caller detects tlsMode).
+	return nil, fmt.Errorf("no dashboard credential source configured (%s or %s unset)", dashboard.EnvDashCredentials, dashboard.EnvAdminToken)
 }

@@ -66,6 +66,7 @@ KEY_FILE=""
 DASHBOARD_DOMAIN=""
 DASHBOARD_CERT_MODE=""       # existing | certbot-arvan (empty = default existing)
 ARVAN_API_KEY_FILE=""         # 0600 local file: ARVAN_API_KEY=<token>
+ROTATE_DASH_CREDS=0          # explicit flag: --rotate-dashboard-credentials (rotate the Basic-auth credential; default = preserve existing)
 SPLITTER_VERSION="oneclick"
 
 # Runtime state
@@ -124,6 +125,11 @@ Options:
                               operator-carried pairing blob (0600); securely
                               handled + deleted after use
   --open-firewall             OPT-IN: add only the role's specific firewall ports
+  --rotate-dashboard-credentials
+                              explicit rotate of the dashboard HTTP Basic-auth
+                              credential (a re-run PRESERVES the existing
+                              credential unless this flag is set). Default =
+                              preserve (idempotent).
   --dry-run                   print the exact commands without executing them
   --uninstall                 delegate to `splitterctl uninstall`
   --yes                       non-interactive (assume yes at confirmations)
@@ -163,6 +169,7 @@ load_env_equivalents() {
   if [ "$(env_or_empty ONECLICK_DRY_RUN)" = "1" ]; then DRY_RUN=1; fi
   if [ "$(env_or_empty ONECLICK_UNINSTALL)" = "1" ]; then UNINSTALL=1; fi
   if [ "$(env_or_empty ONECLICK_YES)" = "1" ]; then YES=1; fi
+  if [ "$(env_or_empty ONECLICK_ROTATE_DASH_CREDS)" = "1" ]; then ROTATE_DASH_CREDS=1; fi
 }
 
 parse_args() {
@@ -172,6 +179,7 @@ parse_args() {
       --dry-run) DRY_RUN=1 ;;
       --uninstall) UNINSTALL=1 ;;
       --open-firewall) OPEN_FIREWALL=1 ;;
+      --rotate-dashboard-credentials) ROTATE_DASH_CREDS=1 ;;
       --yes) YES=1 ;;
       --no-clone) NO_CLONE=1 ;;
       --role) ROLE="$2"; shift ;;
@@ -630,7 +638,17 @@ iran_pair_finalize() {
 readonly DASHBOARD_CONFIG="/etc/split-tunnel/dashboard/config.json"
 readonly DASHBOARD_ENV="/etc/split-tunnel/dashboard.env"
 readonly DASHBOARD_TLS_DIR="/etc/split-tunnel/dashboard/tls"
+# Deprecated legacy admin Bearer token (pre-Basic-auth). Fresh installs no
+# longer generate it; kept as a path constant for the migration runbook so
+# an operator can locate / clean up a token a previous install left behind.
 readonly DASHBOARD_TOKEN_FILE="/etc/split-tunnel/dashboard/token"
+# HTTP Basic-auth credential store: a salted PBKDF2-HMAC-SHA256 verifier
+# (0640 root:split-tunnel, read by the tunneldash user) and a root-only
+# plaintext operator-only credential file (0600 root:root, sudo-cat to recover the actual
+# username + password; not read by the service). Provisioned by
+# `splitterctl rotate-dashboard-credentials`.
+readonly DASHBOARD_CREDENTIALS="/etc/split-tunnel/dashboard/credentials"
+readonly DASHBOARD_CRED_RETRIEVE_FILE="/etc/split-tunnel/dashboard/credentials.recovery"
 readonly ARVAN_KEY_FILE_HOST="/etc/split-tunnel/arvan/env"
 readonly ARVAN_HOOK_DIR="/opt/split-tunnel/scripts"
 readonly ARVAN_ZONE_DEFAULT="ctoplace.ir"
@@ -1012,7 +1030,12 @@ generate_dashboard() {
         fi
         ;;
     esac
-    _log "  [dry-run] generate admin bearer token -> ${DASHBOARD_TOKEN} (0640 root:split-tunnel, readable by the tunneldash user; value never logged)"
+    if [ "$ROTATE_DASH_CREDS" -eq 1 ]; then
+      _log "  [dry-run] splitterctl rotate-dashboard-credentials --fresh  (rotate HTTP Basic-auth credential -> ${DASHBOARD_CREDENTIALS} 0640 root:split-tunnel; operator-only credential file ${DASHBOARD_CRED_RETRIEVE_FILE} 0600 root:root; value never logged)"
+    else
+      _log "  [dry-run] splitterctl rotate-dashboard-credentials --if-missing  (provision HTTP Basic-auth credential if absent -> ${DASHBOARD_CREDENTIALS}; existing credential is PRESERVED on re-run; operator-only credential file ${DASHBOARD_CRED_RETRIEVE_FILE} 0600 root:root; value never logged)"
+    fi
+    _log "  [dry-run] fail-closed check: ${DASHBOARD_CREDENTIALS} must exist and be a valid PBKDF2 verifier before the dashboard TLS listener starts"
     _log "  [dry-run] write + enable hardened tunneldash.service (golden-pinned)"
     DASHBOARD_BASEPATH="<random-32-hex>"
     return 0
@@ -1094,22 +1117,50 @@ generate_dashboard() {
 EOF
   chmod 0640 "$DASHBOARD_CONFIG"
 
-  # D1a: admin bearer token. The tunneldash service runs as the non-root
-  # split-tunnel user, so the token file it reads (via SPLIT_TUNNELDASH_TOKEN_FILE)
-  # MUST be group-readable by split-tunnel: owner root, group split-tunnel, mode
-  # 0640. (0600 root:split-tunnel would leave the group's read bit off, so the
-  # service user could not read it — the D1 defect.) The env file that names the
-  # token path is also group-readable so the unit's EnvironmentFile can load it.
-  # The directory chain /etc/split-tunnel/dashboard is 0750 root:split-tunnel so
-  # the service user can traverse to the token. The value is never printed.
-  openssl rand -hex 32 > "$DASHBOARD_TOKEN"
-  chown root:split-tunnel "$DASHBOARD_TOKEN" 2>/dev/null || true
-  chmod 0640 "$DASHBOARD_TOKEN"
+  # D1a (now HTTP Basic auth): the dashboard authenticates via a salted
+  # PBKDF2-HMAC-SHA256 verifier file (0640 root:split-tunnel, group-readable
+  # so the non-root tunneldash user can read it) plus a root-only plaintext
+  # operator-only credential file (0600 root:root) that the operator `sudo cat`s to recover
+  # the actual username + password. The KDF, generator, and permissions live
+  # in `splitterctl rotate-dashboard-credentials`, so the installer only
+  # delegates — it never generates or prints the credential itself.
+  #
+  # Idempotency: the subcommand PRESERVES an existing credential on a re-run;
+  # it only generates when the verifier is absent. An explicit rotation is
+  # opt-in via --rotate-dashboard-credentials (-> the subcommand's --fresh).
+  local dash_creds_args=("--if-missing")
+  if [ "$ROTATE_DASH_CREDS" -eq 1 ]; then
+    dash_creds_args=("--fresh")
+  fi
+  run_splitterctl rotate-dashboard-credentials "${dash_creds_args[@]}"
 
-  { printf 'SPLIT_TUNNELDASH_TOKEN_FILE=%s\n' "$DASHBOARD_TOKEN"; } > "$DASHBOARD_ENV"
+  # Fail closed: a TLS/non-loopback dashboard MUST have a readable, valid
+  # Basic-auth verifier now. If the subcommand left the file missing/invalid
+  # the tunneldash binary itself will refuse to start (see main.go), but we
+  # catch it here so the install reports a clean, actionable error.
+  if [ ! -f "$DASHBOARD_CREDENTIALS" ]; then
+    error "dashboard HTTP Basic-auth credential file ${DASHBOARD_CREDENTIALS} is missing after provisioning; a TLS dashboard cannot start without a valid verifier. Re-run, or restore with \`splitterctl rotate-dashboard-credentials --recover <dir>\`."
+    return 1
+  fi
+
+  # The env file names the credential store by PATH only (never the value).
+  # SPLIT_TUNNELDASH_CREDENTIALS is the primary source the tunneldash binary
+  # reads; the legacy SPLIT_TUNNELDASH_TOKEN_FILE is emitted ONLY when a
+  # pre-Basic-auth token file already exists, so an in-flight host keeps
+  # working until the operator migrates (the binary prefers Basic when both
+  # are present). Both lines are group-readable for the unit's EnvironmentFile.
+  local env_content="SPLIT_TUNNELDASH_CREDENTIALS=${DASHBOARD_CREDENTIALS}"
+  if [ -f "$DASHBOARD_TOKEN" ]; then
+    env_content="${env_content}
+SPLIT_TUNNELDASH_TOKEN_FILE=${DASHBOARD_TOKEN}"
+  fi
+  printf '%s\n' "$env_content" > "$DASHBOARD_ENV"
   chown root:split-tunnel "$DASHBOARD_ENV" 2>/dev/null || true
   chmod 0640 "$DASHBOARD_ENV"
-  _log "  [i] generated dashboard admin bearer token -> ${DASHBOARD_TOKEN} (0640 root:split-tunnel, readable by the tunneldash user; value never printed here)"
+  _log "  [i] provisioned dashboard HTTP Basic-auth credential -> ${DASHBOARD_CREDENTIALS} (0640 root:split-tunnel, PBKDF2 verifier; never printed). Retrieve the actual username + password with: sudo cat ${DASHBOARD_CRED_RETRIEVE_FILE}"
+  if [ -f "$DASHBOARD_TOKEN" ]; then
+    _log "  [i] legacy Bearer token ${DASHBOARD_TOKEN} still present; kept for backward compatibility (the binary prefers Basic auth). To drop it, remove the file and re-run this installer."
+  fi
 
   mkdir -p /etc/split-tunnel/dashboard/ssh
   chmod 0750 /etc/split-tunnel/dashboard/ssh
@@ -1310,8 +1361,14 @@ main() {
     run_splitterctl install germany
     if [ "$DASHBOARD" = "on" ]; then
       generate_dashboard
-      export SPLIT_TUNNELDASH_TOKEN_FILE="${DASHBOARD_ENV}"
-      _log "  [i] wrote hardened tunneldash.service (Unit=split-tunnel, NoNewPrivileges, ProtectSystem=full)"
+      # systemd wiring: the hardened tunneldash.service's EnvironmentFile=
+      # loads ${DASHBOARD_ENV} (0640 root:split-tunnel), which names the
+      # credential store by path only — the binary reads
+      # SPLIT_TUNNELDASH_CREDENTIALS first, and only falls back to the legacy
+      # SPLIT_TUNNELDASH_TOKEN_FILE when a pre-Basic-auth token file was
+      # preserved for migration compatibility. No shell-level env export is
+      # required here; the unit file is the source of truth.
+      _log "  [i] wrote hardened tunneldash.service (Unit=split-tunnel, NoNewPrivileges, ProtectSystem=full) + provisioned HTTP Basic-auth credential (verifier ${DASHBOARD_CREDENTIALS} 0640 root:split-tunnel, operator-only credential file ${DASHBOARD_CRED_RETRIEVE_FILE} 0600 root:root)"
     fi
   fi
 

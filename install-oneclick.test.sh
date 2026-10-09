@@ -126,6 +126,11 @@ contains "iran plan: pairing handoff names Blob A as the single secret" "$IRAN_O
 contains "germany plan: dashboard basePath generation" "$GERMANY_OUT" "basePath"
 contains "germany plan: tunneldash.service provisioning" "$GERMANY_OUT" "tunneldash.service"
 contains "germany plan: dashboard TLS dir" "$GERMANY_OUT" "dashboard/tls"
+contains "germany plan: provisions HTTP Basic-auth credential via splitterctl" "$GERMANY_OUT" "rotate-dashboard-credentials"
+contains "germany plan: default run preserves an existing credential" "$GERMANY_OUT" "--if-missing"
+contains "germany plan: dry-run output names the credential path" "$GERMANY_OUT" "/etc/split-tunnel/dashboard/credentials"
+contains "germany plan: dry-run output names the retrieval path" "$GERMANY_OUT" "credentials.recovery"
+not_contains "germany dry-run never prints a real password value" "$GERMANY_OUT" "password: "
 not_contains "dry-run output never prints the raw pairing secret" "$IRAN_OUT" "SPLITPAIRINGSECRET"
 not_contains "dry-run output never prints a 64-hex secret" \
   "$(printf '%s\n%s' "$IRAN_OUT" "$GERMANY_OUT")" "deadbeefcafe"
@@ -159,12 +164,44 @@ check "germany pair-apply dry-run exits 0" bash -c "[ $GERMANY_PAIR_RC -eq 0 ]"
 contains "D5: pair step re-emits a fresh Blob B on stale pairing" "$GERMANY_PAIR" "B-fingerprint stale"
 contains "D5: pair step still emits the public Blob B" "$GERMANY_PAIR" "Blob B"
 
-# --- D1: token readability + directory traversal (source-level, dry-run safe) ---
-contains "D1: token written 0640 root:split-tunnel (group-readable by service user)" \
-  "$STATIC_SRC" 'chmod 0640 "$DASHBOARD_TOKEN"'
-contains "D1: env file naming the token is group-readable" "$STATIC_SRC" 'chmod 0640 "$DASHBOARD_ENV"'
+# --- D1: credential readability + directory traversal (source-level, dry-run safe) ---
+# The HTTP Basic-auth credential store is a 0640 root:split-tunnel PBKDF2
+# verifier (group-readable by the non-root service user) inside a 0750
+# root:split-tunnel dir; the env file that names it by path is 0640. The
+# KDF + generator + perms live in `splitterctl rotate-dashboard-credentials`;
+# the installer only delegates and never prints the value.
+contains "D1: env file naming the credential is group-readable" "$STATIC_SRC" 'chmod 0640 "$DASHBOARD_ENV"'
 contains "D1: dashboard dir is group-traversable (0750)" "$STATIC_SRC" 'chmod 0750 "$DASHBOARD_DIR"'
-contains "D1: token path is a fixed readonly constant" "$STATIC_SRC" 'readonly DASHBOARD_TOKEN="$DASHBOARD_TOKEN_FILE"'
+contains "D1: credential path is a fixed readonly constant" "$STATIC_SRC" 'readonly DASHBOARD_CREDENTIALS="/etc/split-tunnel/dashboard/credentials"'
+contains "D1: retrieval file path is a fixed readonly constant" "$STATIC_SRC" 'readonly DASHBOARD_CRED_RETRIEVE_FILE="/etc/split-tunnel/dashboard/credentials.recovery"'
+
+# --- D7: HTTP Basic-auth credential provisioning (idempotent + fail-closed) ---
+contains "D7: installer delegates credential provisioning to splitterctl" \
+  "$STATIC_SRC" 'run_splitterctl rotate-dashboard-credentials'
+contains "D7: default run preserves the existing credential (--if-missing)" \
+  "$STATIC_SRC" 'dash_creds_args=("--if-missing")'
+contains "D7: explicit --rotate-dashboard-credentials rotates (--fresh)" \
+  "$STATIC_SRC" 'dash_creds_args=("--fresh")'
+contains "D7: fail-closed when the credential file is missing after provisioning" \
+  "$STATIC_SRC" 'if [ ! -f "$DASHBOARD_CREDENTIALS" ]; then'
+contains "D7: env file names SPLIT_TUNNELDASH_CREDENTIALS by path only" \
+  "$STATIC_SRC" 'SPLIT_TUNNELDASH_CREDENTIALS=${DASHBOARD_CREDENTIALS}'
+
+# parse_args: the new rotate flag toggles ROTATE_DASH_CREDS.
+check "parse_args: --rotate-dashboard-credentials sets ROTATE_DASH_CREDS=1" \
+  run_sourced 'parse_args --role germany --rotate-dashboard-credentials; [ "$ROTATE_DASH_CREDS" = "1" ]'
+check "parse_args: default ROTATE_DASH_CREDS is 0" \
+  run_sourced 'parse_args --role germany; [ "$ROTATE_DASH_CREDS" = "0" ]'
+
+# No-echo / no-log: the installer NEVER prints the generated password value.
+# The KDF generator is delegated; there is no openssl rand for the credential,
+# and no shell substitution of the credential value into stdout/log.
+not_contains "D7: installer no longer mints the admin credential with openssl" \
+  "$STATIC_SRC" 'openssl rand -hex 32 > "$DASHBOARD_TOKEN"'
+not_contains "D7: installer never interpolates a credential value into a log line" \
+  "$(printf '%s' "$NOCOMMENTS")" '$(cat "$DASHBOARD_CREDENTIALS'
+not_contains "D7: installer never interpolates the retrieval value into a log line" \
+  "$(printf '%s' "$NOCOMMENTS")" '$(cat "$DASHBOARD_CRED_RETRIEVE_FILE'
 
 # --- D2: the served certFile must be the FULL CHAIN (source-level) ---------
 contains "D2: dashboard TLS deploy source is fullchain.pem" "$STATIC_SRC" 'fullchain.pem'

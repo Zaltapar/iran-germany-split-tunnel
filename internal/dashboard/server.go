@@ -277,6 +277,11 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		if _, err := s.auth.Authenticate(r); err != nil {
 			var hErr *httpError
 			if ok := asHTTPError(err, &hErr); ok {
+				if hErr.Code == http.StatusUnauthorized && hErr.Www != "" {
+					// HTTP Basic challenge: makes the browser prompt once,
+					// then cache + auto-send credentials for the origin.
+					w.Header().Set("WWW-Authenticate", hErr.Www)
+				}
 				writeJSONError(w, hErr.Code, hErr.Msg)
 			} else {
 				writeJSONError(w, http.StatusUnauthorized, "authentication failed")

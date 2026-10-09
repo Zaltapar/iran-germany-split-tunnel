@@ -26,7 +26,7 @@ Design: [`plans/oneclick-installer-design.md`](../plans/oneclick-installer-desig
 | No routing/DNS/egress | The installer never touches routing tables, DNS, or egress. |
 | Firewall is opt-in | `--open-firewall` adds *only* the role's specific ports via `splitterctl install` (`SPLITTERCTL_FW_ALLOW`). Without the flag, no firewall mutation happens. |
 | One secret carried | The only human-carried secret is **Blob A** (Iran → Germany). **Blob B is public** (Reality public params + down host/port) and is never carried on the secret path; only fingerprints of blobs are logged. `--pairing-secret-file` is securely deleted after use. |
-| No secrets in logs | The install log (`/var/log/split-tunnel-install.log`, 0600) and stdout carry fingerprints and *names* of secrets only — never values. The dashboard basePath and admin token are generated credentials (not the tunnel secret); they are written to their on-disk homes (the 0640 dashboard `config.json` and the 0600 token file) and are **never echoed to stdout or the log** — recover them from those files. |
+| No secrets in logs | The install log (`/var/log/split-tunnel-install.log`, 0600) and stdout carry fingerprints and *names* of secrets only — never values. The dashboard basePath and Basic-auth credentials are generated at install; the PBKDF2 verifier is written to the 0640 `root:split-tunnel` file `/etc/split-tunnel/dashboard/credentials` and an operator-only plaintext retrieval file to 0600 `root:root` `/etc/split-tunnel/dashboard/credentials.recovery`. **The actual password value is never echoed to stdout, the log, or argv** — recover it with `sudo cat /etc/split-tunnel/dashboard/credentials.recovery` over SSH. |
 | Rollback | Always `splitterctl recover` (journal-driven) — the installer adds no alternative path. |
 
 ---
@@ -88,26 +88,51 @@ Blob B is then securely deleted on both sides.
   32-hex basePath); otherwise the strict loopback bind applies.
 - Security headers (HSTS, CSP, `X-Content-Type-Options`,
   `X-Frame-Options`, `Referrer-Policy`) are set on every TLS response.
-- An admin Bearer token is generated at
-  `/etc/split-tunnel/dashboard/token` (**0640 `root:split-tunnel`**, value
-  read from that file, never printed). The `0640` group-read bit is required
+- **HTTP Basic Auth (username/password)** is the primary authentication for
+  server-hosted TLS deployments. A PBKDF2-HMAC-SHA256 verifier
+  (210 000 iterations, 16-byte salt) is generated at install and written to
+  `/etc/split-tunnel/dashboard/credentials`
+  (**0640 `root:split-tunnel`**). The `0640` group-read bit is required
   because `tunneldash` runs as the non-root `split-tunnel` user and reads the
-  token via `SPLIT_TUNNELDASH_TOKEN_FILE` — a `0600` file would be unreadable
-  to the service user and the dashboard would start with **no** token
-  (D1 defect). The parent dir `/etc/split-tunnel/dashboard` is `0750
-  root:split-tunnel` so the service user can traverse to the token.
-  - **Token gating policy (D1c):** the admin Bearer token gates **only the
-    mutation endpoints** (POST `.../config/apply`, which are disabled —
-    mutations stay 403). Read-only GET/HEAD endpoints under the random
-    `basePath` are **intentionally open**: the random 32-hex `basePath` + TLS
-    is the access control for the read surface. This is the documented design
-    choice, not a regression.
+  verifier via `SPLIT_TUNNELDASH_CREDENTIALS` — a `0600` file would be
+  unreadable to the service user and the dashboard would start with **no**
+  authentication (D1 defect). The parent dir `/etc/split-tunnel/dashboard` is
+  `0750 root:split-tunnel` so the service user can traverse to the verifier.
+  - **Auth gating policy:** every request to the TLS listener (UI GET, API
+    GET, and mutation endpoints) must present valid Basic credentials
+    (username `admin` + the generated password). Unauthenticated requests
+    receive `401` with `WWW-Authenticate: Basic realm="TunnelDash",
+    charset="UTF-8"`; the browser then shows its native credential prompt.
+    The mutation-endpoint read-only policy is unchanged: POST
+    `.../config/apply` remains 403 for everyone, including the authenticated
+    user.
+  - **Safe retrieval:** the actual username/password is written at install to
+    the operator-only file
+    `/etc/split-tunnel/dashboard/credentials.recovery` (**0600 `root:root`**).
+    The service does **not** read this file — it is exclusively for the
+    operator. Retrieve the credentials over SSH:
+    `sudo cat /etc/split-tunnel/dashboard/credentials.recovery`. The value
+    is never printed to stdout, the install log, or argv.
   - **Fail-closed (D1b):** a server-hosted **TLS** build must not serve
-    unauthenticated. If a token source is configured (env var or file path)
-    but the value cannot be loaded (file missing, unreadable, or empty),
-    `tunneldash` **refuses to start** the public TLS listener rather than
-    silently falling back to the loopback authenticator. The loopback-only
-    local build (no TLS) keeps its documented no-token default.
+    unauthenticated. If a credential source is configured (env var or file
+    path) but the verifier cannot be loaded (file missing, unreadable, or
+    malformed), `tunneldash` **refuses to start** the public TLS listener
+    rather than silently falling back to the loopback authenticator. The
+    loopback-only local build (no TLS) keeps its documented
+    no-credential default.
+  - **Legacy Bearer token (deprecated):** the previous
+    `SPLIT_TUNNELDASH_TOKEN_FILE` mechanism is retained as a fallback for
+    in-flight hosts. When both a Basic-credentials file and a Bearer token
+    file are present, Basic auth takes precedence. To migrate: rotate the
+    Basic credentials (`splitterctl rotate-dashboard-credentials --fresh`),
+    confirm the dashboard works, then remove the legacy token file
+    (`rm /etc/split-tunnel/dashboard/token`) and the
+    `SPLIT_TUNNELDASH_TOKEN_FILE` line from `/etc/split-tunnel/dashboard.env`.
+- **Rotation:** regenerate the Basic-auth credentials with
+  `splitterctl rotate-dashboard-credentials --fresh` and restart the service
+  (`systemctl restart tunneldash.service`). The rotation is idempotent when
+  called without `--fresh` (default `--if-missing` preserves existing
+  credentials on re-run).
 - Certs/key live under `/etc/split-tunnel/dashboard/tls/`
   (0640 `root:split-tunnel`). The served `certFile` is the **FULL CHAIN**
   (leaf + intermediates), never a leaf-only cert (D2).
@@ -296,6 +321,7 @@ method: DNS-01-via-Arvan-hook vs HTTP-01-standalone).
 | `--dashboard-cert-mode <existing\|certbot-arvan\|http01>` | `ONECLICK_DASHBOARD_CERT_MODE` | `existing` = use `--cert/--key` (full chain); `certbot-arvan` = obtain via certbot DNS-01 + Arvan API; `http01` = obtain via certbot HTTP-01 standalone on :80 |
 | `--arvan-api-key-file <path>` | `ONECLICK_ARVAN_API_KEY_FILE` | 0600 file with `ARVAN_API_KEY=<token>` (certbot-arvan mode) |
 | `--pairing-secret-file <path>` | `ONECLICK_PAIRING_SECRET_FILE` | operator-carried blob (0600); securely deleted after use |
+| `--rotate-dashboard-credentials` | `ONECLICK_ROTATE_DASH_CREDS=1` | Germany only; forces a fresh Basic-auth credential rotation (`splitterctl rotate-dashboard-credentials --fresh`) instead of the idempotent default (`--if-missing` preserves existing credentials on re-run) |
 | `--open-firewall` | `ONECLICK_OPEN_FIREWALL=1` | opt-in: role-specific firewall ports only |
 | `--dry-run` | `ONECLICK_DRY_RUN=1` | print the exact commands, change nothing |
 | `--uninstall` | `ONECLICK_UNINSTALL=1` | delegate to `splitterctl uninstall` |
@@ -389,14 +415,32 @@ paths. This is how the installer is exercised on a dev box.
 | Toolchain install fails | The installer prefers the distro's Go; otherwise it fetches a pinned, SHA-256-verified tarball. Check egress to go.dev. |
 | Pairing step fails | Confirm `--pairing-secret-file` holds the right blob for the right action (apply takes Blob A, finalize takes Blob B). |
 | Dashboard unreachable | Verify the basePath (32-hex; read it from the dashboard `config.json`), that `--cert`/`--key` were supplied, and that the port is reachable. The unit logs go to the journal (`systemctl -o status -n 50 tunneldash`). |
+| Dashboard asks for credentials (401) but login fails | The browser is prompting for the dashboard's Basic-auth username/password — that is expected. Retrieve the current value over SSH with `sudo cat /etc/split-tunnel/dashboard/credentials.recovery` (never printed at install). A TLS build that cannot load its credential file fails closed: the unit is down (check the journal), not serving anonymous. |
+| Dashboard started with no authentication | This must not happen on a TLS build: `tunneldash` refuses to start when the `SPLIT_TUNNELDASH_CREDENTIALS` file is missing or unparseable. Check `/etc/split-tunnel/dashboard/credentials` exists (0640 `root:split-tunnel`) and that `/etc/split-tunnel/dashboard.env` is read by the unit. |
 | Interrupted transaction | Run `splitterctl recover` — journal-driven, bounded to the journal's pre-state. |
 
 ## Security Notes / Rotation
 
-- **BasePath + admin token rotation:** regenerate with
-  `openssl rand -hex 16` (path) / `openssl rand -hex 32` (token), update
-  `/etc/split-tunnel/dashboard/config.json` (basePath) and the token file,
-  then `systemctl reload tunneldash`. Both values are 0600 and owner-restricted.
+- **Dashboard Basic-auth credential rotation:** run
+  `splitterctl rotate-dashboard-credentials --fresh` on the Germany host, then
+  `systemctl restart tunneldash.service` and re-retrieve the new value with
+  `sudo cat /etc/split-tunnel/dashboard/credentials.recovery`. Without
+  `--fresh` the command is idempotent and preserves the existing credentials.
+  The rotation rewrites both the 0640 `root:split-tunnel` verifier
+  (`credentials`) and the 0600 `root:root` operator-only retrieval file
+  (`credentials.recovery`) atomically.
+- **BasePath rotation:** regenerate with
+  `openssl rand -hex 16`, update
+  `/etc/split-tunnel/dashboard/config.json` (basePath), then
+  `systemctl reload tunneldash`. The basePath is 0600 and owner-restricted.
+- **Legacy Bearer token (deprecated):** pre-Basic-auth hosts may still carry
+  a 0640 `root:split-tunnel` token file at
+  `/etc/split-tunnel/dashboard/token` referenced by
+  `SPLIT_TUNNELDASH_TOKEN_FILE`. The Bearer path is retained only as a
+  fallback for those in-flight hosts; Basic auth takes precedence when both
+  are present. Migration: rotate the Basic credentials, confirm the
+  dashboard answers in a normal browser session, then remove the legacy token
+  file and its env line.
 - **TLS cert rotation:** replace the files under
   `/etc/split-tunnel/dashboard/tls/` and `systemctl reload tunneldash`.
 - The tunnel secret (inside Blob A) is rotated through
@@ -423,5 +467,9 @@ installer in live mode (no `--dry-run`). In that mode the installer will:
 - start/restart the `tunneldash.service` unit.
 
 All other DNS records are untouched. No secrets (Arvan API key, tunnel
-secret, basePath, admin token) are ever printed to stdout, the install log,
-or argv.
+secret, basePath, dashboard Basic-auth password) are ever printed to stdout,
+the install log, or argv. The Basic-auth password value is written only to
+the operator-only 0600 `root:root` retrieval file
+`/etc/split-tunnel/dashboard/credentials.recovery` and is recovered over
+SSH with `sudo cat` — it never passes through the installer, a shell
+history entry, or the process environment.

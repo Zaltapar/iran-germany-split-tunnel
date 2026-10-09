@@ -75,9 +75,16 @@ func (a *BearerTokenAuthenticator) Authenticate(r *http.Request) (http.Handler, 
 }
 
 // httpError is a typed authentication error the handler can detect.
+// Www, when non-empty, is emitted as the WWW-Authenticate response
+// header on the 401 so a browser can prompt for (and cache) Basic
+// credentials. It is empty for every non-HTTP-Basic error.
 type httpError struct {
 	Code int
 	Msg  string
+	// Www is the value of the WWW-Authenticate header to send on a 401,
+	// e.g. `Basic realm="TunnelDash", charset="UTF-8"`. Empty when the
+	// error is not an authentication challenge.
+	Www string
 }
 
 func (e *httpError) Error() string { return e.Msg }

@@ -268,6 +268,11 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return fmt.Errorf("%w: install-extra requires 'xray-consumer' or 'tunneldash'", errUsage)
 		}
 		return installExtraCommand(ctx, args[1], out)
+	case "rotate-dashboard-credentials":
+		// `rotate-dashboard-credentials [--fresh] [--recover <dir>]`.
+		// Exactly one of the two flags (or neither, for idempotent no-op).
+		// The remaining args are passed through to the command handler.
+		return rotateDashboardCredentialsCommand(ctx, out, args[1:])
 	case "pair":
 		if len(args) < 2 || (args[1] != "generate" && args[1] != "apply" && args[1] != "finalize") {
 			return fmt.Errorf("%w: pair requires generate, apply, or finalize", errUsage)
@@ -1553,11 +1558,12 @@ func configShow(_ context.Context, store *deploy.Store, out io.Writer) error {
 }
 
 func printUsage(out io.Writer) {
-	fmt.Fprintln(out, "usage: splitterctl <install|install-extra|pair|status|doctor|upgrade|rollback|uninstall|recover|config>")
+	fmt.Fprintln(out, "usage: splitterctl <install|install-extra|pair|status|doctor|upgrade|rollback|uninstall|recover|config|rotate-dashboard-credentials>")
 	fmt.Fprintln(out, "  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)")
 	fmt.Fprintln(out, "  doctor                              run read-only deployment checks")
 	fmt.Fprintln(out, "  install iran|germany                install a role (Linux root; env contract in package docs)")
 	fmt.Fprintln(out, "  install-extra xray-consumer|tunneldash  provision the one-click extra units (Linux root; env contract in extra.go)")
+	fmt.Fprintln(out, "  rotate-dashboard-credentials [--fresh|--if-missing|--recover <dir>]  provision/rotate the dashboard Basic-auth PBKDF2 verifier + root-only retrieval file (Linux root)")
 	fmt.Fprintln(out, "  pair generate [--force]|apply|finalize  exchange pairing blobs (Germany apply also emits the return Blob B; generate refuses on finalized without --force)")
 	fmt.Fprintln(out, "  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)")
 	fmt.Fprintln(out, "  rollback --to state-id              converge the host to a retained revision (Linux root)")

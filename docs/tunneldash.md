@@ -406,12 +406,21 @@ tunnel to the host and use a bearer token for cross-host API access.
 
 ---
 
-## Server-Hosted Mode: TLS + BasePath + Admin Token (One-Click Installer)
+## Server-Hosted Mode: TLS + BasePath + HTTP Basic Auth (One-Click Installer)
 
-The default build stays local-only (loopback, plain HTTP, fixture data). The
-one-click installer's Germany deployment runs a **server-hosted** variant
-(`NewTLSServer`, `cmd/tunneldash` with the `tls` config block) that keeps
-every fail-closed invariant and adds a deliberately narrow public surface.
+The default build stays local-only (loopback, plain HTTP, fixture data, no
+credentials). The one-click installer's Germany deployment runs a
+**server-hosted** variant (`NewTLSServer`, `cmd/tunneldash` with the `tls`
+config block) that keeps every fail-closed invariant and adds a deliberately
+narrow public surface.
+
+Browser-native **HTTP Basic Auth** (username + password) is the
+documented UX for the TLS build: the browser prompts once, then caches
+the credentials for the origin and re-sends them automatically on every
+same-origin request (UI GET + `/api/v1/...` fetch calls). The 32-hex
+`basePath` does NOT reset the cache (it is part of the path, not the
+origin). To clear a cached credential set, close and re-open the browser,
+or delete the saved password entry from the browser's password manager.
 
 ### Config Schema Extension
 
@@ -427,11 +436,106 @@ every fail-closed invariant and adds a deliberately narrow public surface.
 | Invariant | Enforcement |
 |-----------|-------------|
 | Public bind only with complete TLS | `validateListenAddrSecure`: a non-loopback `listenAddr` is accepted ONLY when `tls.enabled` + `certFile` + `keyFile` + a valid 32-hex `basePath` are all present (`TLSConfig.IsSecure`). Any other non-loopback bind is refused exactly as in the local build. |
-| basePath is an access secret | When set, ALL routes (UI + `/api/v1/...`) are mounted under `/<basePath>/`; requests outside the prefix return `404`. The random path is the first layer of access control. |
+| basePath is an access secret | When set, ALL routes (UI + `/api/v1/...`) are mounted under `/<basePath>/`; requests outside the prefix return `404`. The random path is a second access barrier, **not a substitute for authentication**. |
 | Security headers | In TLS mode every response carries `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. |
-| Admin bearer token | `LoadAdminToken` reads `SPLIT_TUNNELDASH_TOKEN` (explicit value) or `SPLIT_TUNNELDASH_TOKEN_FILE` (0600 file, by path only). The value is never logged or echoed. It gates mutation endpoints; read endpoints remain reachable under TLS + basePath. |
-| Mutations stay disabled | `readOnly` defaults to `true`; `config/apply` returns 403 regardless of the token. |
+| HTTP Basic auth (browser-native) | `BasicAuthenticator` (see [`internal/dashboard/basic_auth.go`](../internal/dashboard/basic_auth.go)) loads a salted PBKDF2-HMAC-SHA256 verifier file (`SPLIT_TUNNELDASH_CREDENTIALS`; a path, never a value) and validates every request's `Authorization: Basic …` in constant time. Every protected request that lacks or fails authentication receives `401` with `WWW-Authenticate: Basic realm="TunnelDash", charset="UTF-8"` — exactly the string a standard browser's credential prompt needs. |
+| Fail-closed public bind | A TLS build with **no resolvable credential source** (Basic verifier AND the deprecated Bearer fallback both absent) refuses to start (`main.go::resolveAuthenticator`). |
+| Mutations stay disabled | `readOnly` defaults to `true`; `config/apply` returns 403 regardless of authentication. |
 | Iran-side reachability | The dashboard is hosted on **Germany only**; it never binds a public port on Iran. Iran data is collected by the pinned-SSH collector described above. |
+
+### Credential store and safe retrieval
+
+The credential store is a **salted PBKDF2-HMAC-SHA256 verifier** — never
+the plaintext password — and is the only file the `tunneldash` service
+reads. Two sibling files co-exist on the host:
+
+| File | Ownership / mode | Read by | Contains |
+|------|------------------|---------|----------|
+| `/etc/split-tunnel/dashboard/credentials` | 0640 `root:split-tunnel` | the `tunneldash` service user (group) | a single-line JSON PBKDF2 verifier (salt + iteration count + 32-byte digest); **never the plaintext password** |
+| `/etc/split-tunnel/dashboard/credentials.recovery` | 0600 `root:root` | root only | the actual `admin <password>` plaintext, for out-of-band operator retrieval |
+
+The KDF, password generator, and file permissions all live in
+[`cmd/splitterctl/dashboard_credentials.go`](../cmd/splitterctl/dashboard_credentials.go)
+behind the `rotate-dashboard-credentials` subcommand; the installer only
+delegates and **never prints the password**. The env file
+`/etc/split-tunnel/dashboard.env` names the store by **path only**
+(`SPLIT_TUNNELDASH_CREDENTIALS=`); the value is never in env, argv, logs,
+or shell history.
+
+### Retrieving the actual username / password (root-only, over SSH)
+
+The installer generates the credential but does not display it. To
+retrieve it after deployment, on the Germany host:
+
+```bash
+# Read the 0600 root-only file (NOT the 0640 verifier the service reads):
+sudo cat /etc/split-tunnel/dashboard/credentials.recovery
+#   -> admin <128-bit hex password>
+```
+
+Carry the value to your own machine out-of-band (never into a commit,
+terminal history you share, or a screenshot). The 0600 root-only file
+can be `sudo rm`-deleted after retrieval so the host holds no plaintext
+at rest; the salted verifier alone cannot be reversed to the password.
+
+### Rotation
+
+```bash
+# Explicit rotate: replace the PBKDF2 verifier AND the root-only
+# retrieval file (no stale credential survives):
+sudo /opt/split-tunnel/splitterctl rotate-dashboard-credentials --fresh
+# Then retrieve the new value the same way:
+sudo cat /etc/split-tunnel/dashboard/credentials.recovery
+# Restart the dashboard so the fresh verifier is loaded:
+sudo systemctl restart tunneldash.service
+```
+
+An idempotent re-run of the one-click installer **preserves** the
+existing credential (`--if-missing` semantics). To rotate on a re-run,
+pass `--rotate-dashboard-credentials` to the installer, which maps to the
+subcommand's `--fresh`.
+
+If you lose the verifier but have carried the retrieval file off-host:
+
+```bash
+sudo /opt/split-tunnel/splitterctl rotate-dashboard-credentials --recover <dir>
+```
+
+### Migrating from the legacy Bearer token (pre-Basic-auth installs)
+
+The pre-Basic-auth one-click build wrote a 64-hex admin token to
+`/etc/split-tunnel/dashboard/token` (0640 `root:split-tunnel`) and named
+it via `SPLIT_TUNNELDASH_TOKEN_FILE`. That token **cannot** be reused as
+a Basic-auth credential: the Bearer authenticator compares the token
+verbatim in constant time, whereas the Basic authenticator derives a
+PBKDF2 digest of a password. To migrate:
+
+1. Re-run the one-click installer with `--rotate-dashboard-credentials`
+   (or `splitterctl rotate-dashboard-credentials --fresh`). This writes
+   the new Basic-auth verifier + retrieval file and leaves the old
+   `token` file untouched (the installer appends a legacy
+   `SPLIT_TUNNELDASH_TOKEN_FILE=` line to the env file so the binary
+   keeps working via the deprecated fallback until you drop it).
+2. Retrieve the new username / password with `sudo cat
+   /etc/split-tunnel/dashboard/credentials.recovery` and use them in the
+   browser's credential prompt.
+3. **After** you have confirmed the dashboard works with the new
+   credentials, remove the legacy `token` file (`sudo rm
+   /etc/split-tunnel/dashboard/token`) and re-run the installer (the
+   env-file writer will drop the now-absent legacy line). `systemctl
+   restart tunneldash.service` picks up the clean env.
+
+The binary prefers Basic auth when both sources are present; the Bearer
+path is the documented legacy fallback and is no longer generated by
+fresh installs.
+
+### Loopback / local dev (unchanged)
+
+The `tunneldash` binary started without a TLS section keeps the
+documented no-credential loopback default
+(`LoopbackAuthenticator`): 127.0.0.1-only, plain HTTP, no
+`WWW-Authenticate`. Basic auth is reachable only on the server-hosted
+TLS surface. This behaviour is not changed by this release.
 
 ### TLS Provisioning: Existing PEMs vs certbot DNS-01 (Arvan)
 
