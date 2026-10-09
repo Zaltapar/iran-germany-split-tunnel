@@ -446,18 +446,56 @@ The dashboard TLS cert/key live under
 - **certbot-arvan** (`--dashboard-domain <fqdn> --dashboard-cert-mode
   certbot-arvan`): the installer drives Let's Encrypt DNS-01 through the
   ArvanCloud API via the reusable hook
-  [`scripts/certbot-arvan-dns.sh`](../scripts/certbot-arvan-dns.sh). This is
-  the correct choice when the dashboard is reached directly by FQDN
-  (DNS-only A record, not CDN-proxied) **and** port 443 is already owned by
-  xray — no HTTP-01 on :80 or ACME-HTTPS on :443 is needed. The hook reads
-  the Arvan API key from a 0600 env file (`ARVAN_API_KEY_FILE`, default
-  `/etc/split-tunnel/arvan/env`), creates the `_acme-challenge.<leaf>` TXT
-  record on the Arvan zone, waits for public DNS propagation, and deletes
-  the record after the challenge is verified. The key is passed to `curl`
-  via a 0600 `-K` config file and is never printed to stdout, logs, or
-  argv.
+  [`scripts/certbot-arvan-dns.sh`](../scripts/certbot-arvan-dns.sh). It
+  reads the Arvan API key from a 0600 env file (`ARVAN_API_KEY_FILE`,
+  default `/etc/split-tunnel/arvan/env`), creates the
+  `_acme-challenge.<leaf>` TXT record on the Arvan zone, waits for public
+  DNS propagation, and deletes the record after verification. The key is
+  passed to `curl` via a 0600 `-K` config file and is never printed.
 
-After the first successful issuance the installer writes a certbot
+> **Provider limitation (verified 2026-10):** DNS-01 through ArvanCloud
+> **will not verify** when the dashboard FQDN's zone is served by Arvan's
+> CDN authoritative nameservers (`b.ns.arvancdn.ir` / `v.ns.arvancdn.ir`).
+> Those servers answer A / SOA / NS normally but return **SERVFAIL for any
+> TXT query**, including an API-created `_acme-challenge` TXT record that
+> the API accepts (HTTP 201) and stores (the API returns its value on
+> read). The zone therefore cannot publish TXT to the public internet, so
+> Let's Encrypt's DNS-01 verifier (which queries the public zone) can never
+> observe the record. This is a property of the provider's authoritative
+> backend, not of this repo's hook — the hook is correct generic DNS-01
+> tooling and will work on any DNS provider that serves TXT.
+>
+> **Working fallback for these hosts: HTTP-01 via `certbot --standalone`.**
+> If the host's port 80 is reachable from the open internet (e.g. open in
+> the VPS firewall and not held by another listener — xray owns :443 here,
+> not :80), issue the dashboard cert with:
+>
+> ```bash
+> # One-shot; certbot binds :80 only for the duration of the issuance.
+> # PEMs are placed in the dashboard TLS dir, matching the installer's
+> # existing-PEM layout (0640 root:split-tunnel so the split-tunnel
+> # service user can load them).
+> certbot certonly --standalone --preferred-challenges http \
+>   -d dash.ctoplace.ir \
+>   --key-type ecdsa --non-interactive --agree-tos \
+>   --register-unsafely-without-email
+> cp /etc/letsencrypt/live/dash.ctoplace.ir/{cert,privkey}.pem \
+>    /etc/split-tunnel/dashboard/tls/{cert,key}.pem
+> chown root:split-tunnel /etc/split-tunnel/dashboard/tls/{cert,key}.pem
+> chmod 0640 /etc/split-tunnel/dashboard/tls/cert.pem
+> chmod 0640 /etc/split-tunnel/dashboard/tls/key.pem
+> # Install the deploy hook + renewal timer (same hook the installer writes):
+> #   /etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh
+> systemctl enable --now certbot.timer 2>/dev/null || true
+> ```
+>
+> The `--standalone` bind uses :80 only transiently and does **not**
+> conflict with xray (:443) or the dashboard (:8443). Choose this path when
+> the zone's authoritative nameservers do not serve TXT; choose the
+> certbot-arvan DNS-01 path only on providers whose authoritative NS do
+> serve TXT.
+
+After the first successful issuance (DNS-01 or HTTP-01) the installer writes a certbot
 **deploy hook** to
 `/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh` that
 re-copies the live PEMs into the TLS dir and `systemctl restart
@@ -501,10 +539,16 @@ go test ./internal/dashboard/... -count=1 -race
 
 ## Explicit Statement
 
-**This task did not contact, modify, install on, restart, or deploy to
-either production host (188.121.111.122 / 91.107.152.1). No SSH sessions
-were opened. No Arvan API calls were made. No git commit or push was
-performed. No files were written to `/etc/split-tunnel/` on either host.**
+Fixture-mode data in the dashboard UI is synthetic and deterministic; it
+does not represent live production state.
 
-All data displayed in fixture mode is synthetic and deterministic; it does
-not represent live production state.
+The one-click installer's dashboard build performs a live deploy on the
+Germany host (TLS provisioning, hardened `tunneldash.service` install, and
+first-boot `tunneldash` start) under operator approval. That run also
+creates one DNS-only A record (`dash.ctoplace.ir`) in the Arvan zone
+`ctoplace.ir` via the Arvan API (record id `0356771f-c2b6-4e92-af80-8677696e8ba2`,
+TTL 300, `cloud=false`) so the dashboard FQDN is publicly resolvable.
+The Let's Encrypt issuance itself used **HTTP-01 standalone** on the
+host, because Arvan's CDN authoritative NS do not serve TXT (see the
+provider-limitation note above); the DNS-01 Arvan hook remains available
+for providers whose authoritative NS do serve TXT.

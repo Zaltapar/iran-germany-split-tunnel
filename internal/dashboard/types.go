@@ -149,11 +149,23 @@ type ServerConfig struct {
 // the dashboard must also carry a 32-hex random BasePath and an admin Bearer
 // token before it may bind a non-loopback address. The key/cert material is
 // read from the filesystem at startup and is never displayed.
+//
+// The JSON wire shape is the conventional nested form under the parent
+// "tls" object (DashboardConfig.TLS, tag "tls,omitempty"):
+//
+//	"tls": { "enabled": true, "certFile": "...", "keyFile": "...", "basePath": "<32-hex>" }
+//
+// NOTE (schema-bug fix): the original tags were flat dotted keys
+// ("tls.enabled" inside the "tls" object), which encoding/json silently
+// ignores for conventional nested input — a conventional config left
+// Enabled=false, and the non-loopback bind gate then refused the public
+// listen address at startup (fail-closed, but a crash-loop). The tags are
+// now conventional; a round-trip test pins the wire shape.
 type TLSConfig struct {
-	Enabled  bool   `json:"tls.enabled"`
-	CertFile string `json:"tls.certFile"`
-	KeyFile  string `json:"tls.keyFile"`
-	BasePath string `json:"tls.basePath"`
+	Enabled  bool   `json:"enabled"`
+	CertFile string `json:"certFile"`
+	KeyFile  string `json:"keyFile"`
+	BasePath string `json:"basePath"`
 }
 
 // IsSecure reports whether the TLS config is complete enough to serve over a

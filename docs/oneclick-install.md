@@ -110,6 +110,17 @@ xray) the installer can instead **obtain the TLS cert itself** via Let's
 Encrypt DNS-01 through the ArvanCloud API. This avoids needing an HTTP-01
 endpoint on :80 and an ACME HTTPS endpoint on :443.
 
+> **Provider limitation (verified 2026-10):** ArvanCloud's authoritative
+> nameservers answer A/SOA/NS queries but return **SERVFAIL for ANY TXT
+> record**, including TXT records created through the Arvan CDN API (the API
+> accepts and stores them, but they never propagate to public DNS). As a
+> result Let's Encrypt **DNS-01 will never verify** against an Arvan-managed
+> zone. Use this `certbot-arvan` flow only if your provider actually serves
+> TXT publicly. For Arvan zones, use the **HTTP-01 standalone fallback** in
+> [`docs/tunneldash.md`](tunneldash.md) instead — the same `dash.ctoplace.ir`
+> record works with `certbot certonly --standalone` on :80 (xray holds :443,
+> not :80, so there is no conflict).
+
 ### Prerequisites
 
 - An ArvanCloud-managed zone for the dashboard domain (e.g. `ctoplace.ir`).

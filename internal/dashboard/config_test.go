@@ -138,3 +138,39 @@ func TestConfigJSONRoundTrip(t *testing.T) {
 		t.Errorf("round-trip lost MetricsURL: %q", restored.Servers[0].MetricsURL)
 	}
 }
+
+// TestParseConfigTLSNestedShape pins the dashboard TLS wire schema to the
+// conventional NESTED form ({"tls":{"enabled":..., "certFile":..., ...}}) that
+// install-oneclick.sh generate_dashboard writes. Regression guard for the
+// flat-dotted-key bug (tags "tls.enabled" inside the "tls" object) which
+// made encoding/json silently drop conventional input, leave Enabled=false,
+// and trip the non-loopback bind gate into a crash-loop on public listen.
+func TestParseConfigTLSNestedShape(t *testing.T) {
+	data := []byte(`{
+		"listenAddr":"0.0.0.0:8443","readOnly":true,
+		"tls":{"enabled":true,"certFile":"/etc/x/cert.pem","keyFile":"/etc/x/key.pem","basePath":"0123456789abcdef0123456789abcdef"},
+		"servers":[{"id":"germany","role":"germany","address":"127.0.0.1","sourceType":"http","metricsUrl":"http://127.0.0.1:9101/metrics"}]
+	}`)
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("ParseConfig(nested tls): %v", err)
+	}
+	if cfg.TLS == nil {
+		t.Fatal("cfg.TLS is nil; nested tls object was not unmarshalled")
+	}
+	if !cfg.TLS.Enabled {
+		t.Errorf("TLS.Enabled = false, want true (nested shape must populate it)")
+	}
+	if cfg.TLS.CertFile != "/etc/x/cert.pem" {
+		t.Errorf("TLS.CertFile = %q", cfg.TLS.CertFile)
+	}
+	if cfg.TLS.KeyFile != "/etc/x/key.pem" {
+		t.Errorf("TLS.KeyFile = %q", cfg.TLS.KeyFile)
+	}
+	if cfg.TLS.BasePath != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("TLS.BasePath = %q", cfg.TLS.BasePath)
+	}
+	if !cfg.TLS.IsSecure() {
+		t.Error("TLS.IsSecure() = false, want true for a complete config")
+	}
+}
