@@ -32,6 +32,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -40,6 +41,11 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/dashboard"
 )
 
+// buildInfo is stamped at build time by the reproducible build script
+// (scripts/build-linux.sh) via -ldflags "-X main.buildInfo=<git-commit>". It is
+// empty in local/dev builds. It carries only a non-secret build identity.
+var buildInfo = ""
+
 func main() {
 	var (
 		configPath string
@@ -47,6 +53,7 @@ func main() {
 		forceRO    bool
 		forceFix   bool
 		validate   bool
+		version    bool
 	)
 
 	fs := flag.NewFlagSet("tunneldash", flag.ExitOnError)
@@ -55,6 +62,7 @@ func main() {
 	fs.BoolVar(&forceRO, "read-only", false, "Force read-only mode (apply endpoint always returns 403)")
 	fs.BoolVar(&forceFix, "fixture", false, "Force fixture data source for all servers (no external host access)")
 	fs.BoolVar(&validate, "validate-config", false, "Validate the config and exit (0 = valid); no listener is started")
+	fs.BoolVar(&version, "version", false, "Print the reproducible-build commit stamp and exit (scripts/build-linux.sh embeds it via -X main.buildInfo)")
 	fs.Usage = func() {
 		out := os.Stderr
 		out.WriteString("Usage: tunneldash [options]\n\n")
@@ -73,6 +81,16 @@ func main() {
 		out.WriteString("  SPLIT_TUNNELDASH_TOKEN_FILE   Path to a 0600 file holding the admin token\n")
 	}
 	fs.Parse(os.Args[1:])
+
+	// -version: print the reproducible-build commit stamp and exit.
+	if version {
+		commit := buildInfo
+		if commit == "" {
+			commit = "dev"
+		}
+		fmt.Println("tunneldash buildInfo:", commit)
+		return
+	}
 
 	// Load config.
 	cfg := dashboard.DefaultConfig()
@@ -122,16 +140,29 @@ func main() {
 	cache := dashboard.NewCache(cfg)
 	audit := dashboard.NewAuditLog(cfg.MaxAudit)
 
+	tlsMode := cfg.TLS != nil && cfg.TLS.Enabled
+
 	// Auth: when an admin Bearer token is resolvable from the environment
-	// (SPLIT_TUNNELDASH_TOKEN / _FILE) use it; otherwise the safe loopback
-	// authenticator. The token is never logged or echoed.
+	// (SPLIT_TUNNELDASH_TOKEN / _FILE) use it. The token is never logged or
+	// echoed.
 	var auth dashboard.Authenticator
 	if tok := dashboard.LoadAdminToken(); tok != "" {
 		auth = dashboard.NewBearerTokenAuthenticator(tok)
+	} else {
+		// D1b fail-closed: a server-hosted TLS build (public bind) must not run
+		// unauthenticated. If a token source was configured (env var or file
+		// path) but failed to resolve — missing file, unreadable by the service
+		// user, or empty — refuse to start rather than silently falling back
+		// to the loopback authenticator. The loopback-only local build (no TLS)
+		// keeps its documented no-token default.
+		if tlsMode && dashboard.AdminTokenConfigured() {
+			log.Fatalf("tunneldash: an admin Bearer token source is configured but the token could not be loaded; refusing to serve the public TLS build unauthenticated (check %s / %s are readable by the tunneldash user and non-empty)", dashboard.EnvAdminToken, dashboard.EnvAdminTokenFile)
+		}
+		// No token configured at all: loopback-only default is safe.
+		auth = dashboard.NewLoopbackAuthenticator()
 	}
 	// nil mutator = safe default (apply endpoint always refuses).
 
-	tlsMode := cfg.TLS != nil && cfg.TLS.Enabled
 	server := dashboard.NewTLSServer(cfg, cache, audit, nil, auth)
 
 	ctx, cancel := context.WithCancel(context.Background())

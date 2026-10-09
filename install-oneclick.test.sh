@@ -136,9 +136,43 @@ contains "germany certbot-arvan plan: runs certbot DNS-01 manual auth" "$GERMANY
 contains "germany certbot-arvan plan: DNS-01 cleanup hook" "$GERMANY_CBT" "certbot-arvan-dns.sh delete"
 contains "germany certbot-arvan plan: deploys PEMs to the dashboard TLS dir" "$GERMANY_CBT" "dashboard/tls"
 contains "germany certbot-arvan plan: installs a renewal deploy hook" "$GERMANY_CBT" "renewal timer"
+contains "D4: certbot-arvan verifies renewal method (manual + Arvan hook)" "$GERMANY_CBT" "authenticator=manual"
+contains "D2: certbot-arvan plan deploys the FULL CHAIN" "$GERMANY_CBT" "FULL CHAIN"
 not_contains "certbot-arvan dry-run never prints the Arvan API key" \
   "$(printf '%s' "$GERMANY_CBT")" "ARVAN_API_KEY="
 check "arvan DNS-01 hook syntax" bash -n "$HERE/scripts/certbot-arvan-dns.sh"
+
+# --- D4: HTTP-01 standalone mode (dry-run, side-effect free) ----------------
+GERMANY_HTTP01="$(bash "$INSTALLER" --role germany --domain example.com --source "$HERE" --no-clone --dry-run --dashboard on --dashboard-domain dash.example.com --dashboard-cert-mode http01 2>&1)"; GERMANY_HTTP01_RC=$?
+check "germany http01 dry-run exits 0" bash -c "[ $GERMANY_HTTP01_RC -eq 0 ]"
+contains "D4: http01 plan names the dashboard domain" "$GERMANY_HTTP01" "dash.example.com"
+contains "D4: http01 uses standalone on :80" "$GERMANY_HTTP01" "standalone"
+contains "D4: http01 documents that xray does not use :80 on Germany" "$GERMANY_HTTP01" "xray does not use"
+contains "D4: http01 verifies renewal method (standalone)" "$GERMANY_HTTP01" "authenticator=standalone"
+not_contains "http01 dry-run output never prints a secret" "$GERMANY_HTTP01" "ARVAN_API_KEY="
+contains "D4: unknown cert modes are rejected (fail closed)" "$STATIC_SRC" "unknown --dashboard-cert-mode"
+contains "D4: cert mode validation accepts the three documented modes" "$STATIC_SRC" 'existing|certbot-arvan|http01'
+
+# --- D5: pair step is stale-aware (dry-run, side-effect free) -------------
+GERMANY_PAIR="$(bash "$INSTALLER" --role germany --domain example.com --source "$HERE" --no-clone --dry-run --pairing-secret-file /tmp/blob-a 2>&1)"; GERMANY_PAIR_RC=$?
+check "germany pair-apply dry-run exits 0" bash -c "[ $GERMANY_PAIR_RC -eq 0 ]"
+contains "D5: pair step re-emits a fresh Blob B on stale pairing" "$GERMANY_PAIR" "B-fingerprint stale"
+contains "D5: pair step still emits the public Blob B" "$GERMANY_PAIR" "Blob B"
+
+# --- D1: token readability + directory traversal (source-level, dry-run safe) ---
+contains "D1: token written 0640 root:split-tunnel (group-readable by service user)" \
+  "$STATIC_SRC" 'chmod 0640 "$DASHBOARD_TOKEN"'
+contains "D1: env file naming the token is group-readable" "$STATIC_SRC" 'chmod 0640 "$DASHBOARD_ENV"'
+contains "D1: dashboard dir is group-traversable (0750)" "$STATIC_SRC" 'chmod 0750 "$DASHBOARD_DIR"'
+contains "D1: token path is a fixed readonly constant" "$STATIC_SRC" 'readonly DASHBOARD_TOKEN="$DASHBOARD_TOKEN_FILE"'
+
+# --- D2: the served certFile must be the FULL CHAIN (source-level) ---------
+contains "D2: dashboard TLS deploy source is fullchain.pem" "$STATIC_SRC" 'fullchain.pem'
+contains "D2: deploy hook copies fullchain.pem into cert.pem" "$STATIC_SRC" 'fullchain.pem" "\${tls_dir}/cert.pem"'
+
+# --- D6: MANIFEST.sha256 is the canonical backup manifest name (docs) -------
+contains "D6: docs canonicalize MANIFEST.sha256 as the backup manifest name" \
+  "$(cat "$HERE/docs/oneclick-install.md")" "MANIFEST.sha256"
 
 # Regression (defect: secret printed to stdout + 0600 log): the installer must
 # no longer echo the generated admin Bearer token value or the generated

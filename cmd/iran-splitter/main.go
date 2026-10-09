@@ -23,6 +23,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// buildInfo is stamped at build time by the reproducible build script
+// (scripts/build-linux.sh) via -ldflags "-X main.buildInfo=<git-commit>". It is
+// empty in local/dev builds. It carries only a non-secret build identity.
+var buildInfo = ""
+
 // ============================================================
 // WebSocket io.ReadWriteCloser adapter
 // (lets *websocket.Conn plug into the CarrierConn abstraction)
@@ -138,6 +143,17 @@ func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
 }
 
 func main() {
+	// --version / -version: print the reproducible-build commit stamp
+	// (scripts/build-linux.sh embeds it via -X main.buildInfo). No other
+	// behavior changes; it exits before any listener or unit work.
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		commit := buildInfo
+		if commit == "" {
+			commit = "dev"
+		}
+		fmt.Println("iran-splitter buildInfo:", commit)
+		return
+	}
 	// Phase 8 (installer): `--validate-config` runs the Phase 7
 	// load→parse→validate→construct path and exits BEFORE any listener
 	// is opened or goroutine started. install.sh uses this as a

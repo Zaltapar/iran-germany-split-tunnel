@@ -89,11 +89,28 @@ Blob B is then securely deleted on both sides.
 - Security headers (HSTS, CSP, `X-Content-Type-Options`,
   `X-Frame-Options`, `Referrer-Policy`) are set on every TLS response.
 - An admin Bearer token is generated at
-  `/etc/split-tunnel/dashboard/token` (0600, value read from that file, never
-  printed); it gates the (currently disabled) mutation endpoints.
-  **Mutations stay 403.**
+  `/etc/split-tunnel/dashboard/token` (**0640 `root:split-tunnel`**, value
+  read from that file, never printed). The `0640` group-read bit is required
+  because `tunneldash` runs as the non-root `split-tunnel` user and reads the
+  token via `SPLIT_TUNNELDASH_TOKEN_FILE` — a `0600` file would be unreadable
+  to the service user and the dashboard would start with **no** token
+  (D1 defect). The parent dir `/etc/split-tunnel/dashboard` is `0750
+  root:split-tunnel` so the service user can traverse to the token.
+  - **Token gating policy (D1c):** the admin Bearer token gates **only the
+    mutation endpoints** (POST `.../config/apply`, which are disabled —
+    mutations stay 403). Read-only GET/HEAD endpoints under the random
+    `basePath` are **intentionally open**: the random 32-hex `basePath` + TLS
+    is the access control for the read surface. This is the documented design
+    choice, not a regression.
+  - **Fail-closed (D1b):** a server-hosted **TLS** build must not serve
+    unauthenticated. If a token source is configured (env var or file path)
+    but the value cannot be loaded (file missing, unreadable, or empty),
+    `tunneldash` **refuses to start** the public TLS listener rather than
+    silently falling back to the loopback authenticator. The loopback-only
+    local build (no TLS) keeps its documented no-token default.
 - Certs/key live under `/etc/split-tunnel/dashboard/tls/`
-  (0640 `root:split-tunnel`).
+  (0640 `root:split-tunnel`). The served `certFile` is the **FULL CHAIN**
+  (leaf + intermediates), never a leaf-only cert (D2).
 - **The dashboard is hosted on Germany only. It never binds a public port on
   Iran.** The Iran node is collected read-only via the pinned-SSH collector
   (pinned host keys, fixed argv allowlist; see
@@ -167,13 +184,19 @@ What happens on the host (fail-closed; any error aborts the install):
    DNS propagation.
 3. `certbot certificate issue --manual --preferred-challenges dns` runs with
    the hook as the manual auth + cleanup hook. No port 80 or 443 is used.
-4. The issued PEMs are copied to `/etc/split-tunnel/dashboard/tls/{cert,key}.pem`
-   (0640 `root:split-tunnel`).
+4. The issued **full chain** (`fullchain.pem`) is copied to
+   `/etc/split-tunnel/dashboard/tls/cert.pem` and `privkey.pem` to
+   `key.pem` (0640 `root:split-tunnel`). The served `certFile` is the full
+   chain so intermediate trust is complete (D2).
 5. A certbot **deploy hook** is written to
    `/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh` that
-   re-copies the live PEMs and `systemctl restart tunneldash.service` on
-   every renewal. `certbot renew` (enabled by `certificate issue`) runs via
-   the systemd `certbot.timer`.
+   re-copies the full chain and `systemctl restart tunneldash.service` on
+   every renewal (failing closed if the chain is missing). `certbot renew`
+   (enabled by `certificate issue`) runs via the systemd `certbot.timer`.
+   The installer verifies the renewal config keeps `authenticator=manual`
+   **and** references the Arvan hook, so renewal re-creates the
+   `_acme-challenge` TXT record with the same method (D4 method-consistency
+   gate).
 
 ### Renewal
 
@@ -221,6 +244,41 @@ sudo certbot delete -d dash.ctoplace.ir
 
 ---
 
+## Dashboard TLS via certbot HTTP-01 (standalone) — `http01` mode
+
+`--dashboard-cert-mode http01` is the alternative to `certbot-arvan` for
+hosts where a DNS-01 (Arvan) hook is not usable (the 2026-10 provider
+limitation above means Arvan zones cannot verify DNS-01). It obtains the
+dashboard cert via **HTTP-01 standalone** on port 80.
+
+- **Why :80 is safe on Germany:** xray (Reality) owns `:443`; the up-carrier
+  URL the operator configured points at the CDN/origin, **not** a local `:80`
+  listener. So xray does not use port 80 on Germany, and a standalone
+  HTTP-01 verifier on `:80` does not collide. The installer **fails closed**
+  if port 80 is already in use (nginx/caddy/etc.), with a clear message to
+  stop the occupant or switch to `certbot-arvan`.
+- **Method consistency (D4):** the installer verifies the renewal config
+  keeps `authenticator=standalone` so `certbot renew` uses the **same**
+  method as the install. Switching methods between issue and renew is refused
+  (fail closed) to avoid a renewal that silently cannot re-verify.
+- **Full chain (D2):** the issued `fullchain.pem` (not a leaf-only cert) is
+  deployed to `/etc/split-tunnel/dashboard/tls/` and re-copied by the shared
+  deploy hook on every renewal.
+
+```bash
+./install-oneclick.sh --role germany --domain ctoplace.ir \
+    --source . --no-clone \
+    --dashboard on --dashboard-port 8443 \
+    --dashboard-domain dash.ctoplace.ir \
+    --dashboard-cert-mode http01
+```
+
+The renewal timer, deploy hook, and fullchain copy are identical to the
+`certbot-arvan` flow (the two modes differ only in the ACME challenge
+method: DNS-01-via-Arvan-hook vs HTTP-01-standalone).
+
+---
+
 ## Flags and Environment Equivalents
 
 | Flag | Env equivalent | Notes |
@@ -235,7 +293,7 @@ sudo certbot delete -d dash.ctoplace.ir
 | `--dashboard-port <port>` | `ONECLICK_DASHBOARD_PORT` | default 8443 |
 | `--cert <pem> --key <pem>` | — | existing Arvan/CDN cert+key for dashboard TLS |
 | `--dashboard-domain <fqdn>` | `ONECLICK_DASHBOARD_DOMAIN` | dashboard public FQDN (Germany); implies certbot-arvan when no cert mode given |
-| `--dashboard-cert-mode <existing\|certbot-arvan>` | `ONECLICK_DASHBOARD_CERT_MODE` | `existing` = use `--cert/--key`; `certbot-arvan` = obtain via certbot DNS-01 + Arvan API |
+| `--dashboard-cert-mode <existing\|certbot-arvan\|http01>` | `ONECLICK_DASHBOARD_CERT_MODE` | `existing` = use `--cert/--key` (full chain); `certbot-arvan` = obtain via certbot DNS-01 + Arvan API; `http01` = obtain via certbot HTTP-01 standalone on :80 |
 | `--arvan-api-key-file <path>` | `ONECLICK_ARVAN_API_KEY_FILE` | 0600 file with `ARVAN_API_KEY=<token>` (certbot-arvan mode) |
 | `--pairing-secret-file <path>` | `ONECLICK_PAIRING_SECRET_FILE` | operator-carried blob (0600); securely deleted after use |
 | `--open-firewall` | `ONECLICK_OPEN_FIREWALL=1` | opt-in: role-specific firewall ports only |
@@ -271,6 +329,44 @@ sudo certbot delete -d dash.ctoplace.ir
 
 `xray-consumer.service` and `tunneldash.service` are part of the protected
 unit set, so uninstall handles them transactionally like the core units.
+
+## Backup Manifest Naming (D6)
+
+The host-side pre-mutation backup (a timestamped directory such as
+`/root/split-tunnel-backups-<TS>`) records the integrity manifest under the
+**canonical name `MANIFEST.sha256`** — a `sha256sum`-style list
+(`<sha256>  <relative-path>`), one line per backed-up file. Rollback scripts
+key off that name. **There is no plain `MANIFEST` file; `MANIFEST.sha256` is
+the single canonical name** and is referenced consistently in the rollback
+script and here. Do not expect a bare `MANIFEST` entry.
+
+## Reproducible Linux Build (D3b)
+
+[`scripts/build-linux.sh`](../scripts/build-linux.sh) produces the four
+deployment binaries (`splitterctl`, `iran-splitter`, `germany-splitter`,
+`tunneldash`) as **reproducible Linux amd64** artifacts:
+
+```bash
+bash scripts/build-linux.sh          # -> dist_onclick/<name>-linux-amd64 + SHA256SUMS
+```
+
+Reproducibility properties:
+
+- `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` — static, no `libstdc++` variance;
+- `-trimpath` — build-dir paths stripped from the binary;
+- `-ldflags="-s -w"` — DWARF symbol table stripped so the SHA-256 depends on
+  source, not the build machine's filesystem;
+- `-ldflags="-X main.buildInfo=<git-commit>"` — the current git commit is
+  stamped into each binary's `main.buildInfo` variable. Every binary exposes
+  it: `splitterctl version`, `germany-splitter --version`,
+  `iran-splitter --version`, and `tunneldash -version` print the stamp
+  (empty in dev builds, "dev").
+- a `SHA256SUMS` sidecar (the canonical host-side manifest name, matching the
+  D6 backup convention) lists the SHA-256 of each produced binary so an
+  operator can verify the exact bytes before a deploy.
+
+The built binaries are **NOT committed** (`dist_onclick/` is `.gitignore`d);
+only the `SHA256SUMS` sidecar is expected to travel with a release tarball.
 
 ## Dry-Run (Local, No Host Changes)
 

@@ -18,12 +18,26 @@ package dashboard
 //     X-Content-Type-Options, X-Frame-Options, Referrer-Policy).
 //   - The admin Bearer token is read from the SPLIT_TUNNELDASH_TOKEN env var
 //     or a token file path named by SPLIT_TUNNELDASH_TOKEN_FILE. It is never
-//     logged or echoed. Mutations remain 403 (readOnly default) regardless.
+//     logged or echoed.
 //
-// The token is loaded at server construction via LoadAdminToken, which the
-// installer wires from the 0600 dashboard.env. Until mutations are ever
-// enabled, the token gates the (future) mutation endpoints; read endpoints
-// are reachable under TLS + basePath.
+// TOKEN GATING POLICY (D1c, design §3): the admin Bearer token gates ONLY the
+// mutation endpoints (POST /api/v1/.../config/apply and the read-only
+// default mutator's 403). Read-only GET/HEAD endpoints under the random
+// basePath are INTENTIONALLY open — the random 32-hex basePath plus TLS is
+// the access control for the read surface. This is the documented design
+// choice, not a regression.
+//
+// FAIL-CLOSED (D1b): a server-hosted TLS build (cfg.TLS enabled) must NOT
+// serve unauthenticated when a token source was CONFIGURED but failed to
+// resolve. The command entrypoint (cmd/tunneldash/main.go) checks
+// AdminTokenConfigured() against LoadAdminToken(): if a source is present
+// (SPLIT_TUNNELDASH_TOKEN or SPLIT_TUNNELDASH_TOKEN_FILE) yet LoadAdminToken
+// returns "" (file missing, unreadable, or empty), the TLS build refuses to
+// start. The loopback-only local build (cfg.TLS disabled) keeps its documented
+// no-token default (LoopbackAuthenticator).
+//
+// The token file is written by the installer as 0640 root:split-tunnel so the
+// non-root tunneldash service user can read it (D1a).
 
 import (
 	"context"
@@ -63,6 +77,20 @@ func LoadAdminToken() string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+// AdminTokenConfigured reports whether an admin-token source is present in the
+// environment (a non-empty SPLIT_TUNNELDASH_TOKEN, or a non-empty
+// SPLIT_TUNNELDASH_TOKEN_FILE path). It is used to distinguish "no token was
+// ever configured" (the safe loopback-only default, which may legitimately run
+// unauthenticated) from "a token source WAS configured but failed to resolve"
+// (a misconfiguration that a public TLS build must fail closed on). The token
+// value itself is never returned or echoed here.
+func AdminTokenConfigured() bool {
+	if strings.TrimSpace(os.Getenv(EnvAdminToken)) != "" {
+		return true
+	}
+	return strings.TrimSpace(os.Getenv(EnvAdminTokenFile)) != ""
 }
 
 // GenerateBasePath returns a fresh 32-hex (128-bit) random base path — the

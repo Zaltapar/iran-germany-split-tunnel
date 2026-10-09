@@ -41,6 +41,10 @@ $null
 # staging key). Rebuild via `go build`; regenerate keys per L5 runbook.
 dist/
 
+# D3b: reproducible Linux amd64 build artifacts (scripts/build-linux.sh output).
+# NEVER commit: only the SHA256SUMS sidecar may be copied to a release manifest.
+dist_onclick/
+
 # T3 Pinned-Xray gate: rendered fixed-vector config written at CI run time
 # (contains the documented non-production test vector; regenerate, never commit).
 internal/xray/testdata/e2e/

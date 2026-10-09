@@ -112,10 +112,12 @@ Options:
   --dashboard-port <port>     dashboard TLS port on Germany (default 8443)
   --cert <pem> --key <pem>   existing Arvan/CDN cert+key for the dashboard TLS
   --dashboard-domain <fqdn>  dashboard public domain (Germany); enables certbot flow
-  --dashboard-cert-mode <existing|certbot-arvan>
+  --dashboard-cert-mode <existing|certbot-arvan|http01>
                               existing = use --cert/--key (default when no
                               --dashboard-domain); certbot-arvan = obtain a TLS
-                              cert via certbot DNS-01 using the Arvan API hook
+                              cert via certbot DNS-01 using the Arvan API hook;
+                              http01 = obtain via certbot HTTP-01 standalone on
+                              :80 (xray does not use :80 on Germany)
   --arvan-api-key-file <path>
                               0600 file with ARVAN_API_KEY=<token> (certbot-arvan)
   --pairing-secret-file <path>
@@ -557,6 +559,19 @@ iran_pair_generate() {
   _log "  [i] Blob A (the ONE secret) -> ${PAIRING_DIR}/${BLOB_A_NAME} (0600). Carry it to Germany."
 }
 
+# D5: report a STALE pairing (DEFECT-3) without printing any secret.
+# `pair apply` already re-emits Blob B deterministically from the CURRENT
+# installed Germany Reality config, so the pair step is idempotent across a
+# Reality keypair rotation — but the operator needs a clear "re-pair required"
+# signal when doctor flags the pairing B-fingerprint as stale. This greps the
+# read-only `splitterctl doctor` output for that finding (public wording only).
+pairing_is_stale() {
+  [ "$DRY_RUN" -ne 1 ] || return 1
+  local out
+  out="$(run_splitterctl doctor 2>&1 || true)"
+  printf '%s' "$out" | grep -Fq "B-fingerprint is stale"
+}
+
 germany_pair_apply() {
   local blob="$PAIRING_SECRET_FILE"
   [ -n "$blob" ] || { error "Germany requires --pairing-secret-file (the copied Blob A)."; return 1; }
@@ -564,15 +579,24 @@ germany_pair_apply() {
   export SPLITTERCTL_PAIR_BLOB_FILE="$blob"
   export SPLITTERCTL_PAIR_DOWN_HOST="${ONECLICK_DOWN_HOST:-}"
   export SPLITTERCTL_PAIR_BLOB_OUT="${PAIRING_DIR}/${BLOB_B_NAME}"
+  # D5: if a previous install left the pairing stale (Reality keypair changed),
+  # `pair apply` below re-emits a FRESH Blob B from the current config. Run it
+  # first so the emitted Blob B is always consistent with the live inbound.
   run_splitterctl pair apply
+  local fp
   if [ "$DRY_RUN" -ne 1 ]; then
-    local fp
     fp="$(sha256sum "${PAIRING_DIR}/${BLOB_B_NAME}" 2>/dev/null | awk '{print $1}' || true)"
     _log "  [i] Blob B (public) emitted; fingerprint ${fp}. Relay it back to Iran for \`pair finalize\`."
+    if pairing_is_stale; then
+      warn "pairing is STALE: the Germany Reality keypair changed since the last Blob B was issued."
+      warn "  The Blob B just emitted (fingerprint ${fp}) reflects the CURRENT installed config — it is the fresh, consistent blob."
+      warn "  re-pair required: carry this fresh Blob B to Iran and run \`pair finalize\` there (it re-derives the consumer config)."
+    fi
     secure_unlink "$blob"
     _log "  [i] secret Blob A securely deleted from ${blob}."
   else
     _log "  [dry-run] would emit public Blob B + fingerprint-only log; secure-delete the carried Blob A"
+    _log "  [dry-run] if doctor later reports the pairing B-fingerprint stale (Reality keypair rotated), re-run pair apply to re-emit a fresh Blob B, then re-carry it to Iran for pair finalize"
   fi
 }
 
@@ -606,9 +630,104 @@ iran_pair_finalize() {
 readonly DASHBOARD_CONFIG="/etc/split-tunnel/dashboard/config.json"
 readonly DASHBOARD_ENV="/etc/split-tunnel/dashboard.env"
 readonly DASHBOARD_TLS_DIR="/etc/split-tunnel/dashboard/tls"
+readonly DASHBOARD_TOKEN_FILE="/etc/split-tunnel/dashboard/token"
 readonly ARVAN_KEY_FILE_HOST="/etc/split-tunnel/arvan/env"
 readonly ARVAN_HOOK_DIR="/opt/split-tunnel/scripts"
 readonly ARVAN_ZONE_DEFAULT="ctoplace.ir"
+readonly RENWAL_DIR="/etc/letsencrypt/renewal"
+readonly DEPLOY_HOOK_PATH="/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh"
+
+# ---------------------------------------------------------------------------
+# Shared dashboard-TLS deploy helpers (D2 + D4).
+#
+# D2: the served TLS chain MUST be the FULL CHAIN (fullchain.pem = leaf +
+# intermediates). certbot's per-domain live dir holds fullchain.pem; a
+# leaf-only cert.pem breaks intermediate trust for clients that do not
+# already have the intermediates cached. key.pem stays the private key.
+# The deploy hook re-copies the full chain on every renewal and restarts
+# tunneldash, failing closed when the chain cannot be delivered.
+# ---------------------------------------------------------------------------
+
+# deploy_dashboard_pems <live-dir>: copy the fullchain + key into the
+# dashboard TLS dir with group-readable perms for the split-tunnel user.
+deploy_dashboard_pems() {
+  local live_dir="$1"
+  local cert_src="${live_dir}/fullchain.pem"
+  local key_src="${live_dir}/privkey.pem"
+  if [ ! -f "$cert_src" ] || [ ! -f "$key_src" ]; then
+    error "expected ${cert_src} + ${key_src} not found (fullchain is required)."
+    return 1
+  fi
+  cp -f "$cert_src" "${DASHBOARD_TLS_DIR}/cert.pem"
+  cp -f "$key_src" "${DASHBOARD_TLS_DIR}/key.pem"
+  chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
+  chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
+  local expiry
+  expiry="$(openssl x509 -enddate -noout -in "${DASHBOARD_TLS_DIR}/cert.pem" 2>/dev/null || echo '<unknown>')"
+  _log "  [i] dashboard TLS FULLCHAIN installed -> ${DASHBOARD_TLS_DIR}/cert.pem (0640 root:split-tunnel). cert expires: ${expiry}"
+  return 0
+}
+
+# write_dashboard_renewal_deploy_hook: write the certbot deploy hook that
+# re-copies the FULL CHAIN on every renewal and restarts tunneldash, failing
+# closed when the chain cannot be delivered. Idempotent.
+write_dashboard_renewal_deploy_hook() {
+  install -d -m 0755 "$(dirname "$DEPLOY_HOOK_PATH")"
+  cat > "$DEPLOY_HOOK_PATH" <<DEPLOFILE
+#!/usr/bin/env bash
+# certbot deploy hook for the split-tunnel dashboard.
+# \$1 = the domain being renewed (e.g. dash.ctoplace.ir)
+set -euo pipefail
+domain="\$1"
+tls_dir="/etc/split-tunnel/dashboard/tls"
+live="/etc/letsencrypt/live/\${domain}"
+# D2: serve the FULL CHAIN (fullchain.pem), never a leaf-only cert.
+if [ -f "\${live}/fullchain.pem" ] && [ -f "\${live}/privkey.pem" ]; then
+  cp -f "\${live}/fullchain.pem" "\${tls_dir}/cert.pem"
+  cp -f "\${live}/privkey.pem" "\${tls_dir}/key.pem"
+  chown root:split-tunnel "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem" 2>/dev/null || true
+  chmod 0640 "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem"
+  if systemctl is-active tunneldash.service >/dev/null 2>&1; then
+    systemctl restart tunneldash.service
+  fi
+else
+  # Fail closed: a renewal that cannot deliver a full chain is a config error.
+  echo "split-tunnel-dashboard deploy hook: missing \${live}/fullchain.pem or privkey.pem" >&2
+  exit 1
+fi
+DEPLOFILE
+  chmod 0755 "$DEPLOY_HOOK_PATH"
+  _log "  [i] certbot deploy hook installed -> ${DEPLOY_HOOK_PATH} (fullchain copy + restarts tunneldash on renewal)"
+}
+
+# ensure_renewal_config <leaf> <expected-authenticator>
+# D4: verify the certbot renewal config for <leaf> exists and uses the expected
+# authenticator, so `certbot renew` uses the SAME method as the install:
+#   - certbot-arvan -> authenticator=manual (DNS-01) and references the Arvan
+#     hook; if certbot did not persist the hook, fail closed with a re-issue
+#     instruction (renewal would otherwise not (re)create the _acme-challenge
+#     TXT record).
+#   - http01        -> authenticator=standalone (port 80).
+ensure_renewal_config() {
+  local leaf="$1" expected_auth="$2"
+  local rc="${RENWAL_DIR}/${leaf}.conf"
+  if [ ! -f "$rc" ]; then
+    error "renewal config ${rc} not found for ${leaf}; cannot guarantee renewal uses '${expected_auth}'."
+    return 1
+  fi
+  if ! grep -Eq "^authenticator[[:space:]]*=[[:space:]]*${expected_auth}[[:space:]]*$" "$rc"; then
+    error "renewal config ${rc} authenticator is not '${expected_auth}' (method drift); certbot renew would fail. Re-issue with the matching --dashboard-cert-mode (${expected_auth})."
+    return 1
+  fi
+  if [ "$expected_auth" = "manual" ]; then
+    if ! grep -q "certbot-arvan-dns.sh" "$rc"; then
+      error "renewal config ${rc} does not reference the Arvan DNS-01 hook (certbot-arvan-dns.sh); 'certbot renew' would NOT (re)create the _acme-challenge TXT record. Re-run the install with --dashboard-cert-mode certbot-arvan so the manual auth/cleanup hooks are persisted, or delete this renewal entry and re-issue."
+      return 1
+    fi
+  fi
+  _log "  [i] renewal config ${rc} verified: authenticator=${expected_auth}"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # install_certbot_arvan_flow <dashboard-domain>
@@ -723,46 +842,24 @@ install_certbot_arvan_flow() {
   fi
   _log "  [i] certbot issued/updated cert for ${dash_domain}."
 
-  # --- 5. Deploy the PEMs into the dashboard TLS dir ----------------------
+  # --- 5. Deploy the FULL CHAIN into the dashboard TLS dir ---------------
+  # D2: the served chain must be the full chain (leaf + intermediates), not a
+  # leaf-only cert.pem. certbot's per-domain live dir ships fullchain.pem; we
+  # copy it as the dashboard certFile and privkey.pem as the keyFile.
   local live_dir="/etc/letsencrypt/live/${leaf}"
-  if [ ! -f "${live_dir}/cert.pem" ] || [ ! -f "${live_dir}/privkey.pem" ]; then
-    error "certbot-arvan: expected ${live_dir}/cert.pem + privkey.pem not found."
+  if ! deploy_dashboard_pems "$live_dir"; then
+    error "certbot-arvan: could not deploy the full chain from ${live_dir}."
     return 1
   fi
-  cp -f "${live_dir}/cert.pem" "${DASHBOARD_TLS_DIR}/cert.pem"
-  cp -f "${live_dir}/privkey.pem" "${DASHBOARD_TLS_DIR}/key.pem"
-  chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
-  chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
-  local expiry
-  expiry="$(openssl x509 -enddate -noout -in "${DASHBOARD_TLS_DIR}/cert.pem" 2>/dev/null || echo '<unknown>')"
-  _log "  [i] dashboard TLS cert installed -> ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel). cert expires: ${expiry}"
 
   # --- 6. Set up auto-renewal with a deploy hook --------------------------
-  # The deploy hook runs on every `certbot renew` for this cert and:
-  #  (a) re-copies the live PEMs into the dashboard TLS dir;
-  #  (b) restarts tunneldash.service if it is active.
-  local deploy_hook="/etc/letsencrypt/renewal-hooks/deploy/split-tunnel-dashboard.sh"
-  install -d -m 0755 "$(dirname "$deploy_hook")"
-  cat > "$deploy_hook" <<DEPLOFILE
-#!/usr/bin/env bash
-# certbot deploy hook for the split-tunnel dashboard.
-# \$1 = the domain being renewed (e.g. dash.ctoplace.ir)
-set -euo pipefail
-domain="\$1"
-tls_dir="/etc/split-tunnel/dashboard/tls"
-live="/etc/letsencrypt/live/\${domain}"
-if [ -f "\${live}/cert.pem" ]; then
-  cp -f "\${live}/cert.pem" "\${tls_dir}/cert.pem"
-  cp -f "\${live}/privkey.pem" "\${tls_dir}/key.pem"
-  chown root:split-tunnel "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem" 2>/dev/null || true
-  chmod 0640 "\${tls_dir}/cert.pem" "\${tls_dir}/key.pem"
-fi
-if systemctl is-active tunneldash.service >/dev/null 2>&1; then
-  systemctl restart tunneldash.service
-fi
-DEPLOFILE
-  chmod 0755 "$deploy_hook"
-  _log "  [i] certbot deploy hook installed -> ${deploy_hook} (restarts tunneldash on renewal)"
+  # D2 + D4: the deploy hook re-copies the FULL CHAIN on every `certbot renew`
+  # and restarts tunneldash (failing closed if the chain is missing). The
+  # renewal config must keep the DNS-01 method consistent with this install
+  # (certbot-arvan = manual authenticator + Arvan hook), so `certbot renew`
+  # re-creates the _acme-challenge TXT record.
+  write_dashboard_renewal_deploy_hook
+  ensure_renewal_config "$leaf" "manual"
 
   # certbot's own renewal timer (systemd timer: certbot.timer / apt-based
   # /etc/cron.daily on Debian) is already enabled by `certificate issue`.
@@ -770,14 +867,119 @@ DEPLOFILE
   _log "  [i] certbot-arvan flow complete for ${dash_domain}."
 }
 
+# ---------------------------------------------------------------------------
+# install_http01_flow <dashboard-domain>
+#
+# D4: the HTTP-01 (standalone) alternative to certbot-arvan. On Germany the
+# up-carrier xray serves :443 (Reality) and :443 cannot be used for ACME;
+# port 80 is NOT used by xray on Germany (the up-carrier URL the operator
+# configured points at the CDN/origin, not at a local :80 listener), so a
+# standalone HTTP-01 verifier on :80 is safe. Fails closed: the port must be
+# free and the renewal config must use authenticator=standalone so `certbot
+# renew` keeps the same method. The deploy hook + fullchain copy are shared
+# with the certbot-arvan flow (write_dashboard_renewal_deploy_hook /
+# deploy_dashboard_pems).
+#
+# This flow matches the live-host reality recorded in commit c3d3a64's host
+# work (the host used HTTP-01 standalone, not DNS-01).
+# ---------------------------------------------------------------------------
+install_http01_flow() {
+  local dash_domain="$1"
+
+  # --- 0. Validate preconditions (fail closed) ----------------------------
+  if [ -z "$dash_domain" ]; then
+    error "http01: --dashboard-domain is required."
+    return 1
+  fi
+  info "http01: xray does not use port 80 on Germany (Reality owns :443; the up-carrier is the CDN/origin URL, not a local :80 listener), so a standalone HTTP-01 verifier on :80 is safe."
+
+  # --- 1. Install certbot if missing --------------------------------------
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "installing certbot (HTTP-01 standalone)..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get -y -qq install certbot
+  fi
+  _log "  [i] certbot $(certbot --version 2>/dev/null | head -1)"
+
+  # --- 2. Fail closed if port 80 is not free ------------------------------
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lnt 2>/dev/null | grep -Eq '[:.]80[[:space:]]'; then
+      error "http01: port 80 is in use; stop the occupying service (xray does NOT own :80 on Germany — check for nginx/caddy) and re-run, or use --dashboard-cert-mode certbot-arvan."
+      return 1
+    fi
+  else
+    warn "http01: ss unavailable; skipping the port-80 free check (fail-open for the check, not for the issue)."
+  fi
+
+  # --- 3. Obtain/renew the cert via HTTP-01 standalone --------------------
+  local leaf="${dash_domain}"
+  local acme_server="${ONECLICK_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+
+  info "obtaining TLS cert for ${dash_domain} via certbot HTTP-01 standalone (:80, ${acme_server})..."
+  if ! certbot certificate issue \
+      --standalone \
+      -d "$leaf" \
+      --server "$acme_server" \
+      --key-type ecdsa \
+      --non-interactive \
+      --agree-tos \
+      --register-unsafely-without-email \
+      2>/dev/null; then
+    _log "  [!] first certbot attempt failed; retrying in 30s..."
+    sleep 30
+    certbot certificate issue \
+      --standalone \
+      -d "$leaf" \
+      --server "$acme_server" \
+      --key-type ecdsa \
+      --non-interactive \
+      --agree-tos \
+      --register-unsafely-without-email \
+      2>/dev/null || {
+      error "http01: failed to obtain cert for ${dash_domain} (2 attempts). Check that :80 is free and the public A record points at this host."
+      return 1
+    }
+  fi
+  _log "  [i] certbot issued/updated cert for ${dash_domain}."
+
+  # --- 4. Deploy the FULL CHAIN into the dashboard TLS dir (D2) -----------
+  local live_dir="/etc/letsencrypt/live/${leaf}"
+  if ! deploy_dashboard_pems "$live_dir"; then
+    error "http01: could not deploy the full chain from ${live_dir}."
+    return 1
+  fi
+
+  # --- 5. Renewal config must keep the SAME method (D4) -------------------
+  # `certbot certificate issue --standalone` persists authenticator=standalone
+  # in /etc/letsencrypt/renewal/<leaf>.conf; verify it, or fail closed. The
+  # deploy hook (fullchain + restart tunneldash) is shared with the
+  # certbot-arvan flow.
+  write_dashboard_renewal_deploy_hook
+  ensure_renewal_config "$leaf" "standalone"
+
+  _log "  [i] certbot auto-renewal timer is enabled (certbot.timer)."
+  _log "  [i] http01 flow complete for ${dash_domain}."
+}
+
 generate_dashboard() {
-  readonly DASHBOARD_TOKEN="/etc/split-tunnel/dashboard/token"
+  readonly DASHBOARD_TOKEN="$DASHBOARD_TOKEN_FILE"
   # Resolve the effective cert mode: explicit flag wins; --dashboard-domain
-  # (with no explicit mode) implies certbot-arvan.
+  # (with no explicit mode) implies certbot-arvan. D4: the two certbot methods
+  # (certbot-arvan = DNS-01 via the Arvan hook, http01 = standalone on :80)
+  # must each keep their renewal config on the SAME method so `certbot renew`
+  # never fails closed or re-issues with a different (unsupported) challenge.
   local cert_mode="${DASHBOARD_CERT_MODE:-existing}"
   if [ -n "$DASHBOARD_DOMAIN" ] && [ -z "$DASHBOARD_CERT_MODE" ]; then
     cert_mode="certbot-arvan"
   fi
+  case "$cert_mode" in
+    existing|certbot-arvan|http01) : ;;
+    *)
+      error "unknown --dashboard-cert-mode '${cert_mode}' (expected: existing, certbot-arvan, or http01)."
+      return 1
+      ;;
+  esac
 
   if [ "$DRY_RUN" -eq 1 ]; then
     _log "  [dry-run] generate ${DASHBOARD_CONFIG} + ${DASHBOARD_ENV} (TLS 0.0.0.0:${DASHBOARD_PORT}, random 32-hex basePath)"
@@ -789,18 +991,28 @@ generate_dashboard() {
         _log "  [dry-run] certbot certificate issue --manual --preferred-challenges dns -d $d"
         _log "             --manual-auth-hook /opt/split-tunnel/scripts/certbot-arvan-dns.sh create \$CERTBOT_DOMAIN \$CERTBOT_VALIDATION"
         _log "             --manual-cleanup-hook /opt/split-tunnel/scripts/certbot-arvan-dns.sh delete \$CERTBOT_DOMAIN"
-        _log "  [dry-run] deploy hook: copy /etc/letsencrypt/live/$d/{cert,privkey}.pem -> ${DASHBOARD_TLS_DIR}/ + chown root:split-tunnel"
+        _log "  [dry-run] deploy hook: copy /etc/letsencrypt/live/$d/fullchain.pem (FULL CHAIN) + privkey.pem -> ${DASHBOARD_TLS_DIR}/ + chown root:split-tunnel"
+        _log "  [dry-run] verify renewal config uses authenticator=manual + Arvan hook (same method as issue)"
+        _log "  [dry-run] renewal timer: certbot renew with deploy hook that restarts tunneldash"
+        ;;
+      http01)
+        local d="${DASHBOARD_DOMAIN:-}"
+        _log "  [dry-run] http01: domain=$d (HTTP-01 standalone on :80; xray does not use :80 on Germany)"
+        _log "  [dry-run] install certbot if missing; check :80 is free (fail closed)"
+        _log "  [dry-run] certbot certificate issue --standalone -d $d"
+        _log "  [dry-run] deploy hook: copy /etc/letsencrypt/live/$d/fullchain.pem (FULL CHAIN) + privkey.pem -> ${DASHBOARD_TLS_DIR}/"
+        _log "  [dry-run] verify renewal config uses authenticator=standalone (same method as issue)"
         _log "  [dry-run] renewal timer: certbot renew with deploy hook that restarts tunneldash"
         ;;
       *)
         if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
-          _log "  [dry-run] copy --cert/--key into ${DASHBOARD_TLS_DIR}/ (0640 root:split-tunnel)"
+          _log "  [dry-run] copy --cert (FULL CHAIN) / --key into ${DASHBOARD_TLS_DIR}/cert.pem + key.pem (0640 root:split-tunnel)"
         else
-          _log "  [dry-run] warning: no --cert/--key supplied; dashboard TLS dir is ${DASHBOARD_TLS_DIR}/ (PEMs must be copied there, or use --dashboard-domain/--dashboard-cert-mode certbot-arvan)"
+          _log "  [dry-run] warning: no --cert/--key supplied; dashboard TLS dir is ${DASHBOARD_TLS_DIR}/ (PEMs must be copied there, or use --dashboard-domain with --dashboard-cert-mode certbot-arvan|http01)"
         fi
         ;;
     esac
-    _log "  [dry-run] generate admin bearer token -> ${DASHBOARD_TOKEN} (0600; value never logged)"
+    _log "  [dry-run] generate admin bearer token -> ${DASHBOARD_TOKEN} (0640 root:split-tunnel, readable by the tunneldash user; value never logged)"
     _log "  [dry-run] write + enable hardened tunneldash.service (golden-pinned)"
     DASHBOARD_BASEPATH="<random-32-hex>"
     return 0
@@ -809,21 +1021,34 @@ generate_dashboard() {
   local basepath metrics_port="${ONECLICK_METRICS_PORT:-9101}"
   basepath="$(openssl rand -hex 16)"
 
-  mkdir -p "$DASHBOARD_TLS_DIR"; chmod 0750 "$DASHBOARD_TLS_DIR"
+  # D1a: the dashboard dir must be group-traversable by the non-root service
+  # user (split-tunnel) so it can reach the token file beneath it. The state
+  # root /etc/split-tunnel converges to 0750 root:split-tunnel; mirror that on
+  # the dashboard dir + its TLS subdir (0750 = owner+group rwx, no world).
+  local DASHBOARD_DIR="/etc/split-tunnel/dashboard"
+  mkdir -p "$DASHBOARD_DIR" "$DASHBOARD_TLS_DIR"
+  chown root:split-tunnel "$DASHBOARD_DIR" "$DASHBOARD_TLS_DIR" 2>/dev/null || true
+  chmod 0750 "$DASHBOARD_DIR"
+  chmod 0750 "$DASHBOARD_TLS_DIR"
 
   case "$cert_mode" in
     certbot-arvan)
       install_certbot_arvan_flow "$DASHBOARD_DOMAIN"
       ;;
+    http01)
+      install_http01_flow "$DASHBOARD_DOMAIN"
+      ;;
     *)
       if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+        # D2: --cert must be the FULL CHAIN (leaf + intermediates) so the
+        # served chain is complete; --key is the matching private key.
         cp -f "$CERT_FILE" "${DASHBOARD_TLS_DIR}/cert.pem"
         cp -f "$KEY_FILE" "${DASHBOARD_TLS_DIR}/key.pem"
         chown root:split-tunnel "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem" 2>/dev/null || true
         chmod 0640 "${DASHBOARD_TLS_DIR}/cert.pem" "${DASHBOARD_TLS_DIR}/key.pem"
-        _log "  [i] installed dashboard TLS cert/key into ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel)."
+        _log "  [i] installed dashboard TLS FULLCHAIN (--cert) + key into ${DASHBOARD_TLS_DIR} (0640 root:split-tunnel). Ensure --cert is the full chain (leaf + intermediates)."
       else
-        warn "no --cert/--key supplied and --dashboard-cert-mode is not certbot-arvan; dashboard TLS is incomplete until PEMs are copied to ${DASHBOARD_TLS_DIR}."
+        warn "no --cert/--key supplied and --dashboard-cert-mode is 'existing'; dashboard TLS is incomplete until a FULL-CHAIN cert + key are copied to ${DASHBOARD_TLS_DIR}, or you use --dashboard-domain with --dashboard-cert-mode certbot-arvan|http01."
       fi
       ;;
   esac
@@ -869,15 +1094,22 @@ generate_dashboard() {
 EOF
   chmod 0640 "$DASHBOARD_CONFIG"
 
-  # Optional admin bearer token (defense-in-depth; mutations stay disabled).
-  # Referenced by the env file via path only; the value is never logged.
+  # D1a: admin bearer token. The tunneldash service runs as the non-root
+  # split-tunnel user, so the token file it reads (via SPLIT_TUNNELDASH_TOKEN_FILE)
+  # MUST be group-readable by split-tunnel: owner root, group split-tunnel, mode
+  # 0640. (0600 root:split-tunnel would leave the group's read bit off, so the
+  # service user could not read it — the D1 defect.) The env file that names the
+  # token path is also group-readable so the unit's EnvironmentFile can load it.
+  # The directory chain /etc/split-tunnel/dashboard is 0750 root:split-tunnel so
+  # the service user can traverse to the token. The value is never printed.
   openssl rand -hex 32 > "$DASHBOARD_TOKEN"
-  chmod 0600 "$DASHBOARD_TOKEN"
   chown root:split-tunnel "$DASHBOARD_TOKEN" 2>/dev/null || true
-  _log "  [i] generated dashboard admin bearer token -> ${DASHBOARD_TOKEN} (0600; read the value from that file — it is never printed here)"
+  chmod 0640 "$DASHBOARD_TOKEN"
 
   { printf 'SPLIT_TUNNELDASH_TOKEN_FILE=%s\n' "$DASHBOARD_TOKEN"; } > "$DASHBOARD_ENV"
-  chmod 0600 "$DASHBOARD_ENV"
+  chown root:split-tunnel "$DASHBOARD_ENV" 2>/dev/null || true
+  chmod 0640 "$DASHBOARD_ENV"
+  _log "  [i] generated dashboard admin bearer token -> ${DASHBOARD_TOKEN} (0640 root:split-tunnel, readable by the tunneldash user; value never printed here)"
 
   mkdir -p /etc/split-tunnel/dashboard/ssh
   chmod 0750 /etc/split-tunnel/dashboard/ssh

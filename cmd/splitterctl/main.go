@@ -81,6 +81,11 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/xray"
 )
 
+// buildInfo is stamped at build time by the reproducible build script
+// (scripts/build-linux.sh) via -ldflags "-X main.buildInfo=<git-commit>". It is
+// empty in local/dev builds. It carries only a non-secret build identity.
+var buildInfo = ""
+
 var errUsage = errors.New("usage error")
 
 // recoverTimeout bounds a single post-crash recovery run: recovery is a
@@ -206,6 +211,18 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		if len(args) == 0 {
 			return errUsage
 		}
+		return nil
+	}
+	// `version` prints the reproducible-build commit stamp (scripts/
+	// build-linux.sh embeds it via -X main.buildInfo). It is not a mutation
+	// command and needs no store, so it is handled before the state-root
+	// resolution below.
+	if args[0] == "version" {
+		commit := buildInfo
+		if commit == "" {
+			commit = "dev"
+		}
+		_, _ = fmt.Fprintf(out, "splitterctl buildInfo: %s\n", commit)
 		return nil
 	}
 	stateRoot := os.Getenv("SPLITTERCTL_STATE_ROOT")

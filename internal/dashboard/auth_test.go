@@ -83,3 +83,43 @@ func TestLoadAdminTokenEmptySources(t *testing.T) {
 		t.Errorf("LoadAdminToken() = %q, want empty", got)
 	}
 }
+
+// TestAdminTokenConfigured (D1b) verifies the fail-closed predicate: it is
+// true whenever a token source is configured (env value OR file path), even
+// when the value later fails to resolve — that is exactly the case a public
+// TLS build must refuse. It is false only when no source is present at all.
+func TestAdminTokenConfigured(t *testing.T) {
+	t.Run("no source -> false", func(t *testing.T) {
+		t.Setenv(EnvAdminToken, "")
+		t.Setenv(EnvAdminTokenFile, "")
+		if AdminTokenConfigured() {
+			t.Error("AdminTokenConfigured() = true, want false with no source")
+		}
+	})
+	t.Run("env token set -> true", func(t *testing.T) {
+		t.Setenv(EnvAdminToken, "abc")
+		t.Setenv(EnvAdminTokenFile, "")
+		if !AdminTokenConfigured() {
+			t.Error("AdminTokenConfigured() = false, want true (env token set)")
+		}
+	})
+	t.Run("file path set but file missing -> true", func(t *testing.T) {
+		t.Setenv(EnvAdminToken, "")
+		t.Setenv(EnvAdminTokenFile, "/no/such/token-file")
+		if !AdminTokenConfigured() {
+			t.Error("AdminTokenConfigured() = false, want true (configured source that failed to resolve)")
+		}
+		// The configured-but-unresolvable source still returns an empty token:
+		// this is the misconfiguration a TLS build must fail closed on.
+		if got := LoadAdminToken(); got != "" {
+			t.Errorf("LoadAdminToken() = %q, want empty for a missing file", got)
+		}
+	})
+	t.Run("whitespace-only env -> false", func(t *testing.T) {
+		t.Setenv(EnvAdminToken, "   ")
+		t.Setenv(EnvAdminTokenFile, "")
+		if AdminTokenConfigured() {
+			t.Error("AdminTokenConfigured() = true, want false (env token is whitespace-only)")
+		}
+	})
+}
