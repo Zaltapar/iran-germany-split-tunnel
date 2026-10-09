@@ -309,4 +309,9 @@ pollChk.addEventListener("change", startPolling);
 pollSecInput.addEventListener("change", startPolling);
 
 // --- init ---
-loadOverview().then(() => startPolling());
+loadOverview()
+  .then(() => startPolling())
+  .catch(err => {
+    overviewEl.innerHTML = '<p class="warnings">API error: ' + esc(err.message) +
+      ' — check that the dashboard is reachable and the metrics endpoint is up.</p>';
+  });

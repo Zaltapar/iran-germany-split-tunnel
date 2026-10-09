@@ -497,10 +497,10 @@ func TestUIIndexContainsExpectedContent(t *testing.T) {
 		t.Fatalf("UI status = %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	// Must contain the warning banner.
+	// Must contain the read-only banner (production + fixture deployments).
 	for _, expected := range []string{
-		"Local fixture / read-only mode",
-		"No production hosts were contacted",
+		"Read-only mode",
+		"No secrets are displayed",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("UI index missing expected text %q", expected)
