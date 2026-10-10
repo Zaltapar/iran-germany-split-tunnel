@@ -567,3 +567,15 @@ Each decision has a recommended default. Phase 2 cannot start until D1, D3, D4, 
 - Section 8 landscape facts marked [A]: unverified; D12 covers verification.
 - Score weights and thresholds in section 6: starting values, tuned in Phase 3 from traces.
 - Egress cost of probe bytes: not verified against provider pricing.
+
+## 14. Dashboard v2 note (branch feat/multi-carrier-phase2)
+
+Scope: READ-ONLY dashboard v2 on the existing TunnelDash. No tunnel data path change, no host contact, no installer change, no write endpoint. Commits: backend `336057d`, frontend `2f98d3a` (local only, not pushed).
+
+- Endpoints (GET/HEAD only, under basePath, same Basic-auth and security-header middleware as v1; other methods answer 405 and never reach the mutator): `/api/v2/overview`, `/hosts`, `/carriers`, `/outbounds`, `/routing`, `/config` (redacted), `/events`, `/timeseries` (list keys, or `?series=a,b&limit=N`), `/schema`, `/schema/{concept}`, `/validate/{concept}` (GET describes a stub contract; POST is rejected).
+- History: in-memory ring buffer per series (`historyPoints`, default 360, clamped to 4320), series cap 512, closed key alphabet, no disk writes. Fed from every collector refresh before counter rate state is replaced.
+- Editing-ready model: `OutboundConfig`, `RoutingRule`, `RoutingPolicy` are typed with json tags and pure validators; `ConceptSchemas` describe them read-only with `editable=false` and the tooltip "editing lands in the next phase". Secret-bearing fields are not representable (a test enforces this).
+- Sections in the UI: Overview, Hosts, Tunnels/Carriers, Routing, Outbounds, Network speed, Configuration, Logs/Events, plus the v1 host detail and dry-run plan form (Apply disabled).
+- Coverage gaps, reported as null with explicit lists, never as zero: CPU and load average (no collector provides them; adding one would change the SSH collector's remote-command allowlist and needs a decision); carrier p10 goodput, TTFB p50, flap count, stall count, per-carrier rebinds and probe budget (computed by the Phase 3 policy but not exported on `/metrics`).
+- Verification status: unit tests cover auth, basePath, read-only, headers, shapes, redaction, ring bounds, schemas, and static-asset rules. Not yet verified: a live browser session against Germany, the installer harness result, and `-race` on Linux (see the completion report).
+- Live verification still required on Germany before trust: TLS handshake and cert chain, Basic auth through the browser, actual collector freshness and stale/unreachable transitions, and that no v2 request triggers any remote command beyond the existing poll.
