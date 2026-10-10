@@ -313,7 +313,7 @@ type Config struct {
 	// (DownCarrierAddr2), and Germany renders the second instance's SNI
 	// (DownSNI2). Port 8443 is reserved for the dashboard and rejected for
 	// any carrier listener.
-	MultiCarrierEnabled bool // SPLIT_MULTI_CARRIER_ENABLED
+	MultiCarrierEnabled bool   // SPLIT_MULTI_CARRIER_ENABLED
 	DownListen2         string // Germany: second down-carrier loopback listener (host:port)
 	DownCarrierAddr2    string // Iran: second down-carrier dial target (host:port)
 	DownSNI2            string // Germany: second instance SNI (TLS 1.3, operator-set)
