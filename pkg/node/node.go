@@ -261,9 +261,15 @@ type Node struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu        sync.RWMutex
-	up        *carrierHandle
-	down      *carrierHandle
+	mu sync.RWMutex
+	// upReg / downReg are the Phase 1 per-direction carrier registries
+	// (multi-carrier-intelligence-design §4.2). Each holds exactly ONE
+	// entry (carrierRegistry.h); the handle pointer is the authoritative
+	// storage, replacing the previous raw n.up / n.down fields. New code
+	// accesses carriers through the registry accessors; the install and
+	// loss-sweep flow stay byte-identical to the pre-registry build.
+	upReg     *carrierRegistry
+	downReg   *carrierRegistry
 	lostUp    bool // up carrier died since the previous install
 	lostDown  bool
 	genSeq    uint64
@@ -337,6 +343,20 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) (*Node, error) {
 		// a carrier is actually installed (Issue #7).
 		upReady:   make(chan struct{}),
 		downReady: make(chan struct{}),
+		// Phase 1 registries: one fixed carrier per direction. The
+		// registry IS the authoritative handle storage — the raw
+		// n.up / n.down fields have been replaced by n.upReg.h /
+		// n.downReg.h (byte-identical wire and config behavior).
+		upReg: newCarrierRegistry(CarrierDescriptor{
+			ID:     DefaultUpCarrierID,
+			Dir:    session.DirUp,
+			Family: FamilyCDNWS,
+		}),
+		downReg: newCarrierRegistry(CarrierDescriptor{
+			ID:     DefaultDownCarrierID,
+			Dir:    session.DirDown,
+			Family: FamilyReality,
+		}),
 	}, nil
 }
 
@@ -380,11 +400,11 @@ func (n *Node) Close() {
 	n.cancel()
 	n.store.CloseAll()
 	n.mu.Lock()
-	if n.up != nil {
-		n.up.carrier.Close()
+	if n.upReg.h != nil {
+		n.upReg.h.carrier.Close()
 	}
-	if n.down != nil {
-		n.down.carrier.Close()
+	if n.downReg.h != nil {
+		n.downReg.h.carrier.Close()
 	}
 	n.mu.Unlock()
 	if reclaimed := n.buf.Close(); reclaimed > 0 {
@@ -403,24 +423,33 @@ func (n *Node) SessionBufferAccounted() int64 { return n.buf.AccountedBytes() }
 func (n *Node) SessionBufferActiveRelays() int { return n.buf.ActiveRelays() }
 
 // UpReady reports whether a live up carrier is currently installed.
+// UpReady reports whether a live up carrier is currently installed.
+// Phase 1: routes through the up registry's sole entry under the
+// Node mutex, so the check-and-capture is atomic (the registry's
+// .h pointer is read under n.mu.RLock, exactly like the legacy
+// n.up field was).
 func (n *Node) UpReady() bool {
-	h := n.current(session.DirUp)
-	return h != nil && h.carrier.Ready()
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.upReg.Ready()
 }
 
 // DownReady reports whether a live down carrier is currently installed.
+// Phase 1: routes through the down registry's sole entry.
 func (n *Node) DownReady() bool {
-	h := n.current(session.DirDown)
-	return h != nil && h.carrier.Ready()
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.downReg.Ready()
 }
-
 func (n *Node) current(dir session.Direction) *carrierHandle {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
+	// Phase 1: the registry mirror is authoritative; the raw slot
+	// is kept in lockstep by install/dropIfCurrent.
 	if dir == session.DirUp {
-		return n.up
+		return n.upReg.h
 	}
-	return n.down
+	return n.downReg.h
 }
 
 // currentIfReady returns the current carrier handle for dir if it is
@@ -434,13 +463,13 @@ func (n *Node) currentIfReady(dir session.Direction) *carrierHandle {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	if dir == session.DirUp {
-		if n.up != nil && n.up.carrier.Ready() {
-			return n.up
+		if h := n.upReg.h; h != nil && h.carrier.Ready() {
+			return h
 		}
 		return nil
 	}
-	if n.down != nil && n.down.carrier.Ready() {
-		return n.down
+	if h := n.downReg.h; h != nil && h.carrier.Ready() {
+		return h
 	}
 	return nil
 }
@@ -452,23 +481,24 @@ func (n *Node) currentIfReady(dir session.Direction) *carrierHandle {
 func (n *Node) currentIfReadyBoth() (upH, downH *carrierHandle) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	if n.up != nil && n.up.carrier.Ready() {
-		upH = n.up
+	if h := n.upReg.h; h != nil && h.carrier.Ready() {
+		upH = h
 	}
-	if n.down != nil && n.down.carrier.Ready() {
-		downH = n.down
+	if h := n.downReg.h; h != nil && h.carrier.Ready() {
+		downH = h
 	}
 	return upH, downH
 }
 
-// dropIfCurrent clears the handle slot if it still points at h.
+// dropIfCurrent clears the registry entry for dir if it still points
+// at h (loss-sweep backstop: a dying carrier only clears the slot if
+// it is still current).
 func (n *Node) dropIfCurrent(dir session.Direction, h *carrierHandle) {
 	n.mu.Lock()
-	if dir == session.DirUp && n.up == h {
-		n.up = nil
-	}
-	if dir == session.DirDown && n.down == h {
-		n.down = nil
+	if dir == session.DirUp {
+		n.upReg.ClearIf(h)
+	} else {
+		n.downReg.ClearIf(h)
 	}
 	n.mu.Unlock()
 }
@@ -559,8 +589,12 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 	var old *carrierHandle
 	var wasLost bool
 	if dir == session.DirUp {
-		old = n.up
-		n.up = h
+		old = n.upReg.h
+		// Phase 1: the up registry holds exactly ONE entry; the install
+		// flow is the only mutator. The registry's fixed ID
+		// (DefaultUpCarrierID) is implicit — there is no other ID the
+		// Node would ever accept in Phase 1.
+		n.upReg.h = h
 		wasLost = n.lostUp
 		n.lostUp = false
 		// Carrier installed and (by construction) ready: mark the ready
@@ -571,8 +605,8 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 			n.upReadyClosed = true
 		}
 	} else {
-		old = n.down
-		n.down = h
+		old = n.downReg.h
+		n.downReg.h = h
 		wasLost = n.lostDown
 		n.lostDown = false
 		if !n.downReadyClosed {
@@ -1181,10 +1215,10 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 // clear their own stream tables during their Close), unindex and count.
 func (n *Node) onSessionClosed(sess *session.Session) {
 	n.mu.RLock()
-	if h := n.up; h != nil && sess.StreamIDUp != 0 {
+	if h := n.upReg.h; h != nil && sess.StreamIDUp != 0 {
 		h.carrier.Deregister(sess.StreamIDUp)
 	}
-	if h := n.down; h != nil && sess.StreamIDDown != 0 {
+	if h := n.downReg.h; h != nil && sess.StreamIDDown != 0 {
 		h.carrier.Deregister(sess.StreamIDDown)
 	}
 	// Phase B (Slice 6): capture the current down carrier so the credit
@@ -1192,7 +1226,7 @@ func (n *Node) onSessionClosed(sess *session.Session) {
 	// ledger on the gate, emitter record) — prevents a map leak of one
 	// entry per finished session. Inert when credits are disabled.
 	var downCar *mux.CarrierConn
-	if h := n.down; h != nil && sess.StreamIDDown != 0 {
+	if h := n.downReg.h; h != nil && sess.StreamIDDown != 0 {
 		downCar = h.carrier
 	}
 	n.mu.RUnlock()

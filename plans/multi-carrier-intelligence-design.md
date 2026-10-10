@@ -374,6 +374,49 @@ Acceptance:
 Gate G1: U1, U2, U3 pass.
 Rollback: revert the single Phase 1 commit set.
 
+#### Phase 1 completion note (2026-10-10, subtask G1)
+
+Completed on branch fix/complete-up-read-implementation at local 8bb4af6. Introduced the
+transport abstraction (CarrierID, CarrierDescriptor, per-direction one-entry
+carrierRegistry) in pkg/node/carrier_registry.go and routed the Node's
+install/ready/teardown paths through the registry (n.upReg / n.downReg are now the
+authoritative handle storage; the legacy raw n.up / n.down fields were removed).
+Registry unit tests added in pkg/node/carrier_registry_test.go (registration,
+lookup, duplicate-ID rejection, removal, generation increment on replacement,
+single-carrier-only invariant via the structurally-absent second slot).
+
+Wire format, frame payloads, rebind semantics, config env names, and metric
+names/values are unchanged; the Node's node-global generation counter (n.genSeq)
+is preserved so rebind generations stay lockstep. Germany's DownReady()
+single-carrier rejection and Iran's 409 for a second up carrier are unchanged.
+Per-carrier metric/label plumbing (item 4) was SKIPPED: it would require new
+metric labels on the single-carrier case and thus risk changing existing metric
+names/values, so it is deferred to Phase 3.
+
+Gate G1 results:
+- U1 (Go tests, Windows host 10.10): go build ./... OK; go vet ./... OK;
+  go test ./... PASS for all 18 packages (cmd/germany-splitter, cmd/iran-splitter,
+  cmd/splitterctl, integration, internal/*, pkg/mux, pkg/node, pkg/session).
+- Golden tests (U2): internal/xray and internal/systemd golden tests pass with
+  golden files unmodified (byte-identical).
+- Installer harness: install-oneclick.test.sh via Git Bash = PASS=74 FAIL=0.
+- Registry unit tests: 11/11 pass.
+- Single-carrier rejection tests: cmd/germany-splitter
+  TestDownCarrierDownReadyUnchanged and TestDownCarrierNormalAuth pass; the Iran
+  409 path is code-unchanged.
+- Linux -race: UNVERIFIED. Windows host cannot run -race (0xc0000139); the
+  Germany host scratch-copy approach (git archive from 8bb4af6 → /root/g1-race-scratch
+  → go test -race ./pkg/... ./internal/... ./cmd/...) could not be executed because
+  the Phase 1 changes are uncommitted (git archive exports only the last commit, which
+  is the docs commit 8bb4af6, not the registry code). No host service was touched; the
+  /root/g1-race-scratch copy was created and removed. The race gate must be re-run on
+  Linux CI after the Phase 1 change is committed.
+- U3 (30-minute external soak): NOT YET RUN — requires the Phase 0 baseline and an
+  operator-approved production-topology soak; not part of this subtask.
+
+Status: Phase 1 code complete, NOT committed, NOT pushed. Pending: commit + Linux
+-race re-run + U3 external soak to fully close Gate G1.
+
 ### Phase 2: second carrier and static failover
 
 Work:
