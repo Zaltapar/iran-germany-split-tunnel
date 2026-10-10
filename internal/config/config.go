@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 )
 
@@ -93,6 +94,20 @@ const (
 	// record filter, equivalent to SPLIT_TARGET_ONLY_IPV4=true). Wired
 	// on BOTH roles for symmetry.
 	EnvTargetAddrPolicy = "SPLIT_TARGET_ADDR_POLICY" // both (enum, default "default")
+	// Multi-carrier down-plane (Phase 2, plans/multi-carrier-intelligence-design.md):
+	//
+	// SPLIT_MULTI_CARRIER_ENABLED is the master on/off for a SECOND down
+	// carrier. OFF by default; when off the single-value down form
+	// (SPLIT_DOWN_LISTEN / SPLIT_DOWN_CARRIER_ADDR) is used and behavior is
+	// byte-identical to the pre-Phase-2 build. When on, the second down
+	// instance (a second VLESS+Reality listener on Germany, a second
+	// consumer inbound on Iran) is added and the three SPLIT_DOWN_*_2 /
+	// SPLIT_DOWN_CARRIER2_SNI values are required and validated.
+	EnvMultiCarrierEnabled = "SPLIT_MULTI_CARRIER_ENABLED" // both (bool, default false)
+	// Second down instance (only consulted when MultiCarrierEnabled).
+	EnvDownListen2      = "SPLIT_DOWN_LISTEN_2"       // Germany: second down-carrier loopback listener (host:port, host required)
+	EnvDownCarrierAddr2 = "SPLIT_DOWN_CARRIER_ADDR_2" // Iran: second down-carrier dial target (host:port, host required)
+	EnvDownSNI2         = "SPLIT_DOWN_CARRIER2_SNI"   // Germany: second instance's TLS 1.3 SNI (operator-set, required when enabled; never a hardcoded third-party default)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -168,9 +183,14 @@ const (
 	// the whole plane is inert until SPLIT_CREDITS_ENABLED is set true. The
 	// credit-plane sub-constants (window, timeout, batch) are fixed by the
 	// design §5/§14 invariants in pkg/node/credit.go and are NOT exposed as
-	// operator env vars (setting one would break the B2 memory-bound
+	// the operator env vars (setting one would break the B2 memory-bound
 	// guarantee creditPreLatchBound < MaxBytesPerStream).
 	DefaultCreditsEnabled = false
+
+	// Multi-carrier down-plane default (Phase 2): OFF. When false the
+	// single-value down form is used and behavior is byte-identical to the
+	// pre-Phase-2 build.
+	DefaultMultiCarrierEnabled = false
 
 	// Opt-in only-IPv4 target-dial policy: false by default preserves the
 	// current net.DialTimeout("tcp") behavior for every host (dual-stack
@@ -197,6 +217,12 @@ const (
 
 	MinPort = 1
 	MaxPort = 65535
+
+	// ReservedPort is the dashboard TLS port (plans/oneclick-installer-design.md
+	// §305). It must never be used for a carrier listener: a carrier bound to
+	// it would fail at bind time once the dashboard is installed, so the
+	// config layer refuses it up front.
+	ReservedPort = 8443
 
 	// SOCKS5 RFC 1929 username bounds: RFC 1929 encodes the username
 	// length in one byte, so 1..255 is the representable range. The
@@ -278,6 +304,19 @@ type Config struct {
 	// the explicit contradiction TargetOnlyIPv4=true + "prefer-ipv4" is a
 	// validation error.
 	TargetAddrPolicy string // SPLIT_TARGET_ADDR_POLICY
+
+	// Multi-carrier down-plane (Phase 2). MultiCarrierEnabled is the master
+	// on/off (default false → single-value down form, byte-identical behavior).
+	// When true, the SECOND down instance is described by the three _2 fields
+	// (all required and validated): Germany adds a second loopback Reality
+	// listener (DownListen2), Iran dials a second local consumer inbound
+	// (DownCarrierAddr2), and Germany renders the second instance's SNI
+	// (DownSNI2). Port 8443 is reserved for the dashboard and rejected for
+	// any carrier listener.
+	MultiCarrierEnabled bool // SPLIT_MULTI_CARRIER_ENABLED
+	DownListen2         string // Germany: second down-carrier loopback listener (host:port)
+	DownCarrierAddr2    string // Iran: second down-carrier dial target (host:port)
+	DownSNI2            string // Germany: second instance SNI (TLS 1.3, operator-set)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -306,6 +345,8 @@ func Defaults() *Config {
 		// Opt-in egress-target address-family policy default ("default"
 		// preserves today's byte-identical dual-stack dial; SUBTASK 42).
 		TargetAddrPolicy: DefaultTargetAddrPolicy,
+		// Multi-carrier down-plane default (Phase 2): OFF.
+		MultiCarrierEnabled: DefaultMultiCarrierEnabled,
 	}
 }
 
@@ -382,6 +423,15 @@ func Load(role string) (*Config, error) {
 	// allowed set) rather than silently falling back to the default —
 	// a typo'd policy must not silently change dial behavior.
 	c.TargetAddrPolicy = envString(EnvTargetAddrPolicy, DefaultTargetAddrPolicy)
+	// Multi-carrier down-plane (Phase 2): master on/off (default false →
+	// single-value form, byte-identical behavior). The three _2 values are
+	// read only when enabled; when disabled they stay at their defaults
+	// (empty) and are NOT validated, so an operator can set them early
+	// without flipping the master switch.
+	c.MultiCarrierEnabled = envBool(&problems, EnvMultiCarrierEnabled, DefaultMultiCarrierEnabled)
+	c.DownListen2 = envString(EnvDownListen2, c.DownListen2)
+	c.DownCarrierAddr2 = envString(EnvDownCarrierAddr2, c.DownCarrierAddr2)
+	c.DownSNI2 = envString(EnvDownSNI2, c.DownSNI2)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -458,9 +508,56 @@ func (c *Config) Validate(role string) error {
 		// address; an invalid entry fails config load so a typo'd allowlist
 		// cannot silently allow everyone.
 		checkSocksAllowedSources(&problems, c.SocksAllowedSources)
+		// Multi-carrier (Phase 2, Iran role): a SECOND down-carrier dial
+		// target (loopback port of the second Xray consumer inbound). Valid
+		// only when multi-carrier is enabled; it must be a well-formed host:port
+		// that differs from the primary down target, otherwise the two carriers
+		// would dial the same endpoint and the second carrier adds nothing.
+		if c.MultiCarrierEnabled {
+			checkHostPort(&problems, EnvDownCarrierAddr2, c.DownCarrierAddr2, true)
+			if c.DownCarrierAddr2 != "" && c.DownCarrierAddr2 == c.DownCarrierAddr {
+				problems = append(problems, fmt.Sprintf(
+					"%s=%q equals %s=%q; the second down carrier must dial a different local consumer inbound",
+					EnvDownCarrierAddr2, c.DownCarrierAddr2, EnvDownCarrier, c.DownCarrierAddr))
+			}
+		}
 	case RoleGermany:
 		checkWsUrl(&problems, c.UpWsUrl)
 		checkHostPort(&problems, EnvDownListen, c.DownListen, false)
+		// Port 8443 is reserved for the dashboard TLS listener
+		// (plans/oneclick-installer-design.md §305); a carrier bound to it
+		// would fail at bind time once the dashboard is installed, so reject
+		// it at config time. The primary down listener and, when enabled, the
+		// second down listener are both carrier listeners.
+		checkNotReservedCarrierPort(&problems, EnvDownListen, c.DownListen)
+		// Multi-carrier (Phase 2, Germany role): a SECOND down-carrier
+		// listener (loopback port of the second splitter down instance) plus
+		// the second instance's TLS 1.3 SNI for Reality config rendering.
+		// All are required and validated only when multi-carrier is enabled.
+		if c.MultiCarrierEnabled {
+			checkHostPort(&problems, EnvDownListen2, c.DownListen2, true)
+			checkNotReservedCarrierPort(&problems, EnvDownListen2, c.DownListen2)
+			// Conflicting listeners: the second down listener must not fight
+			// the first over the same bind address.
+			if c.DownListen2 != "" && conflict(c.DownListen, c.DownListen2) {
+				problems = append(problems, fmt.Sprintf(
+					"%s and %s use the same endpoint %q; the app owns both listeners",
+					EnvDownListen, EnvDownListen2, c.DownListen2))
+			}
+			// SNI: required when multi-carrier is enabled. The default is the
+			// operator-placeholder sentinel; a real TLS 1.3-compliant domain
+			// must be set (decision D3). It is validated with the same SNI
+			// rule the Reality renderer uses (internal/pairing.ValidSNI).
+			if c.DownSNI2 == "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s is required when %s=true (the second down carrier's TLS 1.3 SNI; set a real, TLS 1.3-compliant domain)",
+					EnvDownSNI2, EnvMultiCarrierEnabled))
+			} else if !pairing.ValidSNI(c.DownSNI2) {
+				problems = append(problems, fmt.Sprintf(
+					"%s=%q: must be a lowercase RFC 1123 hostname (no IP literal, no port, no scheme)",
+					EnvDownSNI2, c.DownSNI2))
+			}
+		}
 	case "":
 		return fmt.Errorf("config: no role given")
 	default:
@@ -718,6 +815,26 @@ func checkHostPort(problems *[]string, name, addr string, requireHost bool) {
 	if err != nil || p < MinPort || p > MaxPort {
 		*problems = append(*problems, fmt.Sprintf(
 			"%s=%q: expected a port between %d and %d", name, addr, MinPort, MaxPort))
+	}
+}
+
+// checkNotReservedCarrierPort reports a config problem when the
+// host:port endpoint's port is the dashboard-reserved port 8443
+// (plans/oneclick-installer-design.md §305). A carrier listener on that
+// port would fail to bind once the dashboard is installed, so the config
+// layer refuses it up front. The endpoint's port is parsed with the same
+// host:port rules as checkHostPort (IPv6 bracket syntax supported); when
+// the endpoint is unparseable checkHostPort has already reported the
+// problem, so this helper is a no-op in that case.
+func checkNotReservedCarrierPort(problems *[]string, name, addr string) {
+	_, p, ok := portOf(addr)
+	if !ok {
+		return // checkHostPort already reported the parse problem.
+	}
+	if p == ReservedPort {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: port %d is reserved for the dashboard TLS listener; use a different carrier port",
+			name, addr, ReservedPort))
 	}
 }
 

@@ -40,6 +40,8 @@ func isolatedEnv(t *testing.T) {
 		EnvTargetOnlyIPv4,
 		// Opt-in address-family policy (SUBTASK 42): pin unset ("default").
 		EnvTargetAddrPolicy,
+		// Multi-carrier down-plane (Phase 2): pin unset (off; empty _2 values).
+		EnvMultiCarrierEnabled, EnvDownListen2, EnvDownCarrierAddr2, EnvDownSNI2,
 	} {
 		t.Setenv(name, "")
 	}
