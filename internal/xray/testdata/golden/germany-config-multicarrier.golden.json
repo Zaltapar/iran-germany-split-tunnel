@@ -1,0 +1,96 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/split-tunnel/xray-germany.error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "split-down",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.lovelive123.com:443",
+          "serverNames": [
+            "www.lovelive123.com"
+          ],
+          "privateKey": "gAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHkA",
+          "shortIds": [
+            "0123456789abcdef"
+          ]
+        }
+      }
+    },
+    {
+      "tag": "split-down-b",
+      "listen": "0.0.0.0",
+      "port": 2053,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "9f8e7d6c-5b4a-4321-9876-543210fedcba"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.example-sni-b.com:443",
+          "serverNames": [
+            "www.example-sni-b.com"
+          ],
+          "privateKey": "gAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHkA",
+          "shortIds": [
+            "abcdef0123456789"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "to-splitter",
+      "protocol": "freedom",
+      "settings": {
+        "redirect": "127.0.0.1:9002"
+      }
+    },
+    {
+      "tag": "to-splitter-b",
+      "protocol": "freedom",
+      "settings": {
+        "redirect": "127.0.0.1:9003"
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "split-down"
+        ],
+        "outboundTag": "to-splitter"
+      },
+      {
+        "inboundTag": [
+          "split-down-b"
+        ],
+        "outboundTag": "to-splitter-b"
+      }
+    ]
+  }
+}

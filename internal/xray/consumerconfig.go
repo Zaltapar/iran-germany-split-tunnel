@@ -250,3 +250,171 @@ func EnsureListenPortValid(port int) error {
 
 // ConsumerPortStr returns the port as a string for use in SPLIT_DOWN_CARRIER_ADDR.
 func ConsumerPortStr(port int) string { return strconv.Itoa(port) }
+
+// ConsumerInstance describes ONE consumer instance (D4): a local dokodemo-door
+// inbound that iran-splitter dials, mapped to a Reality VLESS outbound for one
+// Reality instance.
+type ConsumerInstance struct {
+	// PublicKey / SNI / ShortID / UUID / DownHost / DownPort are that
+	// instance's public Reality parameters (from Blob B, or the operator's
+	// second-instance public set for instance b).
+	PublicKey string
+	SNI       string
+	ShortID   string
+	UUID      string
+	DownHost  string
+	DownPort  int
+	// ListenAddr / ListenPort are the local loopback port this instance's
+	// dokodemo-door inbound binds (10802 for a, 10803 for b, proposed).
+	ListenAddr string
+	ListenPort int
+	// Tags for this instance's inbound/outbound/route. Omitted tags render
+	// the primary constants; instance b must set distinct ones.
+	InboundTag  string
+	OutboundTag string
+}
+
+// ConsumerMultiParams is the validated input for the multi-carrier consumer
+// render: instance a (primary, 10802) plus instance b (second, 10803).
+type ConsumerMultiParams struct {
+	A ConsumerInstance
+	B ConsumerInstance
+}
+
+// ValidateConsumerMultiParams validates both consumer instances: each against
+// the single-instance rules, plus the Phase 2 instance-b invariants: b's
+// listen port is set, differs from a's, and b's SNI differs from a's (D3/D4).
+// Errors name fields, never values.
+func ValidateConsumerMultiParams(p ConsumerMultiParams) error {
+	for _, in := range []struct {
+		name string
+		c    ConsumerInstance
+	}{
+		{"a", p.A},
+		{"b", p.B},
+	} {
+		if err := validateConsumerInstance(in.c); err != nil {
+			return fmt.Errorf("instance %s: %w", in.name, err)
+		}
+	}
+	if p.B.ListenPort == p.A.ListenPort {
+		return fmt.Errorf("%w: instance b listenPort must differ from instance a (distinct local inbound)", ErrInvalidConsumerParams)
+	}
+	if p.B.SNI == p.A.SNI {
+		return fmt.Errorf("%w: instance b sni must differ from instance a (a distinct TLS 1.3 SNI, D3)", ErrInvalidConsumerParams)
+	}
+	return nil
+}
+
+// validateConsumerInstance enforces the single-instance field rules for one
+// consumer instance.
+func validateConsumerInstance(p ConsumerInstance) error {
+	var problems []string
+	if !pairing.ValidSNI(p.SNI) {
+		problems = append(problems, "sni: must be a lowercase RFC 1123 hostname")
+	}
+	if !pairing.ValidShortID(p.ShortID) {
+		problems = append(problems, "shortId: must be 16 lowercase hex chars")
+	}
+	if !pairing.ValidUUID(p.UUID) {
+		problems = append(problems, "uuid: must be an RFC 4122 version-4 UUID")
+	}
+	if p.PublicKey == "" {
+		problems = append(problems, "publicKey: required (base64.RawURLEncoding 32-byte X25519)")
+	}
+	if !pairing.ValidUploadDomain(p.DownHost) {
+		problems = append(problems, "downHost: must be a valid public host (IP or RFC 1123 domain)")
+	}
+	if p.DownPort < 1 || p.DownPort > 65535 {
+		problems = append(problems, "downPort: must be 1..65535")
+	}
+	if p.ListenPort < 1 || p.ListenPort > 65535 {
+		problems = append(problems, "listenPort: must be 1..65535")
+	}
+	if p.ListenAddr == "" {
+		problems = append(problems, "listenAddr: required (loopback address)")
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidConsumerParams, strings.Join(problems, "; "))
+}
+
+// renderConsumerInstance builds the (inbound, outbound, route) triplet for one
+// consumer instance, honoring its tag overrides.
+func renderConsumerInstance(in ConsumerInstance) (consumerInb, consumerOutb, consumerRoute) {
+	inbTag := in.InboundTag
+	if inbTag == "" {
+		inbTag = "to-germany"
+	}
+	outTag := in.OutboundTag
+	if outTag == "" {
+		outTag = "reality-germany"
+	}
+	inb := consumerInb{
+		Tag:      inbTag,
+		Listen:   in.ListenAddr,
+		Port:     in.ListenPort,
+		Protocol: "dokodemo-door",
+		Settings: consumerInbSettings{Network: "tcp"},
+	}
+	ob := consumerOutb{
+		Tag:      outTag,
+		Protocol: "vless",
+		Settings: consumerVLESS{
+			VNext: []consumerVNext{{
+				Address: in.DownHost,
+				Port:    in.DownPort,
+				Users: []consumerUser{{
+					ID:         in.UUID,
+					Encryption: "none",
+				}},
+			}},
+		},
+		StreamSettings: consumerStream{
+			Network:  "tcp",
+			Security: "reality",
+			RealitySettings: consumerRealityOut{
+				Dest:       in.SNI + ":443",
+				ServerName: in.SNI,
+				PublicKey:  in.PublicKey,
+				ShortID:    in.ShortID,
+			},
+		},
+	}
+	rule := consumerRoute{
+		InboundTag:  []string{inbTag},
+		OutboundTag: outTag,
+	}
+	return inb, ob, rule
+}
+
+// RenderConsumerMultiConfig renders the two-instance Iran Xray consumer config
+// (Phase 2, D4): two dokodemo-door inbounds (instance a on 10802, instance b
+// on 10803) each routed to its own Reality VLESS outbound. It is a pure,
+// deterministic function; the single-carrier consumer golden is UNCHANGED —
+// this is a distinct function only the multi-carrier path calls. The output
+// ends with a single trailing newline.
+func RenderConsumerMultiConfig(p ConsumerMultiParams) ([]byte, error) {
+	if err := ValidateConsumerMultiParams(p); err != nil {
+		return nil, err
+	}
+	inA, obA, ruleA := renderConsumerInstance(p.A)
+	inB, obB, ruleB := renderConsumerInstance(p.B)
+
+	cfg := consumerConfig{
+		Log: consumerLog{
+			LogLevel: "warning",
+			Error:    "/var/log/split-tunnel/xray-consumer.error.log",
+		},
+		Inbounds:  []consumerInb{inA, inB},
+		Outbounds: []consumerOutb{obA, obB},
+		Routing:   consumerRouting{Rules: []consumerRoute{ruleA, ruleB}},
+	}
+
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("xray: consumer config: render multi: %w", err)
+	}
+	return append(b, '\n'), nil
+}
