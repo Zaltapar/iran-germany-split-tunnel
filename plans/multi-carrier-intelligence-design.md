@@ -436,10 +436,19 @@ Acceptance:
 - F6 (external, mixed): upgrade one side only; no flap storm over 30 minutes.
 
 Gate G2: F1–F6 pass.
+Gate G2: F1–F6 pass.
 Rollback: set config back to the single-value down carrier form; the code path for one carrier is retained and covered by the golden test. If the binary must be reverted, revert the Phase 2 commit set. The Iran xray-consumer change is rolled back from its pre-change config backup (operator-managed, D4).
 
-### Phase 3: health scoring, probes, hysteresis, policy, dashboard
+**Phase 2 completion note (G2, branch `feat/multi-carrier-phase2`):** all in-process work items are implemented and gated; F5/F6 remain external and are intentionally NOT executed here (no host contact, no production changes).
+- Multi down-carrier config: `node.Config.DownCarrierIDs` + `internal/config` validation (dup IDs, conflicting listeners, port 8443 reserved, enabled-with-no-usable-carrier). OFF by default; single-carrier byte-identical (goldens unchanged).
+- Per-CarrierID registry: [`pkg/node/carrier_registry.go`](../pkg/node/carrier_registry.go) with static-priority order, `ReadyExcept` for hot-standby failover, fail-closed unknown IDs.
+- Per-stream pinning + loss-triggered failover: [`pkg/node/node.go`](../pkg/node/node.go) `onCarrierLost` now re-attaches the lost carrier's pinned streams onto a surviving Active carrier within grace (the F1 "re-attach within grace" path); the rebind-anchor invariant holds (no credit/data before the peer registers the stream on the new carrier).
+- Rebind v2 wire + v1 fallback: [`pkg/session/attachment.go`](../pkg/session/attachment.go) `EncodeRebindV2`/`ParseRebindAny`; chosen by local `multiDown()` (D9 capability negotiation).
+- Xray two-instance rendering: [`internal/xray/realityconfig.go`](../internal/xray/realityconfig.go) `RenderGermanyMultiConfig` (inbound 443 + 2053 → 9002/9003) and [`internal/xray/consumerconfig.go`](../internal/xray/consumerconfig.go) `RenderConsumerMultiConfig`; new goldens committed, single-carrier goldens byte-identical. `xray run -test` gate: `go test -tags xraye2e -run TestE2EMultiCarrierRender ./internal/xray/` then `xray run -test -config <rendered path>` for each marker path.
+- Per-carrier /metrics lines emitted only when multi-carrier is enabled.
+- Gates: F1/F2/F4 in-process in [`integration/multicarrier_failover_test.go`](../integration/multicarrier_failover_test.go) (20 MiB sha256-intact failover to the standby; same/diff-ID; no-flap). F3 covered structurally by the credit-storm regression suite. `go build/vet/gofmt/test ./...` green; installer harness PASS=74 FAIL=0.
 
+### Phase 3: health scoring, probes, hysteresis, policy, dashboard
 Work:
 - Mux delivery counters (goodput, stalls, TTFB).
 - In-tunnel probe service on Germany and probe scheduler on both sides; budget enforcement.
