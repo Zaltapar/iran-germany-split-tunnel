@@ -102,6 +102,10 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/health", s.apiHandler(s.handleHealth))
 	mux.HandleFunc("/api/v1/config-keys", s.apiHandler(s.handleConfigKeys))
 
+	// API v2 (Dashboard v2): read-only GET/HEAD JSON under the same basePath
+	// and middleware chain. Any other method is answered 405 by handleV2.
+	mux.HandleFunc("/api/v2/", s.handleV2)
+
 	// Embedded UI: index at "/", assets under "/static/".
 	mux.HandleFunc("/", s.serveUI)
 

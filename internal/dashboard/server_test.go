@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -649,23 +650,28 @@ func TestServerPlanStoreConcurrent(t *testing.T) {
 	audit := NewAuditLog(cfg.MaxAudit)
 	s := NewServer(cfg, cache, audit, nil, nil)
 
+	// Inserting more plans than maxStoredPlans makes eviction part of the
+	// contract, so a plan may legitimately be gone by the time another
+	// goroutine reads it. The guarantees under concurrency are: no data race
+	// (run with -race), no panic, and the stored map never exceeds the cap.
 	const n = 200
-	errCh := make(chan error, n)
+	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
+		wg.Add(1)
 		go func(idx int) {
+			defer wg.Done()
 			planID := fmt.Sprintf("conc-plan-%d", idx)
-			plan := &PlanResult{PlanID: planID, ServerID: "iran"}
-			s.storePlan(plan)
-			if _, ok := s.getPlan(planID); !ok {
-				errCh <- fmt.Errorf("plan %q not found after store", planID)
-			}
-			errCh <- nil
+			s.storePlan(&PlanResult{PlanID: planID, ServerID: "iran"})
+			_, _ = s.getPlan(planID)
 		}(i)
 	}
-	for i := 0; i < n; i++ {
-		if err := <-errCh; err != nil {
-			t.Error(err)
-		}
+	wg.Wait()
+
+	s.planMu.RLock()
+	stored := len(s.plans)
+	s.planMu.RUnlock()
+	if stored > maxStoredPlans {
+		t.Errorf("stored %d plans, cap is %d", stored, maxStoredPlans)
 	}
 }
 

@@ -49,6 +49,12 @@ func (c *DashboardConfig) Validate() error {
 	if c.MaxAudit <= 0 {
 		c.MaxAudit = 500
 	}
+	if c.HistoryPoints <= 0 {
+		c.HistoryPoints = DefaultHistoryPoints
+	}
+	if c.HistoryPoints > MaxHistoryPoints {
+		c.HistoryPoints = MaxHistoryPoints
+	}
 	if len(c.Servers) == 0 {
 		return fmt.Errorf("dashboard: config must define at least one server")
 	}
@@ -81,6 +87,23 @@ func (c *DashboardConfig) Validate() error {
 			if err := ValidateSSHConfig(s.SSH, s.Role); err != nil {
 				return fmt.Errorf("dashboard: server %q ssh config: %w", s.ID, err)
 			}
+		}
+	}
+	// Outbound and routing views (Dashboard v2). Names must be unique and
+	// every object must pass the same validators the future editor will use.
+	outboundNames := map[string]bool{}
+	for i, o := range c.Outbounds {
+		if errs := ValidateOutbound(o); len(errs) > 0 {
+			return fmt.Errorf("dashboard: outbounds[%d] invalid: %s", i, errs[0])
+		}
+		if outboundNames[o.Name] {
+			return fmt.Errorf("dashboard: duplicate outbound name %q", o.Name)
+		}
+		outboundNames[o.Name] = true
+	}
+	if c.Routing != nil {
+		if errs := ValidateRoutingPolicy(*c.Routing, c.Outbounds); len(errs) > 0 {
+			return fmt.Errorf("dashboard: routing invalid: %s", errs[0])
 		}
 	}
 	// TLS config invariants: when enabled, the config must be complete (cert,

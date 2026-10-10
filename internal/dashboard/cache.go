@@ -17,6 +17,9 @@ type Cache struct {
 	prevMetrics map[string][]MetricSample
 	prevTime    map[string]time.Time
 	nowFn       func() time.Time
+	// history is the bounded in-memory timeseries fed on every collection
+	// (Dashboard v2). It is never persisted.
+	history *History
 }
 
 // NewCache creates a Cache for the given config.
@@ -28,6 +31,7 @@ func NewCache(cfg *DashboardConfig) *Cache {
 		prevMetrics: make(map[string][]MetricSample),
 		prevTime:    make(map[string]time.Time),
 		nowFn:       time.Now,
+		history:     NewHistory(cfg.HistoryPoints, 0),
 	}
 	for _, s := range cfg.Servers {
 		c.coll[s.ID] = NewCollector(s.SourceType)
@@ -92,6 +96,9 @@ func (c *Cache) Refresh(ctx context.Context) {
 			}
 		}
 		if snap != nil {
+			// Record history BEFORE prevMetrics is overwritten: counter rates
+			// are computed against the previous sample set.
+			c.recordHistoryLocked(s.ID, snap)
 			// Move previous metrics for rate computation.
 			if snap.Metrics != nil {
 				c.prevMetrics[s.ID] = snap.Metrics.Samples
@@ -123,6 +130,9 @@ func (c *Cache) RefreshServer(ctx context.Context, serverID string) error {
 			Errors:      []string{err.Error()},
 		}
 	}
+	if snap != nil {
+		c.recordHistoryLocked(serverID, snap)
+	}
 	if snap != nil && snap.Metrics != nil {
 		c.prevMetrics[serverID] = snap.Metrics.Samples
 		c.prevTime[serverID] = snap.Metrics.CollectedAt
@@ -132,6 +142,16 @@ func (c *Cache) RefreshServer(ctx context.Context, serverID string) error {
 	}
 	return nil
 }
+
+// recordHistoryLocked feeds the bounded timeseries from one collected snapshot.
+// The caller must hold c.mu for writing and must call this before
+// prevMetrics/prevTime are updated for the same server.
+func (c *Cache) recordHistoryLocked(serverID string, snap *ServerSnapshot) {
+	recordSnapshotHistory(c.history, snap, c.prevMetrics[serverID], c.prevTime[serverID])
+}
+
+// History returns the bounded in-memory timeseries store fed by this cache.
+func (c *Cache) History() *History { return c.history }
 
 // RatesFor returns computed rates for the given server using the previous
 // cached metrics and the current snapshot's metrics.

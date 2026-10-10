@@ -189,6 +189,16 @@ type DashboardConfig struct {
 	MaxAudit      int            `json:"maxAudit"`
 	Servers       []ServerConfig `json:"servers"`
 	TLS           *TLSConfig     `json:"tls,omitempty"`
+	// HistoryPoints bounds the in-memory chart history per series (Dashboard
+	// v2). 0 means DefaultHistoryPoints; values are clamped to
+	// MaxHistoryPoints. Nothing is written to disk.
+	HistoryPoints int `json:"historyPoints,omitempty"`
+	// Outbounds is the read-only view of configured Reality/Xray outbounds
+	// (Dashboard v2). Public identity fields only; no keys or UUIDs.
+	Outbounds []OutboundConfig `json:"outbounds,omitempty"`
+	// Routing is the read-only view of the routing policy (Dashboard v2).
+	// nil means "not declared"; the UI then shows an explicit empty state.
+	Routing *RoutingPolicy `json:"routing,omitempty"`
 }
 
 // validBasePath reports whether p is a 32-character lowercase hex string.
