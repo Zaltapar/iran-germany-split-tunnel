@@ -44,6 +44,15 @@ const (
 	RoleGermany = "germany"
 )
 
+// Phase 3 carrier-intelligence policy modes (the values accepted by
+// SPLIT_POLICY_MODE). These mirror the pkg/node PolicyStatic / PolicyAdaptive
+// constants so the config layer can validate the operator's choice without
+// importing pkg/node (the config package stays transport-free).
+const (
+	PolicyStaticMode   = "static"
+	PolicyAdaptiveMode = "adaptive"
+)
+
 // Environment variable names (single source of truth).
 const (
 	EnvSocksListen         = "SPLIT_SOCKS_LISTEN"               // Iran
@@ -102,12 +111,40 @@ const (
 	// byte-identical to the pre-Phase-2 build. When on, the second down
 	// instance (a second VLESS+Reality listener on Germany, a second
 	// consumer inbound on Iran) is added and the three SPLIT_DOWN_*_2 /
-	// SPLIT_DOWN_CARRIER2_SNI values are required and validated.
 	EnvMultiCarrierEnabled = "SPLIT_MULTI_CARRIER_ENABLED" // both (bool, default false)
 	// Second down instance (only consulted when MultiCarrierEnabled).
 	EnvDownListen2      = "SPLIT_DOWN_LISTEN_2"       // Germany: second down-carrier loopback listener (host:port, host required)
 	EnvDownCarrierAddr2 = "SPLIT_DOWN_CARRIER_ADDR_2" // Iran: second down-carrier dial target (host:port, host required)
 	EnvDownSNI2         = "SPLIT_DOWN_CARRIER2_SNI"   // Germany: second instance's TLS 1.3 SNI (operator-set, required when enabled; never a hardcoded third-party default)
+
+	// Phase 3 carrier-intelligence policy (plans/multi-carrier-intelligence-
+	// design.md §6-§7). These knobs are only consulted when
+	// MultiCarrierEnabled is true (the policy engine is constructed only for a
+	// multi-carrier down plane); in a single-carrier node they are ignored and
+	// the Phase 3 path is fully inert.
+	//
+	// SPLIT_POLICY_MODE selects the new-stream selection policy: "static"
+	// (the Phase 2 static-priority rollback, the default; adaptive switching
+	// is OFF) or "adaptive" (hard gates + weighted score + hysteresis +
+	// cooldown + smooth WRR). The static mode is the design rollback.
+	EnvPolicyMode = "SPLIT_POLICY_MODE" // both (enum static|adaptive, default "static")
+	// SPLIT_POLICY_TOPK is the number of top-scored Active carriers used for
+	// new-stream round-robin in adaptive mode (design §7.1, D13 default 2).
+	EnvPolicyTopK = "SPLIT_POLICY_TOPK" // both (int, default 2, 1..8)
+	// SPLIT_PROBING_ENABLED turns on the bounded in-tunnel active probes.
+	// OFF by default; when ON the probe URL (SPLIT_PROBE_URL) is required —
+	// there is deliberately no third-party default, so probing enabled without
+	// a URL is a config error (fail-closed, design §6.4).
+	EnvProbingEnabled = "SPLIT_PROBING_ENABLED" // both (bool, default false)
+	// SPLIT_PROBE_URL is the operator-configured probe target. No default.
+	EnvProbeURL = "SPLIT_PROBE_URL" // both (string, required when probing enabled)
+	// SPLIT_PROBE_DAILY_BUDGET is the hard daily byte budget per carrier for
+	// active probes (design §6.4, D7 default 96 MiB). 0 = no cap (test
+	// sentinel); NEGATIVE is a config error. Expressed in bytes.
+	EnvProbeDailyBudget = "SPLIT_PROBE_DAILY_BUDGET" // both (int bytes, default 96 MiB, >= 0)
+	// SPLIT_TTFB_BASELINE_MS is the Phase 0 baseline p50 TTFB used to
+	// normalize the T score term (design §6.3). 0 = library default (500 ms).
+	EnvTTFBBaselineMs = "SPLIT_TTFB_BASELINE_MS" // both (int ms, default 500, 0..30000)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -186,12 +223,36 @@ const (
 	// the operator env vars (setting one would break the B2 memory-bound
 	// guarantee creditPreLatchBound < MaxBytesPerStream).
 	DefaultCreditsEnabled = false
-
 	// Multi-carrier down-plane default (Phase 2): OFF. When false the
 	// single-value down form is used and behavior is byte-identical to the
 	// pre-Phase-2 build.
 	DefaultMultiCarrierEnabled = false
 
+	// Phase 3 carrier-intelligence defaults (plans/multi-carrier-intelligence-
+	// design.md §6-§7). The policy engine sanitizes zero values to the
+	// documented starting values; these defaults mirror the ON/OFF and the
+	// bounded ranges enforced at config validation.
+	// DefaultPolicyMode is the Phase 2 rollback: "static" (adaptive switching
+	// OFF by default).
+	DefaultPolicyMode = PolicyStaticMode
+	// DefaultProbingEnabled: OFF (probes are opt-in; the byte budget and the
+	// probe URL are only consulted when ON).
+	DefaultProbingEnabled = false
+	// DefaultProbeURL: no third-party default (empty). Required when
+	// ProbingEnabled is true.
+	DefaultProbeURL = ""
+	// DefaultProbeDailyBudget: the hard daily byte cap for active probes
+	// (design §6.4, D7): 96 MiB.
+	DefaultProbeDailyBudget = 96 << 20 // 96 MiB
+	// MinTTFBBaselineMs / MaxTTFBBaselineMs bound the TTFB baseline (ms).
+	// 0 means "library default" (500 ms).
+	MinTTFBBaselineMs = 0
+	MaxTTFBBaselineMs = 30000
+	// MinPolicyTopK / MaxPolicyTopK bound the top-K carrier count.
+	MinPolicyTopK = 1
+	MaxPolicyTopK = 8
+	// DefaultPolicyTopK (design §7.1, D13).
+	DefaultPolicyTopK = 2
 	// Opt-in only-IPv4 target-dial policy: false by default preserves the
 	// current net.DialTimeout("tcp") behavior for every host (dual-stack
 	// resolution, OS address-family preference). When true, domain hosts
@@ -317,6 +378,15 @@ type Config struct {
 	DownListen2         string // Germany: second down-carrier loopback listener (host:port)
 	DownCarrierAddr2    string // Iran: second down-carrier dial target (host:port)
 	DownSNI2            string // Germany: second instance SNI (TLS 1.3, operator-set)
+
+	// Phase 3 carrier-intelligence policy (only consulted when
+	// MultiCarrierEnabled; inert in single-carrier nodes).
+	PolicyMode       string // SPLIT_POLICY_MODE (static|adaptive, default static)
+	PolicyTopK       int    // SPLIT_POLICY_TOPK (1..8, default 2)
+	ProbingEnabled   bool   // SPLIT_PROBING_ENABLED (default false)
+	ProbeURL         string // SPLIT_PROBE_URL (required when ProbingEnabled; no default)
+	ProbeDailyBudget int64  // SPLIT_PROBE_DAILY_BUDGET (bytes, default 96 MiB, >= 0)
+	TTFBBaselineMs   int    // SPLIT_TTFB_BASELINE_MS (ms, default 0 = library 500 ms)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -347,6 +417,16 @@ func Defaults() *Config {
 		TargetAddrPolicy: DefaultTargetAddrPolicy,
 		// Multi-carrier down-plane default (Phase 2): OFF.
 		MultiCarrierEnabled: DefaultMultiCarrierEnabled,
+		// Phase 3 carrier-intelligence defaults (inert unless
+		// MultiCarrierEnabled): static policy (the Phase 2 rollback),
+		// probing OFF, no third-party probe URL, the 96 MiB daily budget,
+		// and the 0-means-library-default TTFB baseline.
+		PolicyMode:       DefaultPolicyMode,
+		PolicyTopK:       DefaultPolicyTopK,
+		ProbingEnabled:   DefaultProbingEnabled,
+		ProbeURL:         DefaultProbeURL,
+		ProbeDailyBudget: DefaultProbeDailyBudget,
+		TTFBBaselineMs:   0,
 	}
 }
 
@@ -432,6 +512,14 @@ func Load(role string) (*Config, error) {
 	c.DownListen2 = envString(EnvDownListen2, c.DownListen2)
 	c.DownCarrierAddr2 = envString(EnvDownCarrierAddr2, c.DownCarrierAddr2)
 	c.DownSNI2 = envString(EnvDownSNI2, c.DownSNI2)
+	// Phase 3 carrier-intelligence policy (only validated when
+	// MultiCarrierEnabled; inert otherwise).
+	c.PolicyMode = envString(EnvPolicyMode, DefaultPolicyMode)
+	c.PolicyTopK = envInt(&problems, EnvPolicyTopK, DefaultPolicyTopK, MinPolicyTopK, MaxPolicyTopK)
+	c.ProbingEnabled = envBool(&problems, EnvProbingEnabled, DefaultProbingEnabled)
+	c.ProbeURL = envString(EnvProbeURL, c.ProbeURL)
+	c.ProbeDailyBudget = envInt64(&problems, EnvProbeDailyBudget, DefaultProbeDailyBudget)
+	c.TTFBBaselineMs = envInt(&problems, EnvTTFBBaselineMs, 0, MinTTFBBaselineMs, MaxTTFBBaselineMs) // 0 = library default
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -673,6 +761,41 @@ func (c *Config) Validate(role string) error {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d is smaller than %s=%d; the aggregate budget must cover at least one stream",
 			EnvQueueTotal, c.QueueBytesTotal, EnvQueueBytes, c.QueueBytesPerStream))
+	}
+
+	// Phase 3 policy config: all validations are gated on MultiCarrierEnabled
+	// so that single-carrier deployments (the default) are unaffected by the
+	// Phase 3 fields (they stay at their zero defaults and are never
+	// validated). This preserves the "hand-built config must validate without
+	// env" invariant.
+	if c.MultiCarrierEnabled {
+		if c.PolicyMode != PolicyStaticMode && c.PolicyMode != PolicyAdaptiveMode {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%q: expected %q or %q", EnvPolicyMode, c.PolicyMode, PolicyStaticMode, PolicyAdaptiveMode))
+		}
+		if c.PolicyTopK < MinPolicyTopK || c.PolicyTopK > MaxPolicyTopK {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected %d..%d", EnvPolicyTopK, c.PolicyTopK, MinPolicyTopK, MaxPolicyTopK))
+		}
+		if c.ProbeDailyBudget < 0 {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected a non-negative byte count", EnvProbeDailyBudget, c.ProbeDailyBudget))
+		}
+		if c.TTFBBaselineMs < MinTTFBBaselineMs || c.TTFBBaselineMs > MaxTTFBBaselineMs {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected %d..%d milliseconds (0 = library default)", EnvTTFBBaselineMs, c.TTFBBaselineMs, MinTTFBBaselineMs, MaxTTFBBaselineMs))
+		}
+		if c.ProbingEnabled && strings.TrimSpace(c.ProbeURL) == "" {
+			problems = append(problems, fmt.Sprintf(
+				"%s is required when %s=true; configure an operator-owned probe target (no third-party default)", EnvProbeURL, EnvProbingEnabled))
+		}
+		if c.ProbingEnabled && c.ProbeURL != "" {
+			u, err := url.ParseRequestURI(c.ProbeURL)
+			if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				problems = append(problems, fmt.Sprintf(
+					"%s: expected an operator-configured http(s) URL with a host", EnvProbeURL))
+			}
+		}
 	}
 
 	// Secret policy: Phase 6's validator, not duplicated here. The
@@ -953,4 +1076,22 @@ func envBool(problems *[]string, name string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// envInt64 parses an integer64 env variable (the probe byte budget is the one
+// int64-typed knob). Unset/empty returns def. A non-integer value is a config
+// error (no silent zeroing). Negative values are validated by the caller
+// (Validate) since the minimum is knob-specific; this helper only parses.
+func envInt64(problems *[]string, name string, def int64) int64 {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected an integer (bytes)", name, v))
+		return def
+	}
+	return n
 }
