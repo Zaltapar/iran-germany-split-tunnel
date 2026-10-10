@@ -93,9 +93,10 @@ type Splitter struct {
 	node   *node.Node
 	logger *log.Logger
 
-	lnMu   sync.Mutex
-	downLn net.Listener
-	mLn    net.Listener
+	lnMu    sync.Mutex
+	downLn  net.Listener
+	downLn2 net.Listener // second down instance (multi-carrier only, Phase 2)
+	mLn     net.Listener
 
 	// Down-carrier unauthenticated-handshake gate (Issue #5): a buffered
 	// semaphore bounding how many v1 handshakes may run concurrently on
@@ -121,7 +122,7 @@ type Splitter struct {
 func (s *Splitter) closeListeners() {
 	s.lnMu.Lock()
 	defer s.lnMu.Unlock()
-	for _, ln := range []net.Listener{s.downLn, s.mLn} {
+	for _, ln := range []net.Listener{s.downLn, s.downLn2, s.mLn} {
 		if ln != nil {
 			ln.Close()
 		}
@@ -140,6 +141,26 @@ func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
 		return "prefer-ipv4"
 	}
 	return "default"
+}
+
+// downCarrierIDs returns the node's static down-carrier priority order for the
+// split node's constructor. Multi-carrier is always OFF in single-carrier
+// deployments (the default), so this returns the single-instance set; when
+// enabled it returns the two-instance set (primary first).
+func downCarrierIDs(cfg *config.Config) []node.CarrierID {
+	if cfg.MultiCarrierEnabled {
+		return []node.CarrierID{node.DefaultDownCarrierID, node.SecondDownCarrierID}
+	}
+	return []node.CarrierID{node.DefaultDownCarrierID}
+}
+
+// secondListenSuffix renders the optional second down-carrier listener suffix
+// for the startup log line (empty when multi-carrier is disabled).
+func secondListenSuffix(cfg *config.Config) string {
+	if cfg.MultiCarrierEnabled {
+		return fmt.Sprintf(" | Down-carrier #2 (multi-carrier) listen: %s", cfg.DownListen2)
+	}
+	return ""
 }
 
 func main() {
@@ -220,6 +241,10 @@ func main() {
 		// SUBTASK 42): "default" (today's behavior) | "prefer-ipv4" (v4-first
 		// with v6 fallback, recommended) | "ipv4-only" (hard filter).
 		TargetAddrPolicy: cfg.TargetAddrPolicy,
+		// Phase 2 multi-carrier down plane: when enabled, the node's down
+		// registry holds the static-priority two-instance set (primary first),
+		// which enables the v2 rebind wire and per-carrier pinning.
+		DownCarrierIDs: downCarrierIDs(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("germany-splitter: node construction: %v", err)
@@ -264,7 +289,18 @@ func main() {
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runDownCarrier() }()
 
-	s.logger.Printf("Up-carrier (WS) dial: %s | Down-carrier (TCP) listen: %s", cfg.UpWsUrl, cfg.DownListen)
+	// Phase 2 multi-carrier: when enabled, a SECOND down-carrier instance
+	// listens on DownListen2 and is installed under the secondary CarrierID
+	// (down-reality-b). The primary instance above keeps its DownReady()
+	// rejection untouched; the secondary gates on its own instance.
+	if cfg.MultiCarrierEnabled {
+		s.logger.Printf("Down-carrier #2 (multi-carrier) listen: %s", cfg.DownListen2)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.runDownCarrier2() }()
+	}
+
+	s.logger.Printf("Up-carrier (WS) dial: %s | Down-carrier (TCP) listen: %s%s",
+		cfg.UpWsUrl, cfg.DownListen, secondListenSuffix(cfg))
 	s.logger.Println("germany-splitter started")
 
 	<-sigCh
@@ -396,22 +432,48 @@ const maxDownHandshakes = 16
 // unthrottled log would itself become a resource-exhaustion vector.
 const downAuthLogInterval = time.Second
 
-// runDownCarrier is the down-carrier accept loop. It gates each accepted
-// connection through a non-blocking handshake semaphore (maxDownHandshakes)
-// BEFORE spawning a handler: the gate is acquired in the accept loop and is
-// never blocked on, so saturation closes the connection immediately without
-// consuming an auth goroutine and the accept loop itself stays responsive.
-func (s *Splitter) runDownCarrier() {
-	ln := s.downLn // may be pre-configured (tests); production leaves it nil
+// runDownCarrier is the PRIMARY down-carrier accept loop (D1 instance A).
+// Phase 2 multi-carrier keeps this loop byte-for-byte for the single-
+// carrier case; a second instance runs on runDownCarrier2 when enabled.
+func (s *Splitter) runDownCarrier() { s.runDownInstance(false) }
+
+// runDownCarrier2 is the SECOND down-carrier accept loop (D1 instance B,
+// D3: listens on DownListen2 with the second instance's SNI).
+func (s *Splitter) runDownCarrier2() { s.runDownInstance(true) }
+
+// runDownInstance is the down-carrier accept loop for one named instance.
+// It gates each accepted connection through a non-blocking handshake
+// semaphore (maxDownHandshakes) BEFORE spawning a handler: the gate is
+// acquired in the accept loop and is never blocked on, so saturation closes
+// the connection immediately without consuming an auth goroutine and the
+// accept loop itself stays responsive.
+func (s *Splitter) runDownInstance(secondary bool) {
+	// Which named instance this loop serves.
+	var id node.CarrierID
+	listen := s.config.DownListen
+	var ln net.Listener
+	if secondary {
+		id = s.node.SecondaryDownCarrierID()
+		listen = s.config.DownListen2
+		ln = s.downLn2
+	} else {
+		ids := s.node.DownCarrierIDs()
+		id = ids[0]   // primary (index 0 = static priority)
+		ln = s.downLn // may be pre-configured (tests); production leaves it nil
+	}
 	if ln == nil {
 		var err error
-		ln, err = net.Listen("tcp", s.config.DownListen)
+		ln, err = net.Listen("tcp", listen)
 		if err != nil {
 			s.logger.Fatalf("Down-carrier listener: %v", err)
 		}
-		s.lnMu.Lock()
-		s.downLn = ln
-		s.lnMu.Unlock()
+		if secondary {
+			s.downLn2 = ln
+		} else {
+			s.lnMu.Lock()
+			s.downLn = ln
+			s.lnMu.Unlock()
+		}
 	}
 	defer ln.Close()
 	// The gate is normally created by the spawning goroutine (see main),
@@ -420,7 +482,7 @@ func (s *Splitter) runDownCarrier() {
 	if s.downAuthGate == nil {
 		s.downAuthGate = make(chan struct{}, maxDownHandshakes)
 	}
-	s.logger.Printf("Down-carrier listening on %s (max %d concurrent handshakes)", ln.Addr(), cap(s.downAuthGate))
+	s.logger.Printf("Down-carrier instance %s listening on %s (max %d concurrent handshakes)", id, ln.Addr(), cap(s.downAuthGate))
 	var lastSatLog time.Time
 	for {
 		conn, err := ln.Accept()
@@ -428,44 +490,47 @@ func (s *Splitter) runDownCarrier() {
 			return
 		}
 		// Gate the UNAUTHENTICATED handshake. The slot is held only while
-		// the connection is unauthenticated (handleDownConn releases it as
-		// soon as auth completes or fails), so a long-lived installed
+		// the connection is unauthenticated (handleDownConnOn releases it
+		// as soon as auth completes or fails), so a long-lived installed
 		// carrier never occupies a slot and a legitimate reconnect can
-		// never be starved by the gate: a legit carrier can only begin
-		// authenticating when DownReady() is false, i.e. when no carrier
-		// is installed holding a slot.
+		// never be starved by the gate.
 		select {
 		case s.downAuthGate <- struct{}{}:
 			s.downH.Add(1)
-			go s.handleDownConn(conn, func() { <-s.downAuthGate })
+			go s.handleDownConnOn(id, conn, func() { <-s.downAuthGate })
 		default:
 			// Saturated: close promptly. Rate-limited log (the TCP
 			// analogue of the WS endpoint's 429/503 backoff).
 			now := time.Now()
 			if now.Sub(lastSatLog) >= downAuthLogInterval {
 				lastSatLog = now
-				s.logger.Printf("Down-carrier: rejected %s (max %d concurrent handshakes)", conn.RemoteAddr(), cap(s.downAuthGate))
+				s.logger.Printf("Down-carrier %s: rejected %s (max %d concurrent handshakes)", id, conn.RemoteAddr(), cap(s.downAuthGate))
 			}
 			conn.Close()
 		}
 	}
 }
 
-// handleDownConn processes one accepted down-carrier connection: the
-// single-carrier DownReady() check, the bounded v1 authentication
-// handshake, and installation of the authenticated carrier on the node.
-// releaseSlot frees the accept-loop handshake slot; it is invoked exactly
-// once per connection, as soon as the connection is no longer
-// unauthenticated (auth success or failure) so the installed carrier holds
-// no slot.
-func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
+// handleDownConnOn processes one accepted down-carrier connection for the
+// named instance id: the per-instance ready check, the bounded v1
+// authentication handshake, and installation of the authenticated carrier on
+// the node under id. releaseSlot frees the accept-loop handshake slot; it is
+// invoked exactly once per connection, as soon as the connection is no
+// longer unauthenticated (auth success or failure) so the installed carrier
+// holds no slot.
+//
+// In single-carrier mode (multi-carrier disabled) DownCarrierReady(id) is
+// the unchanged DownReady() rule: a second connection is rejected once a
+// carrier is installed. In multi-carrier mode each instance gates on its
+// OWN slot, so a live primary never rejects a connection to the secondary
+// listener (and vice versa) — only a duplicate connection to the same
+// instance is rejected.
+func (s *Splitter) handleDownConnOn(id node.CarrierID, conn net.Conn, releaseSlot func()) {
 	defer s.downH.Done()
 
-	// Only one down-carrier at a time — reject secondaries cleanly
-	// (the node's DownReady() reports whether one is installed).
-	if s.node.DownReady() {
+	if s.node.DownCarrierReady(id) {
 		releaseSlot()
-		s.logger.Printf("Down-carrier: rejected %s (already connected)", conn.RemoteAddr())
+		s.logger.Printf("Down-carrier %s: rejected %s (instance already connected)", id, conn.RemoteAddr())
 		conn.Close()
 		return
 	}
@@ -477,15 +542,25 @@ func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
 	// handshake slot. The carrier must not keep it for its lifetime.
 	releaseSlot()
 	if err != nil {
-		s.logger.Printf("Down-carrier auth failed from %s: %v", conn.RemoteAddr(), err)
+		s.logger.Printf("Down-carrier %s auth failed from %s: %v", id, conn.RemoteAddr(), err)
 		conn.Close()
 		return
 	}
-	s.logger.Printf("Down-carrier authenticated from %s", conn.RemoteAddr())
+	s.logger.Printf("Down-carrier %s authenticated from %s", id, conn.RemoteAddr())
 
-	h := s.node.InstallDown(conn, br)
+	h, err := s.node.InstallDownOn(id, conn, br)
+	if err != nil {
+		s.logger.Printf("Down-carrier %s install failed from %s: %v", id, conn.RemoteAddr(), err)
+		return
+	}
 	<-h.Done()
-	s.logger.Printf("Down-carrier torn down (waiting for reconnect)")
+	s.logger.Printf("Down-carrier %s torn down (waiting for reconnect)", id)
+}
+
+// handleDownConn is the primary-instance entry point kept for tests that
+// call it directly. It installs under the primary CarrierID.
+func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
+	s.handleDownConnOn(s.node.DownCarrierIDs()[0], conn, releaseSlot)
 }
 
 // ============================================================

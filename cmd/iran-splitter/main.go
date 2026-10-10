@@ -142,6 +142,26 @@ func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
 	return "default"
 }
 
+// downCarrierIDs returns the node's static down-carrier priority order for the
+// split node's constructor. Multi-carrier is always OFF in single-carrier
+// deployments (the default), so this returns the single-instance set; when
+// enabled it returns the two-instance set (primary first).
+func downCarrierIDs(cfg *config.Config) []node.CarrierID {
+	if cfg.MultiCarrierEnabled {
+		return []node.CarrierID{node.DefaultDownCarrierID, node.SecondDownCarrierID}
+	}
+	return []node.CarrierID{node.DefaultDownCarrierID}
+}
+
+// secondDialSuffix renders the optional second down-carrier dial-target
+// suffix for the startup log line (empty when multi-carrier is disabled).
+func secondDialSuffix(cfg *config.Config) string {
+	if cfg.MultiCarrierEnabled {
+		return fmt.Sprintf(" | Down-carrier #2 (multi-carrier) → %s", cfg.DownCarrierAddr2)
+	}
+	return ""
+}
+
 func main() {
 	// --version / -version: print the reproducible-build commit stamp
 	// (scripts/build-linux.sh embeds it via -X main.buildInfo). No other
@@ -210,6 +230,10 @@ func main() {
 		// SUBTASK 42); inert on the Iran role (no egress target dial) but
 		// kept for config symmetry.
 		TargetAddrPolicy: cfg.TargetAddrPolicy,
+		// Phase 2 multi-carrier down plane: when enabled, the node's down
+		// registry holds the static-priority two-instance set (primary first),
+		// enabling per-carrier pinning and the v2 rebind wire.
+		DownCarrierIDs: downCarrierIDs(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("iran-splitter: node construction: %v", err)
@@ -244,7 +268,17 @@ func main() {
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runDownCarrier() }()
 
-	s.logger.Printf("SOCKS5: %s | Up-carrier WS: %s | Down-carrier → %s", cfg.SocksListen, cfg.WsListen, cfg.DownCarrierAddr)
+	// Phase 2 multi-carrier: when enabled, a SECOND down-carrier dialer
+	// targets DownCarrierAddr2 (the local second Xray consumer inbound) and
+	// is installed under the secondary CarrierID.
+	if cfg.MultiCarrierEnabled {
+		s.logger.Printf("Down-carrier #2 (multi-carrier) dial: %s", cfg.DownCarrierAddr2)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.runDownCarrier2() }()
+	}
+
+	s.logger.Printf("SOCKS5: %s | Up-carrier WS: %s | Down-carrier → %s%s",
+		cfg.SocksListen, cfg.WsListen, cfg.DownCarrierAddr, secondDialSuffix(cfg))
 	s.logger.Println("iran-splitter started")
 
 	<-sigCh
@@ -438,15 +472,48 @@ func (s *Splitter) secret() []byte { return s.node.Secret() }
 
 const downDialTimeout = 10 * time.Second
 
-func (s *Splitter) runDownCarrier() {
+// runDownCarrier is the PRIMARY down-carrier dial loop (D1 instance A).
+// Phase 2 multi-carrier keeps this loop for the single-carrier case; a
+// second instance dials DownCarrierAddr2 on runDownCarrier2 when enabled.
+func (s *Splitter) runDownCarrier() { s.runDownInstance(false) }
+
+// runDownCarrier2 is the SECOND down-carrier dial loop (D1 instance B,
+// D4: dials the second local Xray consumer inbound).
+func (s *Splitter) runDownCarrier2() { s.runDownInstance(true) }
+
+// runDownInstance is the down-carrier reconnect loop for one named instance:
+// dial → v1 handshake → install under the instance's CarrierID. Each instance
+// owns its own backoff and reconnects independently, so losing one down
+// carrier never disturbs the other.
+func (s *Splitter) runDownInstance(secondary bool) {
+	var id node.CarrierID
+	var addr string
+	if secondary {
+		id = s.node.SecondaryDownCarrierID()
+		addr = s.config.DownCarrierAddr2
+	} else {
+		id = s.node.DownCarrierIDs()[0]
+		addr = s.config.DownCarrierAddr
+	}
 	b := backoff.New(2*time.Second, 60*time.Second)
 	for {
 		if s.node.Shutdown() {
 			return
 		}
-		conn, err := net.DialTimeout("tcp", s.config.DownCarrierAddr, downDialTimeout)
+		// An already-live instance does not need a reconnect: skip the dial
+		// while its CarrierID is installed and ready. In single-carrier mode
+		// this collapses to the original DownReady() behavior; in
+		// multi-carrier mode each instance is gated on its own slot so the
+		// two carriers reconnect independently.
+		if s.node.DownCarrierReady(id) {
+			if s.backoffSleep(b) {
+				return
+			}
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", addr, downDialTimeout)
 		if err != nil {
-			s.logger.Printf("Down-carrier dial %s: %v", s.config.DownCarrierAddr, err)
+			s.logger.Printf("Down-carrier %s dial %s: %v", id, addr, err)
 			if s.backoffSleep(b) {
 				return
 			}
@@ -457,19 +524,26 @@ func (s *Splitter) runDownCarrier() {
 		br, err := mux.CarrierAuth(ctx, conn, true, mux.RoleDownload, s.secret())
 		cancel()
 		if err != nil {
-			s.logger.Printf("Down-carrier auth to %s: %v", s.config.DownCarrierAddr, err)
+			s.logger.Printf("Down-carrier %s auth to %s: %v", id, addr, err)
 			conn.Close()
 			if s.backoffSleep(b) {
 				return
 			}
 			continue
 		}
-		s.logger.Printf("Down-carrier authenticated to %s", s.config.DownCarrierAddr)
+		s.logger.Printf("Down-carrier %s authenticated to %s", id, addr)
 
-		h := s.node.InstallDown(conn, br)
+		h, err := s.node.InstallDownOn(id, conn, br)
+		if err != nil {
+			s.logger.Printf("Down-carrier %s install failed: %v", id, err)
+			if s.backoffSleep(b) {
+				return
+			}
+			continue
+		}
 		<-h.Done()
 		b.Reset() // a full authenticated carrier session ran
-		s.logger.Printf("Down-carrier torn down (reconnecting)")
+		s.logger.Printf("Down-carrier %s torn down (reconnecting)", id)
 		if s.backoffSleep(b) {
 			return
 		}
