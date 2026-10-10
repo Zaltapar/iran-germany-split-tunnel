@@ -146,6 +146,11 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			n.metrics.AddRelayBytesRead(int64(nread))
 			if sess.Stats.MarkFirstByte() {
 				n.metrics.SessionFirstByteSeen()
+				// Phase 3 (G3): stamp the first-byte instant so the
+				// stream's TTFB (open to first DATA byte) is measurable
+				// for the carrier health model. Inert when the open
+				// instant was not stamped (OpenNanos <= 0).
+				sess.Stats.MarkFirstByteNanos(time.Now().UnixNano())
 			}
 			if dir == session.DirUp {
 				n.metrics.AddUp(int64(nread))
@@ -331,6 +336,10 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 		}
 		*pending = (*pending)[len(chunk):]
 		n.metrics.AddRelayBytesWritten(int64(len(chunk)))
+		// Phase 3 (G3): passive goodput feed — application bytes actually
+		// delivered through this carrier. Feeds the policy's per-carrier
+		// goodput EWMA (design §6.2). No-op in single-carrier nodes.
+		n.noteCarrierDelivery(h.id, int64(len(chunk)))
 		// Phase B (Slice 5, S3): charge the credit ledger PER CHUNK
 		// (n = len(chunk)), NEVER per flushPending call — a 256 KiB flush
 		// would otherwise overshoot the 64 KiB-granular gate by up to 4×.

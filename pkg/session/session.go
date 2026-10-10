@@ -339,11 +339,14 @@ func NewSession(id SessionID, dest *Destination, clientConn, targetConn net.Conn
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
+	// OpenNanos stamps the stream-open instant (Phase 3 TTFB input). It is a
+	// diagnostic/telemetry value only (not secret, no peer data).
 	return &Session{
 		ID:         id,
 		Dest:       dest,
 		ClientConn: clientConn,
 		TargetConn: targetConn,
+		Stats:      SessionStats{OpenNanos: time.Now().UnixNano()},
 		Ctx:        ctx,
 		cancel:     cancel,
 		state:      StatePending,
