@@ -307,9 +307,14 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 	if st != session.AttAttached {
 		return false
 	}
-	h := n.current(dir)
-	if h == nil || h.gen != gen {
-		return false // being superseded — treat as unavailable
+	// Multi-carrier (Phase 2): resolve the EXACT carrier the attachment is
+	// pinned to (by its generation token), not the direction's primary —
+	// a stream may be pinned to the standby down carrier. Generations are
+	// node-global and unique, so at most one handle matches. A handle whose
+	// read loop has died is not writable, so treat it as unavailable.
+	h := n.handleForGen(gen)
+	if h == nil || h.gen != gen || !h.carrier.Ready() {
+		return false // being superseded or lost — treat as unavailable
 	}
 	for len(*pending) > 0 {
 		chunk := *pending
@@ -355,9 +360,11 @@ func (n *Node) sendCloseFrame(sess *session.Session, dir session.Direction) bool
 	if st != session.AttAttached {
 		return false
 	}
-	h := n.current(dir)
-	if h == nil || h.gen != gen {
-		return false
+	// Multi-carrier (Phase 2): the close frame must go on the carrier the
+	// attachment is pinned to (by generation), not the direction's primary.
+	h := n.handleForGen(gen)
+	if h == nil || h.gen != gen || !h.carrier.Ready() {
+		return false // being superseded or lost — treat as unavailable
 	}
 	if err := h.carrier.WriteFrame(streamIDOf(sess, dir), mux.FrameClose, nil); err != nil {
 		att.Detach(gen)

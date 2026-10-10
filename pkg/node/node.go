@@ -156,6 +156,15 @@ type Config struct {
 	// Default (nil): 10s TCP dial, address-family policy per
 	// TargetOnlyIPv4 (see target_ipv4.go).
 	TargetDial func(addr string) (net.Conn, error)
+
+	// DownCarrierIDs is the STATIC priority order of down-carrier instances
+	// (multi-carrier Phase 2, D1). Empty or a single entry = the
+	// single-carrier shape (byte-identical to the pre-Phase-2 build,
+	// DefaultDownCarrierID). Two entries = a primary plus a standby:
+	// new streams pin to the first ready carrier, and a lost carrier's
+	// pinned streams may rebind to the other ready down carrier. When len
+	// > 1 the rebind wire is v2 (rebindVersionV2) with per-carrier identity.
+	DownCarrierIDs []CarrierID
 }
 
 // Sanitize replaces zero/negative values with defaults. It returns a loud
@@ -202,10 +211,13 @@ func (c *Config) Sanitize() error {
 
 // carrierHandle is one installed carrier transport. Its generation is
 // monotonically increasing per node+direction and is the ownership token
-// used for stale-carrier protection.
+// used for stale-carrier protection. id is the carrier instance this handle
+// belongs to (Phase 2: a down direction may hold several, one per CarrierID;
+// the up direction always holds DefaultUpCarrierID).
 type carrierHandle struct {
 	carrier *mux.CarrierConn
 	gen     uint64
+	id      CarrierID
 	// done is closed once the carrier's dispatcher has fully exited
 	// (read loop dead, all frames consumed).
 	done chan struct{}
@@ -262,16 +274,18 @@ type Node struct {
 	cancel context.CancelFunc
 
 	mu sync.RWMutex
-	// upReg / downReg are the Phase 1 per-direction carrier registries
-	// (multi-carrier-intelligence-design §4.2). Each holds exactly ONE
-	// entry (carrierRegistry.h); the handle pointer is the authoritative
-	// storage, replacing the previous raw n.up / n.down fields. New code
-	// accesses carriers through the registry accessors; the install and
-	// loss-sweep flow stay byte-identical to the pre-registry build.
+	// upReg / downReg are the per-direction carrier registries
+	// (multi-carrier-intelligence-design §4.2). The up registry holds
+	// exactly ONE entry (D5: single up carrier); the down registry holds
+	// one entry PER CarrierID (Phase 2 multi-carrier: a static-priority
+	// list of down instances). The registry is the authoritative handle
+	// storage. Reconnect accounting is tracked PER CarrierID (a lost
+	// carrier is owed exactly one reconnect metric when it comes back up),
+	// which generalizes the Phase 1 direction-wide lost flags to the
+	// multi-carrier shape (single-carrier reduces to one entry).
 	upReg     *carrierRegistry
 	downReg   *carrierRegistry
-	lostUp    bool // up carrier died since the previous install
-	lostDown  bool
+	lostMap   map[CarrierID]bool // per-CarrierID "died since previous install"
 	genSeq    uint64
 	streamSeq uint32 // atomic counter for logical stream IDs
 
@@ -325,40 +339,70 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) (*Node, error) {
 		creditGate = newCreditGateManager()
 		creditEmitter = newCreditEmitter(uint32(cfg.StreamLimits.MaxBytesPerStream))
 	}
+	downReg := newDownRegistry(cfg.DownCarrierIDs)
+	// Phase 2 multi-carrier (D1): when the down direction holds more than one
+	// instance, enable the per-carrier /metrics names (loss + reconnect). In
+	// single-carrier deployments this is never enabled, so /metrics stays
+	// byte-identical to the pre-Phase-2 build.
+	if !downReg.SingleEntry() {
+		metrics.SetMultiCarrier(downReg.KnownIDs())
+	}
 	return &Node{
 		cfg:           cfg,
 		store:         session.NewSessionStore(),
 		metrics:       metrics,
+		buf:           buf,
 		logger:        logger,
 		muxUpStats:    &mux.QueueStats{},
 		muxDownStats:  &mux.QueueStats{},
 		secret:        secret,
 		ctx:           ctx,
 		cancel:        cancel,
-		buf:           buf,
 		creditGate:    creditGate,
 		creditEmitter: creditEmitter,
+		lostMap:       make(map[CarrierID]bool),
 		// No carrier installed yet: both directions start NOT ready
 		// (open ready channels) — the bootstrap waits must block until
 		// a carrier is actually installed (Issue #7).
 		upReady:   make(chan struct{}),
 		downReady: make(chan struct{}),
-		// Phase 1 registries: one fixed carrier per direction. The
-		// registry IS the authoritative handle storage — the raw
-		// n.up / n.down fields have been replaced by n.upReg.h /
-		// n.downReg.h (byte-identical wire and config behavior).
+		// Phase 2 registries: the up direction is ALWAYS single-carrier
+		// (D5). The down direction is single-carrier unless cfg.DownCarrierIDs
+		// names two or more instances (multi-carrier ON), in which case it
+		// accepts the static-priority list and carries a second standby.
 		upReg: newCarrierRegistry(CarrierDescriptor{
 			ID:     DefaultUpCarrierID,
 			Dir:    session.DirUp,
 			Family: FamilyCDNWS,
 		}),
-		downReg: newCarrierRegistry(CarrierDescriptor{
-			ID:     DefaultDownCarrierID,
-			Dir:    session.DirDown,
-			Family: FamilyReality,
-		}),
+		downReg: downReg,
 	}, nil
 }
+
+// newDownRegistry builds the down-direction registry from the operator's
+// static-priority list. An empty or single-element list is the
+// single-carrier shape (byte-identical to the pre-Phase-2 build); two
+// elements enable the second down instance (multi-carrier ON).
+func newDownRegistry(ids []CarrierID) *carrierRegistry {
+	if len(ids) > 1 {
+		return newMultiCarrierRegistry(session.DirDown, ids)
+	}
+	// Single-carrier (default): exactly one known down carrier.
+	id := DefaultDownCarrierID
+	if len(ids) == 1 {
+		id = ids[0]
+	}
+	return newCarrierRegistry(CarrierDescriptor{
+		ID:     id,
+		Dir:    session.DirDown,
+		Family: FamilyReality,
+	})
+}
+
+// multiDown reports whether the down direction is multi-carrier (two or more
+// instances). When true, the rebind wire is v2 (per-carrier identity) and
+// the second-instance registry slot is live.
+func (n *Node) multiDown() bool { return !n.downReg.SingleEntry() }
 
 // Store is the session store.
 func (n *Node) Store() *session.SessionStore { return n.store }
@@ -400,12 +444,8 @@ func (n *Node) Close() {
 	n.cancel()
 	n.store.CloseAll()
 	n.mu.Lock()
-	if n.upReg.h != nil {
-		n.upReg.h.carrier.Close()
-	}
-	if n.downReg.h != nil {
-		n.downReg.h.carrier.Close()
-	}
+	n.upReg.CloseAll()
+	n.downReg.CloseAll()
 	n.mu.Unlock()
 	if reclaimed := n.buf.Close(); reclaimed > 0 {
 		n.metrics.AddSessionBufferReclaimed(reclaimed)
@@ -423,10 +463,9 @@ func (n *Node) SessionBufferAccounted() int64 { return n.buf.AccountedBytes() }
 func (n *Node) SessionBufferActiveRelays() int { return n.buf.ActiveRelays() }
 
 // UpReady reports whether a live up carrier is currently installed.
-// UpReady reports whether a live up carrier is currently installed.
 // Phase 1: routes through the up registry's sole entry under the
 // Node mutex, so the check-and-capture is atomic (the registry's
-// .h pointer is read under n.mu.RLock, exactly like the legacy
+// Ready() is read under n.mu.RLock, exactly like the legacy
 // n.up field was).
 func (n *Node) UpReady() bool {
 	n.mu.RLock()
@@ -441,15 +480,84 @@ func (n *Node) DownReady() bool {
 	defer n.mu.RUnlock()
 	return n.downReg.Ready()
 }
+
+// DownCarrierReady reports whether the down-carrier instance named id is
+// currently installed and its read loop is alive. For a single-carrier node
+// (id = the registry's sole entry) this is identical to DownReady; for a
+// multi-carrier node it lets the transport layer gate each named instance
+// independently. Unknown ids (an id not in the down registry's allowed set)
+// are reported not-ready (fail-closed) rather than panicking.
+func (n *Node) DownCarrierReady(id CarrierID) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if !n.downReg.IsKnown(id) {
+		return false
+	}
+	return n.downReg.Handle(id) != nil
+}
+
+// MultiDown exposes whether the node's down direction is multi-carrier. The
+// transport layer uses it to decide whether to bring up a second down
+// instance (or to emit the v2 rebind wire). Mirrors multiDown() but is part
+// of the public surface so cmd/* and tests can branch on it.
+func (n *Node) MultiDown() bool { return n.multiDown() }
+
+// DownCarrierIDs returns the node's static down-carrier priority order
+// (index 0 = primary). The transport layer maps its own listener/dialer
+// endpoints onto these ids when multi-carrier is enabled.
+func (n *Node) DownCarrierIDs() []CarrierID {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.downReg.KnownIDs()
+}
+
+// SecondaryDownCarrierID returns the down registry's secondary carrier id
+// (index 1), used by the transport layer to install/instance the second
+// down carrier. When the node is single-carrier (index 1 absent), it returns
+// the configured secondary id so a transport that always names it still
+// resolves to a known, fail-closed value.
+func (n *Node) SecondaryDownCarrierID() CarrierID {
+	ids := n.downReg.KnownIDs()
+	if len(ids) > 1 {
+		return ids[1]
+	}
+	return SecondDownCarrierID
+}
+
 func (n *Node) current(dir session.Direction) *carrierHandle {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	// Phase 1: the registry mirror is authoritative; the raw slot
-	// is kept in lockstep by install/dropIfCurrent.
+	// The registry mirror is authoritative. For the (single) up direction
+	// this is the sole entry; for the down direction it is the static-
+	// priority primary (the first ready carrier in config order).
 	if dir == session.DirUp {
-		return n.upReg.h
+		return n.upReg.Primary()
 	}
-	return n.downReg.h
+	return n.downReg.Primary()
+}
+
+// handleForGen resolves the handle whose generation is gen. Node-global
+// generations (n.genSeq) are unique across BOTH directions and BOTH down
+// carriers, so at most one handle matches. Used by the relays, which pin to
+// a specific attachment generation: the attachment's gen names the exact
+// carrier it is bound to, even when several down carriers are installed.
+func (n *Node) handleForGen(gen uint64) *carrierHandle {
+	if gen == 0 {
+		return nil
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for _, h := range n.upReg.Handles() {
+		if h != nil && h.gen == gen {
+			return h
+		}
+	}
+	for _, h := range n.downReg.Handles() {
+		if h != nil && h.gen == gen {
+			return h
+		}
+	}
+	return nil
 }
 
 // currentIfReady returns the current carrier handle for dir if it is
@@ -463,15 +571,9 @@ func (n *Node) currentIfReady(dir session.Direction) *carrierHandle {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	if dir == session.DirUp {
-		if h := n.upReg.h; h != nil && h.carrier.Ready() {
-			return h
-		}
-		return nil
+		return n.upReg.Primary()
 	}
-	if h := n.downReg.h; h != nil && h.carrier.Ready() {
-		return h
-	}
-	return nil
+	return n.downReg.Primary()
 }
 
 // currentIfReadyBoth is the two-direction snapshot: both handles are
@@ -481,24 +583,20 @@ func (n *Node) currentIfReady(dir session.Direction) *carrierHandle {
 func (n *Node) currentIfReadyBoth() (upH, downH *carrierHandle) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	if h := n.upReg.h; h != nil && h.carrier.Ready() {
-		upH = h
-	}
-	if h := n.downReg.h; h != nil && h.carrier.Ready() {
-		downH = h
-	}
+	upH = n.upReg.Primary()
+	downH = n.downReg.Primary()
 	return upH, downH
 }
 
-// dropIfCurrent clears the registry entry for dir if it still points
-// at h (loss-sweep backstop: a dying carrier only clears the slot if
-// it is still current).
+// dropIfCurrent clears the registry entry for dir that still points at h
+// (loss-sweep backstop: a dying carrier only clears its own slot when it is
+// still current for that CarrierID).
 func (n *Node) dropIfCurrent(dir session.Direction, h *carrierHandle) {
 	n.mu.Lock()
 	if dir == session.DirUp {
-		n.upReg.ClearIf(h)
+		n.upReg.ClearIf(h.id, h)
 	} else {
-		n.downReg.ClearIf(h)
+		n.downReg.ClearIf(h.id, h)
 	}
 	n.mu.Unlock()
 }
@@ -541,15 +639,45 @@ func (n *Node) onGraceTimeout(sess *session.Session, dir session.Direction) {
 // CarrierAuth on the connection first. It then runs the Phase 5 rebind
 // sweep (Iran only) so sessions in their grace window re-attach.
 func (n *Node) InstallUp(conn io.ReadWriteCloser, br *bufio.Reader) *carrierHandle {
-	return n.install(session.DirUp, conn, br)
+	h, err := n.installFor(n.upReg.ID(), session.DirUp, conn, br)
+	if err != nil {
+		// An unknown up id is a misconfiguration; the up registry only
+		// ever knows DefaultUpCarrierID, so this cannot fire in practice.
+		conn.Close()
+		n.logger.Printf("install up carrier: %v", err)
+	}
+	return h
 }
 
-// InstallDown installs an authenticated download-carrier transport.
+// InstallDown installs an authenticated download-carrier transport on the
+// down direction's PRIMARY carrier (the single-carrier / default path). For
+// a multi-carrier down plane, the transport layer instead names the specific
+// instance it just authenticated via InstallDownOn.
 func (n *Node) InstallDown(conn io.ReadWriteCloser, br *bufio.Reader) *carrierHandle {
-	return n.install(session.DirDown, conn, br)
+	h, err := n.installFor(n.downReg.ID(), session.DirDown, conn, br)
+	if err != nil {
+		conn.Close()
+		n.logger.Printf("install down carrier: %v", err)
+	}
+	return h
 }
 
-func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio.Reader) *carrierHandle {
+// InstallDownOn installs an authenticated download-carrier transport as the
+// carrier instance named by id (multi-carrier, Phase 2). id must be one of
+// the down registry's known IDs; an unknown id is rejected (fail-closed,
+// ErrUnknownCarrierID) and the transport is closed. The rebind sweep runs
+// only when this is the direction's currently-losing carrier being replaced
+// (the existing loss-driven logic, now keyed per CarrierID).
+func (n *Node) InstallDownOn(id CarrierID, conn io.ReadWriteCloser, br *bufio.Reader) (*carrierHandle, error) {
+	h, err := n.installFor(id, session.DirDown, conn, br)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return h, nil
+}
+
+func (n *Node) installFor(id CarrierID, dir session.Direction, conn io.ReadWriteCloser, br *bufio.Reader) (*carrierHandle, error) {
 	// Bind the auth bufio.Reader inside the constructor: the carrier's
 	// read loop starts immediately and latches its read buffer on the
 	// first read, so any bytes the auth reader already pulled from the
@@ -584,40 +712,40 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 	}
 
 	n.mu.Lock()
-	n.genSeq++
-	h := &carrierHandle{carrier: c, gen: n.genSeq, done: make(chan struct{}), lost: make(chan struct{})}
-	var old *carrierHandle
-	var wasLost bool
+	// Validate the carrier id against the direction's registry up front
+	// (fail-closed on an unknown id — design §4.4). The registry returns the
+	// previous handle for that ID (nil on first install or a disconnect).
+	reg := n.downReg
 	if dir == session.DirUp {
-		old = n.upReg.h
-		// Phase 1: the up registry holds exactly ONE entry; the install
-		// flow is the only mutator. The registry's fixed ID
-		// (DefaultUpCarrierID) is implicit — there is no other ID the
-		// Node would ever accept in Phase 1.
-		n.upReg.h = h
-		wasLost = n.lostUp
-		n.lostUp = false
-		// Carrier installed and (by construction) ready: mark the ready
-		// signal so the bootstrap waits can wake (Issue #7). Flag-
-		// guarded so a still-closed channel is not double-closed.
+		reg = n.upReg
+	}
+	if !reg.IsKnown(id) {
+		n.mu.Unlock()
+		return nil, fmt.Errorf("%w: direction %s, got %q", ErrUnknownCarrierID, dirName(dir), id)
+	}
+	n.genSeq++
+	h := &carrierHandle{carrier: c, gen: n.genSeq, id: id, done: make(chan struct{}), lost: make(chan struct{})}
+	old, _ := reg.Add(id, h) // replace-on-install per CarrierID
+	wasLost := n.lostMap[id]
+	delete(n.lostMap, id)
+	// Carrier installed and (by construction) ready: mark the direction's
+	// ready signal so the bootstrap waits can wake (Issue #7). Flag-
+	// guarded so a still-closed channel is not double-closed.
+	if dir == session.DirUp {
 		if !n.upReadyClosed {
 			close(n.upReady)
 			n.upReadyClosed = true
 		}
 	} else {
-		old = n.downReg.h
-		n.downReg.h = h
-		wasLost = n.lostDown
-		n.lostDown = false
 		if !n.downReadyClosed {
 			close(n.downReady)
 			n.downReadyClosed = true
 		}
 	}
 	n.mu.Unlock()
-
 	if wasLost {
 		n.metrics.CarrierReconnect()
+		n.metrics.CarrierReconnectOn(h.id)
 	}
 	reconnectCounted := wasLost
 	if old != nil {
@@ -644,19 +772,18 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 			// owed exactly once, whether or not wasLost was true.
 			if !reconnectCounted {
 				n.metrics.CarrierReconnect()
+				n.metrics.CarrierReconnectOn(h.id)
 				reconnectCounted = true
 			}
 			// Settle a stale lost flag: the sweep may have set it after
 			// the clear above (install-before-sweep ordering); the loss
 			// is now fully accounted for and the flag must not leak into
-			// the next replacement.
+			// the next replacement. Keyed per CarrierID (the id being
+			// reinstalled, `h.id`), not direction-wide.
 			n.mu.Lock()
-			if dir == session.DirUp {
-				n.lostUp = false
-			} else {
-				n.lostDown = false
-			}
+			delete(n.lostMap, h.id)
 			n.mu.Unlock()
+			_ = old
 		}
 	}
 
@@ -706,30 +833,44 @@ func (n *Node) install(dir session.Direction, conn io.ReadWriteCloser, br *bufio
 		n.dropIfCurrent(dir, h)
 	}()
 
-	n.logger.Printf("carrier %s ready (gen %d)", dirName(dir), h.gen)
+	n.logger.Printf("carrier %s (id %s) ready (gen %d)", dirName(dir), h.id, h.gen)
 	n.onCarrierReady(dir, h)
-	return h
+	return h, nil
 }
 
-// onCarrierLost runs when a carrier's dispatcher has exited.
+// onCarrierLost runs when a carrier's dispatcher has exited. The detach is
+// scoped to the sessions pinned to THIS carrier instance (h.id, h.gen): a
+// stream pinned to a DIFFERENT healthy down carrier is never touched — only
+// the lost carrier's pinned streams enter the grace window and may rebind to
+// another healthy carrier (design §7.2/§7.3).
 func (n *Node) onCarrierLost(dir session.Direction, h *carrierHandle) {
 	n.mu.Lock()
+	n.lostMap[h.id] = true
+	// Only re-create (open) the direction's ready signal if NO other carrier
+	// in the direction is still ready. In the single-carrier case this is
+	// always true. In multi-carrier, if a standby down carrier is still up
+	// the direction stays Ready (closed signal) and bootstrap waiters keep
+	// their ready snapshot; the lost carrier's pinned streams rebind to the
+	// surviving carrier (see the detach sweep below + rebindDirection).
+	reg := n.downReg
 	if dir == session.DirUp {
-		n.lostUp = true
-		// Not ready: re-create the ready signal (open) so bootstrap
-		// waiters that parked on the now-stale closed channel wake and
-		// re-check ready() (Issue #7). Waiters always re-check state
-		// after a wake, so the wake itself only means "state changed".
-		n.upReady = make(chan struct{})
-		n.upReadyClosed = false
+		reg = n.upReg
+	}
+	reg.ClearIf(h.id, h) // this carrier is dying; drop its slot if still current
+	if dir == session.DirUp {
+		if !n.upReg.Ready() {
+			n.upReady = make(chan struct{})
+			n.upReadyClosed = false
+		}
 	} else {
-		n.lostDown = true
-		n.downReady = make(chan struct{})
-		n.downReadyClosed = false
+		if !n.downReg.Ready() {
+			n.downReady = make(chan struct{})
+			n.downReadyClosed = false
+		}
 	}
 	n.mu.Unlock()
-
 	n.metrics.CarrierLossEvent()
+	n.metrics.CarrierLossEventOn(h.id)
 	n.logger.Printf("carrier %s lost (gen %d); grace window %s for affected sessions",
 		dirName(dir), h.gen, n.cfg.Grace)
 
@@ -746,6 +887,29 @@ func (n *Node) onCarrierLost(dir session.Direction, h *carrierHandle) {
 				shortID(sess.ID), dirName(dir), n.cfg.Grace)
 		}
 	}
+
+	// Phase 2 (D1) hot-standby failover: when OTHER carriers in this
+	// direction are still Active (ready) after this loss — the F1 "re-attach
+	// within grace" case — the detached sessions immediately re-attach onto
+	// the surviving carrier rather than waiting for a fresh install. The
+	// standby never went down, so no install runs onCarrierReady; the loss
+	// itself must trigger the rebind sweep. Only the stream originator
+	// (RoleIran) runs the sweep; the peer (Germany) re-attaches in response
+	// to the resulting FrameRebind (v2, naming the surviving carrier). We
+	// re-attach to the HIGHEST-PRIORITY survivor only (D1: K=2, static
+	// priority): a session already moved onto it is not swept again.
+	if n.cfg.Role == RoleIran {
+		reg := n.downReg
+		if dir == session.DirUp {
+			reg = n.upReg
+		}
+		for _, survivor := range reg.ReadyExcept(h.id) {
+			n.logger.Printf("carrier %s lost; failing over pinned streams to surviving carrier %s",
+				h.id, survivor.id)
+			n.rebindDirection(dir, survivor)
+			break
+		}
+	}
 }
 
 // onCarrierReady runs after a carrier is installed. Iran (the stream
@@ -757,6 +921,20 @@ func (n *Node) onCarrierReady(dir session.Direction, h *carrierHandle) {
 		return
 	}
 	n.rebindDirection(dir, h)
+}
+
+// encodeRebind builds the FrameRebind payload for carrier h. When the node
+// is multi-carrier it emits the v2 payload (version + carrier ID + generation)
+// so the peer can re-attach to the specific carrier this stream rebinds onto;
+// otherwise it emits the byte-identical v1 payload so single-carrier peers
+// (and the golden byte stream) are unaffected. This is the "capability
+// negotiation" half of D9: the wire version is chosen from local state, and
+// receivers accept both versions (see ParseRebindAny).
+func (n *Node) encodeRebind(sessID session.SessionID, h *carrierHandle) []byte {
+	if n.multiDown() {
+		return session.EncodeRebindV2(sessID, string(h.id), h.gen)
+	}
+	return session.EncodeRebind(sessID, h.gen)
 }
 
 // rebindDirection re-attaches every eligible session's dir attachment
@@ -816,7 +994,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 		// FrameRebind MUST be the first frame of this stream on the new
 		// carrier: the peer's OnNewStream branches on its type, and any
 		// user data arriving first would be dropped as malformed.
-		if err := h.carrier.WriteFrame(id, mux.FrameRebind, session.EncodeRebind(sess.ID, h.gen)); err != nil {
+		if err := h.carrier.WriteFrame(id, mux.FrameRebind, n.encodeRebind(sess.ID, h)); err != nil {
 			h.carrier.Deregister(id)
 			n.failRebind(sess, dir, att, "rebind frame write failed: "+err.Error())
 			continue
@@ -974,11 +1152,20 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 	if p == nil {
 		return // FrameClose as first frame — not a rebind
 	}
-	_, gen, ok := session.ParseRebind(p)
+	// D9: accept both v1 and v2 rebind payloads. The arriving carrier h is
+	// the exact carrier this stream re-attaches to, so a v2 payload MUST name
+	// h's carrier ID; any mismatch (or an unknown ID) fails closed. v1
+	// payloads carry no ID (the single-carrier default) and always match h.
+	rb, ok := session.ParseRebindAny(p)
 	if !ok {
 		drop("malformed rebind payload")
 		return
 	}
+	if rb.Version == session.RebindVersionV2 && rb.CarrierID != string(h.id) {
+		drop("rebind carrier id mismatch (unknown for this carrier)")
+		return
+	}
+	gen := rb.Gen
 	sess, ok := n.store.GetByStream(id)
 	if !ok || sess.State() != session.StateActive {
 		drop("no active session for stream")
@@ -997,8 +1184,33 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 		drop("stale sender carrier generation")
 		return
 	}
-	st, _ := att.State()
-	if st != session.AttUnavailable && st != session.AttRebinding {
+	// Hot-standby failover (Phase 2, D1): the surviving down carrier never
+	// went down, so the stream originator's LOSS-triggered rebind sweep
+	// (Iran) writes the FrameRebind naming that surviving carrier IMMEDIATELY
+	// — before THIS node's own loss sweep has detached the attachment from
+	// the just-died carrier. The attachment may still be bound to the dying
+	// generation g (g != gen; gen is strictly newer, it passed the stale
+	// check above). Force-detach it so the stream re-attaches on the
+	// surviving carrier, mirroring rebindDirection's AttAttached backstop.
+	st, g := att.State()
+	switch st {
+	case session.AttAttached:
+		if g == gen {
+			// Already bound to this exact (new) carrier; re-attach is a
+			// no-op — nothing to do.
+			drop("already attached to this carrier")
+			return
+		}
+		if !att.Detach(g) {
+			st2, _ := att.State()
+			if st2 != session.AttUnavailable {
+				drop("attachment not awaiting rebind (state " + st2.String() + ")")
+				return
+			}
+		}
+	case session.AttUnavailable, session.AttRebinding:
+		// proceed to rebind
+	default:
 		drop("attachment not awaiting rebind (state " + st.String() + ")")
 		return
 	}
@@ -1214,30 +1426,46 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 // CURRENT carriers (the session may have re-bound; the old carriers
 // clear their own stream tables during their Close), unindex and count.
 func (n *Node) onSessionClosed(sess *session.Session) {
-	n.mu.RLock()
-	if h := n.upReg.h; h != nil && sess.StreamIDUp != 0 {
-		h.carrier.Deregister(sess.StreamIDUp)
+	// Deregister the session's streams from every installed carrier in the
+	// direction. In multi-carrier a down stream may be pinned to the
+	// standby carrier, not the primary, so deregistering via a single
+	// "current" carrier would leak the stream on the other instance.
+	// Deregister is idempotent/quiet when the stream is absent (a lost
+	// carrier already removed its stream table on Close), so sweeping the
+	// whole direction is safe and leaves no slot behind.
+	if sess.StreamIDUp != 0 {
+		for _, h := range n.upReg.Handles() {
+			if h != nil {
+				h.carrier.Deregister(sess.StreamIDUp)
+			}
+		}
 	}
-	if h := n.downReg.h; h != nil && sess.StreamIDDown != 0 {
-		h.carrier.Deregister(sess.StreamIDDown)
+	if sess.StreamIDDown != 0 {
+		for _, h := range n.downReg.Handles() {
+			if h != nil {
+				h.carrier.Deregister(sess.StreamIDDown)
+			}
+		}
 	}
-	// Phase B (Slice 6): capture the current down carrier so the credit
-	// plane's per-(carrier, streamID) records are cleaned up below (timer +
-	// ledger on the gate, emitter record) — prevents a map leak of one
-	// entry per finished session. Inert when credits are disabled.
-	var downCar *mux.CarrierConn
-	if h := n.downReg.h; h != nil && sess.StreamIDDown != 0 {
-		downCar = h.carrier
-	}
-	n.mu.RUnlock()
+	// Phase B (Slice 6): the captured down carrier cleans up the credit
+	// plane's per-(carrier, streamID) records (timer + ledger on the
+	// gate, emitter record) — prevents a map leak of one entry per
+	// finished session. Inert when credits are disabled.
 	// Remove the credit gate's per-stream ledger + CreditSafeTimeout timer
-	// (Sender side, Germany) and the receiver-side emitter record for the
-	// down carrier. Both are keyed by streamID / (carrier, streamID).
+	// (Sender side, Germany) and the receiver-side emitter records. The gate
+	// is keyed by streamID (direction-wide); the emitter records are keyed
+	// by (carrier, streamID), so in multi-carrier they may exist on ANY
+	// down carrier the stream was ever pinned to — sweep the whole set to
+	// leave no per-session map leak. Inert when credits are disabled.
 	if n.creditGate != nil && sess.StreamIDDown != 0 {
 		n.creditGate.removeStream(sess.StreamIDDown)
 	}
-	if n.creditEmitter != nil && sess.StreamIDDown != 0 && downCar != nil {
-		n.creditEmitter.removeStream(carrierKey{carrier: downCar, streamID: sess.StreamIDDown})
+	if n.creditEmitter != nil && sess.StreamIDDown != 0 {
+		for _, h := range n.downReg.Handles() {
+			if h != nil {
+				n.creditEmitter.removeStream(carrierKey{carrier: h.carrier, streamID: sess.StreamIDDown})
+			}
+		}
 	}
 	n.store.Remove(sess.ID)
 	reason := closeReasonClass(sess)

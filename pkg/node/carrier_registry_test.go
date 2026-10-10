@@ -44,11 +44,11 @@ func TestRegistry_AddRegistersCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: unexpected error: %v", err)
 	}
-	if reg.Handle() != h1 {
+	if reg.Handle(DefaultUpCarrierID) != h1 {
 		t.Fatal("Handle: expected the installed handle")
 	}
-	if reg.Generation() != 1 {
-		t.Fatalf("Generation: got %d want 1", reg.Generation())
+	if reg.Generation(DefaultUpCarrierID) != 1 {
+		t.Fatalf("Generation: got %d want 1", reg.Generation(DefaultUpCarrierID))
 	}
 	if !reg.Ready() {
 		t.Fatal("Ready: expected true after install")
@@ -84,8 +84,8 @@ func TestRegistry_AddReplacesSameID(t *testing.T) {
 	if old != h1 {
 		t.Fatal("Add should return the previous handle")
 	}
-	if reg.Generation() != 2 {
-		t.Fatalf("Generation: got %d want 2", reg.Generation())
+	if reg.Generation(DefaultDownCarrierID) != 2 {
+		t.Fatalf("Generation: got %d want 2", reg.Generation(DefaultDownCarrierID))
 	}
 }
 
@@ -113,11 +113,11 @@ func TestRegistry_AddRejectsDifferentID(t *testing.T) {
 		t.Fatalf("Add with foreign ID: got err=%v, want ErrUnknownCarrierID", err)
 	}
 	// The original entry must be unchanged.
-	if reg.Handle() != h1 {
+	if reg.Handle(DefaultUpCarrierID) != h1 {
 		t.Fatal("Add with foreign ID must not replace the current entry")
 	}
-	if reg.Generation() != 1 {
-		t.Fatalf("Generation after rejected Add: got %d want 1", reg.Generation())
+	if reg.Generation(DefaultUpCarrierID) != 1 {
+		t.Fatalf("Generation after rejected Add: got %d want 1", reg.Generation(DefaultUpCarrierID))
 	}
 }
 
@@ -139,18 +139,18 @@ func TestRegistry_ClearIf(t *testing.T) {
 	// ClearIf with a different handle: no-op.
 	h2 := makeTestHandle(t, 2)
 	t.Cleanup(func() { h2.carrier.Close() })
-	reg.ClearIf(h2)
-	if reg.Handle() != h1 {
+	reg.ClearIf(DefaultUpCarrierID, h2)
+	if reg.Handle(DefaultUpCarrierID) != h1 {
 		t.Fatal("ClearIf with wrong handle must not clear")
 	}
 
 	// ClearIf with the same handle: clears.
-	reg.ClearIf(h1)
-	if reg.Handle() != nil {
+	reg.ClearIf(DefaultUpCarrierID, h1)
+	if reg.Handle(DefaultUpCarrierID) != nil {
 		t.Fatal("ClearIf with matching handle should clear the entry")
 	}
-	if reg.Generation() != 0 {
-		t.Fatalf("Generation after Clear: got %d want 0", reg.Generation())
+	if reg.Generation(DefaultUpCarrierID) != 0 {
+		t.Fatalf("Generation after Clear: got %d want 0", reg.Generation(DefaultUpCarrierID))
 	}
 }
 
@@ -168,8 +168,8 @@ func TestRegistry_Clear(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	reg.Clear()
-	if reg.Handle() != nil {
+	reg.Clear(DefaultDownCarrierID)
+	if reg.Handle(DefaultDownCarrierID) != nil {
 		t.Fatal("Clear should empty the registry")
 	}
 	if reg.Ready() {

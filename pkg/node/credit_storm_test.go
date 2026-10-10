@@ -165,7 +165,7 @@ func TestDownRebindSurvivesNoCarrierStorm(t *testing.T) {
 	}
 	// The root symptom directly: Germany's down carrier must not be dead from
 	// a credit-on-unregistered-stream.
-	if h := tp.de.downReg.h; h != nil {
+	if h := tp.de.downReg.Handle(tp.de.downReg.ID()); h != nil {
 		if err := h.carrier.ReadErr(); errors.Is(err, mux.ErrCreditUnknownStream) {
 			dumpCreditState(t, tp, "down-rebind-fatal")
 			t.Fatalf("DE down carrier died from ErrCreditUnknownStream after a single rebind — the rebind-path anchor race")
