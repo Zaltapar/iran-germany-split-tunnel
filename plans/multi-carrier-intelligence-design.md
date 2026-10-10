@@ -579,3 +579,84 @@ Scope: READ-ONLY dashboard v2 on the existing TunnelDash. No tunnel data path ch
 - Coverage gaps, reported as null with explicit lists, never as zero: CPU and load average (no collector provides them; adding one would change the SSH collector's remote-command allowlist and needs a decision); carrier p10 goodput, TTFB p50, flap count, stall count, per-carrier rebinds and probe budget (computed by the Phase 3 policy but not exported on `/metrics`).
 - Verification status: unit tests cover auth, basePath, read-only, headers, shapes, redaction, ring bounds, schemas, and static-asset rules. Not yet verified: a live browser session against Germany, the installer harness result, and `-race` on Linux (see the completion report).
 - Live verification still required on Germany before trust: TLS handshake and cert chain, Basic auth through the browser, actual collector freshness and stale/unreachable transitions, and that no v2 request triggers any remote command beyond the existing poll.
+
+## 15. Phase 2 staged deployment record — instance B (storage-p2.googleapis.com)
+
+External, host-contact deployment executed on `feat/multi-carrier-phase2` (built from tip
+`06ca66c`, `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 -trimpath -ldflags "-s -w -X main.buildInfo=06ca66c"`).
+Staged on the existing Germany and Iran hosts; no new VPS, no Arvan DNS/cert change, no dashboard
+basePath/credential change, no WARP/full-tunnel. All key material was generated/destroyed on-host and
+never echoed. No secrets appear in this note (host IPs, hashes, and env var *names* are included).
+
+### 15.1 Parameters
+- Instance B: Germany public port **2053**, Reality SNI/serverName **storage-p2.googleapis.com**
+  (TLS 1.3-compliant), a **fresh** X25519 keypair + shortId (not derived from instance A), Xray
+  freedom redirect to loopback **127.0.0.1:9003**. Instance A (443 / play.google.com / 9002) unchanged.
+- Iran second local consumer inbound **127.0.0.1:10803** mapped to instance B; instance A stays 10802.
+- Env names (`internal/config/config.go`): `SPLIT_MULTI_CARRIER_ENABLED` (both, true); Germany
+  `SPLIT_DOWN_LISTEN_2=127.0.0.1:9003`, `SPLIT_DOWN_CARRIER2_SNI=storage-p2.googleapis.com`; Iran
+  `SPLIT_DOWN_CARRIER_ADDR_2=127.0.0.1:10803`. Port 8443 reserved for dashboard; not used.
+- Binaries rebuilt from current feat tip and staged to `/opt/split-tunnel/{germany,iran}-splitter`
+  via tmp→mv, `chmod 0755 root:root`.
+
+### 15.2 Pre-checks
+- SNI pre-check from **both** hosts: `storage-p2.googleapis.com` TLS 1.3, ALPN `h2`, reachable
+  (HTTP 400 on a bare GET is expected for the camouflage target).
+- Germany firewall: `ufw` **inactive**, `iptables INPUT` policy **ACCEPT** (no host rule dropping
+  2053 at start). Hetzner cloud firewall is not inspectable from the host; noted as the one unverified
+  layer. Backup dirs verified with `sha256sum -c` before use:
+  - Germany `/root/split-tunnel-backups-20261010T205830Z-phase2` (all OK)
+  - Iran `/root/split-tunnel-backups-20261010T205831Z-phase2` (all OK)
+- Live config paths (from unit `ExecStart`): Germany `/etc/split-tunnel/xray-germany.json`
+  (xray-germany, split-tunnel user), Iran `/etc/xray-consumer/config.json` (xray-consumer, root).
+
+### 15.3 Binary SHA256 (verified on both hosts with `sha256sum -c` and ELF check `7f 45 4c 46`)
+- germany-splitter-linux-amd64 `d053e437499924eca5e35adda0ef267f3b16fb33eb6ea516c6ef43526ec152ff`
+- iran-splitter-linux-amd64  `f3ee7ff168efe776dac3ce6655cb419d73d36eb0c32519903aca2de5195661f8`
+- splitterctl-linux-amd64   `b4b0a9803396cb65be33c37638638db574914ddef2e79e19af3077d5735e2987`
+- tunneldash-linux-amd64    `7f90dc897976e8d822e962bca41ae8d5b58762f0085928dd35dd4421570800c9`
+
+### 15.4 Deploy + gates (all passed)
+1. Germany: two-inbound Xray config rendered host-side (instance A byte-identical, B appended),
+   `xray run -test -config` **exit 0** ("Configuration OK"). Live config swapped (tmp→mv, matching
+   ownership), xray-germany restarted. Listeners: 443, 2053, 9002, 9003, 8443.
+2. Germany splitter: env backed up, multi-carrier vars appended, `--validate-config` **exit 0**
+   (role germany; two down carriers). Binary swapped, service active; per-carrier metrics
+   `down-reality-a` / `down-reality-b` present.
+3. Iran: two-inbound consumer config rendered host-side mirroring live field shape (singular
+   `serverName`+`fingerprint`/`spiderX`, no `dest` — the pinned build accepts this for the appended
+   outbound), `xray-consumer run -test` **exit 0**. Swapped, xray-consumer restarted; 10802 and 10803
+   listening.
+4. Iran splitter: env backed up, `SPLIT_MULTI_CARRIER_ENABLED`+`SPLIT_DOWN_CARRIER_ADDR_2` appended,
+   `--validate-config` **exit 0** (role iran). Binary swapped, service active.
+5. End-to-end: from Iran, TCP connect `91.107.152.1:2053` **OK**; SOCKS5
+   `socks5h://…@188.121.111.122:10900` → `generate_204` = **204**, egress IP **91.107.152.1**;
+   metrics show per-carrier lines (names/values only) on both hosts.
+
+### 15.5 Fault-injection gates
+- **F5 (bounded, 60 s):** self-restoring 443 DROP armed first (restore at T+90 s), 443 blocked during a
+  20 MiB throttled in-tunnel download. Download **completed** (20 971 520 bytes, sha256
+  `4e403fda…407cc` match=YES); `carrier_rebinds` rose and `down-reality-a` loss/reconnect counters
+  ticked (in-flight stream rebound onto B). 443 self-restored; instance A recovered (443 open, both
+  services active).
+- **F6 (bounded, ~30 s double block):** self-restoring 443+2053 DROP armed first (restore at T+30 s).
+  An in-flight throttled transfer stayed **bounded** during the window (no unbounded hang; partial
+  bytes, terminated at its 30 s cap). After self-restore the full 20 MiB download succeeded with
+  sha256 match. Recovery confirmed; no lingering `iptables` rules. (Note: a from-Iran probe still saw
+  443/2053 open during the host-level DROP, consistent with the known un-inspectable Hetzner cloud-
+  firewall layer; the gate outcome — bounded close + recovery — held regardless.)
+
+### 15.6 Rollback test
+Restored pre-Phase-2 configs + env on both hosts (backups), restarted, and confirmed the pre-Phase-2
+SOCKS5 path still returns **204** (egress 91.107.152.1). Then **re-applied Phase 2** from the staged
+files; verified active + 204 again. Final state: **Phase 2 active on both hosts**.
+
+### 15.7 Cleanup
+- Shredded instance B keypair + staged key files on both hosts (`shred -u`); no `instB*`/`*.x25519`
+  material outside the verified backups / live `/etc` configs. Stopped the temporary 8899 file server.
+- Removed the temp driver `phase2render` from both hosts and the local `dist_onclick/phase2render*`.
+- Confirmed no stray key material outside backups or `/etc` (Germany live config still carries the two
+  private keys as expected; Iran live config carries the two public keys only).
+
+**Hard constraints honored:** no Arvan DNS/cert change; no WARP/full-tunnel; dashboard basePath/creds
+untouched; `/root/rollback-plainhttp*` untouched; no secrets printed; no git push (local commit only).
