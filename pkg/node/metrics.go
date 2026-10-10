@@ -140,10 +140,86 @@ type Metrics struct {
 	relayCreditGateParkTotal      int64 // credit-gate PARK events (the missing D4 counter)
 	relayCreditSentBytesTotal     int64 // bytes charged via recordSent (sender gate)
 	relayCreditConsumedBytesTotal int64 // bytes credited via recordConsumed (receiver)
+
+	// Phase 2 multi-carrier (D1): per-CarrierID loss/reconnect counters.
+	// The direction aggregate above (carrierLossEvents / carrierReconnects)
+	// is ALWAYS kept, so the single-carrier /metrics output is byte-identical
+	// to the pre-Phase-2 build. When the node is multi-carrier, per-carrier
+	// names are additionally enabled (SetMultiCarrier) and rendered as
+	// carrier_loss_events{carrier="..."} / carrier_reconnects{carrier="..."}.
+	// The maps are bounded to the configured carrier set (no open-ended
+	// cardinality); ordering for deterministic rendering is carrierOrder.
+	multiCarrier         bool
+	carrierOrder         []CarrierID
+	carrierLossByID      map[CarrierID]int64
+	carrierReconnectByID map[CarrierID]int64
 }
 
 // NewMetrics creates a zeroed metrics set.
 func NewMetrics() *Metrics { return &Metrics{} }
+
+// SetMultiCarrier enables per-carrier metric names for the given static
+// down-carrier set. The direction aggregate counters are unaffected; when
+// enabled, Render additionally emits one
+// carrier_loss_events{carrier="..."} and one
+// carrier_reconnects{carrier="..."} line per known carrier. In single-carrier
+// deployments this is never called, so /metrics is byte-identical to the
+// pre-Phase-2 build.
+func (m *Metrics) SetMultiCarrier(ids []CarrierID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.multiCarrier = true
+	m.carrierOrder = append([]CarrierID(nil), ids...)
+	m.carrierLossByID = make(map[CarrierID]int64, len(ids))
+	m.carrierReconnectByID = make(map[CarrierID]int64, len(ids))
+}
+
+// IsMultiCarrier reports whether per-carrier metric names are enabled.
+func (m *Metrics) IsMultiCarrier() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.multiCarrier
+}
+
+// CarrierLossEventOn counts a carrier death for a specific CarrierID, in
+// addition to the direction aggregate. Inert (no-op beyond the aggregate)
+// unless multi-carrier is enabled.
+func (m *Metrics) CarrierLossEventOn(id CarrierID) {
+	m.mu.Lock()
+	if m.multiCarrier {
+		m.carrierLossByID[id]++
+	}
+	m.mu.Unlock()
+}
+
+// CarrierReconnectOn counts a carrier (re)establishment for a specific
+// CarrierID, in addition to the direction aggregate. Inert unless
+// multi-carrier is enabled.
+func (m *Metrics) CarrierReconnectOn(id CarrierID) {
+	m.mu.Lock()
+	if m.multiCarrier {
+		m.carrierReconnectByID[id]++
+	}
+	m.mu.Unlock()
+}
+
+// CarrierLossCount returns the per-CarrierID loss count for id (0 when
+// multi-carrier metrics are not enabled or no losses have been recorded).
+// It is a point-in-time read of the per-carrier map; the direction aggregate
+// (CarrierLossEvents) is independent of this value.
+func (m *Metrics) CarrierLossCount(id CarrierID) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.carrierLossByID[id]
+}
+
+// CarrierReconnectCount returns the per-CarrierID reconnect count for id (0
+// when multi-carrier metrics are not enabled or no reconnects recorded).
+func (m *Metrics) CarrierReconnectCount(id CarrierID) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.carrierReconnectByID[id]
+}
 
 // SessionStarted counts a new session (active +1, total +1).
 func (m *Metrics) SessionStarted() {
@@ -538,6 +614,16 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "errors %d\n", s.Errors)
 	fmt.Fprintf(&b, "carrier_loss_events %d\n", s.CarrierLossEvents)
 	fmt.Fprintf(&b, "carrier_reconnects %d\n", s.CarrierReconnects)
+	// Phase 2 multi-carrier: per-carrier names, emitted ONLY when enabled
+	// (single-carrier /metrics stays byte-identical — no lines here).
+	if m.IsMultiCarrier() {
+		m.mu.Lock()
+		for _, id := range m.carrierOrder {
+			fmt.Fprintf(&b, "carrier_loss_events{carrier=%q} %d\n", string(id), m.carrierLossByID[id])
+			fmt.Fprintf(&b, "carrier_reconnects{carrier=%q} %d\n", string(id), m.carrierReconnectByID[id])
+		}
+		m.mu.Unlock()
+	}
 	fmt.Fprintf(&b, "carrier_rebinds %d\n", s.CarrierRebinds)
 	fmt.Fprintf(&b, "carrier_rebind_failures %d\n", s.CarrierRebindFailures)
 	fmt.Fprintf(&b, "carrier_rebind_unknown_peer %d\n", s.RebindUnknownPeer)
