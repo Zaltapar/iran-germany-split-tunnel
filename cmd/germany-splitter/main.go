@@ -154,6 +154,26 @@ func downCarrierIDs(cfg *config.Config) []node.CarrierID {
 	return []node.CarrierID{node.DefaultDownCarrierID}
 }
 
+// nodePolicyConfig maps the operator-configurable Phase 3 fields onto a copy of
+// the documented starting values (node.PolicyConfigDefaults). Only the knobs
+// exposed as environment variables are overridden; every other field keeps the
+// library default. The result is inert in single-carrier nodes: the policy
+// engine is only constructed when DownCarrierIDs has two or more entries.
+func nodePolicyConfig(cfg *config.Config) node.PolicyConfig {
+	pc := node.PolicyConfigDefaults()
+	pc.Mode = cfg.PolicyMode
+	pc.TopK = cfg.PolicyTopK
+	pc.ProbingEnabled = cfg.ProbingEnabled
+	pc.ProbeURL = cfg.ProbeURL
+	// 0 is the "disable the daily budget gate" sentinel; a non-negative value
+	// (bytes) is a hard cap. Negative values are rejected by config validation.
+	pc.ProbeDailyBudgetBytes = cfg.ProbeDailyBudget
+	if cfg.TTFBBaselineMs > 0 {
+		pc.TTFBBaseline = time.Duration(cfg.TTFBBaselineMs) * time.Millisecond
+	}
+	return pc
+}
+
 // secondListenSuffix renders the optional second down-carrier listener suffix
 // for the startup log line (empty when multi-carrier is disabled).
 func secondListenSuffix(cfg *config.Config) string {
@@ -245,10 +265,18 @@ func main() {
 		// registry holds the static-priority two-instance set (primary first),
 		// which enables the v2 rebind wire and per-carrier pinning.
 		DownCarrierIDs: downCarrierIDs(cfg),
+		// Phase 3 carrier-intelligence policy (inert when single-carrier; the
+		// engine is constructed only when DownCarrierIDs has two or more
+		// entries). Operator-configurable fields override the documented
+		// starting values (node.PolicyConfigDefaults).
+		PolicyCfg: nodePolicyConfig(cfg),
 	}, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("germany-splitter: node construction: %v", err)
 	}
+	// Phase 3: start the 10 s policy evaluation ticker. No-op when the node
+	// is single-carrier (n.policy is nil).
+	n.StartPolicyTicker()
 	// Startup guardrail: one line making the ACTIVE egress-target
 	// address-family policy explicit in the operator's log, matching the
 	// other startup config lines below.
