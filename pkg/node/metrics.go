@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 )
@@ -153,6 +154,13 @@ type Metrics struct {
 	carrierOrder         []CarrierID
 	carrierLossByID      map[CarrierID]int64
 	carrierReconnectByID map[CarrierID]int64
+
+	// Phase 3 (G3, design §7.5): the node's carrier-intelligence policy,
+	// set only when multi-carrier is enabled. Render emits one bounded,
+	// non-secret per-carrier health line family from this snapshot when
+	// policy != nil; it is nil in single-carrier nodes, so /metrics stays
+	// byte-identical.
+	policy *Policy
 }
 
 // NewMetrics creates a zeroed metrics set.
@@ -179,6 +187,17 @@ func (m *Metrics) IsMultiCarrier() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.multiCarrier
+}
+
+// SetPolicy associates the node's Phase 3 carrier-intelligence policy with
+// this metrics set so Render can emit per-carrier health gauges. It is called
+// only when multi-carrier is enabled (multi-carrier nodes always have a
+// policy). In single-carrier nodes it is never called, so /metrics stays
+// byte-identical.
+func (m *Metrics) SetPolicy(p *Policy) {
+	m.mu.Lock()
+	m.policy = p
+	m.mu.Unlock()
 }
 
 // CarrierLossEventOn counts a carrier death for a specific CarrierID, in
@@ -621,6 +640,24 @@ func (m *Metrics) Render() string {
 		for _, id := range m.carrierOrder {
 			fmt.Fprintf(&b, "carrier_loss_events{carrier=%q} %d\n", string(id), m.carrierLossByID[id])
 			fmt.Fprintf(&b, "carrier_reconnects{carrier=%q} %d\n", string(id), m.carrierReconnectByID[id])
+		}
+		// Phase 3 (G3, design §7.5): per-carrier health gauges, emitted ONLY
+		// when multi-carrier AND a policy is attached (both true only in
+		// multi-carrier nodes). Fixed label format (carrier only); integer or
+		// fixed-point values; no secrets (gate/state reasons are code-owned
+		// ordinals, not caller input).
+		if p := m.policy; p != nil {
+			for _, cs := range p.HealthSnapshotNow(time.Now()).Carriers {
+				fmt.Fprintf(&b, "carrier_health_state{carrier=%q} %d\n", cs.ID, stateOrdinal(cs.State))
+				fmt.Fprintf(&b, "carrier_health_score{carrier=%q} %.4f\n", cs.ID, cs.Score)
+				fmt.Fprintf(&b, "carrier_health_goodput_mibps{carrier=%q} %.4f\n", cs.ID, cs.GoodputMiBps)
+				fmt.Fprintf(&b, "carrier_health_success_ratio{carrier=%q} %.4f\n", cs.ID, cs.SuccessRatio)
+				fmt.Fprintf(&b, "carrier_health_stall_rate_per_100_mib{carrier=%q} %.4f\n", cs.ID, cs.StallRatePer100MiB)
+				fmt.Fprintf(&b, "carrier_health_eligible{carrier=%q} %d\n", cs.ID, cs.EligibleMetric())
+				fmt.Fprintf(&b, "carrier_health_gate_reason{carrier=%q} %d\n", cs.ID, gateReasonOrdinal(cs.GateReason))
+				fmt.Fprintf(&b, "carrier_health_cooldown_remaining_sec{carrier=%q} %d\n", cs.ID, cs.CooldownRemainingSec)
+				fmt.Fprintf(&b, "carrier_health_probe_bytes_today{carrier=%q} %d\n", cs.ID, cs.ProbeBytesToday)
+			}
 		}
 		m.mu.Unlock()
 	}
