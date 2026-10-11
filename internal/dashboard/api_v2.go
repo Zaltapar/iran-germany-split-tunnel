@@ -159,6 +159,15 @@ type v2Counts struct {
 // unauthenticated.
 func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// C1: POST is allowed for the new /api/v2/changes/validate route
+		// (read-only control validation; no apply, no mutator call).
+		if r.Method == http.MethodPost {
+			parts := v2Segments(r.URL.Path)
+			if len(parts) == 2 && parts[0] == "changes" && parts[1] == "validate" {
+				s.c1HandleChangesValidate(w, r)
+				return
+			}
+		}
 		w.Header().Set("Allow", v2Allow)
 		writeJSONError(w, http.StatusMethodNotAllowed, "dashboard v2 API is read-only: only GET and HEAD are allowed")
 		return
@@ -214,6 +223,14 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if len(parts) == 2 {
+				// C1: the new policy-multi-carrier concept is not in
+				// ConceptSchemas() (which lists the legacy outbound /
+				// routing-rule / routing-policy concepts). Handle it
+				// explicitly before falling through to the 404.
+				if parts[1] == policyMultiCarrierConcept {
+					s.c1HandleSchemaPolicyMultiCarrier(w)
+					return
+				}
 				if c, ok := conceptSchemaByName(parts[1]); ok {
 					writeJSON(w, http.StatusOK, c)
 					return
