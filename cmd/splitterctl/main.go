@@ -320,6 +320,12 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return recoverCommand(ctx, true, out)
 		}
 		return fmt.Errorf("%w: recover accepts only --ack", errUsage)
+	case "control-agent":
+		// C2 daemon (root+Linux-gated internally).
+		return controlAgentCmd(ctx, args[1:], out)
+	case "control":
+		// C2 operator control-plane entrypoints.
+		return controlCmd(ctx, args[1:], out)
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, args[0])
 	}
@@ -1572,4 +1578,7 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  recover --ack                       force-clear the journal without host changes (Linux root)")
 	fmt.Fprintln(out, "  config show                         show the committed deployment config")
 	fmt.Fprintln(out, "  config set KEY=VALUE ...            apply configuration changes transactionally (Linux root)")
+	fmt.Fprintln(out, "  control-agent [--store-root <dir>] [--socket <path>] [--dashboard-uid <u>] [--dashboard-gid <g>] [--dashboard-exe <path>]")
+	fmt.Fprintln(out, "                                      run the C2 control-agent daemon (Linux root; SO_PEERCRED peer check)")
+	fmt.Fprintln(out, "  control freeze|unfreeze|revert-lkg|audit-verify|recover   C2 operator control-plane entrypoints (Linux root except audit-verify)")
 }

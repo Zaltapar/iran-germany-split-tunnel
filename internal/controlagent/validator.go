@@ -61,6 +61,12 @@ type ConfigBuilder func(role string, base, override map[string]string) (*config.
 // called here: it would reject the placeholder values of fields C2
 // never edits (SPLIT_SECRET, the CDN up URL, ...), which would make
 // every candidate invalid on a host whose other settings are healthy.
+// NewConfigBuilder returns the production ConfigBuilder: it folds base +
+// override env vars into a config.Config (no I/O, no full config.Validate)
+// so the agent's per-value bounds + cross-field checks are the gate. This
+// is what the CLI wires into NewAgent; tests may substitute a pure func.
+func NewConfigBuilder() ConfigBuilder { return defaultConfigBuilder }
+
 func defaultConfigBuilder(role string, base, override map[string]string) (*config.Config, error) {
 	_ = role
 	c := config.Defaults()

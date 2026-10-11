@@ -25,3 +25,8 @@ func (unavailableCredentialSource) PeerCredentials(_ net.Conn) (PeerCredentials,
 	// available=false: PeerPolicy.Enforce will reject.
 	return PeerCredentials{}, false, errors.New("SO_PEERCRED unavailable on this host")
 }
+
+// ControlPlaneCredentialSource is the platform-neutral constructor the CLI
+// wires into the agent: on this platform it is the fail-closed source, so
+// a stray `control-agent` start never accepts a peer (design §3.2).
+func ControlPlaneCredentialSource() CredentialSource { return NewUnavailableCredentialSource() }

@@ -169,6 +169,31 @@ func NewAgent(storeRoot string, seam ApplySeam, build ConfigBuilder) (*Agent, er
 	return a, nil
 }
 
+// NewAgentForStore builds an agent over an already-opened RevisionStore
+// (used by the CLI control subcommands: revert-lkg, recover,
+// audit-verify). It returns a nil pointer when the store is not a valid
+// C2 store; callers must check for nil before use.
+func NewAgentForStore(st *RevisionStore, seam ApplySeam, build ConfigBuilder) *Agent {
+	if st == nil {
+		return nil
+	}
+	a := &Agent{
+		Store:         st,
+		Seam:          seam,
+		Build:         build,
+		ApplyMu:       &sync.Mutex{},
+		ApplyPer10Min: 1,
+		ApplyPer24H:   6,
+		Now:           time.Now,
+		idem:          map[string]*idemEntry{},
+	}
+	a.rlShort = newRateLimiter(a.ApplyPer10Min, 10*time.Minute)
+	a.rlLong = newRateLimiter(a.ApplyPer24H, 24*time.Hour)
+	a.Journal = NewControlJournal(st.Root)
+	a.Audit = mustNewAuditLog(filepath.Join(st.Root, "audit.jsonl"))
+	return a
+}
+
 // filepath is aliased below to keep the import block stdlib-only.
 func mustNewAuditLog(path string) *AuditLog {
 	l, err := NewAuditLog(path)
@@ -659,6 +684,14 @@ func (a *Agent) rollback(role string, res *TxResult, revID, parent string, fault
 	_ = a.Store.writePointer("head", parent)
 	a.journalState("rolled-back")
 	a.clearJournal()
+}
+
+// RollbackLKG is the exported operator/CLI entrypoint to revert the last
+// known-good revision (design §6.6: `splitterctl control revert-lkg`). It
+// is allowed even while the kill switch is engaged (a revert is the
+// recovery action, not a forward mutation).
+func (a *Agent) RollbackLKG(actor string) (TxResult, string, string) {
+	return a.rollbackLKG(actor)
 }
 
 // rollbackLKG restores the last-known-good revision's files/.

@@ -23,6 +23,12 @@ func NewSOPCCredentialSource() CredentialSource {
 	return sopcCredentialSource{}
 }
 
+// ControlPlaneCredentialSource is the platform-neutral constructor the
+// CLI wires into the agent (on Linux this is the SO_PEERCRED source; on
+// every other platform it is the fail-closed unavailable source, so a
+// stray `control-agent` start on a laptop never accepts a peer).
+func ControlPlaneCredentialSource() CredentialSource { return NewSOPCCredentialSource() }
+
 // PeerCredentials implements CredentialSource for a live connection.
 func (sopcCredentialSource) PeerCredentials(conn net.Conn) (PeerCredentials, bool, error) {
 	unixConn, ok := conn.(*net.UnixConn)
