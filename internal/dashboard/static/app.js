@@ -33,6 +33,7 @@
     tunnels: { title: "Tunnels / Carriers", render: renderCarriers },
     routing: { title: "Routing", render: renderRouting },
     outbounds: { title: "Outbounds", render: renderOutbounds },
+    inbounds: { title: "Inbounds", render: renderInbounds },
     network: { title: "Network speed", render: renderNetwork },
     config: { title: "Configuration", render: renderConfig },
     logs: { title: "Logs / Events", render: renderEvents }
@@ -488,6 +489,72 @@
         ])
       ]));
       view.appendChild(el("div", { cls: "notice", text: "Editing is disabled in this build (Apply controls are inert)." }));
+    });
+  }
+
+  // ---- Reality / consumer inbounds (C3 editing surface) --------------------------
+  // Read-only list of the Germany Reality + Iran consumer inbounds driven by the
+  // public-field C3 schemas. The API never returns key material — only a 12-hex
+  // fingerprint (keyRef). The Edit affordance is disabled with a tooltip when the
+  // per-capability flag is off; when the schema is editable it shows the (stubbed)
+  // validate + diff + confirm flow behind the restart warning. No CDN, CSP intact.
+  var C3_CONCEPTS = [
+    { concept: "germany-inbounds", role: "germany", label: "Germany Reality inbounds" },
+    { concept: "iran-inbounds", role: "iran", label: "Iran consumer inbounds" }
+  ];
+  function renderInbounds(view) {
+    var prompts = C3_CONCEPTS.map(function (c) {
+      return v2("/schema/" + c.concept).then(function (schema) {
+        return { meta: c, schema: schema };
+      });
+    });
+    return Promise.all(prompts).then(function (entries) {
+      clear(view);
+      view.appendChild(el("div", { cls: "notice", text: "Public inbound fields only. Keys are shown as a 12-hex fingerprint (keyRef) — key material is never displayed or accepted. A Germany-side edit stages a Blob B export for the Iran host and vice versa (peer change required; there is no coordinated apply)." }));
+      entries.forEach(function (entry) {
+        var schema = entry.schema;
+        var concept = entry.meta;
+        var editable = !!schema.editable;
+        var head = el("h3", { text: concept.label + " — " + (schema.status || "read-only") });
+        view.appendChild(el("div", { cls: "card" }, [head]));
+        var rows = (schema.fields || []).map(function (f) {
+          var isKey = f.name === "keyRef";
+          return el("tr", null, [
+            el("td", { text: f.name }),
+            el("td", { text: f.type || "—" }),
+            el("td", { text: f.required ? "yes" : "no" }),
+            el("td", { text: isKey ? "fingerprint (key material never editable)" : (f.pattern || "—") })
+          ]);
+        });
+        view.appendChild(el("div", { cls: "table-wrap" }, [
+          el("table", null, [
+            el("thead", null, [el("tr", null, ["Field", "Type", "Required", "Constraint"].map(function (h) { return el("th", { text: h }); }))]),
+            el("tbody", null, rows)
+          ])
+        ]));
+        if (editable) {
+          // Flag ON: the working form + validate + diff + confirm + restart
+          // countdown is still a stub in this phase. We render the affordance
+          // and an explicit "deferred" notice rather than a half-wired form.
+          view.appendChild(el("div", { cls: "notice" }, [
+            el("button", {
+              cls: "btn",
+              text: "Edit inbounds",
+              attrs: { disabled: "" }
+            }),
+            el("span", { cls: "muted small", text: " — validate + diff + confirm form is deferred; the flag gates the API plane but the in-browser form lands in a later phase." })
+          ]));
+        } else {
+          view.appendChild(el("div", { cls: "notice" }, [
+            el("button", {
+              cls: "btn",
+              text: "Edit",
+              attrs: { disabled: "", title: schema.editDisabledReason || "editing lands in the next phase" }
+            }),
+            el("span", { cls: "muted small", text: " — " + (schema.editDisabledReason || "editing lands in the next phase") })
+          ]));
+        }
+      });
     });
   }
 

@@ -893,3 +893,130 @@ installed/enabled on Germany or Iran; the socket is not live.
 - **Operator follow-up** on both hosts: install + enable
   `control-agent.socket` / `control-agent.service`, set
   `controlApplyEnabled=true`, and wire the dashboard `Control.SocketPath`.
+
+## 19. C3 completion note (code session)
+
+The C3 Reality inbound EDITING surface was implemented locally on
+`feat/multi-carrier-phase2` on top of the C2 tip; nothing was pushed and no
+production host was modified or contacted. C3 is NOT deployed and must not
+be deployed until its per-capability flag is explicitly enabled by an
+operator.
+
+**Files (new):**
+
+- `internal/controlagent/inbounds.go` — the C3 core: the `InboundSeam`
+  interface (nil = fail-closed `inbound_not_configured`), `ValidateInboundChange`
+  (port-conflict, reserved 8443, non-empty SNI, `ValidShortID`, min-one-healthy
+  list, secret-denylist), `BuildInboundDiff` (keyRef always redacted), and the
+  agent ops `opInboundsValidate / opInboundsApply / opInboundsRotate /
+  opInboundsExportBlob / opInboundsImportBlob` over a fault-injectable
+  `runInboundApply`.
+- `internal/controlagent/inbounds_test.go` — 26 C3 agent tests (all pass).
+- `internal/dashboard/control_c3.go` — the web forwarding plane: per-capability
+  flags (all default OFF), the public-field schemas, and the
+  `inbounds-validate` / `inbounds-apply` handlers (confirm token + restart
+  warning + peer-change note; NEVER key material).
+- `internal/dashboard/control_c3_test.go` — 12 C3 dashboard tests (all pass).
+- `cmd/splitterctl/control_c3.go` — the operator CLI surface: `export-blob`,
+  `import-blob`, `rotate-key` (Linux + root gated; blob A export reads
+  `SPLITTERCTL_BLOB_A_SECRET` / `_UPLOAD_DOMAIN` from env; rotate-key is
+  blocked without retain-old).
+
+**Files (modified):** `internal/controlagent/agent.go` (+ `InboundSeam` field
+and the 5 dispatch cases), `internal/controlagent/protocol.go` (+ 5 op
+constants), `cmd/splitterctl/main.go` (+ C3 subcommand dispatch),
+`cmd/splitterctl/control.go` (+ `newOSInboundSeam` wiring),
+`internal/dashboard/control_c2.go` (+ `C3Flags` on `ControlConfig`),
+`internal/dashboard/api_v2.go` (+ C3 routes), and the UI
+(`static/index.html`, `static/app.js` — new read-only "Inbounds" section with a
+flag-gated Edit affordance; the in-browser validate + diff + confirm + restart
+countdown FORM is explicitly deferred, as called out in requirement 7).
+
+**Editable concepts and fields:**
+
+- Germany Reality inbounds: `instance`, `enabled`, `port`, `sni` (required,
+  non-empty, RFC 1123), `dest` (redirect target), `shortId` / `shortIds`
+  (16 lowercase hex), and a `keyRef` that is a 12-hex sha256 fingerprint ONLY.
+- Iran consumer inbounds: `instance`, `enabled`, `port` (local), `remoteHost`
+  + `remotePort` (upstream), `sni`, `shortId`, and `keyRef` (public-key
+  fingerprint; the consumer never holds the private key).
+- Key material is NEVER editable and NEVER returned; every field whose name
+  matches the secret denylist is refused, and a 4xx/5xx response is scanned for
+  key markers in the dashboard tests.
+
+**Key-rotation flow + old-key retention:**
+
+- `rotate-key` calls `InboundSeam.RotateKeypair` (the pinned `xray.Keypair`
+  x25519 equivalent on the host) to mint a fresh keypair, writes it to a 0600
+  file, and updates the config. The OLD key is retained via the revision store
+  `pre/` snapshot taken by the C2 transaction; `RotateRequest` REQUIRES
+  `retainOld=true` and the agent blocks rotation when it is false, because the
+  old private key is the only rollback path (design §6 / C2 §5.4).
+- The rotation output never appears in argv and is never returned to the
+  browser — only the new key's fingerprint is exposed.
+
+**Peer-side staging (Blob A / Blob B, D10):**
+
+- A Germany-side edit stages a Blob B export; an Iran-side edit stages a Blob A
+  export. `export-blob` / `import-blob` write only to operator-chosen 0600
+  files and are never printed. `peerChangeRequired` is surfaced in the apply
+  response so the UI shows "peer change required" and never implies a
+  coordinated apply. `validateBlobKindPair` enforces germany↔b / iran↔a.
+
+**Validation rules (all in `ValidateInboundChange`):**
+
+- Port conflict check (config-level) across the full inbound list.
+- Rejection of port 8443 (reserved for the dashboard, `config.ReservedPort`)
+  plus any operator-supplied reserved list.
+- Non-empty SNI required; `shortId` / `shortIds` must satisfy
+  `pairing.ValidShortID` (16 lowercase hex).
+- Empty inbound lists are refused (min-one-healthy invariant).
+- Any field name matching the secret denylist is refused.
+
+**Apply / rollback path with the xray `-test` gate:**
+
+- `runInboundApply` renders the new config to a sandbox and runs
+  `InboundSeam.ConfigTest` (the `xray run -test` hook; a fake is injected on
+  this Windows host, the pinned xray binary on Linux). If the test fails the
+  swap never happens (fault `configtest` proves this). After a clean swap only
+  the affected service restarts (`xray-germany` / `xray-consumer`), listeners
+  are verified, and any post-swap failure triggers `rollbackInbound`
+  (restore file, restart, verify) — the auto-rollback guarantee.
+- The apply response surfaces the restart warning and `EstimatedDowntimeSec`
+  (D11: a typed RESTART + 10 s countdown) and requires the `confirm` token.
+
+**Per-capability flags (default OFF, C5 rollout model):**
+
+- `Control.C3Flags.GermanyInboundsApply` — POST `inbounds-apply` for Germany.
+- `Control.C3Flags.IranInboundsApply` — POST `inbounds-apply` for Iran.
+- `Control.C3Flags.KeyRotation` — enables the rotate-key action.
+- `Control.C3Flags.BlobExport` — enables the blob export/import staging ops.
+- A C3 apply is refused with `inbound_flag_off` (503) unless the SPECIFIC
+  concept's flag is on; the read-only schema + validate keep working so the UI
+  can render the list with a disabled Edit affordance and a "editing lands in
+  the next phase" tooltip.
+
+**Audit:** entries carry the redacted diff (ports, SNI, keyRef fingerprints)
+and the outcome; no key material (verified by the dashboard no-key-material
+tests over revisions/audit).
+
+**Gates (this session):**
+
+- `gofmt -l` on all changed Go files: clean.
+- `go build ./...`: exit 0.
+- `go test ./internal/controlagent/ -run TestC3`: 26 pass.
+- `go test ./internal/dashboard/`: all pass (incl. the 12 C3 tests).
+- `node --check` on `static/app.js`: clean; the new Inbounds section keeps the
+  no-CDN / CSP contract (the `TestStaticNoExternalURLs` /
+  `TestCSPCompatibleMarkup` / `TestStaticHasRequiredSections` suite stays
+  green).
+
+**Explicitly NOT done / deferred:**
+
+- The in-browser validate + diff + confirm + restart-countdown FORM is
+  deferred (requirement 7 fallback): the UI ships the read-only inbounds list +
+  a flag-gated Edit stub and says so explicitly. The API plane behind the form
+  (validate/apply/rotate/export/import) is complete and unit-tested.
+- C3 is NOT deployed to any host and these commits are NOT pushed to
+  `origin`; the C3 flags default OFF so even a deployed build would refuse
+  inbound applies until an operator enables them.
