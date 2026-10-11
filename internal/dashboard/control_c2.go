@@ -61,7 +61,7 @@ const c2RequestTimeout = 60 * time.Second
 // c2DialTimeout bounds the socket connect step.
 const c2DialTimeout = 2 * time.Second
 
-// ControlConfig is the dashboard's C2 plane configuration.
+// ControlConfig is the dashboard's C2/C3 plane configuration.
 type ControlConfig struct {
 	// ApplyEnabled turns on the C2 apply plane on this web process.
 	// Default (false): POST apply answers 503 control_apply_disabled;
@@ -70,6 +70,11 @@ type ControlConfig struct {
 	ApplyEnabled bool `json:"applyEnabled"`
 	// SocketPath is the agent's Unix socket. Default c2DefaultSocketPath.
 	SocketPath string `json:"socketPath"`
+	// C3Flags are the C3 per-capability feature flags for the Reality
+	// inbound editing surface (all default false; the C5 rollout model
+	// lets each capability be enabled/disabled independently of the C2
+	// policy plane and of each other).
+	C3Flags c3ControlFlags `json:"c3Flags,omitempty"`
 }
 
 // C2Agent is the injectable forwarder seam. The production

@@ -174,6 +174,16 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				s.c2HandleChangesApply(w, r, parts[1])
 				return
 			}
+			// C3 inbound editing surface (per-capability gated in the
+			// handler; the method whitelist already allowed POST).
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "inbounds-validate" {
+				s.c3HandleInboundsValidate(w, r, parts[1])
+				return
+			}
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "inbounds-apply" {
+				s.c3HandleInboundsApply(w, r, parts[1])
+				return
+			}
 		}
 		w.Header().Set("Allow", v2Allow)
 		writeJSONError(w, http.StatusMethodNotAllowed, "dashboard v2 API is read-only: only GET and HEAD are allowed")
@@ -246,6 +256,12 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				// explicitly before falling through to the 404.
 				if parts[1] == policyMultiCarrierConcept {
 					s.c1HandleSchemaPolicyMultiCarrier(w)
+					return
+				}
+				// C3: the Reality inbound editing concepts (public fields
+				// only; key refs as fingerprints, never key material).
+				if _, ok := c3SchemaForConcept(parts[1]); ok {
+					s.c3HandleInboundsSchema(w, parts[1])
 					return
 				}
 				if c, ok := conceptSchemaByName(parts[1]); ok {
