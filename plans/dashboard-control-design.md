@@ -776,3 +776,120 @@ gate was not run on this Windows host — run `go test -race ./...` on Linux.
 pass (0 FAIL); installer harness via Git Bash `install-oneclick.test.sh`
 PASS=74 FAIL=0. Commits: `16e5467` (CSRF fix), `a962d4a` (C1 endpoint),
 `7cbd098` (C1 tests). Nothing pushed.
+
+---
+
+## 18. C2 completion note (code session)
+
+The C2 APPLY plane was implemented locally across five commits (branch
+`feat/multi-carrier-phase2`, ahead of `origin`); nothing was pushed and no
+production host was modified or contacted.
+
+**Commits (local, in order):**
+
+| SHA | Subject |
+|-----|---------|
+| `fb479bc` | controlagent: C2 apply plane - protocol, peer check, revision store, transaction + crash recovery, kill switch, audit |
+| `7f7d774` | dashboard: C2 control plane forwarding endpoints (apply/revisions/audit) + feature flag off by default |
+| `dbdaac9` | systemd: control-agent.service + control-agent.socket unit renderers + goldens |
+| `c31ff76` | C2: add control-agent daemon + control CLI subcommands |
+| _(peercheck fix)_ | peercheck_linux.go: fix SyscallConn two-value return (Linux-only build-tag file, caught by -race) |
+
+**What C2 delivers (as implemented):**
+
+1. **Root-owned Unix-socket daemon** — `splitterctl control-agent` (Linux +
+   root gated, `//go:build linux` SO_PEERCRED; non-Linux fail-closed via
+   `ControlPlaneCredentialSource()`). Accepts one newline-delimited JSON frame
+   per connection (≤16 KiB, `DisallowUnknownFields`, no trailing data).
+   Peer identity is kernel-attested via SO_PEERCRED + canonical
+   `/proc/<pid>/exe`; the pure accept/reject/unavailable decision is unit-
+   tested with an injected `CredentialSource`.
+
+2. **Change lifecycle** — draft → validate → diff → apply(confirm token) →
+   verify → auto-rollback → history. The F1–F15 state machine
+   (`prepared→swapped→restarted→verified→committed`) is fault-injected at
+   every step; post-swap failures restore the pre-snapshot, restart, and
+   mark rolled-back. The editable concept is the splitter-policy /
+   multi-carrier env set ONLY (Reality inbound editing and routing are C3/C4).
+
+3. **Revision store** — default `/var/lib/split-tunnel-ctl/revisions`,
+   `MANIFEST.sha256`, retention 10, atomic writes (tmp+fsync+rename),
+   symlink refusal, 0600/0700; each apply snapshots the previous state first.
+
+4. **Apply transaction** — render to temp, back up current, validate,
+   atomic swap, restart **ONLY the affected splitter service** (never xray
+   in C2), verify (service active + metrics probe). Idempotency keys; a
+   single-apply concurrency lock.
+
+5. **Kill switch + `revert-lkg`** — a local `FREEZE` file blocks all
+   mutating ops; `revert-lkg` restores the last-known-good revision. Both
+   callable from the agent and the CLI (not from the web process).
+
+6. **Dashboard forwarding** — `POST /api/v2/changes/{id}/apply` (confirm
+   token + CSRF header), `GET /api/v2/revisions`, `GET /api/v2/audit`. The
+   web process only dials the agent socket; it never runs systemctl / writes
+   `/etc` / touches the revision store. Socket unavailable → 503 with a clear
+   reason, never fail-open.
+
+7. **Audit log** — append-only, hash-chained; records actor / timestamp /
+   concept / change id / redacted diff / outcome. Secret-named keys are
+   redacted and a value-fragment scan refuses unredacted secrets (fail
+   closed).
+
+8. **Safety** — in-memory sliding-window rate limits (1 apply/10 min,
+   6/24 h, configurable); restart warning via API; oversize body rejection;
+   strict JSON.
+
+9. **Feature flag** — the whole apply plane is **OFF by default**
+   (`controlApplyEnabled=false`); C1 validation and the read-only revision/
+   audit endpoints keep working when off.
+
+**systemd hardening:** `control-agent.service` (Type=notify, root,
+`ProtectHome`/`PrivateTmp`/`ProtectKernelTunables`/`ProtectControlGroups`/
+`ProtectSystem=full`/`ProtectProc=invisible`,
+`RestrictAddressFamilies=AF_UNIX`, `NoNewPrivileges=yes`, scoped
+`ReadWritePaths`, `SupplementaryGroups=tunneldash-ctl`) plus a
+`control-agent.socket` unit (0660, group `tunneldash-ctl`). Two new goldens
+added; existing single-carrier goldens verified byte-identical.
+
+**Fault-injection coverage (unit, `agent_test.go`):** render / validate /
+backup / swap / restart / verify / restore / commit, each forced to fail and
+asserting auto-rollback + journal state; concurrency lock (serialized
+second apply returns `apply_in_progress`); idempotency (same key+request →
+stored result, different → 409 conflict); kill switch (`frozen`); `revert-lkg`;
+crash-recovery on restart (uncertain → roll back, never forward, per §5.6).
+
+**Gates (this session):**
+
+- `gofmt -l` on all changed Go files: clean (exit 0).
+- `go build ./...`: exit 0.
+- `go vet ./cmd/splitterctl/ ./internal/controlagent/ ./internal/dashboard/ ./internal/systemd/`: exit 0.
+- `go test ./...` (all packages): 0 FAIL.
+- Installer harness `install-oneclick.test.sh` via Git Bash: **PASS=74 FAIL=0**.
+- Linux `-race` on a Germany **scratch** copy only
+  (`CGO_ENABLED=1 go test -race -count=1` on the four C2 packages):
+  `internal/controlagent`, `cmd/splitterctl`, `internal/dashboard`,
+  `internal/systemd` — all `ok`, no races. Scratch deleted and verified
+  gone. `systemctl is-active` for `germany-splitter` / `xray-germany` /
+  `tunneldash` was `active` **before and after**; no service was restarted.
+  The -race run surfaced one Linux-only build defect
+  (`peercheck_linux.go: SyscallConn` two-value return), fixed and re-tested
+  green.
+
+**Explicitly NOT done:** C2 is **NOT deployed** to any host, and none of
+these commits are **NOT pushed** to `origin`. The control-agent unit is not
+installed/enabled on Germany or Iran; the socket is not live.
+
+**What remains for C3 / C4 / C5:**
+
+- **C3** — Reality inbound editing surface + validation (the editable
+  concept is currently capped at the splitter-policy / multi-carrier env
+  set).
+- **C4** — routing-plane changes (per-node routing policy editing, live
+  apply).
+- **C5** — dashboard private-key handling D3 (move the key file to 0600
+  root with a tmpfs render), plus any C2→C5 integration of the audit /
+  LKG semantics into the key-rotation runbook.
+- **Operator follow-up** on both hosts: install + enable
+  `control-agent.socket` / `control-agent.service`, set
+  `controlApplyEnabled=true`, and wire the dashboard `Control.SocketPath`.
