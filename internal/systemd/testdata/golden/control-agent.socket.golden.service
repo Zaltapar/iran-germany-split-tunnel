@@ -1,0 +1,13 @@
+# control-agent.socket
+[Unit]
+Description=Split-tunnel control agent socket (C2 apply plane)
+
+[Socket]
+ListenStream=/run/split-tunnel-ctl/control.sock
+SocketUser=root
+SocketGroup=tunneldash-ctl
+SocketMode=0660
+Accept=no
+
+[Install]
+WantedBy=sockets.target

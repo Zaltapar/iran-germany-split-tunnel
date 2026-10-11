@@ -22,6 +22,16 @@ func extraGoldenSpecs() map[string]ExtraUnitSpec {
 			EnvFile:    "/etc/split-tunnel/dashboard.env",
 			ConfigPath: "/etc/split-tunnel/dashboard/config.json",
 		},
+		"control-agent": {
+			Unit:                  "control-agent.service",
+			BinPath:               "/opt/split-tunnel/splitterctl",
+			ControlAgentStoreRoot: "/var/lib/split-tunnel-ctl",
+		},
+		"control-agent.socket": {
+			Unit:                   "control-agent.socket",
+			BinPath:               "/opt/split-tunnel/splitterctl",
+			ControlAgentSocketPath: "/run/split-tunnel-ctl/control.sock",
+		},
 	}
 }
 
@@ -80,6 +90,10 @@ func TestRenderExtraUnitRejection(t *testing.T) {
 		"consumer with basepath": {Unit: "xray-consumer.service", BinPath: "/opt/x", BasePath: "00112233445566778899aabbccddeeff"},
 		"dash bad basepath":      {Unit: "tunneldash.service", BinPath: "/opt/t", BasePath: "tooshort", EnvFile: "/etc/x.env", ConfigPath: "/etc/x.json"},
 		"dash empty envfile":     {Unit: "tunneldash.service", BinPath: "/opt/t", BasePath: "00112233445566778899aabbccddeeff", ConfigPath: "/etc/x.json"},
+		"ctl empty storeroot":    {Unit: "control-agent.service", BinPath: "/opt/splitterctl"},
+		"ctl relative storeroot": {Unit: "control-agent.service", BinPath: "/opt/splitterctl", ControlAgentStoreRoot: "relative/root"},
+		"ctl with basepath":      {Unit: "control-agent.service", BinPath: "/opt/splitterctl", ControlAgentStoreRoot: "/var/lib/ctl", BasePath: "00112233445566778899aabbccddeeff"},
+		"sock empty path":        {Unit: "control-agent.socket", BinPath: "/opt/splitterctl"},
 	}
 	for name, s := range cases {
 		t.Run(name, func(t *testing.T) {

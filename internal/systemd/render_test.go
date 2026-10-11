@@ -87,7 +87,7 @@ func TestRenderGolden(t *testing.T) {
 	// extra_units goldens (xray-consumer, tunneldash) are rendered by
 	// RenderExtraUnit, not RenderUnit, so they are excluded from this
 	// spec-keyed orphan check.
-	extra := map[string]bool{"xray-consumer": true, "tunneldash": true}
+	extra := map[string]bool{"xray-consumer": true, "tunneldash": true, "control-agent": true, "control-agent.socket": true}
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	if err != nil {
 		t.Fatalf("read golden dir: %v", err)

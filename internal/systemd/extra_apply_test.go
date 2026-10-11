@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -24,6 +25,13 @@ func plantExtraPreconditions(t *testing.T, s ExtraUnitSpec) {
 func TestApplyExtraUnitFreshAndNoop(t *testing.T) {
 	for name, s := range extraGoldenSpecs() {
 		t.Run(name, func(t *testing.T) {
+			// Socket units are validated + golden-tested (RenderExtraUnit +
+			// golden), not transactionally applied through unitPath (which
+			// is service-only); the apply path is exercised on the .service
+			// extras only.
+			if strings.HasSuffix(s.Unit, ".socket") {
+				t.Skip("socket units are golden-tested, not applied through the service apply path")
+			}
 			redirectPaths(t)
 			// Re-root the spec paths at the redirected temp tree (the
 			// golden specs carry the canonical /opt and /etc prefixes,
@@ -34,6 +42,11 @@ func TestApplyExtraUnitFreshAndNoop(t *testing.T) {
 				s.ConfigPath = filepath.Join(stateDir, "dashboard", "config.json")
 				writeRaw(t, s.EnvFile, []byte("SPLIT_TUNNELDASH_TOKEN_FILE=/etc/split-tunnel/dashboard/token\n"))
 				writeRaw(t, s.ConfigPath, []byte("{}\n"))
+			}
+			if s.Unit == "control-agent.service" {
+				// Re-root the store dir at the redirected state tree.
+				s.ControlAgentStoreRoot = filepath.Join(stateDir, "control-agent")
+				writeRaw(t, filepath.Join(s.ControlAgentStoreRoot, "revisions"), []byte("{}\n"))
 			}
 			plantExtraPreconditions(t, s)
 
