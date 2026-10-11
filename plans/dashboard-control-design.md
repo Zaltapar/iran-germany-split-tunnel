@@ -702,3 +702,77 @@ For each object: (1) validate passes on a copy; (2) diff matches intent; (3) app
 - A local commit with message `docs: dashboard control plane design` was NOT made: this Architect session has no shell or git tool. The operator (or the orchestrator's code-capable mode) must run:
   `git add plans/dashboard-control-design.md` then `git commit -m "docs: dashboard control plane design"`.
 - Nothing was pushed.
+
+---
+
+## 17. C1 completion note (code session)
+
+The §16 commit was subsequently made locally as `d2990ef` (`docs: dashboard
+control plane design`); the seven phase-2 ops helpers (all secret-free) were
+moved from `scripts/` to [`scripts/ops/`](../scripts/ops/) and committed as
+`2d3946c` (`chore(ops): phase 2 deployment helpers (f5/f6 failover tests,
+multi-config renderers)`).
+
+**Part B security findings (read-only repo evidence, no host contact):**
+
+1. **CSRF origin check was effectively disabled.**
+   [`internal/dashboard/server.go`](../internal/dashboard/server.go:82)
+   constructed `NewOriginChecker("")`, and the pre-fix
+   [`OriginChecker.Check`](../internal/dashboard/auth.go) allowed both an empty
+   expected origin and a *missing* `Origin` header, so a cross-site POST with
+   cached Basic credentials reached the v1 plan/apply handlers. Fixed in C1:
+   every non-GET/non-HEAD request now requires the custom header
+   `X-Tunneldash-Request: 1` **and** a same-origin `Origin`/`Referer` host
+   match (403 otherwise); HTML forms cannot set the custom header, and CORS
+   preflight blocks cross-site fetches that do. 405 is preserved for read-only
+   v2 routes; `POST /api/v2/changes/validate` is the single POST exception.
+   Commit `16e5467`.
+2. **Reality private key readable by the split-tunnel group.** The installer
+   writes live configs (`xray-germany.json`, `Caddyfile`,
+   `xray-consumer.json`) `0640 root:split-tunnel`
+   ([`internal/systemd/user.go`](../internal/systemd/user.go:116), comment
+   lines 6-7, `liveStateFiles` line 76), while `tunneldash.service` runs as
+   `User=split-tunnel Group=split-tunnel`
+   ([`internal/systemd/extra_units.go`](../internal/systemd/extra_units.go:143)).
+   The Germany config embeds the Reality `privateKey`
+   ([`internal/xray/realityconfig.go`](../internal/xray/realityconfig.go:175),
+   rendered at line 250). Residual risk: any tunneldash process compromise
+   (or any other service in the split-tunnel group) can read the private key.
+   Mitigation path is D3 (move the key file to 0600 root with tmpfs render in
+   C5). No host check was needed or performed.
+3. **Secret-named keys writable via `splitterctl config set`.**
+   [`cmd/splitterctl/main.go`](../cmd/splitterctl/main.go:495) accepts
+   `secret` through `applyConfigOverrides` (transactional; values are never
+   echoed, pinned by `TestConfigSetSecretIsNeverEchoed`). The dashboard has no
+   such path: the plan allowlist `SafeConfigKeys`
+   ([`internal/dashboard/planner.go`](../internal/dashboard/planner.go:43))
+   contains no secret-named keys, and the new C1 denylist
+   (`secret|key|token|password|basepath|credential|private`,
+   [`control_c1.go`](../internal/dashboard/control_c1.go:133)) rejects any
+   secret-named field at the validation endpoint;
+   `TestC1EditableSchemaDenylist` enforces the invariant that every editable
+   schema field passes the denylist.
+
+**What C1 proves:** the CSRF hardening blocks cross-site POSTs (header +
+same-origin, proven by `TestC1CSRF*`); `POST /api/v2/changes/validate`
+performs pure in-memory validation (strict JSON: `DisallowUnknownFields`,
+64 KiB cap, single-object, no trailing data; bounds/enum checks reuse
+`internal/config` constants); the filesystem is unchanged after every POST
+(sentinel-file test), the nil mutator is never called (attempt counter), 401
+without Basic auth, 404 outside the basePath, and no secret value is ever
+echoed (redaction test). No UI change was made in C1, per the brief.
+
+**What C1 does not prove / does not include:** no apply, no agent, no
+rollback, no journal, no restart orchestration (those remain C2+); the C1
+diff baseline uses config defaults because the read-only cache does not yet
+collect live splitter env values; assumption A4 (browser cached-Basic
+behavior on cross-origin fetch) is enforced by the header requirement but was
+not verified in a real browser; `SPLIT_PROBE_URL` is deliberately outside the
+C1 editable set (probing-enable validation notes this); the Linux `-race`
+gate was not run on this Windows host — run `go test -race ./...` on Linux.
+
+**Gates (this session, local):** `gofmt -l` on all changed Go files clean;
+`go build ./...` exit 0; `go vet ./...` exit 0; `go test ./...` all packages
+pass (0 FAIL); installer harness via Git Bash `install-oneclick.test.sh`
+PASS=74 FAIL=0. Commits: `16e5467` (CSRF fix), `a962d4a` (C1 endpoint),
+`7cbd098` (C1 tests). Nothing pushed.
