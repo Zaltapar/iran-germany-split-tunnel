@@ -324,7 +324,15 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		// C2 daemon (root+Linux-gated internally).
 		return controlAgentCmd(ctx, args[1:], out)
 	case "control":
-		// C2 operator control-plane entrypoints.
+		// C2 + C3 operator control-plane entrypoints. C3 staging ops
+		// (export-blob / import-blob / rotate-key) are dispatched to
+		// controlC3Cmd; everything else goes to the C2 controlCmd.
+		if len(args) > 2 {
+			switch args[2] {
+			case "export-blob", "import-blob", "rotate-key":
+				return controlC3Cmd(ctx, args[2:], out)
+			}
+		}
 		return controlCmd(ctx, args[1:], out)
 	default:
 		return fmt.Errorf("%w: unknown command %q", errUsage, args[0])

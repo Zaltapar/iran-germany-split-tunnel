@@ -121,6 +121,9 @@ func controlAgentCmd(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("control-agent: open store: %w", err)
 	}
+	// C3: wire the inbound-seam so the C3 Reality inbound editing surface
+	// (inbounds-*, rotate, blob export/import) is available over the socket.
+	a.InboundSeam = newOSInboundSeam()
 	// Crash recovery on start (design §5.6).
 	if outcome, rerr := a.RecoverOnStart(); rerr != nil {
 		return fmt.Errorf("control-agent: recovery: %w", rerr)
