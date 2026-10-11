@@ -9,9 +9,24 @@
 // Behavior neutrality: when multi-carrier is disabled the down registry
 // holds exactly one entry (DefaultDownCarrierID) and the up registry holds
 // exactly one entry (DefaultUpCarrierID) — byte-identical to the Phase 1
-// build. All methods are called with the Node mutex held (the registry has
-// no lock of its own, matching the existing up/down slot discipline under
-// n.mu).
+// build.
+//
+// Synchronization: the handle map is guarded by the registry's OWN mutex
+// (r.mu) — it is self-synchronizing, so every method is safe to call with
+// or without the Node mutex held (the Node callbacks that run without n.mu,
+// e.g. the session OnClose sweep in onSessionClosed, are covered).
+// Lock discipline:
+//   - r.mu is a leaf-ish lock in the order Node.mu -> Registry.mu ->
+//     CarrierConn.mu; it is never held while trying to acquire Node.mu
+//     (no registry method touches Node state), so there is no cycle.
+//   - No I/O, no callbacks, and no channel send/receive happen under
+//     r.mu: Ready() only takes the carrier's brief internal flag check,
+//     and CloseAll snapshots+clears under r.mu then closes the carriers
+//     OUTSIDE the lock.
+//   - Methods that return handle slices (Handles/ReadyExcept/ReadyIDs)
+//     return fresh copies built under r.mu; the live map is never exposed.
+//   - ClearIf is atomic: the check and the assign happen under one
+//     exclusive lock hold.
 //
 // Generation: each installed handle carries a monotonically increasing
 // node-global generation (owned by the Node, n.genSeq, lockstep across both
@@ -22,6 +37,7 @@ package node
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 )
@@ -89,6 +105,9 @@ var ErrUnknownCarrierID = errors.New("node: unknown carrier id for this registry
 //     so replacement bumps it and the rebind wire generations are
 //     unchanged.
 type carrierRegistry struct {
+	// mu guards handles ONLY (see the file-header lock discipline).
+	// allowed and order are immutable after construction.
+	mu      sync.RWMutex
 	dir     session.Direction
 	allowed map[CarrierID]bool
 	order   []CarrierID // static priority order, index 0 = primary
@@ -148,6 +167,8 @@ func (r *carrierRegistry) SingleEntry() bool { return len(r.order) == 1 }
 
 // Handle returns the entry for id, or nil when none is installed.
 func (r *carrierRegistry) Handle(id CarrierID) *carrierHandle {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.handles[id]
 }
 
@@ -155,6 +176,8 @@ func (r *carrierRegistry) Handle(id CarrierID) *carrierHandle {
 // (the static-priority "primary"), or nil when no carrier is ready. For a
 // single-carrier registry this is the sole entry.
 func (r *carrierRegistry) Primary() *carrierHandle {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, id := range r.order {
 		if h := r.handles[id]; h != nil && h.carrier.Ready() {
 			return h
@@ -166,6 +189,8 @@ func (r *carrierRegistry) Primary() *carrierHandle {
 // Ready reports whether at least one entry is installed and its read loop is
 // alive ("at least one carrier installed" — design §4.2).
 func (r *carrierRegistry) Ready() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, id := range r.order {
 		if h := r.handles[id]; h != nil && h.carrier.Ready() {
 			return true
@@ -178,6 +203,8 @@ func (r *carrierRegistry) Ready() bool {
 // have a ready entry. This is the target set for a rebind: a lost carrier's
 // pinned streams move to the first ready carrier OTHER than the lost one.
 func (r *carrierRegistry) ReadyIDs() []CarrierID {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var out []CarrierID
 	for _, id := range r.order {
 		if h := r.handles[id]; h != nil && h.carrier.Ready() {
@@ -193,7 +220,9 @@ func (r *carrierRegistry) ReadyIDs() []CarrierID {
 // surviving Active carriers (design §7.1 static priority). A nil/unknown id
 // excludes nothing.
 func (r *carrierRegistry) ReadyExcept(exclude CarrierID) []*carrierHandle {
-	var out []*carrierHandle
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*carrierHandle, 0, len(r.order))
 	for _, id := range r.order {
 		if id == exclude {
 			continue
@@ -208,6 +237,8 @@ func (r *carrierRegistry) ReadyExcept(exclude CarrierID) []*carrierHandle {
 // Generation returns the current entry's generation for id (0 when not
 // installed).
 func (r *carrierRegistry) Generation(id CarrierID) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if h := r.handles[id]; h != nil {
 		return h.gen
 	}
@@ -224,11 +255,14 @@ func (r *carrierRegistry) Add(id CarrierID, h *carrierHandle) (*carrierHandle, e
 	if h == nil {
 		return nil, errors.New("node: cannot install a nil carrier handle")
 	}
+	r.mu.Lock()
 	if !r.allowed[id] {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: registry %q, got %q", ErrUnknownCarrierID, r.ID(), id)
 	}
 	old := r.handles[id]
 	r.handles[id] = h
+	r.mu.Unlock()
 	return old, nil
 }
 
@@ -236,6 +270,8 @@ func (r *carrierRegistry) Add(id CarrierID, h *carrierHandle) (*carrierHandle, e
 // backstop: a dying carrier only clears its own slot when it is still
 // current for that ID).
 func (r *carrierRegistry) ClearIf(id CarrierID, h *carrierHandle) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.handles[id] == h {
 		r.handles[id] = nil
 	}
@@ -243,6 +279,8 @@ func (r *carrierRegistry) ClearIf(id CarrierID, h *carrierHandle) {
 
 // Clear unconditionally empties the slot for id.
 func (r *carrierRegistry) Clear(id CarrierID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.handles[id] = nil
 }
 
@@ -250,6 +288,8 @@ func (r *carrierRegistry) Clear(id CarrierID) {
 // entries (an uninstalled slot) are included so callers can iterate the
 // full known set; the caller skips nils.
 func (r *carrierRegistry) Handles() []*carrierHandle {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]*carrierHandle, 0, len(r.order))
 	for _, id := range r.order {
 		out = append(out, r.handles[id])
@@ -259,6 +299,8 @@ func (r *carrierRegistry) Handles() []*carrierHandle {
 
 // Count is the number of installed carriers (0..len(order)).
 func (r *carrierRegistry) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	n := 0
 	for _, id := range r.order {
 		if r.handles[id] != nil {
@@ -268,12 +310,21 @@ func (r *carrierRegistry) Count() int {
 	return n
 }
 
-// CloseAll closes every installed carrier (node shutdown).
+// CloseAll closes every installed carrier (node shutdown). The snapshot and
+// slot-clearing happen atomically under r.mu; the carrier Close() calls are
+// made OUTSIDE the lock (I/O never runs under the registry lock).
 func (r *carrierRegistry) CloseAll() {
+	r.mu.Lock()
+	var toClose []*carrierHandle
 	for _, id := range r.order {
 		if h := r.handles[id]; h != nil {
-			h.carrier.Close()
+			toClose = append(toClose, h)
+			r.handles[id] = nil
 		}
+	}
+	r.mu.Unlock()
+	for _, h := range toClose {
+		h.carrier.Close()
 	}
 }
 
