@@ -660,3 +660,73 @@ files; verified active + 204 again. Final state: **Phase 2 active on both hosts*
 
 **Hard constraints honored:** no Arvan DNS/cert change; no WARP/full-tunnel; dashboard basePath/creds
 untouched; `/root/rollback-plainhttp*` untouched; no secrets printed; no git push (local commit only).
+
+## 16. Phase 3 external soak (S5) record — 2-hour live multi-carrier (branch `feat/multi-carrier-phase2`)
+
+External, host-contact soak executed on `feat/multi-carrier-phase2` (2026-10-11 UTC). Vantage =
+Iran host `188.121.111.122`, local SOCKS5 `127.0.0.1:10900`; companion telemetry from Germany
+`91.107.152.1` `/metrics` on loopback `:9101`. READ-only on config/services: no configuration
+change, no service restart, no Arvan DNS/cert change, no WARP. Full record and CSV are in
+`final-suite/phase3-soak/SOAK-REPORT.md` (data in `final-suite/phase3-soak/results.csv`). No
+secrets appear in this note.
+
+### 16.1 Binary decision (explicit)
+
+The soak ran the **running `06ca66c` build (pre-race-fix)**, not the pushed tip `8b2d539`.
+Rationale: the `06ca66c` → `8b2d539` splitter delta is exactly the `carrierRegistry`
+mutex/concurrency fix (`2a543fa` + the `8b2d539` race-regression tests) and does not change
+steady-state goodput, failover behavior, or the probe budget — all three S5 sub-criteria are
+scientifically valid on `06ca66c`. The `8b2d539` splitters **were built and staged locally**
+(sha256 `germany 6b2e2545…db354`, `iran 085a3787…5cc`; `buildInfo=8b2d539`, `trimpath`,
+`-s -w`) as a contingency artifact and remain deployable to re-run the same harness on the
+post-race-fix binary once the stop/backup/validate/swap/rollback deploy gates are approved.
+
+### 16.2 Method
+
+25 samples per direction on a 5-minute cadence (two 20 MiB transfers per sample), reusing the
+exact Phase 0 deterministic method: DOWN `cachefly.cachefly.net/50mb.test` Range-capped to
+20 MiB (HTTP 206), UP `speed.cloudflare.com/__up` POST 20 MiB (HTTP 200). p10 by linear
+interpolation (R-7 / numpy "linear"), identical to `final-suite/phase0/compute_stats.py`.
+SOCKS5 credentials were read in-shell into a 0600 `curlrc` and **shredded** after the run.
+Each sample also recorded the loopback `/metrics` of both hosts, service state, and a
+last-interval journal excerpt.
+
+### 16.3 Results and S5 verdict
+
+| Direction | n | Failures | Min | p10 | Median | Mean | Max | S5 floor (≥1 MiB/s p10) |
+|---|---|---|---|---|---|---|---|---|
+| DOWN | 25 | 0 | 0.42 | **9.21** | 16.39 | 17.37 | 29.21 | PASS |
+| UP | 25 | 0 | 1.43 | **2.22** | 6.94 | 8.48 | 16.91 | PASS |
+
+Comparison to Phase 0 baseline (DOWN p10 23.58 / UP p10 7.66): both soak p10s are below the
+baseline, driven by a small number of long-tail slow samples (DOWN index 7 at 0.42 MiB/s;
+several UP samples 1.4–3.4 MiB/s); the median/mean remain consistent with Phase 0. **0 flap
+storms** across the window; the hysteresis "≤ 1 switch / 5 min under noise" constraint held.
+
+**S5 PASSES the two measured sub-criteria** (per-direction 1 MiB/s p10 floor + 0 flap storms).
+The **probe-budget sub-criterion is UNVERIFIED** because `SPLIT_PROBING_ENABLED` is unset
+(→ default `false`) on both hosts, so `carrier_health_probe_bytes_today` stayed 0 for both
+carriers across all 25 samples; there is no observed day-total to compare to the 96 MiB/carrier
+cap. Closing it requires enabling `SPLIT_PROBING_ENABLED=true` + an operator `SPLIT_PROBE_URL`
+on both hosts and a real 24 h run summing `carrier_health_probe_bytes_today` per carrier
+(procedure in `SOAK-REPORT.md` §5).
+
+### 16.4 Flap / rebind / service-interruption record
+
+- **One bounded shared-IP down-carrier failover at ~09:28:28 UTC:** both down carriers
+  (`down-reality-a`, `down-reality-b`) dropped and reconnected **once each** (they share one
+  Germany IP — the known D2 correlated-failure risk), with **14 session rebinds and 0 rebind
+  failures** (the rebind-anchor invariant held); recovery was within the 5 s grace window.
+  This is a single design-intended loss failover (bypasses hysteresis, §6.5), **not a storm**.
+- **Germany counters were flat** across all 25 samples (the `loss=2/1`, `rebinds=13`,
+  `rebind_failures=146` values are pre-existing from before the soak).
+- The per-interval journal `storm=2` count in one Iran sample is a **substring false positive**
+  (the harness counts case-insensitive `storm` matches in target-domain/CONNECT lines; the word
+  "storm" is not emitted by the splitter binary). Confirmed by re-grepping the loss window.
+- **No service interruption:** all of `iran-splitter`, `xray-consumer`, `germany-splitter`,
+  `xray-germany`, `tunneldash` stayed `active`; `NRestarts` unchanged from pre-soak.
+
+**Hard constraints honored:** no config change during the soak; no service restart during the
+soak; no secrets printed (SOCKS5 / Reality / dashboard / SSH all `<redacted>` or never surfaced;
+the 0600 curlrc shredded); no Arvan DNS/cert change; no WARP; management SSH routed outside the
+tunnel. No git push (this note is a local commit only).
