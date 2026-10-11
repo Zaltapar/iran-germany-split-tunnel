@@ -35,7 +35,10 @@ func (sopcCredentialSource) PeerCredentials(conn net.Conn) (PeerCredentials, boo
 	if !ok {
 		return PeerCredentials{}, false, fmt.Errorf("%w: connection is not a unix socket", ErrPeerRejected)
 	}
-	raw := unixConn.SyscallConn()
+	raw, err := unixConn.SyscallConn()
+	if err != nil {
+		return PeerCredentials{}, false, fmt.Errorf("%w: syscallconn: %v", ErrPeerRejected, err)
+	}
 
 	var (
 		cred       syscall.Ucred
