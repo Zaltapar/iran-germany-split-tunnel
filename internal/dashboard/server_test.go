@@ -27,6 +27,9 @@ func newTestServer(cfg *DashboardConfig) *Server {
 }
 
 // doRequest performs a request against the Router and returns the response.
+// For POST requests it automatically sets the C1 CSRF custom header so that
+// existing v1 plan/apply tests keep working (the loopback test server has
+// no Origin header; the custom header alone satisfies the C1 check).
 func doRequest(t *testing.T, s *Server, method, path string, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rdr io.Reader
@@ -34,6 +37,9 @@ func doRequest(t *testing.T, s *Server, method, path string, body string) *httpt
 		rdr = strings.NewReader(body)
 	}
 	req := httptest.NewRequest(method, path, rdr)
+	if method == http.MethodPost {
+		req.Header.Set(CSRFRequestHeader, CSRFRequestValue)
+	}
 	rr := httptest.NewRecorder()
 	s.Router().ServeHTTP(rr, req)
 	return rr

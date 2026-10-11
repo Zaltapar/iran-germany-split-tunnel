@@ -3,6 +3,7 @@ package dashboard
 import (
 	"crypto/subtle"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -89,47 +90,110 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.Msg }
 
-// --- CSRF / Origin check ---
+// --- CSRF / Origin check (C1 hardened) ---
 
-// OriginChecker rejects mutating requests (POST) whose Origin header does
-// not match the dashboard's own origin. This is a defence-in-depth measure:
-// even though mutations are disabled in this release, the mechanism is in
-// place so that a future enabled-mutation build cannot be CSRF'd by a
-// malicious web page.
+// CSRFRequestHeader is the custom header every mutating (non-GET, non-HEAD)
+// request must carry. Browsers cannot set it from a plain HTML form, and
+// cross-site fetch/XHR requests that set it will be blocked by the CORS
+// preflight (the server never answers OPTIONS with allow headers).
+const CSRFRequestHeader = "X-Tunneldash-Request"
+
+// CSRFRequestValue is the single accepted value for the CSRF custom header.
+const CSRFRequestValue = "1"
+
+// OriginChecker performs CSRF protection for mutating requests.
 //
-// The expected origin is the dashboard's own listen address in the form
-// "http://127.0.0.1:8080". A request without an Origin header (i.e. same-
-// origin form submissions or API clients) is allowed; a request WITH an
-// Origin header that does not match is rejected with 403.
+// C1 hardening (replaces the old disabled-by-default check):
+//  1. The custom header X-Tunneldash-Request: 1 is REQUIRED on every
+//     non-GET, non-HEAD request. Missing or wrong value → 403
+//     "csrf_header_missing".
+//  2. Same-origin check: if the request carries an Origin or Referer
+//     header, its host component must equal the request's Host header.
+//     Mismatch → 403 "origin_forbidden".
+//  3. If neither Origin nor Referer is present (non-browser API client),
+//     the custom header alone is sufficient; no 403.
+//
+// This blocks the two CSRF vectors:
+//   - Cross-site HTML form POST: cannot set the custom header.
+//   - Cross-site JavaScript fetch with cached Basic credentials: the CORS
+//     preflight for a non-simple header (X-Tunneldash-Request) fails
+//     because the server never returns Access-Control-Allow-Headers.
 type OriginChecker struct {
-	// ExpectedOrigin is the dashboard's own origin, e.g. "http://127.0.0.1:8080".
-	// Empty means the check is disabled (safe for local fixture mode).
-	ExpectedOrigin string
+	// Enabled is true when the CSRF checks are active. In the current
+	// build it is always true (the old "disabled when empty" escape
+	// hatch is removed).
+	Enabled bool
 }
 
-// NewOriginChecker creates an OriginChecker for the given dashboard origin.
-func NewOriginChecker(origin string) *OriginChecker {
-	return &OriginChecker{ExpectedOrigin: origin}
+// NewOriginChecker creates an active CSRF checker. The argument is
+// retained for API compatibility but is unused; the check derives the
+// expected origin from the request's Host header at check time.
+func NewOriginChecker(_ string) *OriginChecker {
+	return &OriginChecker{Enabled: true}
 }
 
-// Check returns nil for allowed requests, or an *httpError for rejected ones.
-// It is only meaningful for mutating methods (POST, PUT, PATCH, DELETE);
-// read-only GET/HEAD requests are always allowed.
+// Check returns nil for allowed requests, or an *httpError for rejected
+// ones. It is only meaningful for mutating methods; read-only GET/HEAD
+// requests are always allowed.
 func (o *OriginChecker) Check(r *http.Request) error {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		return nil
 	}
-	if o.ExpectedOrigin == "" {
-		// Disabled (safe default for fixture mode: the server is loopback-only).
+	if !o.Enabled {
 		return nil
 	}
+	// 1. Custom header is mandatory for every non-GET/non-HEAD request.
+	if r.Header.Get(CSRFRequestHeader) != CSRFRequestValue {
+		return &httpError{Code: http.StatusForbidden, Msg: "csrf_header_missing: X-Tunneldash-Request: 1 is required for mutating requests"}
+	}
+	// 2. Same-origin: Origin or Referer, when present, must match r.Host.
 	origin := r.Header.Get("Origin")
-	if origin == "" {
-		// No Origin header: same-origin form submission or API client. Allow.
+	referer := r.Header.Get("Referer")
+	if origin == "" && referer == "" {
+		// No browser origin headers: non-browser API client. The custom
+		// header is the CSRF guard; allow.
 		return nil
 	}
-	if origin != o.ExpectedOrigin {
-		return &httpError{Code: http.StatusForbidden, Msg: "request origin not allowed (CSRF check)"}
+	var srcHost string
+	if origin != "" {
+		srcHost = hostFromOrigin(origin)
+	} else {
+		srcHost = hostFromOrigin(referer)
+	}
+	if srcHost == "" {
+		// Unparseable Origin/Referer: fail closed.
+		return &httpError{Code: http.StatusForbidden, Msg: "origin_forbidden: unparseable Origin or Referer"}
+	}
+	if srcHost != r.Host {
+		return &httpError{Code: http.StatusForbidden, Msg: "origin_forbidden: request origin does not match Host"}
 	}
 	return nil
+}
+
+// hostFromOrigin extracts the authority (host[:port]) from an origin or
+// referer URL string. It returns "" when the value is not a valid
+// http/https URL with a non-empty host.
+func hostFromOrigin(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	// Origin has the form "scheme://host[:port]"; Referer is a full URL.
+	// We only need the authority. Parse both with net/url.
+	// For robustness, handle the "null" origin (opaque/sandboxed iframe):
+	// a "null" origin is always cross-site → reject.
+	if raw == "null" {
+		return "" // unparseable → caller rejects
+	}
+	u, err := parseOriginURL(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Host
+}
+
+// parseOriginURL is a thin wrapper over url.Parse that accepts both a
+// bare origin ("scheme://host:port") and a full URL (Referer). It returns
+// the parsed *url.URL, or an error.
+func parseOriginURL(raw string) (*url.URL, error) {
+	return url.Parse(raw)
 }
