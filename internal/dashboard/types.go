@@ -199,6 +199,11 @@ type DashboardConfig struct {
 	// Routing is the read-only view of the routing policy (Dashboard v2).
 	// nil means "not declared"; the UI then shows an explicit empty state.
 	Routing *RoutingPolicy `json:"routing,omitempty"`
+	// Control configures the C2 control APPLY plane (design §12 C2). nil
+	// (the default) means the apply plane is OFF: POST apply answers 503
+	// and the read-only forwarding endpoints report the agent as
+	// unavailable. It never affects the C1 read-only validation endpoint.
+	Control *ControlConfig `json:"control,omitempty"`
 }
 
 // validBasePath reports whether p is a 32-character lowercase hex string.

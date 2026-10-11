@@ -58,6 +58,9 @@ type Server struct {
 
 	// requestBodyLimit caps POST request bodies.
 	requestBodyLimit int64
+	// c2Agent is the C2 control-plane forwarder (nil by default; the
+	// deploy path wires a ControlClient when control.applyEnabled).
+	c2Agent C2Agent
 }
 
 // planTTL bounds how long a stored dry-run plan remains usable by the apply

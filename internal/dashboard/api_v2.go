@@ -161,10 +161,17 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		// C1: POST is allowed for the new /api/v2/changes/validate route
 		// (read-only control validation; no apply, no mutator call).
+		// C2: POST is allowed for /api/v2/changes/{id}/apply (the
+		// forwarded control-apply op; the handler is flag-gated and the
+		// agent owns every host mutation).
 		if r.Method == http.MethodPost {
 			parts := v2Segments(r.URL.Path)
 			if len(parts) == 2 && parts[0] == "changes" && parts[1] == "validate" {
 				s.c1HandleChangesValidate(w, r)
+				return
+			}
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "apply" {
+				s.c2HandleChangesApply(w, r, parts[1])
 				return
 			}
 		}
@@ -177,6 +184,16 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) > 0 {
 		switch parts[0] {
+		case "revisions":
+			if len(parts) == 1 {
+				s.c2HandleRevisions(w, r)
+				return
+			}
+		case "audit":
+			if len(parts) == 1 {
+				s.c2HandleAudit(w, r)
+				return
+			}
 		case "overview":
 			if len(parts) == 1 {
 				s.v2Overview(w, now)
