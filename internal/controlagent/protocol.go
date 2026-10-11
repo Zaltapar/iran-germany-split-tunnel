@@ -53,6 +53,12 @@ const (
 	OpStatus      = "status"
 	OpRevisions   = "revisions"
 	OpAudit       = "audit"
+	// C3 inbound editing surface (inbounds.go).
+	OpInboundsValidate   = "inbounds-validate"
+	OpInboundsApply      = "inbounds-apply"
+	OpInboundsRotate     = "inbounds-rotate"
+	OpInboundsExportBlob = "inbounds-export-blob"
+	OpInboundsImportBlob = "inbounds-import-blob"
 )
 
 // knownOps is the closed set of op names the agent accepts on the
@@ -65,6 +71,12 @@ var knownOps = map[string]bool{
 	OpStatus:      true,
 	OpRevisions:   true,
 	OpAudit:       true,
+	// C3
+	OpInboundsValidate:   true,
+	OpInboundsApply:      true,
+	OpInboundsRotate:     true,
+	OpInboundsExportBlob: true,
+	OpInboundsImportBlob: true,
 }
 
 // Frame is one newline-delimited JSON request or response. Exactly

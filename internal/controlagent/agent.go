@@ -117,7 +117,12 @@ func (r *fixedRateLimiter) RecordApply(now time.Time) {
 type Agent struct {
 	Store *RevisionStore
 	Seam  ApplySeam
-	Build ConfigBuilder
+	// InboundSeam is the C3 host-facing executor for Reality inbound
+	// editing, key rotation, and blob export/import (inbounds.go). Nil
+	// (the default) keeps the C2 behaviour unchanged: every C3 op fails
+	// closed with inbound_not_configured.
+	InboundSeam InboundSeam
+	Build       ConfigBuilder
 	// ApplyMu is the concurrency lock: only one apply runs at a time.
 	ApplyMu *sync.Mutex
 	// Rate limits per the design; defaults are 1/10min and 6/24h.
@@ -138,10 +143,11 @@ type Agent struct {
 	// prober restarts unconditionally on those rows.
 	ServiceActive ServiceActiveFunc
 
-	rlShort *fixedRateLimiter
-	rlLong  *fixedRateLimiter
-	idemMu  sync.Mutex
-	idem    map[string]*idemEntry
+	rlShort     *fixedRateLimiter
+	rlLong      *fixedRateLimiter
+	idemMu      sync.Mutex
+	idem        map[string]*idemEntry
+	idemInbound map[string]*idemEntry
 }
 
 // NewAgent builds an agent over one store root. The in-flight journal and
@@ -245,6 +251,17 @@ func (a *Agent) ServeConnection(src CredentialSource, policy *PeerPolicy, conn n
 		return a.opRevisions(conn, frame)
 	case OpAudit:
 		return a.opAudit(conn, frame)
+	// C3 inbound editing surface (inbounds.go).
+	case OpInboundsValidate:
+		return a.opInboundsValidate(conn, frame)
+	case OpInboundsApply:
+		return a.opInboundsApply(conn, frame)
+	case OpInboundsRotate:
+		return a.opInboundsRotate(conn, frame)
+	case OpInboundsExportBlob:
+		return a.opInboundsExportBlob(conn, frame)
+	case OpInboundsImportBlob:
+		return a.opInboundsImportBlob(conn, frame)
 	default:
 		return a.reply(conn, frame, false, nil, ErrCodeUnknownOp, "unknown op")
 	}
