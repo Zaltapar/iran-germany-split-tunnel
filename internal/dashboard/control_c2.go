@@ -75,6 +75,10 @@ type ControlConfig struct {
 	// lets each capability be enabled/disabled independently of the C2
 	// policy plane and of each other).
 	C3Flags c3ControlFlags `json:"c3Flags,omitempty"`
+	// C4Flags are the C4 per-capability feature flags for the routing
+	// plane and the multi-carrier control surface (all default false;
+	// the C5 rollout model).
+	C4Flags c4ControlFlags `json:"c4Flags,omitempty"`
 }
 
 // C2Agent is the injectable forwarder seam. The production

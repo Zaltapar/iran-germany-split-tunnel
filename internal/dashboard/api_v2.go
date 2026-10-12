@@ -184,6 +184,25 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				s.c3HandleInboundsApply(w, r, parts[1])
 				return
 			}
+			// C4 routing + multi-carrier editing surface (per-capability
+			// gated in the handlers; the method whitelist already
+			// allowed POST).
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "routing-validate" {
+				s.c4HandleRoutingValidate(w, r, parts[1])
+				return
+			}
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "routing-apply" {
+				s.c4HandleRoutingApply(w, r, parts[1])
+				return
+			}
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "multicarrier-validate" {
+				s.c4HandleMultiCarrierValidate(w, r, parts[1])
+				return
+			}
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "multicarrier-apply" {
+				s.c4HandleMultiCarrierApply(w, r, parts[1])
+				return
+			}
 		}
 		w.Header().Set("Allow", v2Allow)
 		writeJSONError(w, http.StatusMethodNotAllowed, "dashboard v2 API is read-only: only GET and HEAD are allowed")
@@ -262,6 +281,18 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				// only; key refs as fingerprints, never key material).
 				if _, ok := c3SchemaForConcept(parts[1]); ok {
 					s.c3HandleInboundsSchema(w, parts[1])
+					return
+				}
+				// C4: the routing plane and the multi-carrier control
+				// concepts (read-only schemas; the per-capability flag
+				// drives the editable state + the disabled Edit
+				// affordance).
+				if parts[1] == c4ConceptRoutingPlane {
+					s.c4HandleRoutingSchema(w)
+					return
+				}
+				if parts[1] == c4ConceptMultiCarrier {
+					s.c4HandleMultiCarrierSchema(w)
 					return
 				}
 				if c, ok := conceptSchemaByName(parts[1]); ok {
