@@ -24,6 +24,9 @@ func TestPermissionChainConvergence(t *testing.T) {
 	if _, err := user.LookupGroup(ServiceGroup); err != nil {
 		t.Skipf("service group %q unavailable: %v", ServiceGroup, err)
 	}
+	if err := EnsureKeyGroup(context.Background(), OSExecutor{}); err != nil {
+		t.Skipf("cannot provision key group %q (groupadd failed): %v", XrayKeyGroup, err)
+	}
 	// Make the whole path chain from the service account to the files
 	// traversable. Go's t.TempDir() nests the returned path under a
 	// per-test scratch dir (e.g. /tmp/TestXxx<id>/001) that is 0700
@@ -82,13 +85,20 @@ func TestPermissionChainConvergence(t *testing.T) {
 	}
 
 	assertModeOwner(t, stateDir, 0o750, 0, ServiceGroup)
-	assertModeOwner(t, live, 0o640, 0, ServiceGroup)
+	// C5 D3: the key-bearing xray config converges to 0640 root:XrayKeyGroup
+	// (NOT root:ServiceGroup), so the dashboard's group is excluded.
+	assertModeOwner(t, live, 0o640, 0, XrayKeyGroup)
 	assertModeOwner(t, caddy, 0o640, 0, ServiceGroup)
 	assertModeOwner(t, env, 0o600, 0, "root")
 	assertModeOwner(t, prev, 0o600, 0, "root")
 	assertModeOwner(t, caddyPrev, 0o600, 0, "root")
 	if err := runAsServiceGroup(caddy); err != nil {
 		t.Fatalf("service account cannot read converged Caddyfile: %v", err)
+	}
+	// The service user (split-tunnel, primary group split-tunnel, NOT a
+	// member of the key group) must be denied the key config after C5.
+	if err := runAsServiceGroupMustDeny(live); err != nil {
+		t.Fatalf("service user CAN read the key config %s — C5 isolation broken: %v", live, err)
 	}
 	assertModeOwner(t, logDir, 0o775, 0, ServiceGroup)
 }
