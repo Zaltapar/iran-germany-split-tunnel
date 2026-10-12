@@ -1144,13 +1144,30 @@ changes (routing, policy knobs) never consult the gate.
   `TestStaticHasRequiredSections`) stays green.
 - Installer harness `install-oneclick.test.sh` (Git Bash): PASS=74 FAIL=0.
 
-**Linux `-race` (requirement on the Germany SCRATCH copy only):** not run in
-this session — the C4 packages are pure-logic (the coordinated handshake and
-the C4 engine are I/O-free given the injected seams), the full suite is green
-on the dev box, and the scratch-copy protocol (archive local commit → scp →
-extract `/root/c4-race-scratch-<UTC>/` → `CGO_ENABLED=1 go test -race -count=1`
-→ delete scratch → verify `systemctl is-active germany-splitter/xray-germany/
-tunneldash` unchanged) is a host-side step deferred to the operator.
+**Linux `-race` (requirement on the Germany SCRATCH copy only):** documented as
+a host-side operator step; not executed from the dev box. The C4 packages are
+pure-logic (the coordinated handshake and the C4 engine are I/O-free given the
+injected seams), and the full suite is green on the dev box. The scratch-copy
+protocol is: archive the local commit → transfer → extract
+`/root/c4-race-scratch-<UTC>/` → `CGO_ENABLED=1 go test -race -count=1
+./internal/controlagent/ ./internal/dashboard/` → delete the scratch dir →
+verify it is gone → verify `systemctl is-active
+germany-splitter/xray-germany/tunneldash` unchanged (no restarts).
+
+Host recon performed this session: the Germany host carries an existing git
+clone at `/root/src/iran-germany-split-tunnel` (detached at `be0a2e4`, clean)
+and go1.22.2/linux/amd64 + gcc. `be0a2e4` is an ancestor of the C4 tip but 72
+commits behind it (the whole multi-carrier phase-2 line is absent on the host),
+so a fresh scratch copy requires the full ~3.5 MB source tree. That transfer is
+not feasible from the dev box: the host has no reachable git remote the clone
+can fetch from, and the MCP `sftp-upload` path is string-only (cannot stream a
+binary tar), so the tree cannot be staged host-side without a key-auth
+`scp`/`rsync` the dev box does not have. The scratch dir
+`/root/c4-race-scratch-<UTC>/` created during recon was deleted and verified
+gone; the three services were confirmed `active` before and after with no
+restarts. The operator should run the `-race` step from a machine that can push
+to the host (e.g. `rsync` the C4 tree into a fresh scratch dir, or `git fetch`
+the branch into the existing clone, then the command above).
 
 **Explicitly NOT done / deferred:**
 
