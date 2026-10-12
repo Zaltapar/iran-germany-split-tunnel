@@ -1522,3 +1522,89 @@ direct-dial path.
 - Routing is NOT deployed to any host and these commits are NOT pushed to
   `origin`; with the rules file empty (the default) the Germany node's dial
   path is byte-identical to the pre-routing behavior.
+
+## 23. Dashboard editors (code session)
+
+The in-browser editing UI for the three operator-editable surfaces is
+implemented locally on `feat/multi-carrier-phase2` on top of the C4 tip
+`156739c`. Nothing is applied by this work — it builds the UI and its API
+wiring and leaves every apply behind the per-capability feature flags
+(default OFF) and the typed confirm + CSRF gates. `warp-scripts/` is left
+untracked and is not part of any commit.
+
+**Editors built (`internal/dashboard/static/`, vanilla JS, no CDN, CSP-safe,
+responsive, 3x-ui-like styling):**
+
+1. **Routing rules editor (Routing view)** — an ordered, editable rule table
+   (id / enabled / match type [domain suffix|keyword|IP CIDR|port range] /
+   match value / action [direct|warp|block] / fallback [none|direct] /
+   comment) with add / delete / move up-down, a default-action selector, and
+   live client-side validation that mirrors the server validator
+   (`validateRoutingRulesClient` ↔ `pkg/routing.Sanitize`: RFC 1123
+   lowercase domains, CIDR, port 0..65535, unique ids, max 500, no block
+   default, no catch-alls). "Validate" POSTs the rules object to
+   `routing-validate` (no host I/O); "Preview diff" shows the redacted
+   before/after; "Apply" is gated by `routingApply` (disabled + tooltip
+   naming the flag when off) and requires the typed `RESTART` confirm.
+2. **Multi-carrier control (Control view)** — master toggle, second-carrier
+   listen/dial/SNI, and policy knobs (SPLIT_POLICY_MODE static|adaptive,
+   top-k 1..8, probing enable + probe URL, daily budget bytes, TTFB
+   baseline ms). Enabling requires a valid SNI + second-carrier fields;
+   disabling is always allowed. validate/diff/confirm/apply are gated by
+   `multiCarrierApply` (default off → Apply disabled with a tooltip).
+3. **Inbound editor + rotate-key (Inbounds view)** — per-instance cards for
+   the Germany and Iran inbounds (port, SNI, shortId, enabled); key material
+   is shown as a 12-hex fingerprint only (never editable or accepted). The
+   "Rotate key" action requires the typed `ROTATE` confirm, always retains
+   the old key for rollback, and is gated by `keyRotation` (default off →
+   Rotate disabled with a tooltip naming the flag).
+
+**API wiring (reused existing endpoints; added only what was missing):**
+
+- Routing: `POST /api/v2/changes/{id}/routing-validate` /
+  `routing-apply` + `GET /api/v2/schema/routing-plane`. The body carries the
+  rules object under `"rules"`; the dashboard validates it server-side with
+  `routing.ParseRules` (pure, no I/O → the filesystem is unchanged after a
+  validate/diff call) and forwards only the `set` env map to the agent (the
+  agent's strict `CandidateChange` decode would reject an unknown `"rules"`
+  field, so it is NOT forwarded). `GET` returns form-field descriptors, no
+  secrets.
+- Multi-carrier: existing `multicarrier-validate` / `multicarrier-apply`.
+- Inbounds: existing C3 `inbounds-validate` / `inbounds-apply` plus a new
+  `POST /api/v2/changes/{id}/inbounds-rotate` (typed `ROTATE` confirm +
+  control CSRF + `keyRotation` flag) and a new
+  `GET /api/v2/schema/inbounds-rotation` descriptor that reflects the
+  `keyRotation` flag.
+- Every mutating call requires `X-Tunneldash-Request: 1` (middleware CSRF)
+  and, for the control plane, `X-TunnelDash-Control: 1` (control CSRF) plus
+  the typed confirm token. Responses never include key material, `basepath`,
+  or credentials. With a flag off, apply/rotate return 503 with the flag
+  code; validate/diff keep working.
+
+**Security + tests (`control_dashboard_editors_test.go`, 22 new cases):**
+apply refused when the flag is off (503 + flag code, agent NOT called);
+apply/rotate require the typed confirm token (400 otherwise); the control
+CSRF header is required (403 without it); schema GETs return only public
+fields (no key/token/password/secret/basePath markers); routing validate/diff
+leave the filesystem unchanged (temp-dir sentinel + hash comparison, mirroring
+`TestC2ApplyKeepsMutatorNilAndNoFSWrites`); the client and server routing
+validators agree on a shared fixture (parity); and all editor routes are 401
+without Basic auth and 404 outside the basePath on the TLS build. Static
+asset tests (no external URLs, no inline script/style, required nav sections,
+read-only + no-secrets banner) still pass.
+
+**Gates:** `gofmt -l` clean on the changed Go files; `go build ./...`,
+`go vet ./...`, and `go test -count=1 ./...` green; `node --check
+internal/dashboard/static/app.js` clean; installer harness
+`install-oneclick.test.sh` (Git Bash) unchanged PASS=78 FAIL=0. The Linux
+`-race` step is host-side only and is **not** run from the dev box; the exact
+command is:
+
+```
+CGO_ENABLED=1 go test -race -count=1 \
+    ./internal/dashboard/ ./internal/controlagent/ ./pkg/routing/
+```
+
+**Hard constraints honored:** no host contact, no deployment, no secrets in
+code/UI/logs, and no weakening of CSRF/auth/basePath/flag gates. These
+commits are local and are NOT pushed.
