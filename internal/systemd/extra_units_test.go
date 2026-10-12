@@ -29,7 +29,7 @@ func extraGoldenSpecs() map[string]ExtraUnitSpec {
 		},
 		"control-agent.socket": {
 			Unit:                   "control-agent.socket",
-			BinPath:               "/opt/split-tunnel/splitterctl",
+			BinPath:                "/opt/split-tunnel/splitterctl",
 			ControlAgentSocketPath: "/run/split-tunnel-ctl/control.sock",
 		},
 	}
