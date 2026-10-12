@@ -76,6 +76,19 @@ var c4RoutingSchema = ConceptSchema{
 			Pattern: "default|prefer-ipv4|ipv4-only (both roles; the egress-target address-family policy)"},
 		{Name: "SPLIT_SOCKS_ALLOWED_SOURCES", Type: "string", Required: false,
 			Pattern: "comma-separated IPv4/IPv6 addresses or CIDR blocks (Iran role only; empty = allow all)"},
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): per-stream egress outbound
+		// selection (direct / warp / block). SPLIT_ROUTING_RULES_FILE is the
+		// on/off master switch (empty = OFF, byte-identical to no-routing);
+		// when set it is a path to a validated public-fields-only rules JSON
+		// object (the agent's C4 data hook loads + validates it).
+		{Name: "SPLIT_ROUTING_RULES_FILE", Type: "string", Required: false,
+			Pattern: "path to a rules JSON file (Germany role only; empty = routing OFF)"},
+		{Name: "SPLIT_ROUTING_DEFAULT", Type: "string", Required: false,
+			Pattern: "direct|warp (Germany role only; empty = defer to the rules file's default_action; block is not a valid default)"},
+		{Name: "SPLIT_WARP_SOCKS_ADDR", Type: "string", Required: false,
+			Pattern: "host:port (Germany role only; the WARP SOCKS5 endpoint for the warp outbound; empty = 127.0.0.1:40000)"},
+		{Name: "SPLIT_ROUTING_DEBUG", Type: "string", Required: false,
+			Pattern: "true/false (Germany role only; when on, per-dial debug lines include the destination)"},
 	},
 	ValidationEndpoint: "/api/v2/changes/{id}/routing-validate",
 	ValidationStatus:   "active",

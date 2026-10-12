@@ -43,6 +43,7 @@ import (
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 )
 
 // ---------------------------------------------------------------------------
@@ -67,6 +68,17 @@ const ErrCodeXrayGateNotConfigured = "xray_gate_not_configured"
 var c4RoutingFields = map[string]bool{
 	config.EnvTargetAddrPolicy:    true, // SPLIT_TARGET_ADDR_POLICY (both roles)
 	config.EnvSocksAllowedSources: true, // SPLIT_SOCKS_ALLOWED_SOURCES (Iran role)
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): per-stream egress outbound
+	// selection (direct / warp / block, first-match-wins). All four
+	// keys are Germany-role-only (the Germany node is the only side
+	// that dials egress targets). SPLIT_ROUTING_RULES_FILE is the
+	// on/off master switch: empty (unset) = routing OFF, byte-
+	// identical to the no-routing build. SPLIT_ROUTING_DEFAULT, when
+	// set, overrides the rules file's default_action.
+	config.EnvRoutingRulesFile: true, // SPLIT_ROUTING_RULES_FILE (Germany)
+	config.EnvRoutingDefault:   true, // SPLIT_ROUTING_DEFAULT (Germany)
+	config.EnvWarpSocksAddr:    true, // SPLIT_WARP_SOCKS_ADDR (Germany)
+	config.EnvRoutingDebug:     true, // SPLIT_ROUTING_DEBUG (Germany)
 }
 
 // c4SecretBlocklist is the closed set of secret-named env keys that NO C4
@@ -166,13 +178,20 @@ type c4Concept struct {
 // routingKeyRole restricts one key to a role: SPLIT_SOCKS_ALLOWED_SOURCES
 // configures the Iran SOCKS5 listener only; the target-address policy is
 // wired on BOTH roles (config-layer symmetry, the planner's Roles
-// list). Setting the wrong role's key is a validation error, not a
-// silent no-op.
+// list); the GERMANY OUTBOUND ROUTING ENGINE keys (§22) configure the
+// Germany node's egress target dial only (the Germany node is the only
+// side that dials egress targets, so the four routing keys are
+// Germany-role-only). Setting the wrong role's key is a validation
+// error, not a silent no-op.
 func routingKeyRole(key, role string) error {
 	switch key {
 	case config.EnvSocksAllowedSources:
 		if role != config.RoleIran {
 			return fmt.Errorf("set.%s: this key configures the Iran SOCKS5 listener and is not accepted for role %q", key, role)
+		}
+	case config.EnvRoutingRulesFile, config.EnvRoutingDefault, config.EnvWarpSocksAddr, config.EnvRoutingDebug:
+		if role != config.RoleGermany {
+			return fmt.Errorf("set.%s: this key configures the Germany outbound routing engine and is not accepted for role %q", key, role)
 		}
 	}
 	return nil
@@ -198,6 +217,64 @@ func routingValueError(key, value string) error {
 		}
 		if _, err := config.ParseAllowedSources(value); err != nil {
 			return fmt.Errorf("set.%s: %v", key, err)
+		}
+		return nil
+	// GERMANY OUTBOUND ROUTING ENGINE (§22). All four values are validated
+	// against the same rules the config layer enforces, so the C4 routing
+	// concept is authoritative without a full-config fold.
+	case config.EnvRoutingRulesFile:
+		// Empty = routing OFF (byte-identical to the no-routing build). A
+		// non-empty value is a PATH to the rules JSON. The agent loads and
+		// validates the referenced object: routing.LoadRulesFile enforces
+		// the 64 KiB size bound and the strict public-fields-only decode
+		// (routing.ParseRules rejects unknown/credential-named fields, a
+		// block default_action, catch-all rules, and malformed domains /
+		// CIDRs / port ranges). The file is a public artifact — loading it
+		// is safe and is the C4 routing concept's data hook: the engine's
+		// RuleSet is accepted as a validated object, never raw text.
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		if _, err := routing.LoadRulesFile(value); err != nil {
+			return fmt.Errorf("set.%s=%q: %v", key, value, err)
+		}
+		return nil
+	case config.EnvRoutingDefault:
+		// "" = defer to the rules file's default_action; else the override
+		// must be a legal default. "block" is rejected: a block default
+		// would refuse every unmatched destination and lock out the tunnel
+		// (the same rule config.Validate enforces).
+		switch value {
+		case "", "direct", "warp":
+			return nil
+		}
+		return fmt.Errorf("set.%s=%q: must be empty (defer to the rules file), direct, or warp; block is not a valid default", key, value)
+	case config.EnvWarpSocksAddr:
+		// Empty = the config default (127.0.0.1:40000) stands. A non-empty
+		// value must be a well-formed host:port dial target (the WARP
+		// SOCKS5 endpoint); an explicit host is required.
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		host, port, err := net.SplitHostPort(value)
+		if err != nil {
+			return fmt.Errorf("set.%s=%q: expected host:port (e.g. 127.0.0.1:40000)", key, value)
+		}
+		if host == "" {
+			return fmt.Errorf("set.%s=%q: the WARP SOCKS endpoint requires an explicit host", key, value)
+		}
+		if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("set.%s=%q: expected a port between 1 and 65535", key, value)
+		}
+		return nil
+	case config.EnvRoutingDebug:
+		// Empty = off (the default: no destination is ever logged). A
+		// non-empty value must be a boolean (strconv.ParseBool).
+		if strings.TrimSpace(value) == "" {
+			return nil
+		}
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("set.%s=%q: expected a boolean (true/false, 1/0)", key, value)
 		}
 		return nil
 	}
