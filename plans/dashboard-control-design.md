@@ -1178,3 +1178,200 @@ the branch into the existing clone, then the command above).
 - C4 is NOT deployed to any host and these commits are NOT pushed to
   `origin`; the C4 flags default OFF so even a deployed build would refuse
   routing/multi-carrier/coordinated applies until an operator enables them.
+
+---
+
+## 21. C5 completion note (code session)
+
+The C5 key-file hardening and final security pass were implemented locally on
+`feat/multi-carrier-phase2` on top of the C4 tip; nothing was pushed and no
+production host was modified or contacted. C5 is NOT deployed.
+
+**Requirement 1 — closing the key exposure (D3, "dedicated xray-only group now"):**
+
+The Germany Xray config `/etc/split-tunnel/xray-germany.json` embeds the
+Reality `privateKey` and was written `0640 root:split-tunnel`, while
+`tunneldash.service` runs as `User=split-tunnel Group=split-tunnel` — so the
+dashboard (and any process in that group) could read the private key. The fix
+introduces a dedicated key-isolation group:
+
+- `systemd.go:75` — `const XrayKeyGroup = "split-tunnel-xray"`, documented as
+  the group that only the xray unit joins.
+- `user.go:124` — `keyStateFiles = []string{"xray-germany.json"}` (the
+  private-key-bearing file) is split out of `user.go:118`
+  `liveStateFiles = []string{"Caddyfile", "xray-consumer.json"}` (the
+  service-readable files). `user.go:145-149` converges the live set to
+  `root:split-tunnel` and the key set to `root:split-tunnel-xray`
+  (`convergeLiveFileGroup` → `chownRootGroupAs`, `user.go:292-300`), both at
+  `0640`.
+- `user.go:93` — `EnsureKeyGroup` provisions the group (`groupadd --system
+  split-tunnel-xray`), idempotent via a `getent group` probe.
+- `render.go:230` — the `xray-germany.service` unit now emits
+  `SupplementaryGroups=split-tunnel-xray` so the (non-root) xray process can
+  still read the key file, while the dashboard group stays excluded. Golden
+  `internal/systemd/testdata/golden/xray-germany.golden.service` regenerated
+  (the only golden delta: +1 line); the `tunneldash` golden is untouched and
+  remains `Group=split-tunnel` with NO key-group membership.
+- `deploy/linux_adapter.go:253-254` — `NewLinuxAdapter` wires the `Prepare`
+  path to call `EnsureKeyGroup`, so a fresh `install germany` provisions the
+  group before `ActivateGermanyConfig` converges the file.
+
+The dashboard unit is NOT given any key-group membership, so a dashboard
+process (uid/gid `split-tunnel`) cannot read `xray-germany.json` (a `0640
+root:split-tunnel-xray` file is readable only by root or a member of
+`split-tunnel-xray`; `split-tunnel` is neither). This is the safe,
+repo-expressible D3 scheme; the tmpfs `ExecStartPre` render end-state remains
+deferred (design D3 "later").
+
+**Existing-host migration:** pre-C5 hosts have the key file at
+`0640 root:split-tunnel` and no `split-tunnel-xray` group. Running
+`install-extra tunneldash` (or `install germany`) re-applies the units;
+`Prepare` → `EnsureKeyGroup` creates the group and `EnsureStateDir` re-converges
+the file to the key group. Documented step-by-step (including the
+`runuser -u split-tunnel test -r` denial check) in
+`docs/key-rotation-runbook.md` §4.1. No service restart is required for a pure
+permission convergence (the running xray keeps its open fd).
+
+**Requirement 2 — hard guard tests:**
+
+- `internal/systemd/key_isolation_test.go` (cross-platform):
+  `TestC5KeyFileSetsAreDisjoint` asserts `xray-germany.json` is in
+  `keyStateFiles`, `Caddyfile`/`xray-consumer.json` are in `liveStateFiles`,
+  the two sets are disjoint, and the consumer config is NOT in the key set;
+  `TestC5RendererGroupSeparation` asserts the xray unit carries
+  `SupplementaryGroups=split-tunnel-xray` + `Group=split-tunnel`, the
+  tunneldash unit does NOT reference the key group and runs
+  `User=split-tunnel Group=split-tunnel`, the splitter/origin/consumer units do
+  not join the key group, and `XrayKeyGroup != ServiceGroup`.
+- `internal/systemd/key_isolation_linux_test.go` (`//go:build linux`, root-
+  gated end-to-end): writes the key config through the repo's own writer path
+  (`xray.ActivateGermanyConfig` with a synthetic 32-byte RawURL keypair and a
+  no-op xray executor), runs `EnsureKeyGroup` + `EnsureStateDir`, asserts the
+  file is `0640` uid 0 gid == `XrayKeyGroup`, and asserts the service user is
+  DENIED read of the key config but CAN read a service-group `Caddyfile`.
+  Skips cleanly (not a failure) when euid≠0 or the group is absent.
+- `internal/systemd/perms_test.go` (updated): `TestPermissionChainConvergence`
+  now calls `EnsureKeyGroup`, asserts `xray-germany.json` is
+  `0640 root:XrayKeyGroup` (not `ServiceGroup`), and asserts
+  `runAsServiceGroupMustDeny` for the key config.
+
+**Requirement 3 — key-rotation runbook:** `docs/key-rotation-runbook.md` gained
+§4 "Reality key (Xray) rotation — C2/C3 control plane": existing-host
+migration (§4.1), pre-rotation checks incl. `audit-verify` and the kill-switch
+state (§4.2), the freeze → `rotate-key` → verify → unfreeze procedure (§4.3,
+`splitterctl control freeze` / `control rotate-key a` / `control unfreeze`),
+peer Blob B re-coupling (§4.4, `control export-blob b` / `control import-blob
+b`), the `revert-lkg` rollback drill incl. a scratch-clone drill requirement
+(§4.5), the hash-chained + redacted audit-trail readout (§4.6,
+`control audit-verify` + `tail … audit.jsonl`), and a failure table (§4.7).
+Only 12-hex key **fingerprints** are ever printed (the CLI surface in
+`cmd/splitterctl/control_c3.go:350-356` `fpPrefix`); no secret appears in the
+doc. The SSH section was renumbered to §5; cross-references fixed.
+
+**Requirement 4 — final security pass, items (a)–(i):**
+
+- (a) Every v2 endpoint returns 401 without Basic auth and 404 outside
+  `basePath`: `server.go:110` mounts `/api/v2/` under the shared middleware
+  (auth at `server.go:284`, basePath at `server.go:119-121`/`131-151`, the
+  outside-prefix branch 404s at `server.go:147-148`). PASS.
+- (b) CSRF header + same-origin on every non-GET: `server.go:271-281` runs
+  `s.origin.Check(r)` for POST; `auth.go:138-171` enforces the mandatory
+  `X-Tunneldash-Request: 1` header AND a same-origin `Host` match for any
+  Origin/Referer that is present (unparseable/"null" origin fails closed).
+  PASS.
+- (c) No endpoint returns secret-named fields / key material / tokens /
+  basePath / credentials: `api_v2.go:625` exposes only
+  `tls.basePathConfigured` as a **bool**, never the path; `api_v2.go:745` the
+  events note "basePath, credentials, key paths, SSH paths and URL secrets are
+  never shown"; the v2 `ConfigValues` route (`api_v2.go:612-653`) redacts via
+  `internal/dashboard/redact.go` (`RedactValue`/`RedactConfigValue`). PASS.
+- (d) The agent socket refuses non-dashboard peers and fails closed:
+  `peercheck.go:57-77` `PeerPolicy.Enforce` rejects when attestation is
+  unavailable, when uid/gid differ, when the exe is unresolvable, or when the
+  exe ≠ the canonical dashboard binary; `agent.go:232` maps a reject to
+  `ErrPeerRejected` (a closed/EOF connection in `control_c2.go`'s
+  `readUnixLine` path is mapped to 503, never success). PASS.
+- (e) The revision store refuses symlinks and verifies the MANIFEST sha256:
+  `revisionstore.go:421-431,443-503,602,617` `checkNotSymlink`/`Lstat` guards
+  on every managed path; `revisionstore.go:267-278` + `writeManifest`/
+  `parseManifest` verify the MANIFEST self-hash and each file hash, failing
+  closed with `ErrManifestTampered`. PASS.
+- (f) The audit log is hash-chained and redacted: `audit.go:37` `PrevHash`
+  chain, `audit.go:225-237` `VerifyChain` re-hashes every entry;
+  `audit.go:48-60,155-171` `redactSubstrings` + `redactionCheck` refuse to
+  write a non-redacted secret-named value (a second layer over the source
+  `Redact`). PASS.
+- (g) All per-capability flags default OFF: `control_c2.go:70`
+  `Control.ApplyEnabled` (zero-value false); `control_c3.go:43-49`
+  `c3ControlFlags` (`GermanyInboundsApply`/`IranInboundsApply`, zero-value
+  false); `control_c4.go` `c4ControlFlags` likewise. The C2 apply handler
+  answers 503 `control_apply_disabled` when the flag is off
+  (`control_c2.go:302-304`). PASS.
+- (h) No plaintext secret is written to logs by agent/CLI/dashboard: the
+  audit sink runs the redaction gate before append (f above); the C3 CLI
+  surfaces only `fpPrefix` 12-hex fingerprints
+  (`control_c3.go:299,312,335,350-356`) and `rotate-key` returns the new
+  public key's fingerprint only (`control_c3.go:190`); the dashboard v2 event
+  note and config-value redaction (c above) keep values out of output. PASS.
+- (i) The installer does not create any of the C5 exposures:
+  `install-oneclick.sh` never writes `xray-germany.json` (that path is owned
+  by `splitterctl` → `LinuxAdapter.Prepare` → `EnsureKeyGroup` +
+  `ActivateGermanyConfig`); the installer's own `chmod 0640` lines
+  (`install-oneclick.sh:682,707,1071,1118,1159`) apply only to the dashboard
+  TLS dir / config / env / credential store, none of which carry the Reality
+  key. PASS.
+
+No (a)–(i) defect required a new fix in this pass; each was already
+satisfied by C2–C4 code, and the C5 guard tests + installer harness checks
+(`install-oneclick.test.sh` C5 block, `internal/systemd/key_isolation*.go`)
+lock the invariants in.
+
+**Defects found / fixed this pass:** none new. One pre-existing
+`gofmt -l` hit in `internal/systemd/extra_units_test.go` (a one-space struct
+misalignment in the `control-agent.socket` spec, unrelated to C5) was cleaned
+with `gofmt -w` so the C5 gate suite's `gofmt -l` is clean on the whole
+changed package set.
+
+**Requirement 5 — gates:**
+
+- `gofmt -l` on the changed packages (`internal/systemd`, `internal/deploy`,
+  `internal/dashboard`, `internal/controlagent`, `cmd/splitterctl`): clean
+  (after the extra_units_test.go housekeeping fix).
+- `go build ./...`: exit 0.
+- `go vet ./...`: exit 0.
+- `go test ./...`: all 22 packages pass, incl. `internal/systemd`
+  (cross-platform C5 guard tests run; the `//go:build linux` e2e test
+  compiles via `GOOS=linux go test -c -o /dev/null ./internal/systemd/` and
+  is the root-gated end-to-end).
+- `GOOS=linux go vet ./internal/systemd/`: exit 0 (confirms the Linux-only
+  test files compile).
+- Installer harness `install-oneclick.test.sh` (Git Bash): PASS=78 FAIL=0
+  (4 new C5 regression checks: installer never references
+  `xray-germany.json`; the xray golden carries
+  `SupplementaryGroups=split-tunnel-xray`; the tunneldash golden stays in
+  `split-tunnel` only).
+- Static UI checks (`TestStaticNoExternalURLs` / `TestCSPCompatibleMarkup` /
+  `TestStaticHasRequiredSections`): green.
+
+**Requirement 6 — Linux `-race` (Germany SCRATCH copy only):** NOT executed
+from the dev box; documented as a host-side operator step (same posture as the
+C4 note, §20). Go code in `internal/systemd` (and `internal/deploy`) changed,
+so the scratch-copy protocol applies: archive the C5 tip → transfer → extract
+`/root/c5-race-scratch-<UTC>/` → `CGO_ENABLED=1 go test -race -count=1
+./internal/systemd/ ./internal/deploy/ ./internal/dashboard/
+./internal/controlagent/ ./cmd/splitterctl/` → delete the scratch dir → verify
+gone → verify `systemctl is-active
+germany-splitter/xray-germany/tunneldash` unchanged (no restarts). The tree
+transfer is not feasible from this dev box (the host clone has no reachable
+remote to fetch from and the MCP `sftp-upload` path is string-only, per the
+C4 recon), so this is left as an operator step. No `-race` result is asserted
+here.
+
+**Explicitly NOT done / deferred:**
+
+- The tmpfs `ExecStartPre` key render (D3 "later" end-state) is NOT
+  implemented; the D3 "dedicated xray-only group now" scheme is what C5
+  ships. The key file is at-rest `0640 root:split-tunnel-xray`, not a
+  root-only tmpfs copy.
+- C5 is NOT deployed to any host and these commits are NOT pushed to
+  `origin`.
