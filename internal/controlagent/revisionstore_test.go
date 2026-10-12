@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *RevisionStore {
@@ -16,6 +17,25 @@ func newTestStore(t *testing.T) *RevisionStore {
 	st, err := NewRevisionStore(root)
 	if err != nil {
 		t.Fatalf("NewRevisionStore: %v", err)
+	}
+	return st
+}
+
+// newTestStoreDayAdvancing returns a store whose clock advances one UTC
+// day per call, so each revision id embeds a strictly increasing date
+// prefix. With the real clock, a burst of same-day ids is ordered by
+// their random 6-byte suffix, which breaks Prune's "newest last"
+// lexicographic assumption (a pre-existing flake: the head can fall
+// inside the drop window, get skipped as retained, and retention keeps
+// 11 instead of 10).
+func newTestStoreDayAdvancing(t *testing.T) *RevisionStore {
+	t.Helper()
+	st := newTestStore(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var n int
+	st.Now = func() time.Time {
+		n++
+		return base.AddDate(0, 0, n)
 	}
 	return st
 }
@@ -79,7 +99,7 @@ func TestLoadRevisionDetectsFileTamper(t *testing.T) {
 }
 
 func TestPruneRetentionKeepsTen(t *testing.T) {
-	st := newTestStore(t)
+	st := newTestStoreDayAdvancing(t)
 	ids := make([]string, 0, 14)
 	for i := 0; i < 14; i++ {
 		id, err := st.NewRevisionID()
@@ -116,7 +136,7 @@ func TestPruneRetentionKeepsTen(t *testing.T) {
 }
 
 func TestPruneNeverDropsLKG(t *testing.T) {
-	st := newTestStore(t)
+	st := newTestStoreDayAdvancing(t)
 	ids := make([]string, 0, 12)
 	for i := 0; i < 12; i++ {
 		id, _ := st.NewRevisionID()
@@ -124,17 +144,25 @@ func TestPruneNeverDropsLKG(t *testing.T) {
 		src := filepath.Join(t.TempDir(), "e.env")
 		_ = os.WriteFile(src, []byte("x"), 0o600)
 		_ = st.PreSnapshot(id, map[string]string{"e.env": src})
+		// The 11th commit's internal prune drops ids[0] (oldest beyond the
+		// 10-window), so after it ids[1] is the oldest RETAINED revision.
+		// Promote it to LKG just before the final commit so that the final
+		// commit's prune must protect it (the drop candidate) rather than
+		// drop it.
+		if i == 10 {
+			if err := st.PromoteLKG(ids[1]); err != nil {
+				t.Fatal(err)
+			}
+		}
 		_ = st.CommitRevision(RevisionMeta{ID: id, Role: "iran", Kind: "k", Outcome: "committed"},
 			map[string]string{"e.env": src}, "")
 	}
-	// LKG points at the OLDEST retained revision: pruning must keep it.
-	if err := st.PromoteLKG(ids[0]); err != nil {
-		t.Fatal(err)
-	}
+	// ids[1] sits in the drop window of the final commit; the LKG guard
+	// must keep it even though it is the oldest.
 	remaining, _ := st.RevisionIDs()
 	kept := false
 	for _, rid := range remaining {
-		if rid == ids[0] {
+		if rid == ids[1] {
 			kept = true
 		}
 	}
