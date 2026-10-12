@@ -1375,3 +1375,150 @@ here.
   root-only tmpfs copy.
 - C5 is NOT deployed to any host and these commits are NOT pushed to
   `origin`.
+
+---
+
+## 22. Routing engine (GERMANY outbound routing)
+
+The GERMANY outbound routing engine is implemented locally on
+`feat/multi-carrier-phase2` on top of the C5 tip `cf1e73c`; five commits
+landed (`6fc08bf`, `0957ce2`, `70c06f3`, `e08d053`, and this docs commit).
+Nothing was pushed and no production host was modified or contacted. Routing is
+**OFF by default** and, when off, is **byte-identical** to the pre-existing
+direct-dial path.
+
+**Rule model + matching (commit `6fc08bf`, `pkg/routing`):**
+
+- `pkg/routing/rule.go` — a pure, testable rule model (3x-ui/Sanaei style):
+  an ordered `RuleSet{Version, DefaultAction, Rules}` where each `Rule` is
+  `{ID, Enabled, Match{Domain, Keyword, IPCIDR, PortMin, PortMax}, Action
+  (direct|warp|block), Fallback, Comment}`. `ParseOutboundKind` accepts only
+  `direct`/`warp`/`block`. The parser is strict (`DisallowUnknownFields`
+  top-level **and** per-rule), so unknown fields and secret-named fields
+  (e.g. `password`) are hard errors — this is the "public fields only, no
+  secrets" guarantee. `Sanitize` enforces: `version==1`, at most
+  `MaxRules` (500), unique ids, valid lowercase-RFC1123 domains (no
+  wildcards except a leading-dot suffix), valid CIDRs, valid port ranges,
+  and a **catch-all ban** (a rule with no domain/keyword/ip_cidr is
+  rejected — a catch-all `block` would lock out the tunnel, any catch-all
+  would shadow every rule that follows). A `default_action` of `block` is
+  refused (it would block the whole tunnel).
+- `pkg/routing/matcher.go` — `RuleSet.Evaluate(dst *Destination)
+  (OutboundKind, string)`: **first enabled match wins**, returning the
+  action and the matching rule id; when nothing matches, the rule set's
+  `DefaultAction` (lifted to `direct` by `Sanitize`) is returned with the
+  empty rule id. Domain rules match on the host string when available (exact
+  or leading-dot suffix; they never match IP literals); `IPCIDR` rules match
+  literal IPs only; `Keyword` is a case-insensitive substring on the host.
+  `SplitHostPort` and `Match.PortInRange` complete the API.
+- `pkg/routing/rule_test.go` + `matcher_test.go` — the parser/validator
+  matrix (catch-all, bad domain/CIDR/port, unknown action, block default,
+  max rules, max bytes, enabled-omitted-means-true) and the matching matrix
+  (domain vs. literal-IP, suffix, keyword, port range, first-match-wins).
+
+**Config + validation (commit `0957ce2`, `internal/config`):**
+
+- `internal/config/config.go` gained four env keys + defaults:
+  `SPLIT_ROUTING_RULES_FILE` (empty = routing OFF), `SPLIT_ROUTING_DEFAULT`
+  (empty = defer to the rules file's `default_action`; else `direct` or
+  `warp` — a `block` default is rejected by `checkRouting` as it would lock
+  out the tunnel), `SPLIT_WARP_SOCKS_ADDR` (default `127.0.0.1:40000`), and
+  `SPLIT_ROUTING_DEBUG` (default `false`, enables a per-dial log line).
+  `checkRouting` runs only for `RoleGermany` and only when the rules file is
+  non-empty: it validates the default enum, the WARP `host:port`, and
+  loads + validates the rules file via `routing.LoadRulesFile`.
+- `internal/config/routing_test.go` — pure `Validate` tests (off = no
+  validation, on = valid, block/unknown default rejected, bad WARP addr,
+  missing/malformed/block-default rules, a warp rule requires a WARP addr)
+  plus `Load` tests that exercise the same wiring end-to-end.
+
+**Outbounds, WARP dial, fail-closed gate, and the dial hook (commit
+`70c06f3`, `pkg/routing/engine.go` + `pkg/node` + `cmd/germany-splitter`):**
+
+- `pkg/routing/engine.go` — an immutable, concurrency-safe `Engine` with
+  three outbounds: **direct** (the node's existing target-policy dial,
+  exported as `node.DefaultTargetDial` from `pkg/node/target_ipv4.go`),
+  **warp** (a hand-rolled SOCKS5/SOCKS5h CONNECT to the configurable
+  `WARPAddr`; DNS for names happens inside WARP via the domain-form
+  `ATYP 0x03`, while IP literals use the IP-form `ATYP 0x01/0x04`), and
+  **block** (a clean refusal — `ErrBlocked`). The engine's connect timeout
+  is 5s, inside the node's existing 10s target-dial budget.
+- **Error taxonomy (the anti-silent-leak guarantee):** when the WARP
+  endpoint itself is unreachable, the error is wrapped as
+  `ErrWarpUnreachable` and is the ONLY condition that can drive a
+  fallback. When the endpoint is reachable but the CONNECT is refused
+  (`rep != 0`), the error is returned **unwrapped** as a target-level
+  "REFUSED CONNECT", so no fallback occurs. A warp rule falls back to
+  `direct` **only if** that specific rule carries `Fallback: "direct"`;
+  the default is **fail-closed** — the stream is refused with a clear
+  reason rather than silently leaking to a direct connection.
+- `cmd/germany-splitter/main.go` `buildRoutingEngine` (≈ line 187–228)
+  builds the engine (loading + sanitizing the rules, applying the
+  `SPLIT_ROUTING_DEFAULT` override, wiring the direct dial with the same
+  merged IPv4 flags `Sanitize` uses, and enabling debug logging only when
+  `SPLIT_ROUTING_DEBUG` is set) and — **only when the rules file is
+  non-empty** — sets `nodeCfg.TargetDial = routingEngine.Dial`
+  (≈ line 420–426). When routing is off, `nodeCfg.TargetDial` stays `nil`
+  and `NewNode`/`Sanitize` installs the identical default dial, preserving
+  the byte-identical-off invariant. No mux or wire protocol change.
+- `pkg/routing/engine_test.go` — outbound selection on fake dialers,
+  WARP-unreachable fail-closed (direct count stays 0) and
+  WARP-unreachable fallback-direct (direct count becomes 1), the
+  domain-form vs. IP-form request builders, and no-destination-in-default-
+  logs + debug-logging-when-enabled.
+
+**Control-plane data hook (commit `e08d053`, `internal/controlagent` +
+`internal/dashboard`):**
+
+- `internal/controlagent/c4.go` — the C4 routing concept's closed field
+  allowlist `c4RoutingFields` now includes the four routing keys;
+  `routingKeyRole` restricts all four to `RoleGermany` (routing "configures
+  the Germany outbound routing engine and is not accepted for role %q");
+  `routingValueError` validates each value (`SPLIT_ROUTING_RULES_FILE`
+  loads + validates via `routing.LoadRulesFile`; `SPLIT_ROUTING_DEFAULT`
+  must be empty/direct/warp; `SPLIT_WARP_SOCKS_ADDR` must be
+  `host:port`; `SPLIT_ROUTING_DEBUG` must be a boolean). The apply path
+  remains gated by the existing `c4ControlFlags.RoutingApply` flag, which
+  defaults OFF, so no routing apply can happen until an operator enables
+  it. This is the **data hook only** — no in-browser editing UI (deferred,
+  per the §20 note).
+- `internal/dashboard/control_c4.go` — the read-only C4 routing schema now
+  exposes the same four keys.
+- `internal/controlagent/c4_routing_test.go` — role-restriction,
+  rules-file (valid/empty/missing/block-default/secret-field/catch-all),
+  default (valid/block/unknown), WARP-addr (valid/invalid), debug
+  (valid/invalid), and combined-valid tests.
+
+**Gates:**
+
+- `gofmt -l` on the changed packages (`pkg/routing`, `pkg/node`,
+  `internal/config`, `internal/controlagent`, `internal/dashboard`,
+  `cmd/germany-splitter`): clean.
+- `go build ./...`: exit 0.
+- `go vet ./...`: exit 0.
+- `go test -count=1 ./...`: all packages green.
+- `internal/archtest` (the product/deployment boundary test) still passes:
+  `pkg/*` never imports `internal/*`; `internal/config` and
+  `internal/controlagent` importing the pure `pkg/routing` is the legal
+  direction.
+- Installer harness `install-oneclick.test.sh` (Git Bash): unchanged,
+  still PASS=78 FAIL=0 (no installer change this subtask).
+- The Linux `-race` step is host-side only (same posture as §20/§21) and is
+  **not** run from the dev box; the exact operator command is:
+
+  ```
+  CGO_ENABLED=1 go test -race -count=1 \
+      ./pkg/routing/ ./pkg/node/ ./internal/config/ \
+      ./internal/controlagent/ ./internal/dashboard/ \
+      ./cmd/germany-splitter/
+  ```
+
+**Explicitly NOT done / deferred:**
+
+- No in-browser routing editing UI; the dashboard ships the read-only
+  section + flag-gated affordance (consistent with the §20 deferral).
+- No WARP endpoint provisioning / `warp-scripts/` is out of scope and left
+  untracked (not part of any commit).
+- Routing is NOT deployed to any host and these commits are NOT pushed to
+  `origin`; with the rules file empty (the default) the Germany node's dial
+  path is byte-identical to the pre-routing behavior.
