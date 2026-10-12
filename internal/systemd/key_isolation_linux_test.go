@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"syscall"
 	"testing"
 
@@ -66,9 +67,32 @@ func TestC5KeyIsolationEndToEnd(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root for real chown + runuser uid separation")
 	}
-	redirectPaths(t)
+	root := redirectPaths(t)
 	if _, err := user.Lookup(ServiceUser); err != nil {
 		t.Skipf("service user %q unavailable: %v", ServiceUser, err)
+	}
+	// Make the whole path chain from the service account to the files
+	// traversable. Go's t.TempDir() nests the returned path under a
+	// per-test scratch dir (e.g. /tmp/TestXxx<id>/001) that is 0700
+	// root:root. The service-account read check
+	// (runuser -u split-tunnel -- test -r <path>) requires execute on
+	// EVERY ancestor. In production the files live under /etc (0755),
+	// so these scratch layers don't exist there; without opening them
+	// up the chain fails for reasons unrelated to the convergence logic
+	// under test. Walk up from the temp root to (but not including)
+	// /tmp and make each intermediate dir 0755.
+	for d := root; ; {
+		if d == "/tmp" || d == "/" {
+			break
+		}
+		if err := os.Chmod(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if np := filepath.Dir(d); np == d {
+			break
+		} else {
+			d = np
+		}
 	}
 	// Provision the key group through the repo's own writer path first —
 	// this is what the deploy adapter does (LinuxAdapter.Prepare). Idempotent.
