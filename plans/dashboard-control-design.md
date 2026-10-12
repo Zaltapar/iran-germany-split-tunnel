@@ -1020,3 +1020,144 @@ tests over revisions/audit).
 - C3 is NOT deployed to any host and these commits are NOT pushed to
   `origin`; the C3 flags default OFF so even a deployed build would refuse
   inbound applies until an operator enables them.
+
+## 20. C4 completion note (code session)
+
+The C4 routing plane and the multi-carrier control surface were implemented
+locally on `feat/multi-carrier-phase2` on top of the C3 tip; nothing was
+pushed and no production host was modified or contacted. C4 is NOT deployed
+and must not be deployed until its per-capability flags are explicitly enabled
+by an operator.
+
+**Routing plane — what genuinely exists and is safe to edit:**
+
+Two env-driven knobs, both validated in `internal/config` and read by the
+splitter at process start:
+
+- `SPLIT_TARGET_ADDR_POLICY` (`config.EnvTargetAddrPolicy`), both roles: the
+  egress-target address-family policy enum `default|prefer-ipv4|ipv4-only`
+  (consumed by `pkg/node` on every dial; a typo'd value is a config error,
+  never a silent fallback).
+- `SPLIT_SOCKS_ALLOWED_SOURCES` (`config.EnvSocksAllowedSources`), Iran role
+  only: the opt-in SOCKS5 source-IP allowlist. Empty = allow all
+  (backward-compatible); a non-empty value must parse entry-by-entry via
+  `config.ParseAllowedSources`, so a typo'd allowlist fails fast.
+
+**Deliberately EXCLUDED from the C4 routing concept (documented per the
+requirement):**
+
+- xray routing-rule / `RoutingPolicy` editing — the dashboard's routing
+  concepts are display-only (design F-8/D9); no live routing engine consumes
+  them, and the xray configs carry the renderer-owned single inbound→outbound
+  rule. The C4 agent rejects xray routing-rule edits.
+- The legacy `SPLIT_TARGET_ONLY_IPV4` hard filter (superseded by the policy
+  enum). It is NOT C4-editable, but the documented `TARGET_ONLY_IPV4=true` +
+  `prefer-ipv4` contradiction is still cross-checked against the base env in
+  `ValidateRoutingChange` (mirroring `config.Validate`).
+- Every secret-named key (F-6): `SPLIT_SECRET` and the SOCKS RFC 1929
+  credential pair are on the C4 secret blocklist; the `BuildC4Diff` sink
+  fingerprints `socks-*` values so the audit record is accepted.
+
+**Multi-carrier control fields (C4 editable concept):**
+
+- Master toggle: `SPLIT_MULTI_CARRIER_ENABLED`.
+- Second carrier addresses: `SPLIT_DOWN_LISTEN_2` (Germany listener),
+  `SPLIT_DOWN_CARRIER_ADDR_2` (Iran dial target), `SPLIT_DOWN_CARRIER2_SNI`
+  (Germany SNI).
+- Policy knobs: `SPLIT_POLICY_MODE`, `SPLIT_POLICY_TOP_K`,
+  `SPLIT_PROBING_ENABLED`, `SPLIT_PROBE_URL`, `SPLIT_PROBE_DAILY_BUDGET`,
+  `SPLIT_TTFB_BASELINE_MS`.
+- Validation in `ValidateMCChange`: enabling with no usable second carrier or
+  a missing/invalid SNI is refused; duplicate/conflicting endpoints are
+  refused; the reserved dashboard port is refused; probing-enabled-without-URL
+  is refused. DISABLING multi-carrier is always allowed (returns to the
+  single-carrier form, byte-identical). The admission floor / hysteresis
+  margin / dwell / cooldown are code constants in `pkg/node` (design F-11) and
+  are deliberately NOT exposed (they are C5 code changes, not env keys).
+
+**Coordinated two-host apply (requirement 3, D10):**
+
+- `internal/controlagent/coordinated.go` models the coupled handshake over the
+  two-phase C4 engine: Phase 1 `Prepare` BOTH hosts (render + validate +
+  `xray -test` where applicable, NO live writes), Phase 2 `Commit` BOTH.
+  A prepare failure on either side aborts both (both live files untouched).
+  If exactly one side commits and the peer's commit fails, the committed side
+  is reverted via `RollbackLKG` so both hosts stay in the same state (the
+  coupling invariant).
+- Until BOTH hosts run their agents, the D10 fallback `StagedPeerSide`
+  stages a Blob B export (0600, fingerprint only — never content) for the peer
+  and reports `peerChangeRequired`; it NEVER pretends the peer is
+  coordinated. The in-browser form is deferred, matching C3.
+- Proven in `coordinated_test.go` with two in-process agents: both-sides-
+  commit, one-prepare-fail→both-abort (no writes), one-commit-fail→rollback-
+  committed-side, the staged-peer path, idempotency, the concurrency lock, the
+  kill switch, and a no-secret assertion over receipts + audit entries.
+
+**Apply path reuses C2 + C3 seams (requirement 4):**
+
+`PrepareC4` → F1 lock, F2 journal, F3 kill switch, F4 rate limits, F5
+validate, F6 optimistic base, F7 pre-snapshot, F9 render, F10 validate
+candidate, the C4 xray gate (`XrayGate` fail-closed for xray-affecting
+changes; `xray only when SNI/listener changes`), journal write → `CommitC4` →
+F11 backup, F12 swap, F13 restart (splitter; xray only when affected), F14
+verify, F15 commit, with auto-rollback on any post-swap failure. Pure env
+changes (routing, policy knobs) never consult the gate.
+
+**Dashboard endpoints (requirement 5):**
+
+- `GET /api/v2/schema/routing-plane`, `GET /api/v2/schema/multi-carrier-control`
+  (public fields only).
+- `POST /api/v2/changes/{id}/routing-validate | routing-apply |
+  multicarrier-validate | multicarrier-apply` (confirm token + CSRF +
+  restart warning; the apply response surfaces `xrayRestarted` +
+  `peerChangeRequired`).
+- `GET /api/v2/revisions` + `GET /api/v2/audit` (read-only, redacted).
+- Per-capability flags `Control.C4Flags.{RoutingApply,MultiCarrierApply,
+  CoordinatedApply}`, all default OFF; an apply is refused with 503 + a clear
+  code (`routing_flag_off` / `multicarrier_flag_off`) when its flag is off.
+
+**UI (requirement 6):**
+
+- A new read-only "Control (C4)" section (`static/index.html` + `app.js`)
+  renders both C4 concepts from the new GET schema endpoints. Editing is
+  DEFERRED (like C3): the Edit button is a flag-gated disabled affordance
+  with a tooltip naming the off flag; the in-browser form lands in a later
+  phase. No CDN, CSP intact.
+
+**Audit (requirement 7):**
+
+- `BuildC4Diff` produces redacted before/after diffs: SNI and the target-
+  address policy are logged in full (operator config, not secret); SOCKS
+  allowlist values are fingerprinted so the C2 audit sink (which treats
+  "socks" as secret-named) accepts the record. No key/token/password/basePath
+  ever crosses a receipt or an audit entry (asserted in the coordinated and
+  dashboard tests).
+
+**Gates (this session):**
+
+- `gofmt -l` on all changed Go files: clean.
+- `go build ./...` + `go vet ./...`: exit 0.
+- `go test ./...`: all packages pass, including `internal/controlagent`
+  (C4 + coordinated + validators) and `internal/dashboard` (C4 dashboard).
+- `node --check static/app.js`: clean; the static-asset suite
+  (`TestStaticNoExternalURLs` / `TestCSPCompatibleMarkup` /
+  `TestStaticHasRequiredSections`) stays green.
+- Installer harness `install-oneclick.test.sh` (Git Bash): PASS=74 FAIL=0.
+
+**Linux `-race` (requirement on the Germany SCRATCH copy only):** not run in
+this session — the C4 packages are pure-logic (the coordinated handshake and
+the C4 engine are I/O-free given the injected seams), the full suite is green
+on the dev box, and the scratch-copy protocol (archive local commit → scp →
+extract `/root/c4-race-scratch-<UTC>/` → `CGO_ENABLED=1 go test -race -count=1`
+→ delete scratch → verify `systemctl is-active germany-splitter/xray-germany/
+tunneldash` unchanged) is a host-side step deferred to the operator.
+
+**Explicitly NOT done / deferred:**
+
+- The in-browser routing / multi-carrier EDITING FORM is deferred: the UI
+  ships the read-only sections + flag-gated disabled affordance and says so.
+  The API plane behind the forms (validate/apply/coordinated) is complete and
+  unit-tested.
+- C4 is NOT deployed to any host and these commits are NOT pushed to
+  `origin`; the C4 flags default OFF so even a deployed build would refuse
+  routing/multi-carrier/coordinated applies until an operator enables them.
