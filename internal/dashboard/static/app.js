@@ -117,6 +117,173 @@
 
   function v2(path) { return getJSON(API_V2 + path); }
 
+  // ---- POST helper (CSRF + control header) ---------------------------------
+  // All mutating calls require X-Tunneldash-Request: 1 (middleware CSRF) and
+  // X-TunnelDash-Control: 1 (control-plane CSRF). No secrets are sent; only
+  // public config fields + the typed confirm token.
+  function postJSON(path, body, controlHeader) {
+    var headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "X-Tunneldash-Request": "1"
+    };
+    if (controlHeader !== false) {
+      headers["X-TunnelDash-Control"] = "1";
+    }
+    return fetch(API_V2 + path, {
+      method: "POST",
+      headers: headers,
+      credentials: "same-origin",
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (b) {
+        if (!res.ok) {
+          var err = new Error((b.error || "HTTP " + res.status));
+          err.status = res.status;
+          err.body = b;
+          throw err;
+        }
+        return b;
+      });
+    });
+  }
+
+  // ---- confirm modal --------------------------------------------------------
+  // Renders an inline confirm dialog (no external resources). The operator
+  // types the token (RESTART or ROTATE) before the action button is enabled.
+  function confirmModal(label, token, onConfirm, resultNode) {
+    var input = el("input", { cls: "confirm-input", type: "text", placeholder: "Type " + token });
+    var btn = el("button", { cls: "btn btn-danger", type: "button", attrs: { disabled: "" }, text: label });
+    input.addEventListener("input", function () {
+      btn.disabled = (input.value !== token);
+    });
+    btn.addEventListener("click", function () {
+      if (input.value !== token) return;
+      onConfirm();
+    });
+    var row = el("div", { cls: "btn-row confirm-row" }, [
+      el("label", { cls: "muted small", text: "Confirmation" }),
+      input,
+      btn
+    ]);
+    if (resultNode) resultNode.appendChild(row);
+    else return row;
+  }
+
+  // ---- client-side routing-rules validator (parity with pkg/routing) --------
+  // Mirrors the server-side validator so the editor can catch errors before
+  // sending. Shared fixture tests verify parity.
+  var ROUTING_MAX_RULES = 500;
+  var ROUTING_PORT_MAX = 65535;
+  var ROUTING_ACTIONS = ["direct", "warp", "block"];
+  var ROUTING_FALLBACKS = ["", "direct"];
+
+  function validateRoutingRulesClient(rs) {
+    var errs = [];
+    if (rs.version !== 1) errs.push("version must be 1");
+    var da = rs.default_action || "direct";
+    if (da === "block") errs.push("default_action cannot be 'block' (would lock out all unmatched destinations)");
+    if (ROUTING_ACTIONS.indexOf(da) === -1) errs.push("default_action must be direct|warp (got " + JSON.stringify(da) + ")");
+    var rules = rs.rules || [];
+    if (rules.length > ROUTING_MAX_RULES) errs.push("too many rules: " + rules.length + " (max " + ROUTING_MAX_RULES + ")");
+    var seen = {};
+    for (var i = 0; i < rules.length; i++) {
+      var r = rules[i];
+      var prefix = "rules[" + i + "] (" + r.id + ")";
+      if (!r.id) { errs.push(prefix + ": id is required"); continue; }
+      if (seen[r.id]) { errs.push(prefix + ": duplicate rule id"); continue; }
+      seen[r.id] = true;
+      if (ROUTING_ACTIONS.indexOf(r.action) === -1) errs.push(prefix + ": action must be direct|warp|block");
+      if (r.fallback && r.fallback !== "direct") errs.push(prefix + ": fallback must be \"direct\" or empty");
+      if (r.fallback && r.action !== "warp") errs.push(prefix + ": fallback is only valid for action=warp");
+      var m = r.match || {};
+      if (!m.domain && !m.keyword && !m.ip_cidr) errs.push(prefix + ": at least one match criterion (domain, keyword, or ip_cidr) is required");
+      if (m.domain) {
+        var dom = m.domain.toLowerCase();
+        var core = dom.charAt(0) === "." ? dom.substring(1) : dom;
+        if (core.length === 0) errs.push(prefix + ": empty domain");
+        else if (core.length > 253) errs.push(prefix + ": domain too long");
+        else {
+          var labels = core.split(".");
+          for (var li = 0; li < labels.length; li++) {
+            var lbl = labels[li];
+            if (lbl === "") { errs.push(prefix + ": empty label in domain"); break; }
+            if (lbl.length > 63) { errs.push(prefix + ": label too long in domain"); break; }
+            if (lbl.indexOf("*") !== -1) { errs.push(prefix + ": wildcards not allowed in domain"); break; }
+            if (lbl.charAt(0) === "-" || lbl.charAt(lbl.length - 1) === "-") { errs.push(prefix + ": label has leading/trailing hyphen"); break; }
+            for (var ci = 0; ci < lbl.length; ci++) {
+              var c = lbl[ci];
+              if (!((c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c === "-")) {
+                errs.push(prefix + ": invalid character '" + c + "' in domain (lowercase alphanumeric + hyphen only)");
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (m.ip_cidr) {
+        // Basic CIDR check: must contain "/" and both parts non-empty
+        var slash = m.ip_cidr.indexOf("/");
+        if (slash < 0 || slash === 0 || slash === m.ip_cidr.length - 1) {
+          errs.push(prefix + ": ip_cidr must be a valid CIDR (e.g. 10.0.0.0/8)");
+        }
+      }
+      if (m.port_min < 0 || m.port_min > ROUTING_PORT_MAX) errs.push(prefix + ": port_min out of range 0..65535");
+      if (m.port_max < 0 || m.port_max > ROUTING_PORT_MAX) errs.push(prefix + ": port_max out of range 0..65535");
+      if (m.port_min > 0 && m.port_max > 0 && m.port_min > m.port_max) errs.push(prefix + ": port_min exceeds port_max");
+    }
+    return errs;
+  }
+
+  function buildRulesObject(ed) {
+    var rs = { version: 1, default_action: ed.defaultAction, rules: [] };
+    for (var i = 0; i < ed.rules.length; i++) {
+      var r = ed.rules[i];
+      var rule = {
+        id: r.id,
+        enabled: r.enabled,
+        match: {}
+      };
+      if (r.domain) rule.match.domain = r.domain;
+      if (r.keyword) rule.match.keyword = r.keyword;
+      if (r.ipCidr) rule.match.ip_cidr = r.ipCidr;
+      if (r.portMin !== "" && r.portMin !== null) rule.match.port_min = parseInt(r.portMin, 10);
+      if (r.portMax !== "" && r.portMax !== null) rule.match.port_max = parseInt(r.portMax, 10);
+      rule.action = r.action;
+      if (r.fallback) rule.fallback = r.fallback;
+      if (r.comment) rule.comment = r.comment;
+      rs.rules.push(rule);
+    }
+    return rs;
+  }
+
+  // ---- diff display helper --------------------------------------------------
+  function renderDiffList(view, diffList, label) {
+    if (!diffList || !diffList.length) {
+      view.appendChild(el("div", { cls: "notice", text: (label || "Diff") + ": no changes detected." }));
+      return;
+    }
+    var rows = diffList.map(function (d) {
+      var before = JSON.stringify(d.before || {});
+      var after = JSON.stringify(d.after || {});
+      return el("tr", null, [
+        el("td", { text: d.id || "—" }),
+        el("td", null, [badge(d.op || "changed", d.op === "removed" ? "bad" : d.op === "added" ? "ok" : "warn")]),
+        el("td", { cls: "mono small", text: before }),
+        el("td", { cls: "mono small", text: after })
+      ]);
+    });
+    view.appendChild(el("div", { cls: "table-wrap" }, [
+      el("table", null, [
+        el("thead", null, [el("tr", null, [
+          el("th", { text: "ID" }), el("th", { text: "Op" }),
+          el("th", { text: "Before" }), el("th", { text: "After" })
+        ])]),
+        el("tbody", null, rows)
+      ])
+    ]));
+  }
+
   // ---- SVG line / area chart ---------------------------------------------
   // series: [{ name, color, points: [{t: ms, v: number}] }]
   // Returns a DOM node. Hover shows a tooltip with the nearest point.
@@ -428,37 +595,242 @@
     });
   }
 
-  // ---- Routing (read-only; editing-ready schema) -----------------------------
+  // ---- Routing rules editor (Germany C4 routing plane) -------------------------
+  // Operator edits an ordered list of routing rules. Client-side validation
+  // mirrors the server validator (pkg/routing). "Validate" POSTs the rules
+  // object to routing-validate (no host I/O); "Preview diff" shows the
+  // redacted before/after; "Apply" is gated by the routingApply flag and
+  // requires the RESTART confirm token. No secrets in any request/response.
   function renderRouting(view) {
-    return Promise.all([v2("/routing"), v2("/schema/routing-policy")]).then(function (res) {
-      var d = res[0], schema = res[1];
+    return v2("/schema/routing-plane").then(function (schema) {
       clear(view);
-      view.appendChild(el("div", { cls: "notice", text: "Routing settings shown here come from the dashboard configuration. Live routing state is not collected in this phase." }));
-      if (!d.declared) {
-        view.appendChild(missingNote("No routing policy is declared in the dashboard configuration; the default split mode applies."));
+      var editable = !!schema.editable;
+      view.appendChild(el("div", { cls: "notice" }, [
+        el("h3", { text: "Routing rules — " + (schema.status || "read-only") }),
+        el("span", { cls: "muted small", text: "Germany outbound routing engine. The first enabled rule whose match criteria are satisfied selects the outbound (direct / warp / block). When no rule matches, the default action applies (never block)." })
+      ]));
+
+      // --- default action selector ---
+      var defaultAction = el("select", { cls: "editor-select" }, [
+        el("option", { value: "direct", text: "direct (default)" }),
+        el("option", { value: "warp", text: "warp" })
+      ]);
+      view.appendChild(el("div", { cls: "field-row" }, [
+        el("label", { cls: "k", text: "Default action (when no rule matches)" }),
+        defaultAction
+      ]));
+
+      // --- rules table (editable) ---
+      var rulesState = [
+        { id: "rule-1", enabled: true, domain: "", keyword: "", ipCidr: "", portMin: "", portMax: "", action: "direct", fallback: "", comment: "" }
+      ];
+      var ruleSeq = 1;
+      var rulesBody = el("tbody");
+      var rulesTable = el("table", { cls: "rules-editor" }, [
+        el("thead", null, [el("tr", null, ["#","ID","Enabled","Match type","Match value","Action","Fallback","Comment","▲","▼","✕"].map(function(h){return el("th",{text:h});}))]),
+        rulesBody
+      ]);
+
+      function renderRulesTable() {
+        clear(rulesBody);
+        rulesState.forEach(function (r, i) {
+          var idIn = el("input", { cls: "editor-input", value: r.id });
+          var enCb = el("input", { type: "checkbox" });
+          enCb.checked = r.enabled;
+          var mType = el("select", null, [
+            el("option", { value: "", text: "—none—" }),
+            el("option", { value: "domain", text: "domain (suffix/exact)" }),
+            el("option", { value: "keyword", text: "keyword (substring)" }),
+            el("option", { value: "ip_cidr", text: "IP CIDR" }),
+            el("option", { value: "port_range", text: "port range (AND)" })
+          ]);
+          mType.value = mType.value || "";
+          var mVal = el("input", { cls: "editor-input", placeholder: "e.g. .example.com / myapp / 10.0.0.0/8 / 443" });
+          var portMinIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "0", max: "65535", placeholder: "min" });
+          var portMaxIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "0", max: "65535", placeholder: "max" });
+          var actionSel = el("select", null, [
+            el("option", { value: "direct", text: "direct" }),
+            el("option", { value: "warp", text: "warp" }),
+            el("option", { value: "block", text: "block" })
+          ]);
+          var fbSel = el("select", null, [
+            el("option", { value: "", text: "none (fail-closed)" }),
+            el("option", { value: "direct", text: "direct" })
+          ]);
+          var cmIn = el("input", { cls: "editor-input", placeholder: "note" });
+
+          // sync initial values
+          function syncValues() {
+            var mt = mType.value;
+            mVal.value = mt === "domain" ? r.domain : mt === "keyword" ? r.keyword : mt === "ip_cidr" ? r.ipCidr : "";
+            portMinIn.value = r.portMin || "";
+            portMaxIn.value = r.portMax || "";
+            actionSel.value = r.action;
+            fbSel.value = r.fallback;
+            cmIn.value = r.comment;
+            idIn.value = r.id;
+          }
+          mType.addEventListener("change", function () {
+            r.domain = r.keyword = r.ipCidr = "";
+            if (mType.value === "port_range") { r.portMin = ""; r.portMax = ""; }
+            syncValues();
+          });
+          mVal.addEventListener("input", function () {
+            var mt = mType.value;
+            r.domain = r.keyword = r.ipCidr = "";
+            if (mt === "domain") r.domain = mVal.value;
+            else if (mt === "keyword") r.keyword = mVal.value;
+            else if (mt === "ip_cidr") r.ipCidr = mVal.value;
+          });
+          portMinIn.addEventListener("input", function(){ r.portMin = portMinIn.value; });
+          portMaxIn.addEventListener("input", function(){ r.portMax = portMaxIn.value; });
+          actionSel.addEventListener("change", function(){ r.action = actionSel.value; fbSel.disabled = (r.action !== "warp"); if (r.action!=="warp") { r.fallback=""; fbSel.value=""; } });
+          fbSel.addEventListener("change", function(){ r.fallback = fbSel.value; });
+          cmIn.addEventListener("input", function(){ r.comment = cmIn.value; });
+          idIn.addEventListener("input", function(){ r.id = idIn.value; });
+          enCb.addEventListener("change", function(){ r.enabled = enCb.checked; });
+
+          syncValues();
+          // set mType based on which field is populated
+          if (r.domain) mType.value = "domain";
+          else if (r.keyword) mType.value = "keyword";
+          else if (r.ipCidr) mType.value = "ip_cidr";
+          else if (r.portMin || r.portMax) mType.value = "port_range";
+          mVal.value = r.domain || r.keyword || r.ipCidr || "";
+          if (r.action !== "warp") fbSel.disabled = true;
+
+          var upBtn = el("button", { cls: "btn btn-sm", type: "button", text: "▲", attrs: { title: "Move up" } });
+          var dnBtn = el("button", { cls: "btn btn-sm", type: "button", text: "▼", attrs: { title: "Move down" } });
+          var delBtn = el("button", { cls: "btn btn-sm btn-danger", type: "button", text: "✕", attrs: { title: "Delete rule" } });
+          upBtn.addEventListener("click", function(){ if (i > 0) { var tmp = rulesState[i-1]; rulesState[i-1] = rulesState[i]; rulesState[i] = tmp; renderRulesTable(); } });
+          dnBtn.addEventListener("click", function(){ if (i < rulesState.length-1) { var tmp = rulesState[i+1]; rulesState[i+1] = rulesState[i]; rulesState[i] = tmp; renderRulesTable(); } });
+          delBtn.addEventListener("click", function(){ rulesState.splice(i,1); if (!rulesState.length) rulesState.push({id:"rule-"+(++ruleSeq),enabled:true,domain:"",keyword:"",ipCidr:"",portMin:"",portMax:"",action:"direct",fallback:"",comment:""}); renderRulesTable(); });
+
+          var typeCell = el("td", null, [mType, mVal]);
+          var portCell = el("td", null, [portMinIn, el("span",{text:"–"}), portMaxIn]);
+          var row = el("tr", null, [
+            el("td", { text: String(i+1) }),
+            el("td", null, [idIn]),
+            el("td", null, [enCb]),
+            typeCell,
+            el("td", null, [actionSel]),
+            el("td", null, [fbSel]),
+            el("td", null, [cmIn]),
+            el("td", null, [upBtn]),
+            el("td", null, [dnBtn]),
+            el("td", null, [delBtn])
+          ]);
+          rulesBody.appendChild(row);
+        });
       }
-      var fields = (schema.fields || []).map(function (f) {
-        var current = d.policy ? d.policy[f.name] : undefined;
-        var value = f.name === "rules" ? ((d.policy && d.policy.rules ? d.policy.rules.length : 0) + " rule(s)") : (current == null ? "—" : String(current));
-        return el("div", { cls: "field-row" }, [
-          el("div", { cls: "k", text: f.name + (f.required ? " *" : "") }),
-          el("input", { readonly: "readonly", value: value }),
-          el("button", { cls: "btn btn-disabled", type: "button", disabled: "disabled", title: "editing lands in the next phase", text: "Apply" })
-        ]);
+
+      var addRuleBtn = el("button", { cls: "btn", type: "button", text: "+ Add rule" });
+      addRuleBtn.addEventListener("click", function(){
+        ruleSeq++;
+        rulesState.push({ id: "rule-" + ruleSeq, enabled: true, domain: "", keyword: "", ipCidr: "", portMin: "", portMax: "", action: "direct", fallback: "", comment: "" });
+        renderRulesTable();
       });
-      view.appendChild(el("div", { cls: "card" }, [el("h3", { text: "Routing policy" })].concat(fields)));
-      if (d.errors && d.errors.length) view.appendChild(el("div", { cls: "notice bad", text: "Validation: " + d.errors.join("; ") }));
-      var rules = (d.policy && d.policy.rules) || [];
-      if (rules.length) {
-        view.appendChild(el("div", { cls: "table-wrap" }, [
-          el("table", null, [
-            el("thead", null, [el("tr", null, ["ID", "Match", "Value", "Action", "Outbound"].map(function (h) { return el("th", { text: h }); }))]),
-            el("tbody", null, rules.map(function (r) {
-              return el("tr", null, [el("td", { text: r.id }), el("td", { text: r.match }), el("td", { text: r.value }), el("td", { text: r.action }), el("td", { text: r.outbound || "—" })]);
-            }))
-          ])
-        ]));
+
+      view.appendChild(el("div", { cls: "card editor-card" }, [
+        el("h3", { text: "Rules (" + rulesState.length + ")" }),
+        el("div", { cls: "table-wrap" }, [rulesTable]),
+        el("div", { cls: "btn-row" }, [addRuleBtn])
+      ]));
+
+      // --- live client-side validation indicator ---
+      var liveErrs = el("div", { cls: "editor-live-errs", hidden: "hidden" });
+      view.appendChild(liveErrs);
+      function updateLiveErrors() {
+        var rs = buildRulesObject({ defaultAction: defaultAction.value, rules: rulesState });
+        var errs = validateRoutingRulesClient(rs);
+        if (errs.length) {
+          liveErrs.hidden = false;
+          liveErrs.textContent = errs.join("; ");
+          liveErrs.className = "editor-live-errs bad";
+        } else {
+          liveErrs.hidden = true;
+          liveErrs.className = "editor-live-errs";
+        }
       }
+      // observe changes via interval-light approach: re-validate on any input
+      view.querySelectorAll("input, select").forEach(function(n){ n.addEventListener("change", updateLiveErrors); n.addEventListener("input", updateLiveErrors); });
+
+      // --- action buttons: Validate / Preview diff / Apply ---
+      var resultNode = el("div", { cls: "editor-result" });
+      var validateBtn = el("button", { cls: "btn", type: "button", text: "Validate" });
+      var diffBtn = el("button", { cls: "btn", type: "button", text: "Preview diff" });
+      var applyBtn = el("button", { cls: "btn btn-danger", type: "button", text: "Apply" });
+      if (!editable) {
+        applyBtn.disabled = true;
+        applyBtn.title = schema.editDisabledReason || "routingApply flag is off";
+      }
+      validateBtn.addEventListener("click", function() {
+        var rs = buildRulesObject({ defaultAction: defaultAction.value, rules: rulesState });
+        var localErrs = validateRoutingRulesClient(rs);
+        if (localErrs.length) {
+          resultNode.textContent = "Client-side validation failed: " + localErrs.join("; ");
+          resultNode.className = "editor-result bad";
+          return;
+        }
+        resultNode.textContent = "Sending to server validator…";
+        resultNode.className = "editor-result";
+        postJSON("/changes/germany/routing-validate", { role: "germany", set: {}, rules: rs })
+          .then(function (resp) {
+            if (resp.valid) {
+              resultNode.textContent = "✓ Valid. " + ((resp.errors||[]).length ? "Notes: "+resp.errors.join("; ") : "");
+              resultNode.className = "editor-result ok";
+            } else {
+              resultNode.textContent = "✗ Invalid: " + (resp.errors||[]).join("; ");
+              resultNode.className = "editor-result bad";
+            }
+            if (resp.rulesDiff) { resultNode.appendChild(el("div",{cls:"muted small",text:"Rules diff: " + resp.rulesDiff.length + " entr(y/ies)"})); }
+          })
+          .catch(function(e){ resultNode.textContent = "Error: " + e.message; resultNode.className = "editor-result bad"; });
+      });
+      diffBtn.addEventListener("click", function() {
+        var rs = buildRulesObject({ defaultAction: defaultAction.value, rules: rulesState });
+        var localErrs = validateRoutingRulesClient(rs);
+        if (localErrs.length) { resultNode.textContent = "Fix client-side errors first: " + localErrs.join("; "); resultNode.className = "editor-result bad"; return; }
+        resultNode.textContent = "Computing diff…";
+        postJSON("/changes/germany/routing-validate", { role: "germany", set: {}, rules: rs })
+          .then(function (resp) {
+            clear(resultNode);
+            if (resp.rulesDiff) {
+              resultNode.appendChild(el("h4",{text:"Redacted before/after diff"}));
+              renderDiffList(resultNode, resp.rulesDiff, "Rules diff");
+            } else {
+              resultNode.appendChild(el("div",{cls:"notice",text:"No rules diff returned (agent env-set plane unchanged)."}));
+            }
+            resultNode.className = "editor-result";
+          })
+          .catch(function(e){ resultNode.textContent = "Error: " + e.message; resultNode.className = "editor-result bad"; });
+      });
+      applyBtn.addEventListener("click", function() {
+        if (!editable) return;
+        var rs = buildRulesObject({ defaultAction: defaultAction.value, rules: rulesState });
+        var localErrs = validateRoutingRulesClient(rs);
+        if (localErrs.length) { resultNode.textContent = "Fix client-side errors first."; resultNode.className = "editor-result bad"; return; }
+        clear(resultNode);
+        resultNode.appendChild(el("div",{cls:"notice warn",text:"⚠ Applying routing rules RESTARTS the splitter service (~10 s tunnel downtime). The old config is retained for rollback."}));
+        confirmModal("Confirm restart", "RESTART", function() {
+          postJSON("/changes/germany/routing-apply", { role: "germany", set: {}, rules: rs, confirm: "RESTART", reason: "dashboard routing editor apply" })
+            .then(function(resp){
+              resultNode.appendChild(el("div",{cls:"notice ok",text:"✓ Applied. Outcome: "+(resp.outcome||"ok")+" · revision "+(resp.revision||"—")+" · "+(resp.restartWarning||"")+(resp.peerChangeRequired?" · Peer change required: "+resp.peerChangeRequired:"")}));
+              resultNode.className = "editor-result ok";
+            })
+            .catch(function(e){
+              var msg = e.status === 503 ? ("Apply refused: " + e.message) : ("Error: " + e.message);
+              resultNode.appendChild(el("div",{cls:"notice bad",text:msg}));
+              resultNode.className = "editor-result bad";
+            });
+        }, resultNode);
+      });
+
+      view.appendChild(el("div", { cls: "btn-row editor-actions" }, [validateBtn, diffBtn, applyBtn]));
+      view.appendChild(resultNode);
+    }).catch(function(e) {
+      clear(view);
+      view.appendChild(el("div", { cls: "notice bad", text: "Could not load routing schema: " + e.message }));
     });
   }
 
@@ -503,116 +875,339 @@
     { concept: "germany-inbounds", role: "germany", label: "Germany Reality inbounds" },
     { concept: "iran-inbounds", role: "iran", label: "Iran consumer inbounds" }
   ];
+  // Per-role inbound editor: instance cards with editable public fields
+  // (port, SNI, shortId, enabled). Key material is shown as a 12-hex
+  // fingerprint only (keyRef) and is never editable or accepted. Validate /
+  // diff / apply (confirm RESTART) are gated by the per-role inbound flag.
+  function inboundEditorCard(view, entry) {
+    var schema = entry.schema;
+    var concept = entry.meta;
+    var editable = !!schema.editable;
+    var role = concept.role;
+
+    // One editable instance per card (the primary inbound). Operators add
+    // more instances by editing the instance id + fields below.
+    var inst = {
+      instance: role === "germany" ? "reality-1" : "consumer-1",
+      enabled: true,
+      port: "",
+      sni: "",
+      shortId: "",
+      keyRef: "(fingerprint only — never editable)"
+    };
+
+    function inb(label, node, hint) {
+      return el("div", { cls: "field-row" }, [
+        el("label", { cls: "k", text: label }), node,
+        hint ? el("span", { cls: "muted small", text: hint }) : el("span")
+      ]);
+    }
+    var instIn = el("input", { cls: "editor-input", value: inst.instance });
+    var enCb = el("input", { type: "checkbox", cls: "editor-check" }); enCb.checked = true;
+    var portIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "1", max: "65535", placeholder: "port" });
+    var sniIn = el("input", { cls: "editor-input", placeholder: "lowercase SNI" });
+    var shortIn = el("input", { cls: "editor-input editor-input-sm", placeholder: "16-hex shortId" });
+    var keyRefRow = el("div", { cls: "field-row" }, [
+      el("label", { cls: "k", text: "keyRef" }),
+      el("input", { cls: "editor-input", readonly: "readonly", value: inst.keyRef }),
+      el("span", { cls: "muted small", text: "fingerprint; key material is never shown or accepted" })
+    ]);
+
+    var card = el("div", { cls: "card editor-card" }, [
+      el("h3", { text: concept.label + " — " + (schema.status || "read-only") }),
+      inb("instance", instIn, "the inbound instance name"),
+      inb("enabled", enCb, "true = inbound active"),
+      inb("port", portIn, "1..65535"),
+      inb("sni", sniIn, "lowercase RFC 1123 hostname"),
+      inb("shortId", shortIn, "16 hex chars"),
+      keyRefRow
+    ]);
+    view.appendChild(card);
+
+    var resultNode = el("div", { cls: "editor-result" });
+    function inboundsObj() {
+      var o = { instance: instIn.value.trim(), enabled: enCb.checked };
+      if (portIn.value) o.port = parseInt(portIn.value, 10);
+      o.sni = sniIn.value.trim();
+      if (shortIn.value) o.shortId = shortIn.value.trim();
+      return o;
+    }
+    function clientInboundErrors() {
+      var errs = [];
+      if (!instIn.value.trim()) errs.push("instance is required");
+      if (!sniIn.value.trim()) errs.push("sni is required");
+      if (portIn.value) { var p = parseInt(portIn.value,10); if (isNaN(p)||p<1||p>65535) errs.push("port must be 1..65535"); }
+      if (shortIn.value && !/^[0-9a-f]{16}$/.test(shortIn.value)) errs.push("shortId must be 16 hex chars");
+      return errs;
+    }
+
+    var validateBtn = el("button", { cls: "btn", type: "button", text: "Validate" });
+    var applyBtn = el("button", { cls: "btn btn-danger", type: "button", text: "Apply" });
+    if (!editable) { applyBtn.disabled = true; applyBtn.title = schema.editDisabledReason || "the " + role + " inbound flag is off"; }
+
+    validateBtn.addEventListener("click", function () {
+      var ce = clientInboundErrors();
+      if (ce.length) { resultNode.textContent = "Client-side: " + ce.join("; "); resultNode.className = "editor-result bad"; return; }
+      resultNode.textContent = "Validating…"; resultNode.className = "editor-result";
+      postJSON("/changes/" + role + "/inbounds-validate", { role: role, inbounds: [inboundsObj()] })
+        .then(function (resp) {
+          resultNode.textContent = "✓ validate ok (role " + (resp.role || role) + ")" + (resp.flagEnabled ? " · flag enabled" : " · flag disabled (apply will refuse)");
+          resultNode.className = "editor-result ok";
+        })
+        .catch(function (e) { resultNode.textContent = "Error: " + e.message; resultNode.className = "editor-result bad"; });
+    });
+    applyBtn.addEventListener("click", function () {
+      if (!editable) return;
+      var ce = clientInboundErrors();
+      if (ce.length) { resultNode.textContent = "Fix client-side errors first: " + ce.join("; "); resultNode.className = "editor-result bad"; return; }
+      clear(resultNode);
+      resultNode.appendChild(el("div", { cls: "notice warn", text: "⚠ Applying inbounds RESTARTS the affected xray service (~10 s). A Germany-side edit stages a Blob B export for the Iran host (peer change required; there is no coordinated apply)." }));
+      confirmModal("Confirm restart", "RESTART", function () {
+        postJSON("/changes/" + role + "/inbounds-apply", { role: role, inbounds: [inboundsObj()], confirm: "RESTART", reason: "dashboard inbound editor apply" })
+          .then(function (resp) {
+            resultNode.appendChild(el("div", { cls: "notice ok", text: "✓ Applied. " + (resp.restartWarning || "") + (resp.peerChangeRequired ? " · " + resp.peerChangeRequired : "") }));
+            resultNode.className = "editor-result ok";
+          })
+          .catch(function (e) {
+            var msg = e.status === 503 ? ("Apply refused: " + e.message) : ("Error: " + e.message);
+            resultNode.appendChild(el("div", { cls: "notice bad", text: msg }));
+            resultNode.className = "editor-result bad";
+          });
+      }, resultNode);
+    });
+    view.appendChild(el("div", { cls: "btn-row editor-actions" }, [validateBtn, applyBtn]));
+    view.appendChild(resultNode);
+  }
+
+  // Rotate-key affordance: gated by the key-rotation flag. Requires the typed
+  // ROTATE confirm. The old key is always retained for rollback; the response
+  // carries only the new key's fingerprint.
+  function rotateKeyCard(view, rotationSchema) {
+    var editable = !!rotationSchema.editable;
+    view.appendChild(el("div", { cls: "card editor-card" }, [
+      el("h3", { text: "Rotate key — " + (rotationSchema.status || "read-only") })
+    ]));
+    var roleSel = el("select", null, [
+      el("option", { value: "germany", text: "germany" }),
+      el("option", { value: "iran", text: "iran" })
+    ]);
+    var instIn = el("input", { cls: "editor-input", placeholder: "inbound instance (e.g. reality-1)" });
+    var resultNode = el("div", { cls: "editor-result" });
+
+    var rotateBtn = el("button", { cls: "btn btn-danger", type: "button", text: "Rotate key" });
+    if (!editable) {
+      rotateBtn.disabled = true;
+      rotateBtn.title = rotationSchema.editDisabledReason || "the keyRotation flag is off";
+    }
+    rotateBtn.addEventListener("click", function () {
+      if (!editable) return;
+      var role = roleSel.value;
+      var instance = instIn.value.trim();
+      if (!instance) { resultNode.textContent = "An instance name is required."; resultNode.className = "editor-result bad"; return; }
+      clear(resultNode);
+      resultNode.appendChild(el("div", { cls: "notice warn", text: "⚠ Rotating the keypair generates a NEW key. The OLD key is retained for the rollback window. The affected xray service restarts. Type ROTATE to confirm." }));
+      confirmModal("Confirm rotate", "ROTATE", function () {
+        postJSON("/changes/" + role + "/inbounds-rotate", { role: role, instance: instance, confirm: "ROTATE", reason: "dashboard rotate-key" })
+          .then(function (resp) {
+            resultNode.appendChild(el("div", { cls: "notice ok", text: "✓ Rotated. New key fingerprint: " + (resp.newKeyFingerprint || "—") + " · old key retained: " + (resp.oldKeyRetained ? "yes" : "no") }));
+            resultNode.className = "editor-result ok";
+          })
+          .catch(function (e) {
+            var msg = e.status === 503 ? ("Rotate refused: " + e.message) : ("Error: " + e.message);
+            resultNode.appendChild(el("div", { cls: "notice bad", text: msg }));
+            resultNode.className = "editor-result bad";
+          });
+      }, resultNode);
+    });
+
+    view.appendChild(el("div", { cls: "field-row" }, [el("label", { cls: "k", text: "Role" }), roleSel, el("span")]));
+    view.appendChild(el("div", { cls: "field-row" }, [el("label", { cls: "k", text: "Instance" }), instIn, el("span")]));
+    view.appendChild(el("div", { cls: "btn-row editor-actions" }, [rotateBtn]));
+    view.appendChild(resultNode);
+  }
+
   function renderInbounds(view) {
     var prompts = C3_CONCEPTS.map(function (c) {
       return v2("/schema/" + c.concept).then(function (schema) {
         return { meta: c, schema: schema };
       });
     });
-    return Promise.all(prompts).then(function (entries) {
+    return Promise.all(prompts.concat([v2("/schema/inbounds-rotation").catch(function () {
+      return { concept: "inbounds-rotation", editable: false, status: "read-only", editDisabledReason: "key rotation is off (flag disabled or schema unavailable)" };
+    })])).then(function (entries) {
       clear(view);
-      view.appendChild(el("div", { cls: "notice", text: "Public inbound fields only. Keys are shown as a 12-hex fingerprint (keyRef) — key material is never displayed or accepted. A Germany-side edit stages a Blob B export for the Iran host and vice versa (peer change required; there is no coordinated apply)." }));
-      entries.forEach(function (entry) {
-        var schema = entry.schema;
-        var concept = entry.meta;
-        var editable = !!schema.editable;
-        var head = el("h3", { text: concept.label + " — " + (schema.status || "read-only") });
-        view.appendChild(el("div", { cls: "card" }, [head]));
-        var rows = (schema.fields || []).map(function (f) {
-          var isKey = f.name === "keyRef";
-          return el("tr", null, [
-            el("td", { text: f.name }),
-            el("td", { text: f.type || "—" }),
-            el("td", { text: f.required ? "yes" : "no" }),
-            el("td", { text: isKey ? "fingerprint (key material never editable)" : (f.pattern || "—") })
-          ]);
-        });
-        view.appendChild(el("div", { cls: "table-wrap" }, [
-          el("table", null, [
-            el("thead", null, [el("tr", null, ["Field", "Type", "Required", "Constraint"].map(function (h) { return el("th", { text: h }); }))]),
-            el("tbody", null, rows)
-          ])
-        ]));
-        if (editable) {
-          // Flag ON: the working form + validate + diff + confirm + restart
-          // countdown is still a stub in this phase. We render the affordance
-          // and an explicit "deferred" notice rather than a half-wired form.
-          view.appendChild(el("div", { cls: "notice" }, [
-            el("button", {
-              cls: "btn",
-              text: "Edit inbounds",
-              attrs: { disabled: "" }
-            }),
-            el("span", { cls: "muted small", text: " — validate + diff + confirm form is deferred; the flag gates the API plane but the in-browser form lands in a later phase." })
-          ]));
-        } else {
-          view.appendChild(el("div", { cls: "notice" }, [
-            el("button", {
-              cls: "btn",
-              text: "Edit",
-              attrs: { disabled: "", title: schema.editDisabledReason || "editing lands in the next phase" }
-            }),
-            el("span", { cls: "muted small", text: " — " + (schema.editDisabledReason || "editing lands in the next phase") })
-          ]));
-        }
-      });
+      view.appendChild(el("div", { cls: "notice", text: "Public inbound fields only. Keys are shown as a 12-hex fingerprint (keyRef) — key material is never displayed or accepted. Inbound applies and rotate-key are gated by per-capability flags (default off)." }));
+      for (var i = 0; i < C3_CONCEPTS.length; i++) {
+        inboundEditorCard(view, entries[i]);
+      }
+      rotateKeyCard(view, entries[entries.length - 1]);
     });
   }
 
-  // ---- C4 control plane: routing + multi-carrier (read-only) ---------------------
-  // Driven by the C4 public-field schemas. Both sections are READ-ONLY in this
-  // build: the in-browser editing form is deferred (like C3), so the Edit
-  // affordance is a disabled button whose tooltip names the per-capability
-  // flag that gates the API plane. No CDN, CSP intact. The SOCKS allowlist
-  // value is shown as a fingerprint (the agent redacts it); SNI / policy
-  // values are operator config and shown in full.
-  var C4_CONCEPTS = [
-    { concept: "routing-plane", label: "Routing plane (C4)" },
-    { concept: "multi-carrier-control", label: "Multi-carrier control (C4)" }
-  ];
+  // ---- C4 multi-carrier control editor -------------------------------------------
+  // Master toggle + second carrier listener/dial/SNI + policy knobs. Enabling
+  // requires a valid SNI + second-carrier fields; disabling is always allowed.
+  // Validate/diff/confirm/apply are gated by the multiCarrierApply flag
+  // (default off → Apply disabled with a tooltip naming the flag). No secrets
+  // are sent: only public operator config. No CDN, CSP intact.
   function renderControl(view) {
-    var prompts = C4_CONCEPTS.map(function (c) {
-      return v2("/schema/" + c.concept).then(function (schema) {
-        return { meta: c, schema: schema };
-      });
-    });
-    return Promise.all(prompts).then(function (entries) {
+    return v2("/schema/multi-carrier-control").then(function (schema) {
       clear(view);
-      view.appendChild(el("div", { cls: "notice", text: "Read-only C4 control plane. Routing (target-address policy + SOCKS source allowlist) and multi-carrier (master toggle, second carrier listener/dial + SNI, policy knobs) are shown. Editing is deferred in this build; the Edit button is disabled and its tooltip names the per-capability flag that must be enabled before the API plane is live. SNI and policy values are shown in full; the SOCKS allowlist is shown as a fingerprint." }));
-      entries.forEach(function (entry) {
-        var schema = entry.schema;
-        var concept = entry.meta;
-        var editable = !!schema.editable;
-        var head = el("h3", { text: concept.label + " — " + (schema.status || "read-only") });
-        var card = el("div", { cls: "card" }, [head]);
-        var rows = (schema.fields || []).map(function (f) {
-          return el("tr", null, [
-            el("td", { text: f.name }),
-            el("td", { text: f.type || "—" }),
-            el("td", { text: f.required ? "yes" : "no" }),
-            el("td", { text: (f.pattern || "—") })
-          ]);
-        });
-        card.appendChild(el("div", { cls: "table-wrap" }, [
-          el("table", null, [
-            el("thead", null, [el("tr", null, ["Field", "Type", "Required", "Constraint"].map(function (h) { return el("th", { text: h }); }))]),
-            el("tbody", null, rows)
-          ])
-        ]));
-        // Flag-gated, disabled Edit affordance + tooltip (deferred editing form).
-        var editBtn = el("button", { cls: "btn", text: "Edit", attrs: { disabled: "" } });
-        if (!editable) {
-          editBtn.setAttribute("title", schema.editDisabledReason || "editing lands in the next phase");
+      var editable = !!schema.editable;
+      view.appendChild(el("div", { cls: "notice" }, [
+        el("h3", { text: "Multi-carrier control — " + (schema.status || "read-only") }),
+        el("span", { cls: "muted small", text: "Second down-carrier + policy engine. Enabling requires a valid SNI and second-carrier listener/dial; disabling is always allowed. Applying restarts the affected splitter service (and xray when SNI/listener changes)." })
+      ]));
+
+      var st = {
+        enabled: false,
+        listen2: "", dial2: "", sni2: "",
+        policyMode: "static", topK: 1,
+        probing: false, probeUrl: "", probeBudget: 0, ttfbBaseline: 0
+      };
+
+      function field(label, node, hint) {
+        return el("div", { cls: "field-row" }, [
+          el("label", { cls: "k", text: label }),
+          node,
+          hint ? el("span", { cls: "muted small", text: hint }) : el("span")
+        ]);
+      }
+
+      var enabledCb = el("input", { type: "checkbox", cls: "editor-check" });
+      var listen2In = el("input", { cls: "editor-input", placeholder: "e.g. 127.0.0.1:40002", value: st.listen2 });
+      var dial2In = el("input", { cls: "editor-input", placeholder: "e.g. 127.0.0.1:40003", value: st.dial2 });
+      var sni2In = el("input", { cls: "editor-input", placeholder: "lowercase RFC 1123 SNI", value: st.sni2 });
+      var modeSel = el("select", null, [el("option",{value:"static",text:"static"}), el("option",{value:"adaptive",text:"adaptive"})]);
+      modeSel.value = st.policyMode;
+      var topKIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "1", max: "8", value: String(st.topK) });
+      var probeCb = el("input", { type: "checkbox", cls: "editor-check" });
+      var probeUrlIn = el("input", { cls: "editor-input", placeholder: "operator-owned probe URL" });
+      var probeBudgetIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "0", value: "0" });
+      var ttfbIn = el("input", { cls: "editor-input editor-input-sm", type: "number", min: "0", max: "30000", value: "0" });
+
+      var formCard = el("div", { cls: "card editor-card" }, [
+        el("h3", { text: "Master toggle" }),
+        field("SPLIT_MULTI_CARRIER_ENABLED", enabledCb, "true = second carrier active"),
+        el("h3", { text: "Second carrier" }),
+        field("SPLIT_DOWN_LISTEN_2", listen2In, "host:port (Germany)"),
+        field("SPLIT_DOWN_CARRIER_ADDR_2", dial2In, "host:port (Iran)"),
+        field("SPLIT_DOWN_CARRIER2_SNI", sni2In, "lowercase SNI"),
+        el("h3", { text: "Policy" }),
+        field("SPLIT_POLICY_MODE", modeSel, "static|adaptive"),
+        field("SPLIT_POLICY_TOP_K", topKIn, "1..8"),
+        field("SPLIT_PROBING_ENABLED", probeCb, "enable probing"),
+        field("SPLIT_PROBE_URL", probeUrlIn, "operator-owned http(s) URL"),
+        field("SPLIT_PROBE_DAILY_BUDGET", probeBudgetIn, "bytes/day (0 = off)"),
+        field("SPLIT_TTFB_BASELINE_MS", ttfbIn, "0..30000 ms")
+      ]);
+      view.appendChild(formCard);
+
+      function currentSet() {
+        var set = {
+          "SPLIT_MULTI_CARRIER_ENABLED": enabledCb.checked ? "true" : "false"
+        };
+        if (enabledCb.checked) {
+          set["SPLIT_DOWN_CARRIER2_SNI"] = sni2In.value.trim();
+          if (listen2In.value.trim()) set["SPLIT_DOWN_LISTEN_2"] = listen2In.value.trim();
+          if (dial2In.value.trim()) set["SPLIT_DOWN_CARRIER_ADDR_2"] = dial2In.value.trim();
+          set["SPLIT_POLICY_MODE"] = modeSel.value;
+          set["SPLIT_POLICY_TOP_K"] = topKIn.value || "1";
+          set["SPLIT_PROBING_ENABLED"] = probeCb.checked ? "true" : "false";
+          if (probeCb.checked) {
+            set["SPLIT_PROBE_URL"] = probeUrlIn.value.trim();
+            set["SPLIT_PROBE_DAILY_BUDGET"] = probeBudgetIn.value || "0";
+            set["SPLIT_TTFB_BASELINE_MS"] = ttfbIn.value || "0";
+          }
         }
-        var noteText = editable
-          ? " — the API plane is enabled, but the in-browser editing form is deferred to a later phase."
-          : " — " + (schema.editDisabledReason || "editing lands in the next phase");
-        card.appendChild(el("div", { cls: "notice" }, [
-          editBtn,
-          el("span", { cls: "muted small", text: noteText })
-        ]));
-        view.appendChild(card);
+        return set;
+      }
+
+      var resultNode = el("div", { cls: "editor-result" });
+      var validateBtn = el("button", { cls: "btn", type: "button", text: "Validate" });
+      var diffBtn = el("button", { cls: "btn", type: "button", text: "Preview diff" });
+      var applyBtn = el("button", { cls: "btn btn-danger", type: "button", text: "Apply" });
+      if (!editable) {
+        applyBtn.disabled = true;
+        applyBtn.title = schema.editDisabledReason || "multiCarrierApply flag is off";
+      }
+
+      // Enabling requires SNI + a valid second carrier; disabling always allowed.
+      function enablingErrors() {
+        if (!enabledCb.checked) return [];
+        var errs = [];
+        if (!sni2In.value.trim()) errs.push("SNI is required when the second carrier is enabled");
+        var tK = parseInt(topKIn.value, 10);
+        if (isNaN(tK) || tK < 1 || tK > 8) errs.push("top-k must be 1..8");
+        if (probeCb.checked && !probeUrlIn.value.trim()) errs.push("a probe URL is required when probing is enabled");
+        return errs;
+      }
+
+      validateBtn.addEventListener("click", function () {
+        var errs = enablingErrors();
+        if (errs.length) { resultNode.textContent = "Client-side: " + errs.join("; "); resultNode.className = "editor-result bad"; return; }
+        resultNode.textContent = "Sending to server validator…"; resultNode.className = "editor-result";
+        postJSON("/changes/germany/multicarrier-validate", { role: "germany", set: currentSet() })
+          .then(function (resp) {
+            if (resp.valid) { resultNode.textContent = "✓ Valid" + ((resp.xrayAffected) ? " · xray will restart" : ""); resultNode.className = "editor-result ok"; }
+            else { resultNode.textContent = "✗ Invalid: " + (resp.errors||[]).join("; "); resultNode.className = "editor-result bad"; }
+          })
+          .catch(function(e){ resultNode.textContent = "Error: " + e.message; resultNode.className = "editor-result bad"; });
       });
+      diffBtn.addEventListener("click", function () {
+        var errs = enablingErrors();
+        if (errs.length) { resultNode.textContent = "Fix client-side errors first: " + errs.join("; "); resultNode.className = "editor-result bad"; return; }
+        clear(resultNode);
+        resultNode.textContent = "Computing diff…";
+        postJSON("/changes/germany/multicarrier-validate", { role: "germany", set: currentSet() })
+          .then(function (resp) {
+            clear(resultNode);
+            var diffs = (resp.diff || []);
+            if (diffs.length) {
+              resultNode.appendChild(el("h4", { text: "Env-set diff (redacted)" }));
+              var rows = diffs.map(function (d) {
+                return el("tr", null, [
+                  el("td", { text: d.key || d.name || "—" }),
+                  el("td", { cls: "mono small", text: String(d.before == null ? "(unset)" : d.before) }),
+                  el("td", { cls: "mono small", text: String(d.after == null ? "(unset)" : d.after) })
+                ]);
+              });
+              resultNode.appendChild(el("div", { cls: "table-wrap" }, [el("table", null, [
+                el("thead", null, [el("tr", null, [el("th",{text:"Key"}), el("th",{text:"Before"}), el("th",{text:"After"})])]),
+                el("tbody", null, rows)
+              ])]));
+            } else {
+              resultNode.appendChild(el("div", { cls: "notice", text: "No env-set diff returned (no changes or agent not available)." }));
+            }
+            resultNode.className = "editor-result";
+          })
+          .catch(function(e){ resultNode.textContent = "Error: " + e.message; resultNode.className = "editor-result bad"; });
+      });
+      applyBtn.addEventListener("click", function () {
+        if (!editable) return;
+        var errs = enablingErrors();
+        if (errs.length) { resultNode.textContent = "Fix client-side errors first: " + errs.join("; "); resultNode.className = "editor-result bad"; return; }
+        clear(resultNode);
+        resultNode.appendChild(el("div", { cls: "notice warn", text: "⚠ Applying multi-carrier settings RESTARTS the splitter service (and xray if the SNI/listener changed, ~10 s). The old config is retained for rollback." }));
+        confirmModal("Confirm restart", "RESTART", function () {
+          postJSON("/changes/germany/multicarrier-apply", { role: "germany", set: currentSet(), confirm: "RESTART", reason: "dashboard multi-carrier editor apply" })
+            .then(function (resp) {
+              resultNode.appendChild(el("div", { cls: "notice ok", text: "✓ Applied. " + (resp.restartWarning || "") + (resp.peerChangeRequired ? " · Peer change required: " + resp.peerChangeRequired : "") }));
+              resultNode.className = "editor-result ok";
+            })
+            .catch(function (e) {
+              var msg = e.status === 503 ? ("Apply refused: " + e.message) : ("Error: " + e.message);
+              resultNode.appendChild(el("div", { cls: "notice bad", text: msg }));
+              resultNode.className = "editor-result bad";
+            });
+        }, resultNode);
+      });
+
+      view.appendChild(el("div", { cls: "btn-row editor-actions" }, [validateBtn, diffBtn, applyBtn]));
+      view.appendChild(resultNode);
+    }).catch(function (e) {
+      clear(view);
+      view.appendChild(el("div", { cls: "notice bad", text: "Could not load multi-carrier schema: " + e.message }));
     });
   }
 
