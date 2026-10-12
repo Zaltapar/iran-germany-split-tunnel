@@ -46,6 +46,13 @@ type ControlJournalEntry struct {
 	Parent   string              `json:"parent,omitempty"`
 	PreHash  string              `json:"preHash,omitempty"`
 	NewHash  string              `json:"newHash,omitempty"`
+	// C4 two-phase handshake (c4.go / coordinated.go): XrayCand is the
+	// sandbox xray candidate path reserved during PREPARE ("" when the
+	// change is not xray-affected); XrayAffected records whether the
+	// change owns the xray unit. Both survive a crash between prepare and
+	// commit so recovery can classify the live file (design §5.6).
+	XrayCand     string `json:"xrayCand,omitempty"`
+	XrayAffected bool   `json:"xrayAffected,omitempty"`
 }
 
 // ControlJournal persists one in-flight control journal under a root.

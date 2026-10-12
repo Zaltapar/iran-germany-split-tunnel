@@ -59,6 +59,15 @@ const (
 	OpInboundsRotate     = "inbounds-rotate"
 	OpInboundsExportBlob = "inbounds-export-blob"
 	OpInboundsImportBlob = "inbounds-import-blob"
+	// C4 routing plane + multi-carrier control (c4.go). The C4
+	// coordinated two-host flow is built on these: each host runs
+	// prepare (validate + xray -test where applicable, no writes), then
+	// a two-phase commit/abort handshake; a single-agent host stages a
+	// peer Blob B export instead of the handshake (peerChangeRequired).
+	OpC4RoutingValidate = "c4-routing-validate"
+	OpC4RoutingApply    = "c4-routing-apply"
+	OpC4MCValidate      = "c4-mc-validate"
+	OpC4MCApply         = "c4-mc-apply"
 )
 
 // knownOps is the closed set of op names the agent accepts on the
@@ -77,6 +86,11 @@ var knownOps = map[string]bool{
 	OpInboundsRotate:     true,
 	OpInboundsExportBlob: true,
 	OpInboundsImportBlob: true,
+	// C4
+	OpC4RoutingValidate: true,
+	OpC4RoutingApply:    true,
+	OpC4MCValidate:      true,
+	OpC4MCApply:         true,
 }
 
 // Frame is one newline-delimited JSON request or response. Exactly

@@ -122,7 +122,14 @@ type Agent struct {
 	// (the default) keeps the C2 behaviour unchanged: every C3 op fails
 	// closed with inbound_not_configured.
 	InboundSeam InboundSeam
-	Build       ConfigBuilder
+	// XrayGate is the C4 host-facing executor for the `xray run -test`
+	// gate that runs only when a C4 multi-carrier change alters the
+	// rendered xray config (SNI/listener/master flip — a C3-shaped
+	// inbound change). Nil (the default) keeps every C4 apply
+	// fail-closed for xray-affecting changes; pure env changes (routing,
+	// policy knobs) never consult the gate (c4.go).
+	XrayGate XrayGate
+	Build    ConfigBuilder
 	// ApplyMu is the concurrency lock: only one apply runs at a time.
 	ApplyMu *sync.Mutex
 	// Rate limits per the design; defaults are 1/10min and 6/24h.
@@ -148,6 +155,7 @@ type Agent struct {
 	idemMu      sync.Mutex
 	idem        map[string]*idemEntry
 	idemInbound map[string]*idemEntry
+	idemC4      map[string]*idemEntry
 }
 
 // NewAgent builds an agent over one store root. The in-flight journal and
@@ -262,6 +270,15 @@ func (a *Agent) ServeConnection(src CredentialSource, policy *PeerPolicy, conn n
 		return a.opInboundsExportBlob(conn, frame)
 	case OpInboundsImportBlob:
 		return a.opInboundsImportBlob(conn, frame)
+	// C4 routing plane + multi-carrier control (c4.go).
+	case OpC4RoutingValidate:
+		return a.opRoutingValidate(conn, frame)
+	case OpC4RoutingApply:
+		return a.opRoutingApply(conn, frame)
+	case OpC4MCValidate:
+		return a.opMCValidate(conn, frame)
+	case OpC4MCApply:
+		return a.opMCApply(conn, frame)
 	default:
 		return a.reply(conn, frame, false, nil, ErrCodeUnknownOp, "unknown op")
 	}
