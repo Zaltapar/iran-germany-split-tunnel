@@ -445,3 +445,15 @@ func strVal(m map[string]any, key string) string {
 	}
 	return ""
 }
+
+// joinStrings concatenates a string slice with "; " (empty slice → "").
+func joinStrings(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	out := ss[0]
+	for _, s := range ss[1:] {
+		out += "; " + s
+	}
+	return out
+}

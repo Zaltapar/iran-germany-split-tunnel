@@ -184,6 +184,13 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				s.c3HandleInboundsApply(w, r, parts[1])
 				return
 			}
+			// C3 rotate-key action (typed ROTATE confirm; the old key is
+			// retained for rollback; per-capability keyRotation flag-gated,
+			// default off → 503 key_rotation_flag_off).
+			if len(parts) == 3 && parts[0] == "changes" && parts[2] == "inbounds-rotate" {
+				s.c3HandleInboundsRotate(w, r, parts[1])
+				return
+			}
 			// C4 routing + multi-carrier editing surface (per-capability
 			// gated in the handlers; the method whitelist already
 			// allowed POST).
@@ -281,6 +288,12 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 				// only; key refs as fingerprints, never key material).
 				if _, ok := c3SchemaForConcept(parts[1]); ok {
 					s.c3HandleInboundsSchema(w, parts[1])
+					return
+				}
+				// C3: the rotate-key action descriptor (the per-capability
+				// key-rotation flag drives the disabled Rotate affordance).
+				if parts[1] == c3ConceptInboundsRotation {
+					s.c3HandleInboundsRotationSchema(w)
 					return
 				}
 				// C4: the routing plane and the multi-carrier control

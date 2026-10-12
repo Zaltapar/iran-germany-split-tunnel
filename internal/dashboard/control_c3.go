@@ -31,11 +31,23 @@ import (
 const (
 	c3ConceptGermanyInbounds = "germany-inbounds"
 	c3ConceptIranInbounds    = "iran-inbounds"
+	// c3ConceptInboundsRotation is the rotate-key action descriptor.
+	c3ConceptInboundsRotation = "inbounds-rotation"
 )
 
 // c3InboundFlagOffError is the agent error code the web maps to a 503 when
 // the per-capability flag is off.
 const c3InboundFlagOffError = "inbound_flag_off"
+
+// c3KeyRotationFlagOffError is the agent error code the web maps to a 503
+// when the key-rotation flag is off.
+const c3KeyRotationFlagOffError = "key_rotation_flag_off"
+
+// c3RotateConfirmToken is the typed confirmation the operator must type for a
+// rotate-key action (distinct from the C2/C3 RESTART apply token): rotating
+// the keypair is a key change, not a service restart, and the old key is
+// retained in the revision store's pre/ copy for the transition window.
+const c3RotateConfirmToken = "ROTATE"
 
 // c3ControlFlags are the C3 per-capability feature flags. All default
 // OFF (the C5 rollout model: each capability is enabled independently and
@@ -132,6 +144,15 @@ func (s *Server) c3FlagForRole(role string) bool {
 	return false
 }
 
+// c3KeyRotationFlag reports whether the per-capability key-rotation flag is
+// enabled. nil Control config → false (fail-closed).
+func (s *Server) c3KeyRotationFlag() bool {
+	if s.cfg == nil || s.cfg.Control == nil {
+		return false
+	}
+	return s.cfg.Control.C3Flags.KeyRotation
+}
+
 // c3InboundsValidateRequest is the strictly-decoded body for
 // POST /api/v2/changes/{id}/inbounds-validate.
 type c3InboundsValidateRequest struct {
@@ -160,6 +181,34 @@ type c3InboundsApplyResponse struct {
 	RestartWarning       string `json:"restartWarning"`
 	EstimatedDowntimeSec int    `json:"estimatedDowntimeSec"`
 	PeerChangeRequired   string `json:"peerChangeRequired,omitempty"`
+}
+
+// c3InboundsRotateRequest is the strictly-decoded body for
+// POST /api/v2/changes/{id}/inbounds-rotate. Confirm must equal
+// "ROTATE" (c3RotateConfirmToken): the operator has read that the old key
+// is retained for rollback and the xray service will restart. The agent
+// requires retainOld=true (fail-closed; rotation is blocked otherwise).
+type c3InboundsRotateRequest struct {
+	Role     string `json:"role"`
+	Instance string `json:"instance"`
+	// Confirm must equal c3RotateConfirmToken ("ROTATE").
+	Confirm string `json:"confirm"`
+	// RetainOld is ALWAYS set to true by the web forwarder: the dashboard
+	// never initiates a rotation that drops the old key (the agent blocks
+	// it with rotation_blocked regardless).
+	RetainOld bool   `json:"retainOld"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// c3InboundsRotateResponse is the forwarded rotation result. It carries only
+// the NEW key's fingerprint and the retention statement — never key
+// material.
+type c3InboundsRotateResponse struct {
+	Outcome           string `json:"outcome"`
+	NewKeyFingerprint string `json:"newKeyFingerprint"`
+	OldKeyRetained    bool   `json:"oldKeyRetained"`
+	Revision          string `json:"revision"`
+	ChangeID          string `json:"changeId"`
 }
 
 // c3HandleInboundsValidate forwards the validate op to the agent.
@@ -270,6 +319,83 @@ func (s *Server) c3HandleInboundsApply(w http.ResponseWriter, r *http.Request, c
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// c3HandleInboundsRotate forwards the key-rotation op, gated by the
+// per-capability key-rotation flag and the typed ROTATE confirm. The old
+// key is retained for rollback; the response carries only the new key's
+// fingerprint (never key material).
+func (s *Server) c3HandleInboundsRotate(w http.ResponseWriter, r *http.Request, changeID string) {
+	// Per-capability key-rotation flag: apply is refused when the flag is
+	// off (C5 rollout model; default off).
+	if !s.c3KeyRotationFlag() {
+		writeJSONError(w, http.StatusServiceUnavailable,
+			c3KeyRotationFlagOffError+": the C3 key-rotation plane is off in this build (control.c3Flags.keyRotation=false); the read-only schema and validate remain available")
+		return
+	}
+	if r.Header.Get(c2ControlHeader) != "1" {
+		writeJSONError(w, http.StatusForbidden, "missing control CSRF header "+c2ControlHeader+": 1")
+		return
+	}
+	if s.c2AgentFor("inbounds-rotate") == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "agent_unavailable: no control agent socket is configured on this host")
+		return
+	}
+
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, c1BodyLimit))
+	dec.DisallowUnknownFields()
+	var req c3InboundsRotateRequest
+	if err := dec.Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid rotate body: "+err.Error())
+		return
+	}
+	// The typed confirm token must be ROTATE (D: the operator typed the
+	// explicit rotate confirmation; RESTART is the apply token, not the
+	// rotate token).
+	if req.Confirm != c3RotateConfirmToken {
+		writeJSONError(w, http.StatusBadRequest,
+			"confirm token: the body must carry confirm=\""+c3RotateConfirmToken+"\" (rotate-key generates a new keypair; the old key is retained for rollback; the affected xray service restarts)")
+		return
+	}
+	// The dashboard always retains the old key; the agent re-checks
+	// retainOld and fails closed otherwise.
+	req.RetainOld = true
+	if req.Role == "" {
+		req.Role = s.c3RoleForChange(changeID)
+		if req.Role == "" {
+			writeJSONError(w, http.StatusBadRequest, "role required (germany or iran)")
+			return
+		}
+	}
+	if req.Instance == "" {
+		writeJSONError(w, http.StatusBadRequest, "instance is required for a rotate-key action")
+		return
+	}
+
+	res, err := s.c2AgentFor("inbounds-rotate").Call(r.Context(), "inbounds-rotate", c2ReqID(), changeID, changeID, map[string]any{
+		"role":      req.Role,
+		"instance":  req.Instance,
+		"retainOld": true,
+		"changeId":  changeID,
+		"reason":    req.Reason,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "agent_unavailable: "+err.Error())
+		return
+	}
+	if !res.OK {
+		s.c2AgentError(w, res.Error)
+		return
+	}
+	data, _ := res.Data.(map[string]any)
+	resp := c3InboundsRotateResponse{
+		Outcome:           strVal(data, "outcome"),
+		NewKeyFingerprint: strVal(data, "newKeyFingerprint"),
+		OldKeyRetained:    true,
+		Revision:          strVal(data, "revision"),
+		ChangeID:          changeID,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // c3RoleForChange maps a changeId to the C3 role when it names a
 // configured server; "" otherwise.
 func (s *Server) c3RoleForChange(changeID string) string {
@@ -317,3 +443,38 @@ func schemaConceptRole(concept string) string {
 var _ = c3InboundRoleForConcept
 
 func c3InboundRoleForConcept(concept string) string { return schemaConceptRole(concept) }
+
+// c3InboundsRotationSchema is the public-field schema for the C3 rotate-key
+// action. Key material is never a field; the action is typed-confirmation
+// (ROTATE) gated by the per-capability keyRotation flag (default OFF).
+var c3InboundsRotationSchema = ConceptSchema{
+	Concept:  c3ConceptInboundsRotation,
+	Editable: false, // editable state is driven by the keyRotation flag
+	Status:   "read-only",
+	Fields: []FieldSchema{
+		{Name: "instance", Type: "string", Required: true, MaxLen: 64,
+			Pattern: "the inbound instance whose keypair is rotated"},
+		{Name: "confirm", Type: "string", Required: true, MaxLen: 8,
+			Pattern: "must equal \"ROTATE\" (the operator has read that the old key is retained for rollback)"},
+		{Name: "retainOld", Type: "bool", Required: true,
+			Pattern: "always true from the dashboard: rotation is blocked unless the old key is retained"},
+	},
+	ValidationEndpoint: "/api/v2/changes/{id}/inbounds-rotate",
+	ValidationStatus:   "active",
+}
+
+// c3HandleInboundsRotationSchema serves the rotate-key action descriptor,
+// reflecting the key-rotation flag so the UI can enable/disable the Rotate
+// affordance (disabled + tooltip when the flag is off).
+func (s *Server) c3HandleInboundsRotationSchema(w http.ResponseWriter) {
+	schema := c3InboundsRotationSchema
+	flagOn := s.c3KeyRotationFlag()
+	schema.Editable = flagOn
+	if !flagOn {
+		schema.Status = "read-only"
+		schema.EditDisabledReason = "key rotation is off in this build (per-capability flag keyRotation=false)"
+	} else {
+		schema.Status = "editable"
+	}
+	writeJSON(w, http.StatusOK, schema)
+}

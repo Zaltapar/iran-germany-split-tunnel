@@ -32,7 +32,11 @@ package dashboard
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sort"
+
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 )
 
 // c4 concept names (URL path segments under /api/v2/schema/).
@@ -89,6 +93,37 @@ var c4RoutingSchema = ConceptSchema{
 			Pattern: "host:port (Germany role only; the WARP SOCKS5 endpoint for the warp outbound; empty = 127.0.0.1:40000)"},
 		{Name: "SPLIT_ROUTING_DEBUG", Type: "string", Required: false,
 			Pattern: "true/false (Germany role only; when on, per-dial debug lines include the destination)"},
+		// GERMANY ROUTING RULES OBJECT (§22, dashboard routing editor). The
+		// editor builds this public-fields-only object client-side and the
+		// dashboard carries it in the routing validate/apply request body
+		// under "rules". These descriptors are what the form renders; the
+		// object is validated against the same rules the splitter engine
+		// enforces (pkg/routing): RFC 1123 domains, CIDR, port ranges,
+		// unique ids, max 500 rules, no block default, no catch-alls. No
+		// secret-named field appears here.
+		{Name: "rules.version", Type: "int", Required: false, Min: 1, Max: 1,
+			Pattern: "rules schema version (always 1)"},
+		{Name: "rules.default_action", Type: "enum", Required: false, Enum: []string{"direct", "warp"},
+			Pattern: "outbound when no rule matches; block is not a valid default"},
+		{Name: "rules[]", Type: "array", Required: false, Max: 500,
+			Pattern: "ordered rules; the first enabled match wins"},
+		{Name: "rules[].id", Type: "string", Required: true, MaxLen: 64,
+			Pattern: "unique within the rule set"},
+		{Name: "rules[].enabled", Type: "bool", Required: false,
+			Pattern: "absent = true"},
+		{Name: "rules[].match.domain", Type: "string", Required: false, MaxLen: 253,
+			Pattern: "lowercase RFC 1123 hostname; a leading '. ' is the suffix form; no wildcards"},
+		{Name: "rules[].match.keyword", Type: "string", Required: false,
+			Pattern: "case-insensitive substring matched against the destination host"},
+		{Name: "rules[].match.ip_cidr", Type: "string", Required: false,
+			Pattern: "IPv4/IPv6 CIDR block (matched against literal-IP destinations only)"},
+		{Name: "rules[].match.port_min", Type: "int", Required: false, Min: 0, Max: 65535},
+		{Name: "rules[].match.port_max", Type: "int", Required: false, Min: 0, Max: 65535},
+		{Name: "rules[].action", Type: "enum", Required: true, Enum: []string{"direct", "warp", "block"}},
+		{Name: "rules[].fallback", Type: "enum", Required: false, Enum: []string{"", "direct"},
+			Pattern: "only meaningful for action=warp; '' = fail-closed"},
+		{Name: "rules[].comment", Type: "string", Required: false, MaxLen: 256,
+			Pattern: "operator note; never matched and never logged"},
 	},
 	ValidationEndpoint: "/api/v2/changes/{id}/routing-validate",
 	ValidationStatus:   "active",
@@ -168,18 +203,28 @@ func (s *Server) c4CoordinatedFlag() bool {
 // ---------------------------------------------------------------------------
 
 // c4ValidateRequest is the strictly-decoded body for a C4 validate POST.
+//
+// Rules, when present, is the Germany routing-rules object built by the
+// dashboard's routing editor. It is validated server-side against the same
+// rules the splitter engine enforces (pkg/routing) and forwarded to the
+// agent, which remains authoritative. Only public fields are accepted;
+// DisallowUnknownFields rejects any secret-bearing key at the top level.
 type c4ValidateRequest struct {
-	Role string            `json:"role"`
-	Set  map[string]string `json:"set"`
+	Role  string            `json:"role"`
+	Set   map[string]string `json:"set"`
+	Rules json.RawMessage   `json:"rules,omitempty"`
 }
 
 // c4ApplyRequest is the strictly-decoded body for a C4 apply POST.
 type c4ApplyRequest struct {
-	Role         string            `json:"role"`
-	Set          map[string]string `json:"set"`
-	Confirm      string            `json:"confirm"` // must be "RESTART"
-	Reason       string            `json:"reason,omitempty"`
-	BaseRevision string            `json:"baseRevision,omitempty"`
+	Role string            `json:"role"`
+	Set  map[string]string `json:"set"`
+	// Rules carries the routing-rules object on the routing apply; the
+	// multi-carrier apply ignores it (its body has no rules).
+	Rules        json.RawMessage `json:"rules,omitempty"`
+	Confirm      string          `json:"confirm"` // must be "RESTART"
+	Reason       string          `json:"reason,omitempty"`
+	BaseRevision string          `json:"baseRevision,omitempty"`
 }
 
 // c4ApplyResponse is the forwarded C4 apply result. It surfaces the
@@ -194,6 +239,92 @@ type c4ApplyResponse struct {
 	RestartWarning     string `json:"restartWarning"`
 	XrayRestarted      bool   `json:"xrayRestarted,omitempty"`
 	PeerChangeRequired string `json:"peerChangeRequired,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// routing-rules object: server-side validation + redacted diff
+// ---------------------------------------------------------------------------
+
+// c4ValidateRoutingRules parses and validates the routing-rules object the
+// dashboard's routing editor builds, using the SAME authoritative parser the
+// splitter engine uses (pkg/routing.ParseRules → RuleSet.Sanitize): RFC 1123
+// domains, CIDR, port ranges, unique ids, max 500 rules, no block default,
+// no catch-alls, and the strict public-fields-only decode that rejects any
+// secret-named key. It returns a field-level error list (empty = valid) plus
+// the validated set for the diff. An empty object (len(raw)==0) yields no
+// errors and a nil set (no rules supplied). This is the shared-fixture
+// parity point: the dashboard validates against the exact bytes the splitter
+// would load.
+func c4ValidateRoutingRules(raw json.RawMessage) (errs []string, set *routing.RuleSet) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	set, err := routing.ParseRules(raw)
+	if err != nil {
+		return []string{"rules: " + err.Error()}, nil
+	}
+	return nil, set
+}
+
+// c4RoutingRuleDiff renders a before/after diff of two routing-rule sets.
+// The rules are public fields only (no secret-named key exists in the
+// schema), so nothing is redacted; each entry carries the changed rule id
+// and its before/after public fields. Entries are ordered by rule id.
+func c4RoutingRuleDiff(base, after *routing.RuleSet) []map[string]any {
+	baseSet := routingRuleMap(base)
+	afterSet := routingRuleMap(after)
+	var ids []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for id := range afterSet {
+		add(id)
+	}
+	for id := range baseSet {
+		add(id)
+	}
+	sort.Strings(ids)
+	out := []map[string]any{}
+	for _, id := range ids {
+		b, bok := baseSet[id]
+		a, aok := afterSet[id]
+		switch {
+		case bok && aok:
+			out = append(out, map[string]any{"id": id, "op": "changed", "before": b, "after": a})
+		case aok:
+			out = append(out, map[string]any{"id": id, "op": "added", "before": map[string]any{}, "after": a})
+		default:
+			out = append(out, map[string]any{"id": id, "op": "removed", "before": b, "after": map[string]any{}})
+		}
+	}
+	return out
+}
+
+// routingRuleMap indexes a rule set by rule id (nil set → empty map).
+func routingRuleMap(rs *routing.RuleSet) map[string]map[string]any {
+	m := map[string]map[string]any{}
+	if rs == nil {
+		return m
+	}
+	for _, r := range rs.Rules {
+		m[r.ID] = map[string]any{
+			"id":       r.ID,
+			"enabled":  r.Enabled,
+			"domain":   r.Match.Domain,
+			"keyword":  r.Match.Keyword,
+			"ip_cidr":  r.Match.IPCIDR,
+			"port_min": r.Match.PortMin,
+			"port_max": r.Match.PortMax,
+			"action":   r.Action,
+			"fallback": r.Fallback,
+			"comment":  r.Comment,
+		}
+	}
+	return m
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +389,15 @@ func (s *Server) c4HandleRoutingValidate(w http.ResponseWriter, r *http.Request,
 		req.Role = role
 	}
 
+	// Routing-rules object (the C1-style, purely-JSON validation of the
+	// dashboard's routing editor). It is validated against the engine's own
+	// parser with NO filesystem I/O (the editor's rules are an in-memory
+	// object, not a file), so a validate call never touches the host and
+	// leaves the filesystem unchanged. The diff is computed locally.
+	ruleErrs, rules := c4ValidateRoutingRules(req.Rules)
+
+	// Forward the (unchanged) env-set plane to the agent; the agent
+	// remains authoritative for its own C4 env concept.
 	res, err := s.c2AgentFor("c4-routing-validate").Call(r.Context(), "c4-routing-validate", c2ReqID(), changeID, changeID, map[string]any{
 		"role": req.Role,
 		"set":  req.Set,
@@ -271,14 +411,52 @@ func (s *Server) c4HandleRoutingValidate(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	data, _ := res.Data.(map[string]any)
-	writeJSON(w, http.StatusOK, map[string]any{
+	// Merge the local routing-rules validation into the agent's env-set
+	// validation: the overall result is valid only when BOTH are.
+	agentErrs := agentStringList(data["errors"])
+	allErrs := append(agentErrs, ruleErrs...)
+	if allErrs == nil {
+		allErrs = []string{}
+	}
+	out := map[string]any{
 		"role":            req.Role,
 		"flagEnabled":     s.c4Flag(c4ConceptRoutingPlane),
-		"valid":           data["valid"],
-		"errors":          data["errors"],
+		"valid":           len(allErrs) == 0,
+		"errors":          allErrs,
 		"restartRequired": true,
 		"diff":            data["diff"],
-	})
+	}
+	if len(req.Rules) > 0 {
+		out["rules"] = rules
+		out["rulesDiff"] = c4RoutingRuleDiff(nil, rules)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// agentStringList normalizes an agent-provided error list (which arrives as
+// []interface{} after JSON re-decoding) to []string; nil when absent.
+func agentStringList(v any) []string {
+	switch l := v.(type) {
+	case nil:
+		return nil
+	case []string:
+		return l
+	case []any:
+		out := make([]string, 0, len(l))
+		for _, e := range l {
+			out = append(out, fmtString(e))
+		}
+		return out
+	}
+	return nil
+}
+
+// fmtString renders one value for display without allocating a JSON body.
+func fmtString(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
 }
 
 // c4HandleRoutingApply forwards the routing apply op, gated by the
@@ -317,6 +495,19 @@ func (s *Server) c4HandleRoutingApply(w http.ResponseWriter, r *http.Request, ch
 			return
 		}
 		req.Role = role
+	}
+
+	// Local routing-rules validation: the editor's in-memory rules object
+	// must pass the engine's own parser before the apply is forwarded. The
+	// rules themselves are NOT forwarded to the agent (its C4 env-set
+	// concept is authoritative over its own plane and uses strict decoding
+	// that would reject an unknown "rules" field); this keeps the apply
+	// fail-closed on a malformed rules object without weakening the agent's
+	// gates.
+	ruleErrs, _ := c4ValidateRoutingRules(req.Rules)
+	if len(ruleErrs) > 0 {
+		writeJSONError(w, http.StatusUnprocessableEntity, "routing rules validation failed: "+joinStrings(ruleErrs))
+		return
 	}
 
 	res, err := s.c2AgentFor("c4-routing-apply").Call(r.Context(), "c4-routing-apply", c2ReqID(), changeID, changeID, map[string]any{
