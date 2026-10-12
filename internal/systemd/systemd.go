@@ -63,6 +63,17 @@ const (
 	ServiceGroup = "split-tunnel"
 )
 
+// XrayKeyGroup is the C5 key-isolation group (design D3, §12 C5). The only
+// live config that embeds a Reality PRIVATE key (xray-germany.json) is
+// converged to 0640 root:XrayKeyGroup, and ONLY the xray unit joins that
+// group (SupplementaryGroups=XrayKeyGroup in its rendered unit). The
+// dashboard unit runs User=ServiceUser Group=ServiceGroup and is NEVER in
+// XrayKeyGroup, so a dashboard process (or any other ServiceGroup process)
+// cannot read the Reality private key from disk. This is the "now" state of
+// D3; the "end state" (tmpfs render at ExecStartPre, no group-readable copy
+// at rest) is a larger control-agent refactor, documented in the C5 note.
+const XrayKeyGroup = "split-tunnel-xray"
+
 // Fixed managed paths (design §4.1 — NOT user inputs; eliminating them as
 // inputs removes a whole injection class). These constants are the
 // canonical production values and the T8 contract.

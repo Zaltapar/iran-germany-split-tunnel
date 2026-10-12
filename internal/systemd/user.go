@@ -4,14 +4,25 @@
 // non-root xray that could not read its own config):
 //
 //	/etc/split-tunnel            0750 root:split-tunnel   (service group enters)
-//	  xray-germany.json (live)   0640 root:split-tunnel   (service group reads)
 //	  Caddyfile (live)           0640 root:split-tunnel   (service group reads)
+//	  xray-germany.json (live)   0640 root:split-tunnel-xray (C5 D3 key isolation)
+//	  xray-consumer.json (live)  0640 root:split-tunnel   (service group reads;
+//	                                                   holds NO private key)
 //	  *.prev / *.tmp (rollback)  0600 root:root           (private keys — root only)
 //	  <role>.env                 0600 root:root           (systemd reads as root
 //	                                                   before Setuid — staging)
 //	/var/log/split-tunnel        0775 root:split-tunnel   (service group writes
 //	                                                   — it creates its own error log)
 //	/var/lib/split-tunnel        0755 split-tunnel:split-tunnel (Caddy ACME)
+//
+// C5 D3 key isolation: the ONLY live config that embeds a Reality private
+// key is xray-germany.json. It is group-converged to the dedicated
+// split-tunnel-xray group (XrayKeyGroup), whose sole member is the
+// xray-germany unit (via its SupplementaryGroups= line). The dashboard
+// unit (User=split-tunnel Group=split-tunnel) is NOT in that group, so a
+// compromised tunneldash process cannot read the key from disk. The state
+// dir stays 0750 root:split-tunnel so the xray unit (which belongs to the
+// split-tunnel group by its User/Group= lines) can still traverse it.
 //
 // T3 (internal/xray) rewrites the live config 0600 root:root on every
 // (re)activation, so the deploy layer (T8) MUST re-run EnsureStateDir after
@@ -69,15 +80,54 @@ func EnsureUser(ctx context.Context, ex SystemdExecutor) error {
 	return nil
 }
 
+// EnsureKeyGroup creates the C5 key-isolation group (XrayKeyGroup,
+// design D3) if absent. Idempotent: an existing group is NEVER mutated.
+// It is the group that owns the live xray config holding the Reality
+// private key (0640 root:split-tunnel-xray). The dashboard's user is NOT a
+// member; only the xray unit joins it via SupplementaryGroups=.
+//
+// Exact groupadd args (asserted by tests):
+//
+//	getent group split-tunnel-xray   (probe)
+//	groupadd --system split-tunnel-xray
+func EnsureKeyGroup(ctx context.Context, ex SystemdExecutor) error {
+	if err := contextCheck(ctx); err != nil {
+		return err
+	}
+	if err := rootCheck(); err != nil {
+		return err
+	}
+	if ex == nil {
+		return fmt.Errorf("%w: executor is nil", ErrSpec)
+	}
+	if _, err := ex.Run(ctx, "getent", "group", XrayKeyGroup); err == nil {
+		return nil // exists — no-op, never mutated
+	}
+	if _, cerr := ex.Run(ctx, "groupadd", "--system", XrayKeyGroup); cerr != nil {
+		return fmt.Errorf("%w: groupadd %s: %v", ErrPreflight, XrayKeyGroup, cerr)
+	}
+	return nil
+}
+
 // liveStateFiles are the state-dir files the service group must be able to
-// READ (converged to 0640 root:split-tunnel). Rollback artifacts (.prev /
+// READ (converged to 0640 root:split-tunnel). They carry no private key:
+// the Iran consumer config embeds only PUBLIC Reality parameters, and the
+// Caddyfile is the origin unit's configuration. Rollback artifacts (.prev /
 // .tmp) are deliberately NOT here — they contain previous private keys and
 // stay 0600 root:root.
-var liveStateFiles = []string{"xray-germany.json", "Caddyfile", "xray-consumer.json"}
+var liveStateFiles = []string{"Caddyfile", "xray-consumer.json"}
 
-// EnsureStateDir converges /etc/split-tunnel to 0750 root:split-tunnel and
-// the live service-readable configs to 0640 root:split-tunnel. Idempotent;
-// safe (and required) to call after every T3 activation.
+// keyStateFiles are the state-dir files that embed a Reality PRIVATE key
+// (converged to 0640 root:XrayKeyGroup per C5 D3). Only the xray unit,
+// which joins XrayKeyGroup via its SupplementaryGroups= line, can read
+// them. The dashboard's ServiceGroup is deliberately NOT a reader.
+var keyStateFiles = []string{"xray-germany.json"}
+
+// EnsureStateDir converges /etc/split-tunnel to 0750 root:split-tunnel,
+// the live service-readable configs to 0640 root:split-tunnel, and the
+// key-bearing xray config to 0640 root:XrayKeyGroup (C5 D3 key
+// isolation). Idempotent; safe (and required) to call after every T3
+// activation.
 //
 // Refusals (fail closed): the path exists as a symlink, or it exists but is
 // not root-owned (we never take over a foreign directory).
@@ -92,7 +142,21 @@ func EnsureStateDir(ctx context.Context) error {
 		return err
 	}
 	// Converge the live configs the service group must read.
-	for _, name := range liveStateFiles {
+	if err := convergeLiveFileGroup(liveStateFiles, ServiceGroup); err != nil {
+		return err
+	}
+	// Converge the key-bearing config to the dedicated key group (C5 D3).
+	if err := convergeLiveFileGroup(keyStateFiles, XrayKeyGroup); err != nil {
+		return err
+	}
+	return fsyncDir(stateDir)
+}
+
+// convergeLiveFileGroup converges each named live state file (when it
+// exists) to 0640 root:<group>. A missing file is a no-op (not installed
+// yet). Symlinks and non-root-owned files are refused (fail closed).
+func convergeLiveFileGroup(names []string, group string) error {
+	for _, name := range names {
 		p := stateDir + "/" + name
 		st, lerr := os.Lstat(p)
 		if lerr != nil {
@@ -110,14 +174,14 @@ func EnsureStateDir(ctx context.Context) error {
 		if !isRootOwned(st) {
 			return fmt.Errorf("%w: %s is not root-owned (refusing)", ErrPreflight, p)
 		}
-		if err := chownRootGroup(p); err != nil {
+		if err := chownRootGroupAs(p, group); err != nil {
 			return fmt.Errorf("%w: chown %s: %v", ErrPreflight, p, err)
 		}
 		if err := os.Chmod(p, 0o640); err != nil {
 			return fmt.Errorf("%w: chmod %s: %v", ErrPreflight, p, err)
 		}
 	}
-	return fsyncDir(stateDir)
+	return nil
 }
 
 // EnsureLogDir converges /var/log/split-tunnel to 0775 root:split-tunnel.
@@ -225,10 +289,13 @@ func ConvergeRootGroup(ctx context.Context, path string, perm os.FileMode) error
 }
 
 // chownRootGroup chowns path to root:split-tunnel.
-func chownRootGroup(path string) error {
-	gid, err := lookupGroupGID(ServiceGroup)
+func chownRootGroup(path string) error { return chownRootGroupAs(path, ServiceGroup) }
+
+// chownRootGroupAs chowns path to root:<group> (used for the C5 key group).
+func chownRootGroupAs(path string, group string) error {
+	gid, err := lookupGroupGID(group)
 	if err != nil {
-		return fmt.Errorf("group %s: %v", ServiceGroup, err)
+		return fmt.Errorf("group %s: %v", group, err)
 	}
 	return os.Chown(path, 0, gid)
 }

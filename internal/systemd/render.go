@@ -221,6 +221,13 @@ func RenderUnit(s Spec) ([]byte, error) {
 		b.WriteString("AmbientCapabilities=CAP_NET_BIND_SERVICE\n")
 		b.WriteString("CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n")
 		b.WriteString("LimitNOFILE=100000\n")
+		// C5 D3 key isolation: the xray unit joins the dedicated key group
+		// (SupplementaryGroups) so it can read the 0640 root:split-tunnel-xray
+		// config that carries the Reality private key. The unit's primary user
+		// and group are still split-tunnel:split-tunnel; this supplementary
+		// membership is the ONLY way it reads the key file. The dashboard
+		// unit never joins this group.
+		b.WriteString("SupplementaryGroups=" + XrayKeyGroup + "\n")
 	default:
 		b.WriteString("LimitNOFILE=65535\n")
 	}
