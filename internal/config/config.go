@@ -288,10 +288,11 @@ const (
 	// DefaultRoutingRulesFile: empty — routing is OFF unless the operator
 	// (or the C4 control plane) sets SPLIT_ROUTING_RULES_FILE.
 	DefaultRoutingRulesFile = ""
-	// DefaultRoutingDefault: the default outbound kind ("direct") used
-	// when SPLIT_ROUTING_DEFAULT is unset AND the rules file has no
-	// default_action.
-	DefaultRoutingDefault = "direct"
+	// DefaultRoutingDefault: empty — SPLIT_ROUTING_DEFAULT defers to the
+	// rules file's default_action (which the rules validator lifts to
+	// "direct" when the file omits it). An explicit env value OVERRIDES
+	// the rules file's default_action; the empty value never overrides.
+	DefaultRoutingDefault = ""
 	// RoutingDefaultAllowed is the valid value set for SPLIT_ROUTING_DEFAULT.
 	// "block" is deliberately NOT allowed: a block default would refuse
 	// every unmatched destination and lock out the tunnel (the same

@@ -18,6 +18,7 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
 )
@@ -174,6 +175,58 @@ func nodePolicyConfig(cfg *config.Config) node.PolicyConfig {
 	return pc
 }
 
+// buildRoutingEngine constructs the GERMANY OUTBOUND ROUTING ENGINE (§22)
+// from the operator's config. It loads and validates the rules file,
+// applies the SPLIT_ROUTING_DEFAULT override (when set) to the rules
+// file's default_action, and wires the "direct" outbound to the node's
+// policy-aware dial (byte-identical to the pre-routing dial).
+//
+// The returned engine's Dial method is the node's TargetDial when routing
+// is ON; when routing is OFF (RoutingRulesFile empty) this function is not
+// called and the node uses its default dial.
+func buildRoutingEngine(cfg *config.Config, logger *log.Logger) (*routing.Engine, error) {
+	rs, err := routing.LoadRulesFile(cfg.RoutingRulesFile)
+	if err != nil {
+		return nil, err
+	}
+	// SPLIT_ROUTING_DEFAULT, when explicitly set by the operator, OVERRIDES
+	// the rules file's default_action. When empty the rules file's value
+	// (lifted to "direct" by Sanitize when omitted) stands.
+	if cfg.RoutingDefault != "" {
+		rs.DefaultAction = cfg.RoutingDefault
+		// Re-validate after the override (the override must still be a
+		// legal default; "block" was already rejected by config.Load).
+		if err := rs.Sanitize(); err != nil {
+			return nil, fmt.Errorf("routing: default_action override %q: %w", cfg.RoutingDefault, err)
+		}
+	}
+
+	// The "direct" outbound is the node's policy-aware dial, built with the
+	// SAME merged flags Config.Sanitize derives, so routing ON keeps the
+	// pre-routing dial behavior byte-identical for direct/warp-fallback.
+	activePolicy := activeTargetAddrPolicy(cfg.TargetOnlyIPv4, cfg.TargetAddrPolicy)
+	var onlyIPv4, preferIPv4 bool
+	switch activePolicy {
+	case "ipv4-only":
+		onlyIPv4 = true
+	case "prefer-ipv4":
+		preferIPv4 = true
+	}
+	directDial := node.DefaultTargetDial(onlyIPv4, preferIPv4)
+
+	var debugSink func(format string, args ...any)
+	if cfg.RoutingDebug {
+		debugSink = logger.Printf
+	}
+
+	return routing.New(routing.Config{
+		Rules:        rs,
+		Direct:       directDial,
+		WARPAddr:     cfg.WarpSocksAddr,
+		DebugLogging: debugSink,
+	})
+}
+
 // secondListenSuffix renders the optional second down-carrier listener suffix
 // for the startup log line (empty when multi-carrier is disabled).
 func secondListenSuffix(cfg *config.Config) string {
@@ -225,6 +278,16 @@ func main() {
 		default:
 			log.Printf("germany-splitter: egress targets use the default dual-stack dial (OS address-family preference)")
 		}
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): operator visibility.
+		// When ON the routing engine owns the egress TargetDial; when OFF
+		// the node's default policy dial is used (byte-identical to the
+		// no-routing build).
+		if vcfg.RoutingRulesFile != "" {
+			log.Printf("germany-splitter: outbound routing = ON (rules file %s; default=%q; WARP=%s; debug=%v)",
+				vcfg.RoutingRulesFile, vcfg.RoutingDefault, vcfg.WarpSocksAddr, vcfg.RoutingDebug)
+		} else {
+			log.Printf("germany-splitter: outbound routing = OFF (node default policy dial)")
+		}
 		return
 	}
 
@@ -237,7 +300,21 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "[germany-splitter] ", log.LstdFlags)
-	n, err := node.NewNode(node.Config{
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): when SPLIT_ROUTING_RULES_FILE
+	// is set, the routing engine owns the egress TargetDial (per-stream
+	// outbound selection: direct / warp / block, fail-closed by default).
+	// When unset, routingEngine is nil and the node's default policy dial
+	// is used — byte-identical to the no-routing build.
+	var routingEngine *routing.Engine
+	if cfg.RoutingRulesFile != "" {
+		routingEngine, err = buildRoutingEngine(cfg, logger)
+		if err != nil {
+			log.Fatalf("germany-splitter: routing engine: %v", err)
+		}
+	}
+
+	nodeCfg := node.Config{
 		Role:  node.RoleGermany,
 		Grace: time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		// Issue #7: bounded bootstrap wait for a temporarily down carrier
@@ -270,7 +347,16 @@ func main() {
 		// entries). Operator-configurable fields override the documented
 		// starting values (node.PolicyConfigDefaults).
 		PolicyCfg: nodePolicyConfig(cfg),
-	}, logger, mux.DeriveSecret(cfg.Secret))
+	}
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): when routing is ON the
+	// engine's Dial replaces the node's default TargetDial (the per-
+	// stream egress outbound selection: direct / warp / block). When
+	// OFF the node's default policy dial is used — byte-identical to
+	// the no-routing build.
+	if routingEngine != nil {
+		nodeCfg.TargetDial = routingEngine.Dial
+	}
+	n, err := node.NewNode(nodeCfg, logger, mux.DeriveSecret(cfg.Secret))
 	if err != nil {
 		log.Fatalf("germany-splitter: node construction: %v", err)
 	}
@@ -288,6 +374,21 @@ func main() {
 		logger.Printf("target dial policy: prefer-IPv4 active — domains dial v4 first, fall back to v6 when no v4 candidate succeeds; AAAA-only domains still succeed")
 	default:
 		logger.Printf("target dial policy: default dual-stack dial (OS address-family preference)")
+	}
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): operator visibility for the
+	// routing status. When ON, the per-stream egress outbound is selected
+	// by the routing engine (direct / warp / block); when OFF the node's
+	// default policy dial is used. The destination is logged ONLY when
+	// SPLIT_ROUTING_DEBUG is on.
+	if routingEngine != nil {
+		logger.Printf("outbound routing: ON (%d rule(s)) | default outbound=%q | WARP=%s | debug=%v",
+			len(routingEngine.Rules().Rules),
+			routingEngine.Rules().DefaultAction,
+			cfg.WarpSocksAddr,
+			cfg.RoutingDebug)
+	} else {
+		logger.Printf("outbound routing: OFF (node default policy dial)")
 	}
 
 	s := &Splitter{

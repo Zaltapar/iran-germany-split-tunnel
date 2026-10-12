@@ -153,8 +153,8 @@ func TestRoutingDefaults(t *testing.T) {
 	if c.RoutingRulesFile != "" {
 		t.Errorf("RoutingRulesFile default = %q, want empty (routing OFF)", c.RoutingRulesFile)
 	}
-	if c.RoutingDefault != "direct" {
-		t.Errorf("RoutingDefault = %q, want %q", c.RoutingDefault, "direct")
+	if c.RoutingDefault != "" {
+		t.Errorf("RoutingDefault = %q, want empty (defer to the rules file's default_action)", c.RoutingDefault)
 	}
 	if c.WarpSocksAddr != "127.0.0.1:40000" {
 		t.Errorf("WarpSocksAddr = %q, want 127.0.0.1:40000", c.WarpSocksAddr)
@@ -180,8 +180,8 @@ func TestLoadRoutingOff(t *testing.T) {
 	if c.RoutingRulesFile != "" {
 		t.Fatalf("RoutingRulesFile = %q, want empty", c.RoutingRulesFile)
 	}
-	if c.RoutingDefault != "direct" {
-		t.Fatalf("RoutingDefault = %q, want direct", c.RoutingDefault)
+	if c.RoutingDefault != "" {
+		t.Fatalf("RoutingDefault = %q, want empty (defer to the rules file's default_action)", c.RoutingDefault)
 	}
 }
 

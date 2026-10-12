@@ -238,6 +238,20 @@ func dialWithBudget(deadline time.Time, addr string) (net.Conn, error) {
 // The two flags are mutually reinforcing but only "prefer" is
 // meaningful when "only" is off; the caller (Config.Sanitize, node.go)
 // enforces the merge precedence.
+// DefaultTargetDial is the exported form of newDefaultTargetDial: it
+// builds the node's policy-aware egress TargetDial for the given
+// address-family flags. The GERMANY outbound routing engine (§22) uses
+// it as its "direct" outbound, so a routing-enabled build's direct path
+// is byte-identical to the dial the node would install when routing is
+// OFF (Config.Sanitize's nil-TargetDial default). Callers pass the SAME
+// merged flags Sanitize derives from Config.TargetOnlyIPv4 /
+// Config.TargetAddrPolicy (onlyIPv4 = TargetOnlyIPv4 || policy==ipv4-only,
+// preferIPv4 = policy==prefer-ipv4).
+func DefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn, error) {
+	return newDefaultTargetDial(onlyIPv4, preferIPv4)
+}
+
+// newDefaultTargetDial builds the node's default egress TargetDial.
 func newDefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn, error) {
 	if onlyIPv4 {
 		// Hard filter: A records only, no v6 fallback. Unchanged from
