@@ -34,6 +34,7 @@
     routing: { title: "Routing", render: renderRouting },
     outbounds: { title: "Outbounds", render: renderOutbounds },
     inbounds: { title: "Inbounds", render: renderInbounds },
+    control: { title: "Control (C4)", render: renderControl },
     network: { title: "Network speed", render: renderNetwork },
     config: { title: "Configuration", render: renderConfig },
     logs: { title: "Logs / Events", render: renderEvents }
@@ -554,6 +555,63 @@
             el("span", { cls: "muted small", text: " — " + (schema.editDisabledReason || "editing lands in the next phase") })
           ]));
         }
+      });
+    });
+  }
+
+  // ---- C4 control plane: routing + multi-carrier (read-only) ---------------------
+  // Driven by the C4 public-field schemas. Both sections are READ-ONLY in this
+  // build: the in-browser editing form is deferred (like C3), so the Edit
+  // affordance is a disabled button whose tooltip names the per-capability
+  // flag that gates the API plane. No CDN, CSP intact. The SOCKS allowlist
+  // value is shown as a fingerprint (the agent redacts it); SNI / policy
+  // values are operator config and shown in full.
+  var C4_CONCEPTS = [
+    { concept: "routing-plane", label: "Routing plane (C4)" },
+    { concept: "multi-carrier-control", label: "Multi-carrier control (C4)" }
+  ];
+  function renderControl(view) {
+    var prompts = C4_CONCEPTS.map(function (c) {
+      return v2("/schema/" + c.concept).then(function (schema) {
+        return { meta: c, schema: schema };
+      });
+    });
+    return Promise.all(prompts).then(function (entries) {
+      clear(view);
+      view.appendChild(el("div", { cls: "notice", text: "Read-only C4 control plane. Routing (target-address policy + SOCKS source allowlist) and multi-carrier (master toggle, second carrier listener/dial + SNI, policy knobs) are shown. Editing is deferred in this build; the Edit button is disabled and its tooltip names the per-capability flag that must be enabled before the API plane is live. SNI and policy values are shown in full; the SOCKS allowlist is shown as a fingerprint." }));
+      entries.forEach(function (entry) {
+        var schema = entry.schema;
+        var concept = entry.meta;
+        var editable = !!schema.editable;
+        var head = el("h3", { text: concept.label + " — " + (schema.status || "read-only") });
+        var card = el("div", { cls: "card" }, [head]);
+        var rows = (schema.fields || []).map(function (f) {
+          return el("tr", null, [
+            el("td", { text: f.name }),
+            el("td", { text: f.type || "—" }),
+            el("td", { text: f.required ? "yes" : "no" }),
+            el("td", { text: (f.pattern || "—") })
+          ]);
+        });
+        card.appendChild(el("div", { cls: "table-wrap" }, [
+          el("table", null, [
+            el("thead", null, [el("tr", null, ["Field", "Type", "Required", "Constraint"].map(function (h) { return el("th", { text: h }); }))]),
+            el("tbody", null, rows)
+          ])
+        ]));
+        // Flag-gated, disabled Edit affordance + tooltip (deferred editing form).
+        var editBtn = el("button", { cls: "btn", text: "Edit", attrs: { disabled: "" } });
+        if (!editable) {
+          editBtn.setAttribute("title", schema.editDisabledReason || "editing lands in the next phase");
+        }
+        var noteText = editable
+          ? " — the API plane is enabled, but the in-browser editing form is deferred to a later phase."
+          : " — " + (schema.editDisabledReason || "editing lands in the next phase");
+        card.appendChild(el("div", { cls: "notice" }, [
+          editBtn,
+          el("span", { cls: "muted small", text: noteText })
+        ]));
+        view.appendChild(card);
       });
     });
   }
