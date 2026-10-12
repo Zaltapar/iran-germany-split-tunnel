@@ -219,6 +219,23 @@ not_contains "installer never echoes the admin token value" \
 not_contains "installer never logs the generated basePath value" \
   "$(printf '%s' "$NOCOMMENTS")" 'dashboard basePath (random'
 
+# --- C5: key-file isolation invariant (design D3, §12 C5) -------------------
+# The Reality key-bearing config (xray-germany.json) is written ONLY by
+# splitterctl (LinuxAdapter.Prepare -> systemd.EnsureKeyGroup ->
+# EnsureStateDir converges it to 0640 root:split-tunnel-xray). The bash
+# installer must NEVER reference or chmod it: doing so could recreate the
+# C5 exposure where the dashboard group could read the private key.
+not_contains "C5: installer never references xray-germany.json (key config delegated to splitterctl)" \
+  "$STATIC_SRC" "xray-germany.json"
+# Repo-level pin: the golden xray unit joins the dedicated key group, so a
+# future renderer regression drops the SupplementaryGroups line and fails.
+contains "C5: xray-germany golden unit joins the key group (SupplementaryGroups=split-tunnel-xray)" \
+  "$(cat "$HERE/internal/systemd/testdata/golden/xray-germany.golden.service")" "SupplementaryGroups=split-tunnel-xray"
+contains "C5: dashboard golden unit does NOT join the key group" \
+  "$(cat "$HERE/internal/systemd/testdata/golden/tunneldash.golden.service")" "Group=split-tunnel"
+not_contains "C5: dashboard golden unit stays out of the key group" \
+  "$(cat "$HERE/internal/systemd/testdata/golden/tunneldash.golden.service")" "split-tunnel-xray"
+
 # No host paths are created by a dry-run.
 check "dry-run creates no source dir (/opt/split-tunnel-src)" test ! -d /opt/split-tunnel-src
 check "dry-run creates no bin dir (/opt/split-tunnel)" test ! -d /opt/split-tunnel
