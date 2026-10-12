@@ -37,6 +37,7 @@ import (
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 )
 
 const (
@@ -145,6 +146,35 @@ const (
 	// SPLIT_TTFB_BASELINE_MS is the Phase 0 baseline p50 TTFB used to
 	// normalize the T score term (design §6.3). 0 = library default (500 ms).
 	EnvTTFBBaselineMs = "SPLIT_TTFB_BASELINE_MS" // both (int ms, default 500, 0..30000)
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22, plans/dashboard-control-
+	// design.md). The rule file is the 3x-ui-style ordered rule set
+	// (domains, CIDRs, port ranges, first-match-wins) that decides the
+	// egress outbound for every NEW stream on the Germany node's
+	// target dial path. OFF by default: an empty (unset) SPLIT_ROUTING_
+	// RULES_FILE means the pre-routing policy dial is used, byte-
+	// identical to the no-routing build. The routing concept is
+	// Germany-only (only the Germany node dials egress targets).
+	EnvRoutingRulesFile = "SPLIT_ROUTING_RULES_FILE" // Germany: JSON rules file path (empty = routing OFF)
+	// SPLIT_ROUTING_DEFAULT is the outbound used when NO rule matches:
+	// "direct" (the default) or "warp". "block" is NOT a valid default
+	// (it would lock out the tunnel for every unmatched destination —
+	// the same reason the rule validator rejects a catch-all block
+	// rule). Overridden from the rules file's default_action when the
+	// env is set; when unset the rules file's default_action stands.
+	EnvRoutingDefault = "SPLIT_ROUTING_DEFAULT" // Germany: enum "direct"|"warp" (default "direct" when routing ON and the rules file has no default_action)
+	// SPLIT_WARP_SOCKS_ADDR is the WARP SOCKS5 endpoint the routing
+	// engine dials for the "warp" outbound (SOCKS5h: DNS resolution
+	// happens inside WARP, not on this host). Required when any rule
+	// or the default routes to warp; empty (unset) is only valid when
+	// no warp routing is configured. Default 127.0.0.1:40000 (the
+	// WARP local forwarder on a typical host) applies when routing is
+	// ON and the env is unset.
+	EnvWarpSocksAddr = "SPLIT_WARP_SOCKS_ADDR" // Germany: host:port of the WARP SOCKS5 endpoint
+	// SPLIT_ROUTING_DEBUG turns on the per-dial debug log line
+	// ("routing: <host>:<port> → <outbound> (rule <id>)"). OFF by
+	// default: at the default level the destination is NEVER logged.
+	EnvRoutingDebug = "SPLIT_ROUTING_DEBUG" // Germany (bool, default false)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -253,6 +283,26 @@ const (
 	MaxPolicyTopK = 8
 	// DefaultPolicyTopK (design §7.1, D13).
 	DefaultPolicyTopK = 2
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22):
+	// DefaultRoutingRulesFile: empty — routing is OFF unless the operator
+	// (or the C4 control plane) sets SPLIT_ROUTING_RULES_FILE.
+	DefaultRoutingRulesFile = ""
+	// DefaultRoutingDefault: the default outbound kind ("direct") used
+	// when SPLIT_ROUTING_DEFAULT is unset AND the rules file has no
+	// default_action.
+	DefaultRoutingDefault = "direct"
+	// RoutingDefaultAllowed is the valid value set for SPLIT_ROUTING_DEFAULT.
+	// "block" is deliberately NOT allowed: a block default would refuse
+	// every unmatched destination and lock out the tunnel (the same
+	// reason a catch-all block rule is rejected by the validator).
+	RoutingDefaultAllowed = "direct|warp"
+	// DefaultWarpSocksAddr: the WARP local SOCKS5 forwarder. The routing
+	// engine only reaches it when a rule or the default routes to warp.
+	DefaultWarpSocksAddr = "127.0.0.1:40000"
+	// DefaultRoutingDebug: OFF — at the default log level the engine
+	// logs no destination at all.
+	DefaultRoutingDebug = false
 	// Opt-in only-IPv4 target-dial policy: false by default preserves the
 	// current net.DialTimeout("tcp") behavior for every host (dual-stack
 	// resolution, OS address-family preference). When true, domain hosts
@@ -387,6 +437,24 @@ type Config struct {
 	ProbeURL         string // SPLIT_PROBE_URL (required when ProbingEnabled; no default)
 	ProbeDailyBudget int64  // SPLIT_PROBE_DAILY_BUDGET (bytes, default 96 MiB, >= 0)
 	TTFBBaselineMs   int    // SPLIT_TTFB_BASELINE_MS (ms, default 0 = library 500 ms)
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22). Germany role only (the
+	// Germany node is the only side that dials egress targets). When
+	// RoutingRulesFile is empty the routing engine is NOT constructed:
+	// the node's default policy dial (post-Sanitize) is used, which is
+	// byte-identical to the no-routing build.
+	RoutingRulesFile string // SPLIT_ROUTING_RULES_FILE (empty = routing OFF)
+	// RoutingDefault is the outbound kind ("direct"|"warp") used when no
+	// rule matches; it OVERRIDES the rules file's default_action when
+	// non-empty. "block" is not a valid value.
+	RoutingDefault string // SPLIT_ROUTING_DEFAULT ("" = use the rules file's default_action; "direct"|"warp")
+	// WarpSocksAddr is the WARP SOCKS5 endpoint for the "warp" outbound.
+	// Required when any rule or the default routes to warp; default
+	// DefaultWarpSocksAddr when routing is ON and the env is unset.
+	WarpSocksAddr string // SPLIT_WARP_SOCKS_ADDR (default 127.0.0.1:40000 when routing ON)
+	// RoutingDebug turns on the per-dial debug log line (destination is
+	// logged ONLY when this is true).
+	RoutingDebug bool // SPLIT_ROUTING_DEBUG (default false)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -427,6 +495,12 @@ func Defaults() *Config {
 		ProbeURL:         DefaultProbeURL,
 		ProbeDailyBudget: DefaultProbeDailyBudget,
 		TTFBBaselineMs:   0,
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): routing OFF by default.
+		// Empty rules file = the pre-routing policy dial (byte-identical).
+		RoutingRulesFile: DefaultRoutingRulesFile,
+		RoutingDefault:   DefaultRoutingDefault,
+		WarpSocksAddr:    DefaultWarpSocksAddr,
+		RoutingDebug:     DefaultRoutingDebug,
 	}
 }
 
@@ -520,6 +594,21 @@ func Load(role string) (*Config, error) {
 	c.ProbeURL = envString(EnvProbeURL, c.ProbeURL)
 	c.ProbeDailyBudget = envInt64(&problems, EnvProbeDailyBudget, DefaultProbeDailyBudget)
 	c.TTFBBaselineMs = envInt(&problems, EnvTTFBBaselineMs, 0, MinTTFBBaselineMs, MaxTTFBBaselineMs) // 0 = library default
+	// GERMANY OUTBOUND ROUTING ENGINE (§22). OFF by default: an empty
+	// rules-file value leaves routing disabled and the node's pre-
+	// routing policy dial in place (byte-identical to no-routing).
+	// SPLIT_ROUTING_DEFAULT, when set, OVERRIDES the rules file's
+	// default_action; when empty the rules file's default_action (or
+	// "direct" if the file omits it) stands.
+	c.RoutingRulesFile = envString(EnvRoutingRulesFile, c.RoutingRulesFile) // "" = routing OFF
+	c.RoutingDefault = envString(EnvRoutingDefault, c.RoutingDefault)       // empty env → keep the default ("direct")
+	// SPLIT_WARP_SOCKS_ADDR: the DefaultWarpSocksAddr (127.0.0.1:40000)
+	// is applied only when routing is ON; when routing is OFF the value
+	// stays at the default (unused, so it is never dialed).
+	c.WarpSocksAddr = envString(EnvWarpSocksAddr, DefaultWarpSocksAddr)
+	// SPLIT_ROUTING_DEBUG: OFF by default — at the default level the
+	// engine logs no destination at all.
+	c.RoutingDebug = envBool(&problems, EnvRoutingDebug, DefaultRoutingDebug)
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -646,6 +735,12 @@ func (c *Config) Validate(role string) error {
 					EnvDownSNI2, c.DownSNI2))
 			}
 		}
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): routing is OFF unless the
+		// operator (or the C4 control plane) sets SPLIT_ROUTING_RULES_FILE.
+		// When OFF, the node's pre-routing policy dial is used, byte-
+		// identical to the no-routing build, so no routing fields are
+		// validated here.
+		checkRouting(&problems, c)
 	case "":
 		return fmt.Errorf("config: no role given")
 	default:
@@ -911,6 +1006,46 @@ func AllowedSourcesMatch(raw, clientIP string) bool {
 		}
 	}
 	return false
+}
+
+// checkRouting validates the GERMANY OUTBOUND ROUTING ENGINE fields (§22).
+// It is a no-op when routing is OFF (empty RoutingRulesFile). When ON, it
+// validates:
+//   - SPLIT_ROUTING_DEFAULT is "" (use the rules file's default_action) or
+//     one of "direct"|"warp" ("block" is rejected — a block default would
+//     lock out the tunnel for every unmatched destination);
+//   - SPLIT_WARP_SOCKS_ADDR is a well-formed host:port when any rule or the
+//     default could route to warp (the same condition the engine's New
+//     checks, surfaced earlier at config-load time);
+//   - the rules file exists and parses (routing.LoadRulesFile); the error
+//     message names the file path, not its contents (no destination or
+//     rule data is echoed — the file is a public artifact, not secret,
+//     but its contents may include operator-chosen domain strings and
+//     should not be echoed into a config error).
+func checkRouting(problems *[]string, c *Config) {
+	if c.RoutingRulesFile == "" {
+		return // routing OFF: byte-identical, nothing to validate.
+	}
+	// Default outbound enum: only "direct"|"warp" (empty = deferral to
+	// the rules file). "block" is deliberately rejected: a block default
+	// would refuse every unmatched destination and lock out the tunnel.
+	if c.RoutingDefault != "" && c.RoutingDefault != "direct" && c.RoutingDefault != "warp" {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected one of %s (a block default would lock out the tunnel)",
+			EnvRoutingDefault, c.RoutingDefault, RoutingDefaultAllowed))
+	}
+	// WARP endpoint must be a valid host:port when routing is ON (it will
+	// be dialed whenever any rule or the default routes to warp).
+	if c.WarpSocksAddr != "" {
+		checkHostPort(problems, EnvWarpSocksAddr, c.WarpSocksAddr, true)
+	}
+	// Rules file must exist and parse (public-field validation happens in
+	// routing.ParseRules; the error text names only the file path and the
+	// first parse problem, never rule contents).
+	if _, err := routing.LoadRulesFile(c.RoutingRulesFile); err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: %v", EnvRoutingRulesFile, c.RoutingRulesFile, err))
+	}
 }
 
 // checkHostPort validates a host:port endpoint. requireHost applies to

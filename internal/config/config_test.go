@@ -42,6 +42,8 @@ func isolatedEnv(t *testing.T) {
 		EnvTargetAddrPolicy,
 		// Multi-carrier down-plane (Phase 2): pin unset (off; empty _2 values).
 		EnvMultiCarrierEnabled, EnvDownListen2, EnvDownCarrierAddr2, EnvDownSNI2,
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): pin unset (routing OFF).
+		EnvRoutingRulesFile, EnvRoutingDefault, EnvWarpSocksAddr, EnvRoutingDebug,
 	} {
 		t.Setenv(name, "")
 	}
