@@ -44,6 +44,13 @@ func (sopcCredentialSource) PeerCredentials(conn net.Conn) (PeerCredentials, boo
 		cred       syscall.Ucred
 		credDone   chan struct{} = make(chan struct{})
 		syscallErr syscall.Errno
+		// optlen is the kernel's in/out socklen_t for getsockopt: the 6th
+		// argument to SYS_GETSOCKOPT must be a POINTER to a socklen_t, not
+		// the value. Passing the value made the kernel dereference a bogus
+		// pointer and return EFAULT, so the peer check always failed
+		// closed (production-only; the Windows test suite never runs the
+		// //go:build linux path).
+		optlen int32 = int32(unsafe.Sizeof(cred))
 	)
 	raw.Control(func(fd uintptr) {
 		buf := (*[unsafe.Sizeof(syscall.Ucred{})]byte)(unsafe.Pointer(&cred))
@@ -51,7 +58,7 @@ func (sopcCredentialSource) PeerCredentials(conn net.Conn) (PeerCredentials, boo
 			syscall.SYS_GETSOCKOPT, fd,
 			syscall.SOL_SOCKET, syscall.SO_PEERCRED,
 			uintptr(unsafe.Pointer(buf)),
-			uintptr(unsafe.Sizeof(cred)), 0,
+			uintptr(unsafe.Pointer(&optlen)), 0,
 		)
 		syscallErr = errno
 		if errno == 0 {

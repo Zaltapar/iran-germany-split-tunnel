@@ -214,7 +214,9 @@ func lookupGID(name string) (int, bool) {
 
 // controlCmd dispatches: freeze, unfreeze, revert-lkg, audit-verify, recover.
 func controlCmd(ctx context.Context, args []string, out io.Writer) error {
-	if len(args) < 2 {
+	// main.go strips the "control" verb before dispatching (args[1:]), so the
+	// subcommand sits at index 0 — matching controlC3Cmd's convention.
+	if len(args) < 1 {
 		return fmt.Errorf("%w: control requires a subcommand (freeze|unfreeze|revert-lkg|audit-verify|recover)", errUsage)
 	}
 	storeRoot := os.Getenv(controlStoreRootEnv)
@@ -222,18 +224,18 @@ func controlCmd(ctx context.Context, args []string, out io.Writer) error {
 		storeRoot = defaultControlStoreRoot
 	}
 
-	switch args[1] {
+	switch args[0] {
 	case "freeze", "unfreeze", "revert-lkg", "recover":
 		if goos != "linux" {
-			return fmt.Errorf("control %s: requires Linux (mutates the store or restarts the splitter)", args[1])
+			return fmt.Errorf("control %s: requires Linux (mutates the store or restarts the splitter)", args[0])
 		}
-		if err := requireRoot("control " + args[1]); err != nil {
+		if err := requireRoot("control " + args[0]); err != nil {
 			return err
 		}
 	case "audit-verify":
 		// read-only; no platform or root gate
 	default:
-		return fmt.Errorf("%w: unknown control subcommand %q", errUsage, args[1])
+		return fmt.Errorf("%w: unknown control subcommand %q", errUsage, args[0])
 	}
 
 	st, err := controlagent.NewRevisionStore(storeRoot)
@@ -243,7 +245,7 @@ func controlCmd(ctx context.Context, args []string, out io.Writer) error {
 	// Build the agent over the already-opened store (nil-safe).
 	agent := controlagent.NewAgentForStore(st, &osControlSeam{}, controlagent.NewConfigBuilder())
 
-	switch args[1] {
+	switch args[0] {
 	case "freeze":
 		if err := st.Freeze(); err != nil {
 			return fmt.Errorf("control freeze: %w", err)
