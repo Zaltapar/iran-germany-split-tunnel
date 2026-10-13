@@ -104,6 +104,44 @@ const (
 	// record filter, equivalent to SPLIT_TARGET_ONLY_IPV4=true). Wired
 	// on BOTH roles for symmetry.
 	EnvTargetAddrPolicy = "SPLIT_TARGET_ADDR_POLICY" // both (enum, default "default")
+	// up-carrier drop-storm fix (Parts 2 & 3): bounded target-dial ceiling +
+	// jittered per-target retry backoff + per-target dial-failure circuit
+	// breaker. Every one is OFF / byte-identical by default; only an operator
+	// who opts in changes the dial-path timing. Wired on BOTH roles for
+	// symmetry (only the Germany role actually dials egress targets, so these
+	// are inert on Iran). See docs/upcarrier-drop-fix.md.
+	//
+	// SPLIT_TARGET_DIAL_BOUND_MS: per-dial ceiling for the default TargetDial
+	// (Part 2). 0 = no extra ceiling (the raw dialer's own 10s bound stands —
+	// byte-identical default). A positive value makes a hung target fail fast.
+	EnvTargetDialBoundMs = "SPLIT_TARGET_DIAL_BOUND_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_ENABLED: master on/off for the per-target dial
+	// circuit breaker (Part 3, default false → byte-identical).
+	EnvTargetBreakerEnabled = "SPLIT_TARGET_BREAKER_ENABLED" // both (bool, default false)
+	// SPLIT_TARGET_BREAKER_WINDOW_MS: rolling window (ms) over which consecutive
+	// failures count toward opening the breaker (Part 3). 0 = library default
+	// (60 s).
+	EnvTargetBreakerWindowMs = "SPLIT_TARGET_BREAKER_WINDOW_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_THRESHOLD: number of failures within the window that
+	// opens the breaker (Part 3). 0 = library default (5).
+	EnvTargetBreakerThreshold = "SPLIT_TARGET_BREAKER_THRESHOLD" // both (int, default 0)
+	// SPLIT_TARGET_BREAKER_COOLDOWN_MS: how long an open breaker stays open
+	// before it admits a single half-open probe (Part 3). 0 = library default
+	// (30 s).
+	EnvTargetBreakerCooldownMs = "SPLIT_TARGET_BREAKER_COOLDOWN_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_MAX_TARGETS: LRU cap on the tracked-target map
+	// (Part 3). 0 = library default (1024). A full map evicts the LRU target,
+	// which thereafter fails closed to the direct dial.
+	EnvTargetBreakerMaxTargets = "SPLIT_TARGET_BREAKER_MAX_TARGETS" // both (int, default 0)
+	// SPLIT_TARGET_DIAL_BACKOFF_ENABLED: master on/off for the jittered per
+	// target retry backoff (Part 2, default false → byte-identical).
+	EnvTargetDialBackoffEnabled = "SPLIT_TARGET_DIAL_BACKOFF_ENABLED" // both (bool, default false)
+	// SPLIT_TARGET_DIAL_BACKOFF_BASE_MS: exponential backoff base (Part 2).
+	// 0 = library default (500 ms).
+	EnvTargetDialBackoffBaseMs = "SPLIT_TARGET_DIAL_BACKOFF_BASE_MS" // both (ms, default 0)
+	// SPLIT_TARGET_DIAL_BACKOFF_MAX_MS: exponential backoff cap (Part 2).
+	// 0 = library default (30 s).
+	EnvTargetDialBackoffMaxMs = "SPLIT_TARGET_DIAL_BACKOFF_MAX_MS" // both (ms, default 0)
 	// Multi-carrier down-plane (Phase 2, plans/multi-carrier-intelligence-design.md):
 	//
 	// SPLIT_MULTI_CARRIER_ENABLED is the master on/off for a SECOND down
@@ -456,6 +494,21 @@ type Config struct {
 	// RoutingDebug turns on the per-dial debug log line (destination is
 	// logged ONLY when this is true).
 	RoutingDebug bool // SPLIT_ROUTING_DEBUG (default false)
+
+	// up-carrier drop-storm fix (Parts 2 & 3). All default to the OFF /
+	// zero-sentinel values so the dial path is byte-identical to the
+	// pre-fix build unless an operator opts in. The 0 sentinel on a numeric
+	// knob means "use the library default" (pkg/node/target_dial_governor.go
+	// lifts it); 0 on SPLIT_TARGET_DIAL_BOUND_MS means "no extra ceiling".
+	TargetDialBoundMs       int  // SPLIT_TARGET_DIAL_BOUND_MS (ms, default 0)
+	TargetBreakerEnabled    bool // SPLIT_TARGET_BREAKER_ENABLED (default false)
+	TargetBreakerWindowMs   int  // SPLIT_TARGET_BREAKER_WINDOW_MS (ms, default 0)
+	TargetBreakerThreshold  int  // SPLIT_TARGET_BREAKER_THRESHOLD (default 0)
+	TargetBreakerCooldownMs int  // SPLIT_TARGET_BREAKER_COOLDOWN_MS (ms, default 0)
+	TargetBreakerMaxTargets int  // SPLIT_TARGET_BREAKER_MAX_TARGETS (default 0)
+	TargetBackoffEnabled    bool // SPLIT_TARGET_DIAL_BACKOFF_ENABLED (default false)
+	TargetBackoffBaseMs     int  // SPLIT_TARGET_DIAL_BACKOFF_BASE_MS (ms, default 0)
+	TargetBackoffMaxMs      int  // SPLIT_TARGET_DIAL_BACKOFF_MAX_MS (ms, default 0)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -610,6 +663,21 @@ func Load(role string) (*Config, error) {
 	// SPLIT_ROUTING_DEBUG: OFF by default — at the default level the
 	// engine logs no destination at all.
 	c.RoutingDebug = envBool(&problems, EnvRoutingDebug, DefaultRoutingDebug)
+	// up-carrier drop-storm fix (Parts 2 & 3): bounded dial, circuit breaker,
+	// jittered backoff. Every knob ships at its OFF / zero-sentinel default so
+	// an unconfigured deployment is byte-identical to the pre-fix build. The
+	// 0 sentinel means "use the library default" (lifted in
+	// pkg/node/target_dial_governor.go); 0 on the bound means "no extra
+	// ceiling" (the raw dialer's 10s stands).
+	c.TargetDialBoundMs = envInt(&problems, EnvTargetDialBoundMs, 0, 0, 120000) // 0 = no ceiling
+	c.TargetBreakerEnabled = envBool(&problems, EnvTargetBreakerEnabled, false)
+	c.TargetBreakerWindowMs = envInt(&problems, EnvTargetBreakerWindowMs, 0, 0, 3600000)     // 0 = library 60s
+	c.TargetBreakerThreshold = envInt(&problems, EnvTargetBreakerThreshold, 0, 0, 100000)    // 0 = library 5
+	c.TargetBreakerCooldownMs = envInt(&problems, EnvTargetBreakerCooldownMs, 0, 0, 3600000) // 0 = library 30s
+	c.TargetBreakerMaxTargets = envInt(&problems, EnvTargetBreakerMaxTargets, 0, 0, 100000)  // 0 = library 1024
+	c.TargetBackoffEnabled = envBool(&problems, EnvTargetDialBackoffEnabled, false)
+	c.TargetBackoffBaseMs = envInt(&problems, EnvTargetDialBackoffBaseMs, 0, 0, 60000) // 0 = library 500ms
+	c.TargetBackoffMaxMs = envInt(&problems, EnvTargetDialBackoffMaxMs, 0, 0, 300000)  // 0 = library 30s
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)

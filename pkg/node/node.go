@@ -157,6 +157,45 @@ type Config struct {
 	// TargetOnlyIPv4 (see target_ipv4.go).
 	TargetDial func(addr string) (net.Conn, error)
 
+	// --- up-carrier drop-storm fix, Parts 2 and 3 (env-gated, all default-off
+	// so the healthy path is byte-identical to the pre-fix build) ---
+	// TargetDialBoundedMs is the per-dial ceiling for the default TargetDial
+	// (Part 2, SPLIT_TARGET_DIAL_BOUND_MS). 0 = no extra ceiling: the raw
+	// dialer's own internal 10s bound stands (byte-identical default). A
+	// positive value bounds a single dial so a hung target cannot stall a
+	// bootstrap stream beyond the operator's ceiling.
+	TargetDialBoundedMs int
+	// TargetBreakerEnabled turns on the per-target dial-failure circuit
+	// breaker (Part 3, SPLIT_TARGET_BREAKER_ENABLED; default false). When on,
+	// repeated dials to the same failing target open a breaker that refuses
+	// further dials during a cooldown, with a half-open probe to readmit.
+	TargetBreakerEnabled bool
+	// TargetBreakerWindowMs (SPLIT_TARGET_BREAKER_WINDOW_MS; default 60s):
+	// the rolling window over which consecutive failures are counted before
+	// the breaker opens.
+	TargetBreakerWindowMs int
+	// TargetBreakerThreshold (SPLIT_TARGET_BREAKER_THRESHOLD; default 5):
+	// the number of failures within the window that opens the breaker.
+	TargetBreakerThreshold int
+	// TargetBreakerCooldownMs (SPLIT_TARGET_BREAKER_COOLDOWN_MS; default 30s):
+	// how long an open breaker stays open before it admits a single
+	// half-open probe.
+	TargetBreakerCooldownMs int
+	// TargetBreakerMaxTargets (SPLIT_TARGET_BREAKER_MAX_TARGETS; default 1024):
+	// the LRU cap on tracked targets; a full map evicts the LRU target, which
+	// thereafter fails closed to the direct dial.
+	TargetBreakerMaxTargets int
+	// TargetBackoffEnabled turns on the jittered per-target retry backoff
+	// (Part 2, SPLIT_TARGET_DIAL_BACKOFF_ENABLED; default false). When on,
+	// repeated retries of the same failing target are spaced (and capped)
+	// so a single unreachable target cannot spin a 1,562x retransmit loop.
+	TargetBackoffEnabled bool
+	// TargetBackoffBaseMs / TargetBackoffMaxMs (SPLIT_TARGET_DIAL_BACKOFF_
+	// BASE_MS default 500, SPLIT_TARGET_DIAL_BACKOFF_MAX_MS default 30000):
+	// the exponential schedule bounds, jittered into [d/2, d].
+	TargetBackoffBaseMs int
+	TargetBackoffMaxMs  int
+
 	// DownCarrierIDs is the STATIC priority order of down-carrier instances
 	// (multi-carrier Phase 2, D1). Empty or a single entry = the
 	// single-carrier shape (byte-identical to the pre-Phase-2 build,
@@ -336,6 +375,14 @@ type Node struct {
 	policy *Policy
 	// policyTickerOnce guards the one-shot start of the policy ticker.
 	policyTickerOnce sync.Once
+
+	// dialGovernor is the up-carrier drop-storm fix (Parts 2 & 3): a bounded
+	// target-dial ceiling + jittered per-target retry backoff + a per-target
+	// dial-failure circuit breaker. It is nil when every feature is disabled
+	// (the default), so bootstrapUpStream dials directly and the healthy path
+	// is byte-identical to the pre-fix build. When non-nil, bootstrapUpStream
+	// runs the target dial through its governed Dial() method.
+	dialGovernor *TargetDialGovernor
 }
 
 // NewNode creates a Node with the given role, config (sanitized),
@@ -386,6 +433,24 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) (*Node, error) {
 		// multi-carrier nodes; single-carrier /metrics stays byte-identical.
 		metrics.SetPolicy(policy)
 	}
+	// up-carrier drop-storm fix (Parts 2 & 3): build the target-dial governor
+	// from the operator knobs. All-default (feature off) yields a nil governor
+	// so bootstrapUpStream dials directly and the healthy path is
+	// byte-identical to the pre-fix build; any opt-in knob constructs one.
+	// Germany-only in effect: the governor is consulted in bootstrapUpStream
+	// (RoleGermany), but it is built for both roles for config symmetry (it
+	// is inert on Iran because Iran never dials egress targets).
+	dialGovernor := BuildTargetDialGovernor(GovernorConfig{
+		BoundedTimeout:   time.Duration(cfg.TargetDialBoundedMs) * time.Millisecond,
+		BreakerEnabled:   cfg.TargetBreakerEnabled,
+		FailureWindow:    time.Duration(cfg.TargetBreakerWindowMs) * time.Millisecond,
+		FailureThreshold: cfg.TargetBreakerThreshold,
+		Cooldown:         time.Duration(cfg.TargetBreakerCooldownMs) * time.Millisecond,
+		MaxTargets:       cfg.TargetBreakerMaxTargets,
+		BackoffEnabled:   cfg.TargetBackoffEnabled,
+		BackoffBase:      time.Duration(cfg.TargetBackoffBaseMs) * time.Millisecond,
+		BackoffMax:       time.Duration(cfg.TargetBackoffMaxMs) * time.Millisecond,
+	})
 	return &Node{
 		cfg:           cfg,
 		store:         session.NewSessionStore(),
@@ -414,8 +479,9 @@ func NewNode(cfg Config, logger *log.Logger, secret []byte) (*Node, error) {
 			Dir:    session.DirUp,
 			Family: FamilyCDNWS,
 		}),
-		downReg: downReg,
-		policy:  policy,
+		downReg:      downReg,
+		policy:       policy,
+		dialGovernor: dialGovernor,
 	}, nil
 }
 
@@ -1154,6 +1220,14 @@ func (n *Node) hasChannelConsumer(dir session.Direction) bool {
 // onUpNewStream handles a new up-carrier stream (RoleGermany only).
 // FrameHeader bootstraps a new session; FrameRebind re-attaches an
 // existing one; anything else is malformed and dropped.
+//
+// up-carrier drop-storm fix (Part 1 + 4): the default branch is the
+// 0x00/0x04 re-fire / malformed first-frame condition. It now uses
+// TERMINATING semantics (Terminate keeps the record registered and marks it
+// terminated, so any peer retransmit on this id is dropped SILENTLY by the
+// dispatcher instead of re-firing OnNewStream and re-logging a fresh drop),
+// and it increments the dedicated re-fire counter (Part 4) that the old
+// quiet-Deregister path was blind to.
 func (n *Node) onUpNewStream(h *carrierHandle, id uint32, firstType uint8, ch chan []byte) {
 	switch firstType {
 	case mux.FrameHeader:
@@ -1161,21 +1235,26 @@ func (n *Node) onUpNewStream(h *carrierHandle, id uint32, firstType uint8, ch ch
 	case mux.FrameRebind:
 		go n.handleRebind(session.DirUp, h, id, ch)
 	default:
+		n.metrics.UpNewStreamRefiredAfterDeregister()
 		n.logger.Printf("up carrier: dropping stream %d opened with frame type 0x%02x", id, firstType)
-		h.carrier.Deregister(id)
+		h.carrier.Terminate(id)
 	}
 }
 
 // onDownNewStream handles a new down-carrier stream (RoleGermany only).
 // Down streams are only ever opened by the peer's FrameRebind — there is
 // no bootstrap on the down direction.
+//
+// As onUpNewStream, the default branch now terminates the stream (Part 1) and
+// increments the down-equivalent re-fire counter (Part 4).
 func (n *Node) onDownNewStream(h *carrierHandle, id uint32, firstType uint8, ch chan []byte) {
 	switch firstType {
 	case mux.FrameRebind:
 		go n.handleRebind(session.DirDown, h, id, ch)
 	default:
+		n.metrics.DownNewStreamRefiredAfterDeregister()
 		n.logger.Printf("down carrier: dropping stream %d opened with frame type 0x%02x", id, firstType)
-		h.carrier.Deregister(id)
+		h.carrier.Terminate(id)
 	}
 }
 
@@ -1851,9 +1930,20 @@ func (n *Node) noteRebind(id CarrierID) {
 // session. (A resumed stream arrives as FrameRebind and goes to
 // handleRebind instead.)
 func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
+	// up-carrier drop-storm fix (Part 1): TERMINATING semantics. The old
+	// path used the quiet Deregister, so any peer FrameData/FrameClose still
+	// in flight on this id re-created the stream (re-firing OnNewStream) and
+	// re-logged a fresh drop — the 0x00/0x04 re-drop storm. Terminate keeps
+	// the record registered and marks it terminated, so the peer's subsequent
+	// frames on this id are dropped SILENTLY by the dispatcher (OnNewStream
+	// does not re-fire). The peer is signalled a best-effort FrameClose (the
+	// same signal this drop writes) so it tears its end down too. A brand-NEW
+	// stream with a NEW id for the same destination is unaffected — that is
+	// the recovery path. The rebind-anchor invariant is preserved: we only
+	// close/terminate a stream whose target failed to dial, so no credit/data
+	// is ever sent on a new carrier before the peer registers it.
 	drop := func(err error) {
-		h.carrier.WriteFrame(id, mux.FrameClose, nil)
-		h.carrier.Deregister(id)
+		h.carrier.Terminate(id)
 		n.metrics.Error()
 		n.logger.Printf("up carrier stream %d: dropped: %v", id, err)
 	}
@@ -1871,8 +1961,29 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 		return
 	}
 
-	targetConn, err := n.cfg.TargetDial(net.JoinHostPort(dest.Addr, strconv.Itoa(int(dest.Port))))
+	// Part 2 + 3: when the target-dial governor is enabled, run the target
+	// dial through it (bounded ceiling, jittered per-target backoff, and
+	// per-target circuit breaker). The governor is nil unless an operator
+	// opted in, in which case bootstrapUpStream dials directly and the
+	// healthy path is byte-identical to the pre-fix build.
+	targetAddr := net.JoinHostPort(dest.Addr, strconv.Itoa(int(dest.Port)))
+	var targetConn net.Conn
+	var err error
+	if n.dialGovernor == nil {
+		targetConn, err = n.cfg.TargetDial(targetAddr)
+	} else {
+		targetConn, err = n.dialGovernor.Dial(n.ctx, n.cfg.TargetDial, targetAddr)
+	}
 	if err != nil {
+		// Cheap Part-4 outcome counters: classify the failure kind BEFORE
+		// the generic dial-failure counter so the breaker-open fast-refusal
+		// and the bounded-timeout are observable on their own.
+		switch {
+		case errors.Is(err, ErrTargetBreakerOpen):
+			n.metrics.TargetDialFailureBreakerOpen()
+		case errors.Is(err, ErrTargetDialTimeout):
+			n.metrics.TargetDialFailureTimeout()
+		}
 		n.metrics.TargetDialFailure()
 		drop(fmt.Errorf("target %s dial failed: %w", dest.Addr, err))
 		return

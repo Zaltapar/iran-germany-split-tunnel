@@ -78,6 +78,11 @@ import (
 // preserved byte-for-byte from the pre-policy net.DialTimeout default.
 const targetDialTimeout = 10 * time.Second
 
+// DefaultTargetDialTimeoutMs is the library-default single-dial budget in
+// milliseconds, expressed the way internal/config expresses millisecond
+// knobs (0 is the "use the library default" sentinel).
+const DefaultTargetDialTimeoutMs = int(targetDialTimeout / time.Millisecond) // 10000
+
 // dialPlain is the historical dual-stack default: a single 10s TCP dial with
 // no address-family steering. It is also the exact behavior when BOTH
 // policy flags are OFF (SPLIT_TARGET_ADDR_POLICY=default and
@@ -85,6 +90,18 @@ const targetDialTimeout = 10 * time.Second
 // pre-change code.
 func dialPlain(addr string) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, targetDialTimeout)
+}
+
+// dialPlainWithTimeout is dialPlain under an operator-bound budget. When
+// budget == targetDialTimeout it is byte-identical to dialPlain; otherwise
+// the single-dial ceiling is the operator's bound so a slow/hung target
+// cannot stall a bootstrap stream for longer than the operator allowed.
+// budget <= 0 falls back to the historical 10s (never unbounded).
+func dialPlainWithTimeout(addr string, budget time.Duration) (net.Conn, error) {
+	if budget <= 0 {
+		budget = targetDialTimeout
+	}
+	return net.DialTimeout("tcp", addr, budget)
 }
 
 // Target address-family policy values (Config.TargetAddrPolicy,
@@ -251,25 +268,39 @@ func DefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn, e
 	return newDefaultTargetDial(onlyIPv4, preferIPv4)
 }
 
-// newDefaultTargetDial builds the node's default egress TargetDial.
+// newDefaultTargetDial builds the node's default egress TargetDial with the
+// historical 10s single-dial budget.
 func newDefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn, error) {
+	return newDefaultTargetDialWithTimeout(onlyIPv4, preferIPv4, targetDialTimeout)
+}
+
+// newDefaultTargetDialWithTimeout builds the node's default egress
+// TargetDial with an operator-bound single-dial budget (the up-carrier drop
+// storm fix, Part 2). The default (10s, targetDialTimeout) is byte-identical
+// to the pre-fix code path, so the healthy-path behavior is preserved.
+// budget <= 0 falls back to the historical 10s so a zero or misconfigured
+// value can never make the dial UNBOUNDED — the safety property the whole
+// part exists to guarantee.
+func newDefaultTargetDialWithTimeout(onlyIPv4, preferIPv4 bool, budget time.Duration) func(addr string) (net.Conn, error) {
+	if budget <= 0 {
+		budget = targetDialTimeout
+	}
 	if onlyIPv4 {
 		// Hard filter: A records only, no v6 fallback. Unchanged from
-		// the pre-SUBTASK-42 behavior.
 		return func(addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
 			// Literal IP (v4 or v6) or a host that does not need
-			// resolution: dial exactly as given. No family filter, no
-			// rewrite — an IPv6 literal stays IPv6.
+			// resolution: dial exactly as given under the operator bound.
+			// No family filter, no rewrite — an IPv6 literal stays IPv6.
 			if net.ParseIP(host) != nil {
-				return dialPlain(addr)
+				return dialPlainWithTimeout(addr, budget)
 			}
-			// Bound the resolution within the same 10s budget so a hung
+			// Bound the resolution within the same budget so a hung
 			// resolver cannot stall the stream.
-			ctx, cancel := context.WithTimeout(context.Background(), targetDialTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
 			defer cancel()
 			ips, err := ipv4Lookup(ctx, host)
 			if err != nil {
@@ -279,12 +310,12 @@ func newDefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn
 				return nil, fmt.Errorf(
 					"target %q has no IPv4 A record; the SPLIT_TARGET_ONLY_IPV4 policy refuses to dial AAAA/IPv6 (set SPLIT_TARGET_ONLY_IPV4=false to allow dual-stack)", host)
 			}
-			// Shared 10s budget across the candidate A records so a slow
+			// Shared budget across the candidate A records so a slow
 			// first record cannot multiply the wait. "tcp4" keeps the
 			// kernel on IPv4 (net.DialTimeout picks the family from the
 			// address; we use the same primitive as the pre-policy code
-			// for byte-identical behavior).
-			deadline := time.Now().Add(targetDialTimeout)
+			// for byte-identical behavior at the default 10s).
+			deadline := time.Now().Add(budget)
 			var lastErr error
 			for _, ip := range ips {
 				remaining := time.Until(deadline)
@@ -305,9 +336,15 @@ func newDefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn
 	}
 
 	if !preferIPv4 {
-		// default policy: the historical dual-stack net.DialTimeout,
-		// byte-identical to the pre-policy code path.
-		return dialPlain
+		// default policy: the historical dual-stack net.DialTimeout.
+		// At the default 10s budget this is byte-identical to dialPlain;
+		// at an operator bound the single-dial ceiling is the bound.
+		if budget == targetDialTimeout {
+			return dialPlain
+		}
+		return func(addr string) (net.Conn, error) {
+			return dialPlainWithTimeout(addr, budget)
+		}
 	}
 
 	// prefer-ipv4: deterministic v4-first with v6 fallback (NOT a race).
@@ -332,15 +369,16 @@ func newDefaultTargetDial(onlyIPv4, preferIPv4 bool) func(addr string) (net.Conn
 		if err != nil {
 			return nil, err
 		}
-		// Literal IP (v4 or v6): dial exactly as given. No resolver, no
-		// rewrite — an IPv6 literal stays IPv6 under prefer-ipv4 too.
+		// Literal IP (v4 or v6): dial exactly as given under the operator
+		// bound. No resolver, no rewrite — an IPv6 literal stays IPv6
+		// under prefer-ipv4 too.
 		if net.ParseIP(host) != nil {
-			return dialPlain(addr)
+			return dialPlainWithTimeout(addr, budget)
 		}
-		// Bound the resolution within the same 10s budget so a hung
+		// Bound the resolution within the same budget so a hung
 		// resolver cannot stall the stream.
-		ctx, cancel := context.WithTimeout(context.Background(), targetDialTimeout)
-		deadline := time.Now().Add(targetDialTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		deadline := time.Now().Add(budget)
 		v4s, v6s, err := dualStackLookup(ctx, host)
 		cancel() // resolver is done; the budget for dials is the same deadline
 		if err != nil {

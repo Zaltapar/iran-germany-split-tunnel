@@ -111,6 +111,17 @@ type Metrics struct {
 	sessionCleanComplete  int64
 	targetDialOK          int64
 	targetDialFail        int64
+	// up-carrier drop-storm fix (Part 4): observability for the re-fire
+	// condition the bootstrap drop() is blind to. The 0x00/0x04 re-fired
+	// OnNewStream drops do NOT increment Error() (that is why the live
+	// "errors" 8,930 did not match the 31,432 log lines). These counters
+	// make the re-fire noise measurable and separable from genuine
+	// bootstrap drops.
+	upNewStreamRefiredAfterDeregister   int64
+	downNewStreamRefiredAfterDeregister int64
+	// Part 4: target-dial failure by outcome (cheap, fixed-cardinality).
+	targetDialFailBreakerOpen int64 // refused fast (breaker open, no dial spent)
+	targetDialFailTimeout     int64 // bounded dial hit its ceiling
 
 	// Shape-A relay accounting and bounded-buffer observations.
 	relayBytesRead       int64
@@ -390,6 +401,41 @@ func (m *Metrics) TargetDialFailure() {
 	m.mu.Unlock()
 }
 
+// UpNewStreamRefiredAfterDeregister counts a re-fired OnNewStream on the up
+// carrier whose stream ID had already been terminated/deregistered: the
+// 0x00/0x04 retransmit-after-drop condition (Part 4). This is the counter
+// that was missing, which is why the live "errors" (Error()) undercounted the
+// re-fire log storm.
+func (m *Metrics) UpNewStreamRefiredAfterDeregister() {
+	m.mu.Lock()
+	m.upNewStreamRefiredAfterDeregister++
+	m.mu.Unlock()
+}
+
+// DownNewStreamRefiredAfterDeregister is the down-carrier equivalent of
+// UpNewStreamRefiredAfterDeregister (Part 4).
+func (m *Metrics) DownNewStreamRefiredAfterDeregister() {
+	m.mu.Lock()
+	m.downNewStreamRefiredAfterDeregister++
+	m.mu.Unlock()
+}
+
+// TargetDialFailureBreakerOpen counts a target dial refused fast because the
+// per-target circuit breaker was open (Part 4): no dial was spent.
+func (m *Metrics) TargetDialFailureBreakerOpen() {
+	m.mu.Lock()
+	m.targetDialFailBreakerOpen++
+	m.mu.Unlock()
+}
+
+// TargetDialFailureTimeout counts a target dial that hit its bounded ceiling
+// (Part 4).
+func (m *Metrics) TargetDialFailureTimeout() {
+	m.mu.Lock()
+	m.targetDialFailTimeout++
+	m.mu.Unlock()
+}
+
 // AddRelayBytesRead adds shape-A socket-read bytes.
 func (m *Metrics) AddRelayBytesRead(n int64) {
 	if n <= 0 {
@@ -548,21 +594,26 @@ type Snapshot struct {
 	SessionsCleanComplete         int64
 	TargetDialSuccess             int64
 	TargetDialFailure             int64
-	RelayBytesRead                int64
-	RelayBytesWritten             int64
-	RelayPendingHighBytes         int64
-	RelayBufferHighBytes          int64
-	RelayWriteFailures            int64
-	RelayBufferFull               int64
-	RelaySocketReadErrors         int64
-	RelaySocketWriteErrors        int64
-	CloseReasonClientEOF          int64
-	CloseReasonTargetEOF          int64
-	CloseReasonCarrier            int64
-	CloseReasonOverflow           int64
-	CloseReasonTimeout            int64
-	CloseReasonDataUndeliverable  int64
-	CloseReasonOther              int64
+	// up-carrier drop-storm fix (Part 4) observability.
+	UpNewStreamRefiredAfterDeregister   int64
+	DownNewStreamRefiredAfterDeregister int64
+	TargetDialFailureBreakerOpen        int64
+	TargetDialFailureTimeout            int64
+	RelayBytesRead                      int64
+	RelayBytesWritten                   int64
+	RelayPendingHighBytes               int64
+	RelayBufferHighBytes                int64
+	RelayWriteFailures                  int64
+	RelayBufferFull                     int64
+	RelaySocketReadErrors               int64
+	RelaySocketWriteErrors              int64
+	CloseReasonClientEOF                int64
+	CloseReasonTargetEOF                int64
+	CloseReasonCarrier                  int64
+	CloseReasonOverflow                 int64
+	CloseReasonTimeout                  int64
+	CloseReasonDataUndeliverable        int64
+	CloseReasonOther                    int64
 
 	// Phase B credit flow-control counters (design §13, Slices 4-5).
 	RelayCreditEmittedTotal       int64
@@ -576,48 +627,52 @@ func (m *Metrics) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
-		ActiveSessions:                m.activeSessions,
-		TotalSessions:                 m.totalSessions,
-		TotalBytesUp:                  m.bytesUp,
-		TotalBytesDown:                m.bytesDown,
-		Errors:                        m.errs,
-		CarrierLossEvents:             m.carrierLossEvents,
-		CarrierReconnects:             m.carrierReconnects,
-		CarrierRebinds:                m.carrierRebinds,
-		CarrierRebindFailures:         m.carrierRebindFailures,
-		RebindUnknownPeer:             m.rebindUnknownPeer,
-		RebindStaleGeneration:         m.rebindStaleGeneration,
-		RebindOtherRefusal:            m.rebindOtherRefusal,
-		SessionsRecovered:             m.sessionsRecovered,
-		SessionsLostAfterCarF:         m.sessionsLostAfterCarF,
-		GraceTimeoutTerminalClose:     m.graceTimeoutTerminalClose,
-		SessionBufferReclaimed:        m.sessionBufferReclaimed,
-		SessionsFirstByteSeen:         m.sessionFirstByteSeen,
-		SessionsClosedBeforeFirstByte: m.sessionClosedPreFirst,
-		SessionsMidTransfer:           m.sessionMidTransfer,
-		SessionsCleanComplete:         m.sessionCleanComplete,
-		TargetDialSuccess:             m.targetDialOK,
-		TargetDialFailure:             m.targetDialFail,
-		RelayBytesRead:                m.relayBytesRead,
-		RelayBytesWritten:             m.relayBytesWritten,
-		RelayPendingHighBytes:         m.relayPendingHigh,
-		RelayBufferHighBytes:          m.relayBufferHighBytes,
-		RelayWriteFailures:            m.relayWriteFail,
-		RelayBufferFull:               m.relayBufferFull,
-		RelaySocketReadErrors:         m.relaySocketReadErr,
-		RelaySocketWriteErrors:        m.relaySocketWriteErr,
-		CloseReasonClientEOF:          m.closeReasonClientEOF,
-		CloseReasonTargetEOF:          m.closeReasonTargetEOF,
-		CloseReasonCarrier:            m.closeReasonCarrier,
-		CloseReasonOverflow:           m.closeReasonOverflow,
-		CloseReasonTimeout:            m.closeReasonTimeout,
-		CloseReasonDataUndeliverable:  m.closeReasonDataUndeliverable,
-		CloseReasonOther:              m.closeReasonOther,
-		RelayCreditEmittedTotal:       m.relayCreditEmittedTotal,
-		RelayCreditDroppedTotal:       m.relayCreditDroppedTotal,
-		RelayCreditGateParkTotal:      m.relayCreditGateParkTotal,
-		RelayCreditSentBytesTotal:     m.relayCreditSentBytesTotal,
-		RelayCreditConsumedBytesTotal: m.relayCreditConsumedBytesTotal,
+		ActiveSessions:                      m.activeSessions,
+		TotalSessions:                       m.totalSessions,
+		TotalBytesUp:                        m.bytesUp,
+		TotalBytesDown:                      m.bytesDown,
+		Errors:                              m.errs,
+		CarrierLossEvents:                   m.carrierLossEvents,
+		CarrierReconnects:                   m.carrierReconnects,
+		CarrierRebinds:                      m.carrierRebinds,
+		CarrierRebindFailures:               m.carrierRebindFailures,
+		RebindUnknownPeer:                   m.rebindUnknownPeer,
+		RebindStaleGeneration:               m.rebindStaleGeneration,
+		RebindOtherRefusal:                  m.rebindOtherRefusal,
+		SessionsRecovered:                   m.sessionsRecovered,
+		SessionsLostAfterCarF:               m.sessionsLostAfterCarF,
+		GraceTimeoutTerminalClose:           m.graceTimeoutTerminalClose,
+		SessionBufferReclaimed:              m.sessionBufferReclaimed,
+		SessionsFirstByteSeen:               m.sessionFirstByteSeen,
+		SessionsClosedBeforeFirstByte:       m.sessionClosedPreFirst,
+		SessionsMidTransfer:                 m.sessionMidTransfer,
+		SessionsCleanComplete:               m.sessionCleanComplete,
+		TargetDialSuccess:                   m.targetDialOK,
+		TargetDialFailure:                   m.targetDialFail,
+		UpNewStreamRefiredAfterDeregister:   m.upNewStreamRefiredAfterDeregister,
+		DownNewStreamRefiredAfterDeregister: m.downNewStreamRefiredAfterDeregister,
+		TargetDialFailureBreakerOpen:        m.targetDialFailBreakerOpen,
+		TargetDialFailureTimeout:            m.targetDialFailTimeout,
+		RelayBytesRead:                      m.relayBytesRead,
+		RelayBytesWritten:                   m.relayBytesWritten,
+		RelayPendingHighBytes:               m.relayPendingHigh,
+		RelayBufferHighBytes:                m.relayBufferHighBytes,
+		RelayWriteFailures:                  m.relayWriteFail,
+		RelayBufferFull:                     m.relayBufferFull,
+		RelaySocketReadErrors:               m.relaySocketReadErr,
+		RelaySocketWriteErrors:              m.relaySocketWriteErr,
+		CloseReasonClientEOF:                m.closeReasonClientEOF,
+		CloseReasonTargetEOF:                m.closeReasonTargetEOF,
+		CloseReasonCarrier:                  m.closeReasonCarrier,
+		CloseReasonOverflow:                 m.closeReasonOverflow,
+		CloseReasonTimeout:                  m.closeReasonTimeout,
+		CloseReasonDataUndeliverable:        m.closeReasonDataUndeliverable,
+		CloseReasonOther:                    m.closeReasonOther,
+		RelayCreditEmittedTotal:             m.relayCreditEmittedTotal,
+		RelayCreditDroppedTotal:             m.relayCreditDroppedTotal,
+		RelayCreditGateParkTotal:            m.relayCreditGateParkTotal,
+		RelayCreditSentBytesTotal:           m.relayCreditSentBytesTotal,
+		RelayCreditConsumedBytesTotal:       m.relayCreditConsumedBytesTotal,
 	}
 }
 
@@ -677,6 +732,11 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "sessions_clean_complete %d\n", s.SessionsCleanComplete)
 	fmt.Fprintf(&b, "target_dial_success %d\n", s.TargetDialSuccess)
 	fmt.Fprintf(&b, "target_dial_failure %d\n", s.TargetDialFailure)
+	// up-carrier drop-storm fix (Part 4): the re-fire + dial-outcome counters.
+	fmt.Fprintf(&b, "up_newstream_refired_after_deregister %d\n", s.UpNewStreamRefiredAfterDeregister)
+	fmt.Fprintf(&b, "down_newstream_refired_after_deregister %d\n", s.DownNewStreamRefiredAfterDeregister)
+	fmt.Fprintf(&b, "target_dial_failure_breaker_open %d\n", s.TargetDialFailureBreakerOpen)
+	fmt.Fprintf(&b, "target_dial_failure_timeout %d\n", s.TargetDialFailureTimeout)
 	fmt.Fprintf(&b, "relay_bytes_read %d\n", s.RelayBytesRead)
 	fmt.Fprintf(&b, "relay_bytes_written %d\n", s.RelayBytesWritten)
 	fmt.Fprintf(&b, "relay_pending_high_bytes %d\n", s.RelayPendingHighBytes)

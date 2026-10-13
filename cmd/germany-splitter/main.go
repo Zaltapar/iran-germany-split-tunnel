@@ -338,6 +338,21 @@ func main() {
 		// SUBTASK 42): "default" (today's behavior) | "prefer-ipv4" (v4-first
 		// with v6 fallback, recommended) | "ipv4-only" (hard filter).
 		TargetAddrPolicy: cfg.TargetAddrPolicy,
+		// up-carrier drop-storm fix (Parts 2 & 3): bounded target-dial ceiling
+		// + per-target dial-failure circuit breaker + jittered retry backoff.
+		// All ship default-OFF (zero/off), so the dial path is byte-identical
+		// to the pre-fix build unless the operator opts in. Germany is the role
+		// that actually dials egress targets; the governor is built for both
+		// roles for config symmetry and is inert on Iran.
+		TargetDialBoundedMs:     cfg.TargetDialBoundMs,
+		TargetBreakerEnabled:    cfg.TargetBreakerEnabled,
+		TargetBreakerWindowMs:   cfg.TargetBreakerWindowMs,
+		TargetBreakerThreshold:  cfg.TargetBreakerThreshold,
+		TargetBreakerCooldownMs: cfg.TargetBreakerCooldownMs,
+		TargetBreakerMaxTargets: cfg.TargetBreakerMaxTargets,
+		TargetBackoffEnabled:    cfg.TargetBackoffEnabled,
+		TargetBackoffBaseMs:     cfg.TargetBackoffBaseMs,
+		TargetBackoffMaxMs:      cfg.TargetBackoffMaxMs,
 		// Phase 2 multi-carrier down plane: when enabled, the node's down
 		// registry holds the static-priority two-instance set (primary first),
 		// which enables the v2 rebind wire and per-carrier pinning.

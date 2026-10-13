@@ -250,6 +250,19 @@ func main() {
 		// SUBTASK 42); inert on the Iran role (no egress target dial) but
 		// kept for config symmetry.
 		TargetAddrPolicy: cfg.TargetAddrPolicy,
+		// up-carrier drop-storm fix (Parts 2 & 3): bounded target-dial ceiling
+		// + per-target dial-failure circuit breaker + jittered retry backoff.
+		// Set on BOTH roles for config symmetry (inert on Iran, which never
+		// dials egress targets). All default OFF → byte-identical healthy path.
+		TargetDialBoundedMs:     cfg.TargetDialBoundMs,
+		TargetBreakerEnabled:    cfg.TargetBreakerEnabled,
+		TargetBreakerWindowMs:   cfg.TargetBreakerWindowMs,
+		TargetBreakerThreshold:  cfg.TargetBreakerThreshold,
+		TargetBreakerCooldownMs: cfg.TargetBreakerCooldownMs,
+		TargetBreakerMaxTargets: cfg.TargetBreakerMaxTargets,
+		TargetBackoffEnabled:    cfg.TargetBackoffEnabled,
+		TargetBackoffBaseMs:     cfg.TargetBackoffBaseMs,
+		TargetBackoffMaxMs:      cfg.TargetBackoffMaxMs,
 		// Phase 2 multi-carrier down plane: when enabled, the node's down
 		// registry holds the static-priority two-instance set (primary first),
 		// enabling per-carrier pinning and the v2 rebind wire.
