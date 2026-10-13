@@ -23,5 +23,20 @@
       "sourceType": "fixture",
       "allowMutations": false
     }
-  ]
+  ],
+  "control": {
+    "applyEnabled": false,
+    "socketPath": "/run/split-tunnel-ctl/control.sock",
+    "c3Flags": {
+      "germanyInboundsApply": false,
+      "iranInboundsApply": false,
+      "keyRotation": false,
+      "blobExport": false
+    },
+    "c4Flags": {
+      "routingApply": false,
+      "multiCarrierApply": false,
+      "coordinatedApply": false
+    }
+  }
 }

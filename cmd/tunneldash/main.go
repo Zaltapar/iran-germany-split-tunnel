@@ -166,6 +166,24 @@ func main() {
 
 	server := dashboard.NewTLSServer(cfg, cache, audit, nil, auth)
 
+	// Wire the C2/C3/C4 control agent from config.
+	//
+	// - No control section (cfg.Control == nil): c2Agent stays nil; all
+	//   forwarding endpoints return 503 agent_unavailable (exactly the
+	//   today behaviour — read-only dashboard is fully functional).
+	// - Control section with socketPath set: attach a ControlClient. The
+	//   client itself does not dial at construction time; each Call dials
+	//   the socket. If the socket is absent at request time the endpoint
+	//   answers 503 agent_unavailable (no crash).
+	// - applyEnabled=true + empty socketPath is already refused by
+	//   cfg.Validate() above (fail closed), so we only reach here with a
+	//   valid config.
+	if cfg.Control != nil && cfg.Control.SocketPath != "" {
+		server.SetControlAgent(dashboard.NewControlClient(cfg.Control.SocketPath))
+		log.Printf("tunneldash: control agent wired to %s (applyEnabled=%v, c3Flags/c4Flags from config)",
+			cfg.Control.SocketPath, cfg.Control.ApplyEnabled)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

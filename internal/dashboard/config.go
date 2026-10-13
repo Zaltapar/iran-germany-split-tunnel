@@ -120,6 +120,14 @@ func (c *DashboardConfig) Validate() error {
 			return fmt.Errorf("dashboard: tls.enabled=true requires tls.basePath to be exactly 32 lowercase hex chars")
 		}
 	}
+	// Control config invariants: when the C2 apply plane is explicitly
+	// enabled, the socket path MUST be set (fail closed, matching the TLS
+	// "complete or refuse" pattern). Without a socketPath the operator
+	// cannot have intended a working agent; starting would give a
+	// misleading 503 on every apply while claiming the plane is "on".
+	if c.Control != nil && c.Control.ApplyEnabled && c.Control.SocketPath == "" {
+		return fmt.Errorf("dashboard: control.applyEnabled=true requires control.socketPath to be set (the agent socket must be named explicitly)")
+	}
 	return nil
 }
 
