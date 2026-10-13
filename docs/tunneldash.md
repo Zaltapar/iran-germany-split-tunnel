@@ -113,6 +113,69 @@ cp config/tunneldash-example.json my-config.json
 | `servers[].sourceType` | string | `"fixture"` | `"fixture"`, `"http"`, or `"ssh"` (ssh fails closed unless a valid `ssh` sub-config is present) |
 | `servers[].ssh` | object | `null` | Strict remote SSH collector config; see [SSH collector](#ssh-collector-sub-config) below |
 | `servers[].allowMutations` | bool | `false` | Per-server mutation gate (only relevant when a real mutator is injected) |
+| `control` | object | `null` | C2/C3/C4 control-plane config; see [Control plane](#control-plane) below |
+
+<a id="control-plane"></a>
+### Control plane
+
+The optional `control` section wires the dashboard's forwarding endpoints
+(`revisions`, `audit`, `validate`, `apply`, `rotate`, `routing-validate/apply`,
+`multicarrier-validate/apply`) to the root-owned control agent's Unix socket.
+When the section is absent, all forwarding endpoints return
+`503 agent_unavailable` while the read-only dashboard (overview, servers,
+metrics, logs, config, health) continues to work normally — this is the
+shipped default state.
+
+```json
+"control": {
+  "applyEnabled": false,
+  "socketPath": "/run/split-tunnel-ctl/control.sock",
+  "c3Flags": {
+    "germanyInboundsApply": false,
+    "iranInboundsApply": false,
+    "keyRotation": false,
+    "blobExport": false
+  },
+  "c4Flags": {
+    "routingApply": false,
+    "multiCarrierApply": false,
+    "coordinatedApply": false
+  }
+}
+```
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `control.applyEnabled` | bool | `false` | Master switch for the C2 apply plane. When `false`, `POST .../apply` returns 503 `control_apply_disabled`; read-only forwarding (revisions/audit) still works when a socket is configured. |
+| `control.socketPath` | string | `""` | Absolute path to the agent's Unix socket. Must be set whenever `applyEnabled` is `true` (fail-closed: the dashboard refuses to start otherwise). The `ControlClient` dials this path per request; if the socket is absent at request time the endpoint answers 503 (no crash). |
+| `control.c3Flags.germanyInboundsApply` | bool | `false` | C3 per-capability flag: enables `POST .../inbounds-apply` for the Germany Reality concept. |
+| `control.c3Flags.iranInboundsApply` | bool | `false` | C3 per-capability flag: enables `POST .../inbounds-apply` for the Iran consumer concept. |
+| `control.c3Flags.keyRotation` | bool | `false` | C3 per-capability flag: enables the rotate-key action. |
+| `control.c3Flags.blobExport` | bool | `false` | C3 per-capability flag: enables blob export/import staging. |
+| `control.c4Flags.routingApply` | bool | `false` | C4 per-capability flag: enables `POST .../routing-apply`. |
+| `control.c4Flags.multiCarrierApply` | bool | `false` | C4 per-capability flag: enables `POST .../multicarrier-apply`. |
+| `control.c4Flags.coordinatedApply` | bool | `false` | C4 per-capability flag: enables the coordinated two-host apply. |
+
+**Fail-closed rules:**
+
+- `applyEnabled=true` + `socketPath=""` → the dashboard **refuses to start**
+  (config validation error, matching the TLS "complete or refuse" pattern in
+  `Validate`). The dashboard does not start with a misconfigured apply plane.
+- `socketPath` set but the socket file does not exist at request time → the
+  forwarding endpoint returns `503 agent_unavailable` with a clear reason;
+  the dashboard does not crash.
+- No `control` section → the agent stays nil; every C2/C3/C4 forwarding
+  endpoint returns `503 agent_unavailable`; the read-only dashboard is fully
+  functional. This is the default and the only state that ships.
+- All per-capability flags default `false`: the corresponding apply endpoint
+  returns 503 with a `<capability>_flag_off` code even when a socket is
+  configured and `applyEnabled` is `true`.
+
+**Deployment step:** to enable the control plane on a live host, add the
+`control` section to `/etc/split-tunnel/dashboard/config.json` (with at
+minimum `socketPath` set to the agent's socket, and the capability flags you
+want to turn on) and run `sudo systemctl restart tunneldash.service`. No
+other restart is required; the flags take effect on the next request.
 
 The config file must **never** contain secrets. Fields for `SPLIT_SECRET`,
 SOCKS credentials, SSH keys, or pairing blobs are not part of the schema
