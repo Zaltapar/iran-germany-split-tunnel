@@ -790,6 +790,50 @@ func (c *CarrierConn) Deregister(id uint32) {
 	c.mu.Unlock()
 }
 
+// Terminate ends the stream id with TERMINATING semantics (the up-carrier
+// drop-storm fix, Part 1). It is the safe replacement for Deregister at any
+// "this destination is dead, do not re-open it" drop path.
+//
+// Unlike Deregister (which is quiet and lets a later peer retransmit on the
+// SAME id re-open it as a brand-new stream and re-fire OnNewStream — the
+// 0x00/0x04 re-drop storm), Terminate keeps the stream record registered and
+// marks it terminated. Every subsequent frame the peer retransmits on that id
+// (FrameData 0x00, FrameClose 0x04, ...) is therefore dropped SILENTLY by the
+// dispatcher (the terminated record is still in c.streams, so the dispatcher
+// never re-creates it and OnNewStream does not re-fire), and the peer is
+// signalled a best-effort FrameClose over the control plane so it tears its
+// end down too. This matches the documented invariant pinned by
+// TestTerminatedStreamStaysRegistered: a dead stream stays registered so it
+// does NOT re-open and re-dial a dead destination.
+//
+// A brand-NEW stream with a NEW id for the same destination is UNaffected:
+// that is the recovery path, and it is the ONLY way the peer re-establishes a
+// session after a termination.
+//
+// Safe to call from the dispatcher goroutine (mirrors the overflow
+// applyPressure path that already calls terminateStream) or from a spawned
+// consumer goroutine. If the id is already unknown (deregistered, or the
+// carrier is closing) it installs a terminated tombstone so any in-flight
+// retransmit on the id is dropped silently; on a closing carrier it is a
+// quiet no-op.
+func (c *CarrierConn) Terminate(id uint32) {
+	c.mu.Lock()
+	s, ok := c.streams[id]
+	if !ok && !c.closing {
+		// Not yet registered: install a terminated tombstone. callback=false
+		// so OnNewStream can NEVER fire for this id (a retransmit that does
+		// arrive is dropped silently by the dispatcher, not re-opened).
+		s = c.createStreamLocked(id, false)
+	}
+	c.mu.Unlock()
+	if s == nil {
+		return // closing carrier, or stream 0
+	}
+	// signalPeer=true: best-effort FrameClose over the control plane so the
+	// remote side tears down its end of the stream too.
+	c.terminateStream(s, true)
+}
+
 // WriteFrame encodes and sends one frame. Serialized via writeCh.
 func (c *CarrierConn) WriteFrame(streamID uint32, typ uint8, payload []byte) error {
 	if len(payload) > MaxPayload {
