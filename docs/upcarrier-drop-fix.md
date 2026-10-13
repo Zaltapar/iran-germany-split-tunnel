@@ -186,3 +186,125 @@ dialers):
 | `pkg/node/metrics.go` | 4 new fixed-cardinality counters + `Snapshot`/`Render` wiring |
 | `internal/config/config.go` | 9 new env vars (all default-off) |
 | `cmd/germany-splitter/main.go`, `cmd/iran-splitter/main.go` | pass the new `Config` fields into the node |
+
+## Deployment verification (steady-state, 2026-10-13)
+
+Facts only. No secrets, keys, or credentials in this section. Deployed as
+`germany-splitter` restart **2026-10-13 19:19:25 UTC**
+(`systemctl show germany-splitter -p ActiveEnterTimestamp`); service up
+~1.4 h at time of writing (no restart since). Deployed fix commits:
+`4ebcdc4` (Part 1 — mux `CarrierConn.Terminate`) and `b7b4f04` (Parts 2/3/4 —
+bounded dial + jittered backoff + per-target breaker + re-fire metrics), on
+`feat/multi-carrier-phase2`, over base `53021db`.
+
+### Breaker env in effect (Germany `/etc/split-tunnel/germany.env`)
+
+| Knob | Value |
+|---|---|
+| `SPLIT_TARGET_BREAKER_ENABLED` | `true` |
+| `SPLIT_TARGET_BREAKER_THRESHOLD` | `5` |
+| `SPLIT_TARGET_BREAKER_WINDOW_MS` | `60000` |
+| `SPLIT_TARGET_BREAKER_COOLDOWN_MS` | `30000` |
+
+`SPLIT_TARGET_DIAL_BOUND_MS` and the `SPLIT_TARGET_DIAL_BACKOFF_*` knobs are
+unset on the host (library defaults apply; the breaker is the active control).
+
+### Drop-line counts (journalctl, `germany-splitter`)
+
+Restart-artifact window (first 5 min, 19:19:25–19:24:25):
+
+| Signal | Count |
+|---|---|
+| `dropping stream` (169 frame 0x00 + 107 frame 0x04) | **276** |
+| `i/o timeout` lines | 19 |
+| `up carrier … bootstrapped session` (reconnect flood) | 1462 |
+| `up carrier … lost / torn down` | 0 |
+
+Confirmed one-time reconnect burst: the artifact window is dominated by 1462
+new-session bootstraps immediately after the restart, of which 276 became drop
+lines (18.5%); **0** of the 276 artifact drops were `i/o timeout` drops.
+
+Clean window (restart + 6 min onward), split into two observed phases:
+
+| Window | `dropping stream` | /min | /hour | `i/o timeout` | `breaker open` |
+|---|---|---|---|---|---|
+| Phase 1: 19:25:25–20:01 (~36 min) | 35 | 1.0 | ~58 | 234 | 892 |
+| Phase 2: 20:02–20:33 (~31 min) | 794 | 25.6 | ~1532 | 357 | 2220 |
+| Clean total (19:25:25–20:43, ~78 min) | 1125 | ~14.4 | ~882 | 591 | 3112+ |
+| Last 5 min snapshot (20:37–20:42) | 13 | 2.6 | — | 23 | 0 |
+
+Phase 1 steady state (1.0/min) is well below the pre-fix ~4.1/min. Phase 2 is a
+**genuine ongoing Cloudflare egress `i/o timeout` storm** (top offenders:
+`190.2.134.28`×100, `77.42.56.66`×44, `167.233.139.145`×44,
+`65.109.240.103`×41, `194.221.250.50`×33) that drove the aggregate clean-window
+rate up to ~25.6/min peak; by the final 5-min snapshot it had subsided to
+~2.6/min. This is a *downstream target-egress* failure storm, not the
+pre-fix per-stream retransmit amplification.
+
+### Metric snapshot (`http://127.0.0.1:9101/metrics`, single consistent shot)
+
+| Counter | Value |
+|---|---|
+| `up_newstream_refired_after_deregister` | 1125 |
+| `down_newstream_refired_after_deregister` | 0 |
+| `target_dial_failure` | 4062 |
+| `target_dial_failure_breaker_open` | 3241 |
+| `target_dial_failure_timeout` | 0 |
+
+Total `dropping stream` lines since restart = **1125** ==
+`up_newstream_refired_after_deregister` = **1125** (exactly 1:1). This is the
+pre-fix comparison the earlier 297-vs-297 data pointed at: the re-fire counter
+tracks drop lines 1:1, i.e. **no retransmit amplification** (the old root cause
+was a 1,562× per-stream re-fire storm; each drop now produces exactly one
+recorded re-fire, not a storm).
+
+### Mechanism evidence
+
+The journal does **not** log a per-event "re-fire" line, so the log alone
+cannot isolate a re-fire. Instead, two independent signals confirm the
+terminating semantics:
+
+1. **No re-bootstrap of dropped IDs.** For dropped clean-window stream IDs
+   (139936, 145218, 143784, 145170, 142990), `journalctl` shows **0**
+   `stream <id>:` bootstrap lines after 19:25:25 — a dropped stream is not
+   re-opened and re-dialed (the old amplification path).
+2. **Re-fire counter == drop lines (1:1).** As above, 1125 == 1125.
+
+Together: a dial-failed bootstrap is terminated and its peer retransmit is
+dropped silently; the breaker fast-refuses (`target_dial_failure_breaker_open`
+= 3241) instead of re-dialing; `target_dial_failure_timeout` = 0 (bounded
+dials are not hitting the ceiling in this window).
+
+### E2E health
+
+- **Tunnel egresses Germany:** via the Iran-side SOCKS5 self-test,
+  `https://www.google.com/generate_204` → **204**; `https://api.ipify.org`
+  → **91.107.152.1** (Germany egress); `https://www.openai.com` → **308**
+  (valid redirect); **20 MiB** download (2×10 MiB) completed in **3.81 s ≈
+  5.25 MB/s**.
+- **Local Windows curl note:** a direct `socks5h://` fetch from the Windows box
+  is rejected by the SOCKS5 server ("User was rejected (1 1)") — a client-side
+  SOCKS5 auth-negotiation failure, **not** a tunnel fault; the identical
+  request from the Iran host succeeds (204).
+- **Six Germany services active:** `control-agent`, `germany-splitter`,
+  `tunneldash`, `warp-svc`, `xray-germany`, `ufw`.
+- **Default route unchanged:** `default via 172.31.1.1 dev eth0`
+  (DHCP internal gateway, src 91.107.152.1) — not via warp; correct for
+  split-tunnel.
+- **warp-svc proxy mode:** listening on `127.0.0.1:40000`; `warp-cli status`
+  → Connected / healthy.
+
+### Verdict
+
+- **Fix mechanism: VERIFIED** — re-fire amplification eliminated (1:1
+  counter, no re-bootstrap of dropped IDs), breaker active (fast-refuse),
+  bounded dials, silent retransmit drops; tunnel healthy (204/egress/openai/
+  20 MiB green, six services active, route + warp proxy unchanged).
+- **Steady-state rate gate: FAIL** — the longer clean window does **not**
+  stay "materially lower than the pre-fix ~4.1/min": Phase 2 is an ongoing
+  Cloudflare egress i/o-timeout storm episode that raised the aggregate
+  clean-window drop rate to ~25.6/min peak (subsiding to ~2.6/min by the final
+  snapshot). The restart-burst explanation for the first-5-min artifact is
+  confirmed, but an ongoing egress storm episode was observed in the clean
+  window and therefore could **not** be fully ruled out. Per the gate, the
+  branch is **not** pushed; this note is committed locally only.
