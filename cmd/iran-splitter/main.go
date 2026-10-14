@@ -507,10 +507,12 @@ func (s *Splitter) secret() []byte { return s.node.Secret() }
 // that tunnels over VLESS+Reality to Germany's :9002)
 // ============================================================
 //
-// Reconnect loop with internal/backoff (2s → 60s, jittered, reset on
-// a successfully authenticated carrier; shutdown-cancellable via the
-// node context). Each authenticated transport is installed on the
-// node, which owns it from there.
+// Reconnect loop with a configurable, bounded internal/backoff schedule
+// (exponential base → cap, plus a cumulative reconnect window so a brief
+// underlay blip cannot amplify into a multi-minute outage; jittered, reset
+// on a successfully authenticated carrier; shutdown-cancellable via the node
+// context). See docs/carrier-reconnect-backoff.md. Each authenticated
+// transport is installed on the node, which owns it from there.
 
 const downDialTimeout = 10 * time.Second
 
@@ -537,7 +539,8 @@ func (s *Splitter) runDownInstance(secondary bool) {
 		id = s.node.DownCarrierIDs()[0]
 		addr = s.config.DownCarrierAddr
 	}
-	b := backoff.New(2*time.Second, 60*time.Second)
+	b := s.reconnectBackoff()
+	windowExhaustedLogged := false
 	for {
 		if s.node.Shutdown() {
 			return
@@ -556,6 +559,11 @@ func (s *Splitter) runDownInstance(secondary bool) {
 		conn, err := net.DialTimeout("tcp", addr, downDialTimeout)
 		if err != nil {
 			s.logger.Printf("Down-carrier %s dial %s: %v", id, addr, err)
+			if b.WindowExhausted() && !windowExhaustedLogged {
+				s.logger.Printf("Down-carrier %s: reconnect window exhausted; probing every %v",
+					id, time.Duration(s.config.ReconnectClampMs)*time.Millisecond)
+				windowExhaustedLogged = true
+			}
 			if s.backoffSleep(b) {
 				return
 			}
@@ -568,6 +576,11 @@ func (s *Splitter) runDownInstance(secondary bool) {
 		if err != nil {
 			s.logger.Printf("Down-carrier %s auth to %s: %v", id, addr, err)
 			conn.Close()
+			if b.WindowExhausted() && !windowExhaustedLogged {
+				s.logger.Printf("Down-carrier %s: reconnect window exhausted; probing every %v",
+					id, time.Duration(s.config.ReconnectClampMs)*time.Millisecond)
+				windowExhaustedLogged = true
+			}
 			if s.backoffSleep(b) {
 				return
 			}
@@ -585,11 +598,26 @@ func (s *Splitter) runDownInstance(secondary bool) {
 		}
 		<-h.Done()
 		b.Reset() // a full authenticated carrier session ran
+		windowExhaustedLogged = false
 		s.logger.Printf("Down-carrier %s torn down (reconnecting)", id)
 		if s.backoffSleep(b) {
 			return
 		}
 	}
+}
+
+// reconnectBackoff builds the carrier reconnect schedule from config:
+// exponential base → max, with the cumulative reconnect window bounded so a
+// transient underlay failure cannot amplify into a multi-minute outage.
+// The old hardcoded 2s→60s schedule summed to 122s across six attempts.
+// See docs/carrier-reconnect-backoff.md.
+func (s *Splitter) reconnectBackoff() *backoff.Backoff {
+	return backoff.NewBounded(
+		time.Duration(s.config.ReconnectBaseMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectMaxMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectWindowMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectClampMs)*time.Millisecond,
+	)
 }
 
 // backoffSleep waits for the next jittered delay; returns true when the

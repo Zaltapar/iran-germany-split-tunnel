@@ -474,30 +474,43 @@ func streamLimits(cfg *config.Config) mux.StreamLimits {
 
 // ============================================================
 // Up-Carrier: WebSocket client → wss://<cdn-domain>/upload
-// Reconnect loop with internal/backoff (2s → 60s, jittered, reset on
-// a successfully authenticated carrier; shutdown-cancellable via the
-// node context).
+// Reconnect loop with a configurable, bounded internal/backoff schedule
+// (exponential base → cap, plus a cumulative reconnect window so a brief
+// underlay blip cannot amplify into a multi-minute outage; jittered, reset
+// on a successfully authenticated carrier; shutdown-cancellable via the node
+// context). See docs/carrier-reconnect-backoff.md.
 // ============================================================
 
-// runUpCarrier is the reconnect loop (exponential backoff, reset on a
-// successfully authenticated carrier, shutdown-cancellable). Each
-// iteration runs one full connection attempt via runUpCarrierOnce.
+// runUpCarrier is the reconnect loop (bounded exponential backoff, reset on
+// a successfully authenticated carrier, shutdown-cancellable). Each
+// iteration runs one full connection attempt via runUpCarrierOnce. The
+// schedule is built from config (the SPLIT_RECONNECT_* knobs) via
+// reconnectBackoff; once the cumulative reconnect window is exhausted the
+// carrier is probed at the per-attempt clamp cadence.
 func (s *Splitter) runUpCarrier() {
-	b := backoff.New(2*time.Second, 60*time.Second)
+	b := s.reconnectBackoff()
+	windowExhaustedLogged := false
 	for {
 		if s.node.Shutdown() {
 			return
 		}
 		err := s.runUpCarrierOnce(s.config.UpWsUrl)
 		if err != nil {
+			if b.WindowExhausted() && !windowExhaustedLogged {
+				s.logger.Printf("Up-carrier reconnect window exhausted; probing every %v",
+					time.Duration(s.config.ReconnectClampMs)*time.Millisecond)
+				windowExhaustedLogged = true
+			}
 			if s.backoffSleep(b) {
 				return
 			}
 			continue
 		}
 		// A full authenticated carrier session ran (or was torn down
-		// after installing): reset the backoff and reconnect.
+		// after installing): reset the backoff and reconnect. A fresh
+		// failure episode restarts the (new) reconnect window.
 		b.Reset()
+		windowExhaustedLogged = false
 		if s.backoffSleep(b) {
 			return
 		}
@@ -539,6 +552,20 @@ func (s *Splitter) runUpCarrierOnce(url string) error {
 	<-h.Done()
 	s.logger.Printf("Up-carrier torn down (reconnecting)")
 	return nil
+}
+
+// reconnectBackoff builds the carrier reconnect schedule from config:
+// exponential base → max, with the cumulative reconnect window bounded so a
+// transient underlay failure cannot amplify into a multi-minute outage.
+// The old hardcoded 2s→60s schedule summed to 122s across six attempts.
+// See docs/carrier-reconnect-backoff.md.
+func (s *Splitter) reconnectBackoff() *backoff.Backoff {
+	return backoff.NewBounded(
+		time.Duration(s.config.ReconnectBaseMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectMaxMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectWindowMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectClampMs)*time.Millisecond,
+	)
 }
 
 // backoffSleep waits for the next jittered delay; returns true when the

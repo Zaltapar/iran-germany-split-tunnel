@@ -73,6 +73,10 @@ const (
 	EnvQueueTotal          = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
 	EnvOverflowMs          = "SPLIT_STREAM_OVERFLOW_MS"         // both
 	EnvCarrierGrace        = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
+	EnvReconnectBaseMs     = "SPLIT_RECONNECT_BASE_MS"          // both (ms) — carrier reconnect backoff base
+	EnvReconnectMaxMs      = "SPLIT_RECONNECT_MAX_MS"           // both (ms) — carrier reconnect backoff cap
+	EnvReconnectWindowMs   = "SPLIT_RECONNECT_WINDOW_MS"        // both (ms) — cumulative reconnect-sleep bound; 0 disables
+	EnvReconnectClampMs    = "SPLIT_RECONNECT_CLAMP_MS"         // both (ms) — per-attempt delay once the window is exhausted; 0 disables
 	EnvBootstrapWait       = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
 	EnvSessionBuf          = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
 	EnvSessionBufTotal     = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
@@ -252,6 +256,27 @@ const (
 	MinCarrierGraceMs = 500    // 0.5 s
 	MaxCarrierGraceMs = 600000 // 10 min
 
+	// Carrier reconnect backoff bounds (internal/backoff.NewBounded). These
+	// keep a misconfiguration from sleeping for hours (or busy-looping at
+	// zero); the window/clamp bounds of 0 mean "disabled" (pure
+	// exponential backoff — the pre-fix behavior).
+	MinReconnectBaseMs   = 100
+	MaxReconnectBaseMs   = 60000
+	MinReconnectMaxMs    = 100
+	MaxReconnectMaxMs    = 300000
+	MinReconnectWindowMs = 0
+	MaxReconnectWindowMs = 600000 // 10 min
+	MinReconnectClampMs  = 0
+	MaxReconnectClampMs  = 300000 // 5 min
+
+	// Carrier reconnect backoff defaults: a bounded reconnect window so a
+	// brief underlay blip cannot amplify into a multi-minute outage.
+	// Defaults: base 1s, cap 10s, window 30s, clamp 2s.
+	DefaultReconnectBaseMs   = 1000
+	DefaultReconnectMaxMs    = 10000
+	DefaultReconnectWindowMs = 30000
+	DefaultReconnectClampMs  = 2000
+
 	// Issue #7 bootstrap wait bounds (ms). 0 = library default
 	// (node.defaultBootstrapWait, 30 s). The maximum keeps a
 	// misconfiguration from holding a new session hostage for hours;
@@ -421,6 +446,13 @@ type Config struct {
 
 	// Phase 5 carrier-loss recovery (pkg/node engine).
 	CarrierGraceMs int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
+	// Carrier reconnect backoff (internal/backoff.NewBounded). Both roles run
+	// a reconnect loop, so these are wired for both; window/clamp of 0
+	// disables the bound (pure exponential backoff — the pre-fix behavior).
+	ReconnectBaseMs   int // SPLIT_RECONNECT_BASE_MS: exponential backoff base (ms)
+	ReconnectMaxMs    int // SPLIT_RECONNECT_MAX_MS: exponential backoff cap (ms)
+	ReconnectWindowMs int // SPLIT_RECONNECT_WINDOW_MS: cumulative sleep bound per episode (ms; 0 disables)
+	ReconnectClampMs  int // SPLIT_RECONNECT_CLAMP_MS: per-attempt delay once the window is exhausted (ms; 0 disables)
 	// Issue #7 bootstrap wait (pkg/node engine).
 	BootstrapWaitMs int // SPLIT_BOOTSTRAP_WAIT_MS: bounded bootstrap wait for a down carrier (ms; 0 = library default)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
@@ -528,6 +560,10 @@ func Defaults() *Config {
 		RelayBufSize:      DefaultRelayBuf,
 		KeepAliveInterval: DefaultKeepAlive,
 		CarrierGraceMs:    5000,
+		ReconnectBaseMs:   DefaultReconnectBaseMs,
+		ReconnectMaxMs:    DefaultReconnectMaxMs,
+		ReconnectWindowMs: DefaultReconnectWindowMs,
+		ReconnectClampMs:  DefaultReconnectClampMs,
 		SessionBufBytes:   DefaultSessionBuf,
 		// Phase B credit flow-control default (Slices 6-7): credits off.
 		CreditsEnabled: DefaultCreditsEnabled,
@@ -611,7 +647,16 @@ func Load(role string) (*Config, error) {
 	c.QueueBytesTotal = envInt(&problems, EnvQueueTotal, 0, 0, MaxQueueBytesTotal)
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
 	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
-	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs) // 0 = library default
+	// Carrier reconnect backoff (internal/backoff.NewBounded). Both roles run
+	// a reconnect loop (Germany: up-carrier WS → CDN; Iran: down-carrier TCP →
+	// local Xray), so all four knobs are wired here, in the role-agnostic part
+	// of Load — not gated on RoleIran/RoleGermany. 0 on the window or clamp
+	// disables the bound (pure exponential backoff — the pre-fix behavior).
+	c.ReconnectBaseMs = envInt(&problems, EnvReconnectBaseMs, DefaultReconnectBaseMs, MinReconnectBaseMs, MaxReconnectBaseMs)
+	c.ReconnectMaxMs = envInt(&problems, EnvReconnectMaxMs, DefaultReconnectMaxMs, MinReconnectMaxMs, MaxReconnectMaxMs)
+	c.ReconnectWindowMs = envInt(&problems, EnvReconnectWindowMs, DefaultReconnectWindowMs, MinReconnectWindowMs, MaxReconnectWindowMs) // 0 = disabled
+	c.ReconnectClampMs = envInt(&problems, EnvReconnectClampMs, DefaultReconnectClampMs, MinReconnectClampMs, MaxReconnectClampMs)      // 0 = disabled
+	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs)                              // 0 = library default
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
