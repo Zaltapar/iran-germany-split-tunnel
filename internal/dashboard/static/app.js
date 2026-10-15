@@ -1627,92 +1627,91 @@
     document.getElementById("pageTitle").textContent = SECTIONS[section].title;
     document.getElementById("sidebar").classList.remove("open");
   }
-var inFlight = false;
+  var inFlight = false;
 
-// Build a clean, redacted diagnostics snapshot for the "Copy Diagnostics"
-// button. Never includes secrets — only public, operator-visible state.
-function buildDiagnostics() {
-  var out = {
-    generatedAt: new Date().toISOString(),
-    section: state.section,
-    lastPollSuccess: state.lastPollSuccess ? new Date(state.lastPollSuccess).toISOString() : null,
-    lastApiError: state.lastApiError,
-    overview: state.lastOverview || null,
-    carriers: state.lastCarriers || null,
-    notes: [
-      "This diagnostics snapshot is read-only. No secrets or credentials are included."
-    ]
-  };
-  return JSON.stringify(out, null, 2);
-}
-
-function copyDiagnostics() {
-  var text = buildDiagnostics();
-  var btn = document.getElementById("copyDiagnosticsBtn");
-  function done(ok) {
-    if (!btn) return;
-    btn.textContent = ok ? "✓ Copied" : "✗ Copy failed";
-    btn.disabled = true;
-    setTimeout(function () { btn.textContent = "⧉ Diagnostics"; btn.disabled = false; }, 2000);
+  // Build a clean, redacted diagnostics snapshot for the "Copy Diagnostics"
+  // button. Never includes secrets — only public, operator-visible state.
+  function buildDiagnostics() {
+    var out = {
+      generatedAt: new Date().toISOString(),
+      section: state.section,
+      lastPollSuccess: state.lastPollSuccess ? new Date(state.lastPollSuccess).toISOString() : null,
+      lastApiError: state.lastApiError,
+      overview: state.lastOverview || null,
+      carriers: state.lastCarriers || null,
+      notes: [
+        "This diagnostics snapshot is read-only. No secrets or credentials are included."
+      ]
+    };
+    return JSON.stringify(out, null, 2);
   }
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
-  } else {
-    // Fallback: select a temporary textarea and use execCommand.
-    var ta = document.createElement("textarea");
-    ta.value = text;
-    ta.style.position = "fixed";
-    ta.style.left = "-9999px";
-    document.body.appendChild(ta);
-    ta.select();
-    try { done(document.execCommand("copy")); } catch (e) { done(false); }
-    document.body.removeChild(ta);
-  }
-}
 
-function refresh() {
-  if (inFlight) return Promise.resolve();
-  inFlight = true;
-  var section = state.section;
-  var view = document.querySelector('.view[data-view="' + section + '"]');
-  var api = document.getElementById("apiStatus");
-  return SECTIONS[section].render(view).then(function () {
-    state.lastApiError = null;
-    api.textContent = "API: ok";
-    api.className = "small";
-    updateGlobalBadges();
-  }).catch(function (err) {
-    var msg = (err && err.message) ? err.message : "unknown error";
-    state.lastApiError = { status: err.status || null, message: msg, at: new Date().toISOString() };
-    clear(view);
-    var status = err && err.status;
-    var node;
-    if (status === 401 || status === 403) {
-      node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
-        el("h3", { text: "Permission denied (" + status + ")" }),
-        el("p", { text: "The dashboard rejected this request. You do not have the required credentials for this host." }),
-        el("p", { cls: "muted small", text: "Action: verify your HTTP Basic credentials or Bearer token, then retry." })
-      ]);
-    } else if (status === 503) {
-      node = el("div", { cls: "notice warn", attrs: { role: "alert" } }, [
-        el("h3", { text: "Control plane unavailable (503)" }),
-        el("p", { text: "The control agent socket is not reachable or the required capability flag is off. Read-only telemetry continues normally." })
-      ]);
-    } else {
-      node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
-        el("h3", { text: "Could not load section" }),
-        el("p", { text: msg + ". Check that the dashboard is reachable." })
-      ]);
+  function copyDiagnostics() {
+    var text = buildDiagnostics();
+    var btn = document.getElementById("copyDiagnosticsBtn");
+    function done(ok) {
+      if (!btn) return;
+      btn.textContent = ok ? "✓ Copied" : "✗ Copy failed";
+      btn.disabled = true;
+      setTimeout(function () { btn.textContent = "⧉ Diagnostics"; btn.disabled = false; }, 2000);
     }
-    view.appendChild(node);
-    api.textContent = "API: " + (status ? status : "error");
-    api.className = "small badge bad";
-    updateGlobalBadges();
-  }).then(function () {
-    inFlight = false;
-    document.getElementById("lastPoll").textContent = "Last update: " + new Date().toLocaleTimeString();
-  });
-}
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    } else {
+      // Fallback: select a temporary textarea and use execCommand.
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      try { done(document.execCommand("copy")); } catch (e) { done(false); }
+      document.body.removeChild(ta);
+    }
+  }
+
+  function refresh() {
+    if (inFlight) return Promise.resolve();
+    inFlight = true;
+    var section = state.section;
+    var view = document.querySelector('.view[data-view="' + section + '"]');
+    var api = document.getElementById("apiStatus");
+    return SECTIONS[section].render(view).then(function () {
+      state.lastApiError = null;
+      api.textContent = "API: ok";
+      api.className = "small";
+      updateGlobalBadges();
+    }).catch(function (err) {
+      var msg = (err && err.message) ? err.message : "unknown error";
+      state.lastApiError = { status: err.status || null, message: msg, at: new Date().toISOString() };
+      clear(view);
+      var status = err && err.status;
+      var node;
+      if (status === 401 || status === 403) {
+        node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
+          el("h3", { text: "Permission denied (" + status + ")" }),
+          el("p", { text: "The dashboard rejected this request. You do not have the required credentials for this host." }),
+          el("p", { cls: "muted small", text: "Action: verify your HTTP Basic credentials or Bearer token, then retry." })
+        ]);
+      } else if (status === 503) {
+        node = el("div", { cls: "notice warn", attrs: { role: "alert" } }, [
+          el("h3", { text: "Control plane unavailable (503)" }),
+          el("p", { text: "The control agent socket is not reachable or the required capability flag is off. Read-only telemetry continues normally." })
+        ]);
+      } else {
+        node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
+          el("h3", { text: "Could not load section" }),
+          el("p", { text: msg + ". Check that the dashboard is reachable." })
+        ]);
+      }
+      view.appendChild(node);
+      api.textContent = "API: " + (status ? status : "error");
+      api.className = "small badge bad";
+      updateGlobalBadges();
+    }).then(function () {
+      inFlight = false;
+      document.getElementById("lastPoll").textContent = "Last update: " + new Date().toLocaleTimeString();
+    });
   }
 
   function startPolling() {
