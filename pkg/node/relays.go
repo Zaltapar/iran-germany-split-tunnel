@@ -180,6 +180,22 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				socketEOF = true
+				// Issue #21: on the StartSessionAndWait path the caller has
+				// not yet adopted the client conn (the 0x00 reply is still
+				// pending), so ClientConnAdopted() is false. If the client
+				// closed the socket BEFORE the remote bootstrap verdict, it
+				// gave up waiting — abort the whole session now so the
+				// bounded WaitBootstrap resolves immediately (via teardown's
+				// backstop) instead of outliving the client. For the
+				// fire-and-forget StartSession path the conn was adopted at
+				// construction (gate pre-closed), so this is a no-op.
+				if dir == session.DirUp && !sess.ClientConnAdopted() {
+					n.metrics.Error()
+					n.logger.Printf("session %s: client disconnected before bootstrap completed; closing",
+						shortID(sess.ID))
+					sess.Close("client disconnected before bootstrap")
+					return
+				}
 			} else {
 				// Non-EOF socket read error.
 				//
@@ -223,6 +239,19 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 						// live journal records RST-vs-teardown-artifact.
 						n.metrics.Error()
 						n.metrics.RelaySocketReadError()
+						// Issue #21: if the bootstrap gate is still open
+						// (StartSessionAndWait path, the client has not yet
+						// been adopted), an RST means the client gave up
+						// before the 0x00 reply was sent — abort the whole
+						// session so WaitBootstrap unblocks immediately
+						// instead of waiting for the target dial to
+						// complete on Germany.
+						if dir == session.DirUp && !sess.ClientConnAdopted() {
+							n.logger.Printf("session %s: client RST before bootstrap completed; closing: %v",
+								shortID(sess.ID), rerr)
+							sess.Close("client disconnected before bootstrap")
+							return
+						}
 						n.logger.Printf("session %s: up read non-EOF error (tolerated as up half-close): %v",
 							shortID(sess.ID), rerr)
 						socketEOF = true // run the uncapped flush + FrameClose path
@@ -499,6 +528,29 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 	att.SetEpochDone(done)
 	go func() {
 		defer close(done)
+		// Issue #21 bootstrap gate: the down→client relay must not write any
+		// target payload byte to clientConn before the caller has written the
+		// SOCKS5 0x00 reply (which happens right before AdoptConn). Await the
+		// gate so the 0x00 reply is guaranteed to precede every payload byte.
+		// For the fire-and-forget StartSession path the gate is pre-closed, so
+		// this returns immediately and the happy path is unchanged. On the
+		// AndWait path the gate closes when the caller adopts the conn, or on
+		// session teardown / ctx cancellation — so a client that disconnects
+		// while the bootstrap is in flight unblocks this promptly and the
+		// relay exits without writing to a dead socket.
+		if dir == session.DirDown && n.cfg.Role == RoleIran {
+			sess.AwaitClientConn(sess.Ctx)
+			// The AndWait path captured `sock` before the caller adopted the
+			// client conn (it was nil at relay start). Now that the gate
+			// has released, re-resolve the socket so the relay writes to the
+			// adopted conn, not the nil captured at start. If the session
+			// tore down before adoption (teardown released the gate),
+			// ClientConn is still nil and we exit below.
+			sock = sess.ClientConn
+			if sock == nil {
+				return
+			}
+		}
 		for {
 			select {
 			case <-sess.Ctx.Done():

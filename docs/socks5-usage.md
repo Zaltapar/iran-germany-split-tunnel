@@ -61,6 +61,42 @@ export HTTPS_PROXY="$ALL_PROXY"
 export HTTP_PROXY="$ALL_PROXY"
 ```
 
+## Connection-Result Semantics (SOCKS5 status bytes)
+
+As of the Phase 2 multi-carrier work, the Iran SOCKS5 handler returns the
+**accurate** RFC 1928 connection-status byte instead of an unconditional
+`0x00`. This is the client-visible behavior change introduced by
+[`FrameBootstrapAck`](../protocol-frames.md) (Issue #21).
+
+- **`0x00` (success) is sent only after the remote target connection
+  actually succeeded** on the Germany node. The handler
+  (`handleSOCKS5Conn`, `StartSessionAndWait`) **blocks** for Germany's
+  bootstrap verdict before replying, and a
+  `clientConnGate` guarantees the `0x00` reply is written to the client
+  *before* any downstream payload byte reaches the client.
+- On failure the client receives the **specific RFC 1928 code** (internal
+  details stay in the log, not on the wire):
+
+  | Byte | Meaning |
+  |---|---|
+  | `0x01` | general failure (unrecognized error, per-target breaker open, WARP unreachable, or no remote verdict before the bounded wait) |
+  | `0x02` | connection not allowed by ruleset (routing block) |
+  | `0x03` | network unreachable |
+  | `0x04` | host unreachable / DNS failure |
+  | `0x05` | connection refused |
+  | `0x06` | target dial timed out |
+
+- A local teardown (carrier loss, client abort, node shutdown) that ends the
+  stream before any remote verdict arrives is reported as a general `0x01`
+  (`BootstrapEndedWithoutResult` is normalized, never `0xFF` reaches the
+  wire).
+
+**Practical effect for client tooling:** a `curl`/browser CONNECT that
+"worked" on the pre-fix build but whose target was refused or blocked now
+surfaces as an accurate non-zero status instead of a false success followed by
+a mid-stream drop. Clients that hard-depended on a bogus `0x00` will now see
+the real outcome — this is the intended, more-correct behavior.
+
 ## Reboot Safety
 
 - `iran-splitter` unit is **enabled** (auto-starts on boot) and `Restart=always`

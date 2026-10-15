@@ -24,7 +24,12 @@
     section: "overview",
     pollTimer: null,
     pollSec: 5,
-    detailHost: null
+    detailHost: null,
+    lastPollSuccess: null,
+    lastStateChange: null,
+    lastApiError: null,
+    lastOverview: null,
+    lastCarriers: null
   };
 
   var SECTIONS = {
@@ -453,33 +458,212 @@
     ]);
   }
 
-  function renderOverview(view) {
-    return Promise.all([v2("/overview"), fetchSeries(["iran.up_mibps", "iran.down_mibps", "germany.up_mibps", "germany.down_mibps"], 120)]).then(function (res) {
-      var d = res[0], series = res[1];
-      clear(view);
-      var c = d.counts || {};
-      view.appendChild(metaNotice(d.meta));
-      view.appendChild(el("div", { cls: "grid" }, [
-        statCard("Hosts", c.hosts, (c.hostsStale || 0) + " stale · " + (c.hostsUnreachable || 0) + " unreachable"),
-        statCard("Collectors missing", c.hostsCollectorMissing || 0, "hosts without a metrics source"),
-        statCard("Carriers", c.carriers, (c.carriersEligible || 0) + " eligible"),
-        statCard("Outbounds", c.outbounds, (c.outboundsEnabled || 0) + " enabled (config)"),
-        statCard("Routing rules", c.routingRules, "mode: " + (d.routingMode || "—"))
-      ]));
-      var up = seriesPoints(series, "iran.up_mibps");
-      var down = seriesPoints(series, "iran.down_mibps");
-      view.appendChild(el("div", { cls: "grid-2" }, [
-        el("div", { cls: "card" }, [
-          el("h3", { text: "Throughput (MiB/s) — iran host" }),
-          lineChart({ series: [{ name: "upload", color: PALETTE[0], points: up }, { name: "download", color: PALETTE[1], points: down }], unit: "MiB/s", area: true, empty: "Throughput history appears after two collections with byte counters." })
-        ]),
-        el("div", { cls: "card" }, [
-          el("h3", { text: "Hosts" }),
-          hostTable(d.hosts || [], true)
-        ])
-      ]));
-      (d.notes || []).forEach(function (n) { view.appendChild(el("div", { cls: "notice", text: n })); });
+  // ---- tunnel state helpers ------------------------------------------------
+
+  // Classify the overall tunnel state. The "up" host is the one whose
+  // sourceType is not missing/unreachable and that carries a carrier. The
+  // result drives both the global badge and the overview card.
+  function tunnelState(d, carriers) {
+    var hosts = d.hosts || [];
+    var c = d.counts || {};
+    var unreachable = (c.hostsUnreachable || 0) > 0;
+    var stale = (c.hostsStale || 0) > 0;
+    var anyCarrier = (c.carriers || 0) > 0;
+    var anyEligible = (c.carriersEligible || 0) > 0;
+    var carriersHalfOpen = false, carriersExcluded = false;
+    carriers.forEach(function (k) {
+      if (k.state === "half_open") carriersHalfOpen = true;
+      if (k.state === "excluded" || k.state === "unreachable") carriersExcluded = true;
     });
+    var activeDown = 0, downStates = [];
+    hosts.forEach(function (h) {
+      if (h.role === "iran") {
+        if (h.status === "fresh" || h.status === "active") activeDown++;
+      } else {
+        downStates.push(h);
+      }
+    });
+    var downBad = downStates.some(function (h) { return h.status === "unreachable"; });
+    var downStale = downStates.some(function (h) { return h.status === "stale"; });
+    if (unreachable || downBad) return "unavailable";
+    if (stale || downStale || carriersHalfOpen || (anyCarrier && !anyEligible)) return "degraded";
+    if (carriersExcluded) return "recovering";
+    return "healthy";
+  }
+
+  function stateIcon(s) {
+    if (s === "healthy") return "●";
+    if (s === "degraded") return "◐";
+    if (s === "recovering") return "◔";
+    return "○";
+  }
+  function stateTone2(s) {
+    if (s === "healthy") return "ok";
+    if (s === "degraded") return "warn";
+    if (s === "recovering") return "warn";
+    return "bad";
+  }
+
+  function updateGlobalBadges() {
+    var container = document.getElementById("globalBadges");
+    if (!container) return;
+    clear(container);
+    var ov = state.lastOverview;
+    var carr = state.lastCarriers || [];
+    if (!ov) {
+      container.appendChild(badge("loading…", ""));
+      return;
+    }
+    var s = tunnelState(ov, carr);
+    var stale = (ov.counts.hostsStale || 0) > 0 ||
+                (ov.counts.hostsUnreachable || 0) > 0;
+    container.appendChild(badge(stateIcon(s) + " " + s, stateTone2(s)));
+    if (stale) {
+      container.appendChild(badge("⚠ stale telemetry", "warn"));
+    }
+    var age = state.lastPollSuccess
+      ? Math.round((Date.now() - state.lastPollSuccess) / 1000)
+      : null;
+    if (age != null) {
+      container.appendChild(el("span", { cls: "small muted", text: "last poll " + fmtAge(age) + " ago" }));
+    }
+  }
+
+  function carrierDetailCard(carrier) {
+    var c = carrier;
+    var stateBadge = badge((c.state || "unknown").replace(/_/g, " "), stateTone(c.state));
+    var eligibleCell;
+    if (c.eligible == null) {
+      eligibleCell = el("div", null, [badge("unmeasured", "")]);
+    } else if (c.eligible) {
+      eligibleCell = el("div", null, [badge("eligible / active", "ok")]);
+    } else {
+      eligibleCell = el("div", null, [badge("gated: " + (c.gateReason || "unknown"), "bad")]);
+    }
+    var creditCell;
+    if (c.creditWindowOpen == null) {
+      creditCell = el("div", { cls: "num", text: "unmeasured" });
+    } else {
+      creditCell = el("div", { cls: "num", text: c.creditWindowOpen ? "open" : "closed" });
+    }
+    var rows = [
+      ["State", el("div", null, [stateBadge])],
+      ["Last transition", el("div", { cls: "small muted", text: "not exported (N/A)" })],
+      ["Score (0–1)", c.score == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: fmtNum(c.score, 3) })],
+      ["Goodput", c.goodputMiBps == null
+        ? el("div", { cls: "num", text: "unmeasured" })
+        : el("div", { cls: "num", text: fmtNum(c.goodputMiBps, 2) + " MiB/s" })],
+      ["Success ratio", c.successRatio == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: fmtNum(c.successRatio, 3) })],
+      ["Stall rate / 100 MiB", c.stallRatePer100MiB == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: fmtNum(c.stallRatePer100MiB, 2) })],
+      ["Eligibility", eligibleCell],
+      ["Cooldown remaining", c.cooldownRemainingSec == null ? el("div", { cls: "num", text: "N/A" }) : el("div", { cls: "num", text: c.cooldownRemainingSec + " s" })],
+      ["Probe bytes today", c.probeBytesToday == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: fmtNum(c.probeBytesToday / 1048576, 1) + " MiB" })],
+      ["Loss events", c.lossEvents == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: String(c.lossEvents) })],
+      ["Reconnects", c.reconnects == null ? el("div", { cls: "num", text: "unmeasured" }) : el("div", { cls: "num", text: String(c.reconnects) })],
+      ["Gate reason", c.gateReason ? el("div", { text: c.gateReason }) : el("div", { cls: "muted small", text: "none" })],
+      ["TTFB p50 (ms)", el("div", { cls: "num", text: "unmeasured (not collected)" })],
+      ["RTT (diagnostic)", el("div", { cls: "num", text: "unmeasured (diagnostic only)" })],
+      ["Queue usage", el("div", { cls: "num", text: "unmeasured" })],
+      ["Credit window", creditCell]
+    ];
+    var tableRows = rows.map(function (r) {
+      return el("tr", null, [el("th", { text: r[0], attrs: { scope: "row" } }), el("td", null, [r[1]])]);
+    });
+    var unavailable = c.unavailable || [];
+    var unavNote = unavailable.length
+      ? el("div", { cls: "notice", text: "Not collected in this phase: " + unavailable.join(", ") })
+      : null;
+    var guidance;
+    if (c.eligible === true) {
+      guidance = el("div", { cls: "notice", text: "Carrier is eligible and can be selected for new flows. No operator action required." });
+    } else if (c.eligible === false) {
+      guidance = el("div", { cls: "notice warn", text: "Carrier is gated (" + (c.gateReason || "unknown") + "). Check carrier connectivity and probe results. Operator action: verify the carrier link and policy configuration." });
+    } else {
+      guidance = el("div", { cls: "notice", text: "Carrier eligibility is unmeasured. No policy decision available yet." });
+    }
+    return el("div", { cls: "card carrier-card" }, [
+      el("h3", { text: c.serverId + " / " + c.carrier }),
+      el("table", { cls: "carrier-detail-table" }, [el("tbody", null, tableRows)]),
+      unavNote,
+      guidance
+    ]);
+  }
+
+  function renderOverview(view) {
+    return Promise.all([v2("/overview"), v2("/carriers"), fetchSeries(["iran.up_mibps", "iran.down_mibps", "germany.up_mibps", "germany.down_mibps"], 120)])
+      .then(function (res) {
+        var d = res[0], carr = res[1], series = res[2];
+        state.lastOverview = d;
+        state.lastCarriers = (carr && carr.carriers) || [];
+        state.lastPollSuccess = Date.now();
+        clear(view);
+        var c = d.counts || {};
+        var ts = tunnelState(d, state.lastCarriers);
+
+        // Overall state banner
+        view.appendChild(el("div", { cls: "overview-state " + ts }, [
+          el("div", { cls: "overview-state-label" }, [
+            el("span", { text: stateIcon(ts) + " ", cls: "state-icon" }),
+            el("span", { text: ts, cls: "state-word" })
+          ]),
+          el("div", { cls: "stat-sub", text: "Up-carrier: " + (d.hosts || []).filter(function (h) { return h.role === "iran"; }).length + " host(s) · " + ts + " telemetry" }),
+          d.meta ? el("div", { cls: "stat-sub", text: "refresh every " + d.meta.refreshSec + " s · generated " + fmtTime(d.meta.generatedAt) }) : null
+        ]));
+
+        view.appendChild(metaNotice(d.meta));
+
+        // Down-carrier summary cards
+        var downHosts = (d.hosts || []).filter(function (h) { return h.role !== "iran"; });
+        if (downHosts.length) {
+          view.appendChild(el("h3", { cls: "section-subhead", text: "Down-carriers" }));
+          var cards = downHosts.map(function (h) {
+            return el("div", { cls: "card carrier-summary-card " + stateTone(h.status) }, [
+              el("h3", { text: h.name || h.id }),
+              hostBadges(h),
+              el("div", { cls: "stat-sub", text: "active sessions: " + (h.activeSessions == null ? "—" : h.activeSessions) }),
+              el("div", { cls: "stat-sub", text: "losses: " + (h.carrierLossEvents == null ? "—" : h.carrierLossEvents) }),
+              el("div", { cls: "stat-sub", text: "collected " + (h.collectedAt ? fmtTime(h.collectedAt) : "never") + " · age " + fmtAge(h.ageSec) })
+            ]);
+          });
+          view.appendChild(el("div", { cls: "grid" }, cards));
+        }
+
+        // KPI cards
+        view.appendChild(el("h3", { cls: "section-subhead", text: "Key indicators" }));
+        view.appendChild(el("div", { cls: "grid" }, [
+          statCard("Hosts", c.hosts, (c.hostsStale || 0) + " stale · " + (c.hostsUnreachable || 0) + " unreachable"),
+          statCard("Collectors missing", c.hostsCollectorMissing || 0, "hosts without a metrics source"),
+          statCard("Carriers", c.carriers, (c.carriersEligible || 0) + " eligible"),
+          statCard("Outbounds", c.outbounds, (c.outboundsEnabled || 0) + " enabled (config)"),
+          statCard("Routing rules", c.routingRules, "mode: " + (d.routingMode || "—")),
+          statCard("Active sessions", (d.hosts || []).reduce(function (a, h) { return a + (h.activeSessions || 0); }, 0), "across all hosts"),
+          statCard("Carrier losses", (d.hosts || []).reduce(function (a, h) { return a + (h.carrierLossEvents || 0); }, 0), "cumulative"),
+          statCard("Buffer pressure", "unmeasured", "queue/buffer metrics not collected in this phase")
+        ]));
+
+        var up = seriesPoints(series, "iran.up_mibps");
+        var down = seriesPoints(series, "iran.down_mibps");
+        view.appendChild(el("div", { cls: "grid-2" }, [
+          el("div", { cls: "card" }, [
+            el("h3", { text: "Throughput (MiB/s) — iran host" }),
+            lineChart({ series: [{ name: "upload", color: PALETTE[0], points: up }, { name: "download", color: PALETTE[1], points: down }], unit: "MiB/s", area: true, empty: "Throughput history appears after two collections with byte counters." })
+          ]),
+          el("div", { cls: "card" }, [
+            el("h3", { text: "Hosts" }),
+            hostTable(d.hosts || [], true)
+          ])
+        ]));
+
+        // Carrier detail cards
+        if (state.lastCarriers.length) {
+          view.appendChild(el("h3", { cls: "section-subhead", text: "Carrier details" }));
+          var carrCards = state.lastCarriers.map(carrierDetailCard);
+          view.appendChild(el("div", { cls: "grid-2" }, carrCards));
+        }
+
+        (d.notes || []).forEach(function (n) { view.appendChild(el("div", { cls: "notice", text: n })); });
+      })
+      .then(updateGlobalBadges, updateGlobalBadges);
   }
 
   function hostTable(hosts, compact) {
@@ -546,6 +730,7 @@
   function renderCarriers(view) {
     return v2("/carriers").then(function (d) {
       clear(view);
+      state.lastCarriers = d.carriers || [];
       view.appendChild(metaNotice(d.meta));
       var carriers = d.carriers || [];
       if (!carriers.length) {
@@ -553,18 +738,22 @@
         return;
       }
       var rows = carriers.map(function (c) {
+        var eligibleCell;
+        if (c.eligible == null) eligibleCell = el("div", null, [badge("unmeasured", "")]);
+        else if (c.eligible) eligibleCell = el("div", null, [badge("eligible", "ok")]);
+        else eligibleCell = el("div", null, [badge("gated: " + (c.gateReason || "unknown"), "bad")]);
         return el("tr", null, [
           el("td", { text: c.serverId + " / " + c.carrier }),
-          el("td", null, [badge(c.state || "unknown", stateTone(c.state))]),
-          valueCell(c.score, function (v) { return fmtNum(v, 3); }),
-          valueCell(c.goodputMiBps, function (v) { return fmtNum(v, 2); }),
-          valueCell(c.successRatio, function (v) { return fmtNum(v, 3); }),
-          valueCell(c.stallRatePer100MiB, function (v) { return fmtNum(v, 2); }),
-          el("td", null, [c.eligible == null ? badge("—", "") : (c.eligible ? badge("eligible", "ok") : badge(c.gateReason || "excluded", "bad"))]),
-          valueCell(c.cooldownRemainingSec, function (v) { return v + " s"; }),
-          valueCell(c.probeBytesToday, function (v) { return fmtNum(v / 1048576, 1) + " MiB"; }),
-          valueCell(c.lossEvents),
-          valueCell(c.reconnects)
+          el("td", null, [badge((c.state || "unknown").replace(/_/g, " "), stateTone(c.state))]),
+          c.score == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.score, function (v) { return fmtNum(v, 3); }),
+          c.goodputMiBps == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.goodputMiBps, function (v) { return fmtNum(v, 2) + " MiB/s"; }),
+          c.successRatio == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.successRatio, function (v) { return fmtNum(v, 3); }),
+          c.stallRatePer100MiB == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.stallRatePer100MiB, function (v) { return fmtNum(v, 2); }),
+          el("td", null, [eligibleCell]),
+          c.cooldownRemainingSec == null ? el("td", { cls: "num", text: "N/A" }) : valueCell(c.cooldownRemainingSec, function (v) { return v + " s"; }),
+          c.probeBytesToday == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.probeBytesToday, function (v) { return fmtNum(v / 1048576, 1) + " MiB"; }),
+          c.lossEvents == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.lossEvents),
+          c.reconnects == null ? el("td", { cls: "num", text: "unmeasured" }) : valueCell(c.reconnects)
         ]);
       });
       view.appendChild(el("div", { cls: "table-wrap" }, [
@@ -573,6 +762,11 @@
           el("tbody", null, rows)
         ])
       ]));
+
+      // Per-carrier detail cards
+      view.appendChild(el("h3", { cls: "section-subhead", text: "Carrier details" }));
+      var detailCards = carriers.map(carrierDetailCard);
+      view.appendChild(el("div", { cls: "grid-2" }, detailCards));
 
       var keys = [];
       carriers.forEach(function (c) {
@@ -1433,26 +1627,92 @@
     document.getElementById("pageTitle").textContent = SECTIONS[section].title;
     document.getElementById("sidebar").classList.remove("open");
   }
+var inFlight = false;
 
-  var inFlight = false;
-  function refresh() {
-    if (inFlight) return Promise.resolve();
-    inFlight = true;
-    var section = state.section;
-    var view = document.querySelector('.view[data-view="' + section + '"]');
-    var api = document.getElementById("apiStatus");
-    return SECTIONS[section].render(view).then(function () {
-      api.textContent = "API: ok";
-      api.className = "small";
-    }).catch(function (err) {
-      clear(view);
-      view.appendChild(el("div", { cls: "notice bad", text: "Could not load this section: " + (err && err.message ? err.message : "unknown error") + ". Check that the dashboard is reachable." }));
-      api.textContent = "API: error";
-      api.className = "small badge bad";
-    }).then(function () {
-      inFlight = false;
-      document.getElementById("lastPoll").textContent = "Last update: " + new Date().toLocaleTimeString();
-    });
+// Build a clean, redacted diagnostics snapshot for the "Copy Diagnostics"
+// button. Never includes secrets — only public, operator-visible state.
+function buildDiagnostics() {
+  var out = {
+    generatedAt: new Date().toISOString(),
+    section: state.section,
+    lastPollSuccess: state.lastPollSuccess ? new Date(state.lastPollSuccess).toISOString() : null,
+    lastApiError: state.lastApiError,
+    overview: state.lastOverview || null,
+    carriers: state.lastCarriers || null,
+    notes: [
+      "This diagnostics snapshot is read-only. No secrets or credentials are included."
+    ]
+  };
+  return JSON.stringify(out, null, 2);
+}
+
+function copyDiagnostics() {
+  var text = buildDiagnostics();
+  var btn = document.getElementById("copyDiagnosticsBtn");
+  function done(ok) {
+    if (!btn) return;
+    btn.textContent = ok ? "✓ Copied" : "✗ Copy failed";
+    btn.disabled = true;
+    setTimeout(function () { btn.textContent = "⧉ Diagnostics"; btn.disabled = false; }, 2000);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+  } else {
+    // Fallback: select a temporary textarea and use execCommand.
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    try { done(document.execCommand("copy")); } catch (e) { done(false); }
+    document.body.removeChild(ta);
+  }
+}
+
+function refresh() {
+  if (inFlight) return Promise.resolve();
+  inFlight = true;
+  var section = state.section;
+  var view = document.querySelector('.view[data-view="' + section + '"]');
+  var api = document.getElementById("apiStatus");
+  return SECTIONS[section].render(view).then(function () {
+    state.lastApiError = null;
+    api.textContent = "API: ok";
+    api.className = "small";
+    updateGlobalBadges();
+  }).catch(function (err) {
+    var msg = (err && err.message) ? err.message : "unknown error";
+    state.lastApiError = { status: err.status || null, message: msg, at: new Date().toISOString() };
+    clear(view);
+    var status = err && err.status;
+    var node;
+    if (status === 401 || status === 403) {
+      node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
+        el("h3", { text: "Permission denied (" + status + ")" }),
+        el("p", { text: "The dashboard rejected this request. You do not have the required credentials for this host." }),
+        el("p", { cls: "muted small", text: "Action: verify your HTTP Basic credentials or Bearer token, then retry." })
+      ]);
+    } else if (status === 503) {
+      node = el("div", { cls: "notice warn", attrs: { role: "alert" } }, [
+        el("h3", { text: "Control plane unavailable (503)" }),
+        el("p", { text: "The control agent socket is not reachable or the required capability flag is off. Read-only telemetry continues normally." })
+      ]);
+    } else {
+      node = el("div", { cls: "notice bad", attrs: { role: "alert" } }, [
+        el("h3", { text: "Could not load section" }),
+        el("p", { text: msg + ". Check that the dashboard is reachable." })
+      ]);
+    }
+    view.appendChild(node);
+    api.textContent = "API: " + (status ? status : "error");
+    api.className = "small badge bad";
+    updateGlobalBadges();
+  }).then(function () {
+    inFlight = false;
+    document.getElementById("lastPoll").textContent = "Last update: " + new Date().toLocaleTimeString();
+  });
+}
   }
 
   function startPolling() {
@@ -1483,11 +1743,31 @@
       var cur = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
       applyTheme(cur);
     });
-    document.getElementById("menuBtn").addEventListener("click", function () {
-      document.getElementById("sidebar").classList.toggle("open");
+    var menuBtn = document.getElementById("menuBtn");
+    menuBtn.addEventListener("click", function () {
+      var sidebar = document.getElementById("sidebar");
+      var open = sidebar.classList.toggle("open");
+      menuBtn.setAttribute("aria-expanded", String(open));
     });
     document.getElementById("refreshBtn").addEventListener("click", function () { refresh(); });
     document.getElementById("pollSec").addEventListener("change", startPolling);
+    var copyBtn = document.getElementById("copyDiagnosticsBtn");
+    if (copyBtn) copyBtn.addEventListener("click", copyDiagnostics);
+    // Keyboard: Escape closes the mobile sidebar; 'r' refreshes when not in an input.
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") {
+        var sidebar = document.getElementById("sidebar");
+        if (sidebar.classList.contains("open")) {
+          sidebar.classList.remove("open");
+          menuBtn.setAttribute("aria-expanded", "false");
+          menuBtn.focus();
+        }
+      } else if (ev.key === "r" && !ev.metaKey && !ev.ctrlKey) {
+        var tag = (document.activeElement && document.activeElement.tagName) || "";
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        refresh();
+      }
+    });
     window.addEventListener("hashchange", function () {
       state.section = sectionFromHash();
       setActive(state.section);
@@ -1495,6 +1775,7 @@
     });
     state.section = sectionFromHash();
     setActive(state.section);
+    updateGlobalBadges();
     refresh();
     startPolling();
   }

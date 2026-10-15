@@ -60,7 +60,9 @@ func closeReasonClass(s *session.Session) CloseReason {
 		strings.Contains(reason, "grace") ||
 		strings.Contains(reason, "stream registration failed") ||
 		strings.Contains(reason, "up-carrier header write failed") ||
-		strings.Contains(reason, "closed by peer") {
+		strings.Contains(reason, "closed by peer") ||
+		strings.Contains(reason, "peer reset") ||
+		strings.Contains(reason, "bootstrap") {
 		return ReasonCarrier
 	}
 	if strings.Contains(reason, "client EOF") || strings.Contains(reason, "client socket EOF") {
@@ -119,6 +121,10 @@ type Metrics struct {
 	// bootstrap drops.
 	upNewStreamRefiredAfterDeregister   int64
 	downNewStreamRefiredAfterDeregister int64
+	// Issue #20 / #21: stream-level negative ack (FrameReset) and
+	// bootstrap-result (FrameBootstrapAck) counters.
+	streamResetsReceived  int64
+	bootstrapAcksReceived int64
 	// Part 4: target-dial failure by outcome (cheap, fixed-cardinality).
 	targetDialFailBreakerOpen int64 // refused fast (breaker open, no dial spent)
 	targetDialFailTimeout     int64 // bounded dial hit its ceiling
@@ -436,6 +442,23 @@ func (m *Metrics) TargetDialFailureTimeout() {
 	m.mu.Unlock()
 }
 
+// ResetReceived counts a peer FrameReset (Issue #20) received on this node:
+// the stream-level negative ack that terminates a stranded local session.
+func (m *Metrics) ResetReceived() {
+	m.mu.Lock()
+	m.streamResetsReceived++
+	m.mu.Unlock()
+}
+
+// BootstrapAckReceived counts a peer FrameBootstrapAck (Issue #21) received
+// on this node: the remote bootstrap verdict that resolves a pending
+// StartSession wait.
+func (m *Metrics) BootstrapAckReceived() {
+	m.mu.Lock()
+	m.bootstrapAcksReceived++
+	m.mu.Unlock()
+}
+
 // AddRelayBytesRead adds shape-A socket-read bytes.
 func (m *Metrics) AddRelayBytesRead(n int64) {
 	if n <= 0 {
@@ -599,21 +622,24 @@ type Snapshot struct {
 	DownNewStreamRefiredAfterDeregister int64
 	TargetDialFailureBreakerOpen        int64
 	TargetDialFailureTimeout            int64
-	RelayBytesRead                      int64
-	RelayBytesWritten                   int64
-	RelayPendingHighBytes               int64
-	RelayBufferHighBytes                int64
-	RelayWriteFailures                  int64
-	RelayBufferFull                     int64
-	RelaySocketReadErrors               int64
-	RelaySocketWriteErrors              int64
-	CloseReasonClientEOF                int64
-	CloseReasonTargetEOF                int64
-	CloseReasonCarrier                  int64
-	CloseReasonOverflow                 int64
-	CloseReasonTimeout                  int64
-	CloseReasonDataUndeliverable        int64
-	CloseReasonOther                    int64
+	// Issue #20 / #21 observability.
+	StreamResetsReceived         int64
+	BootstrapAcksReceived        int64
+	RelayBytesRead               int64
+	RelayBytesWritten            int64
+	RelayPendingHighBytes        int64
+	RelayBufferHighBytes         int64
+	RelayWriteFailures           int64
+	RelayBufferFull              int64
+	RelaySocketReadErrors        int64
+	RelaySocketWriteErrors       int64
+	CloseReasonClientEOF         int64
+	CloseReasonTargetEOF         int64
+	CloseReasonCarrier           int64
+	CloseReasonOverflow          int64
+	CloseReasonTimeout           int64
+	CloseReasonDataUndeliverable int64
+	CloseReasonOther             int64
 
 	// Phase B credit flow-control counters (design §13, Slices 4-5).
 	RelayCreditEmittedTotal       int64
@@ -653,6 +679,8 @@ func (m *Metrics) Snapshot() Snapshot {
 		DownNewStreamRefiredAfterDeregister: m.downNewStreamRefiredAfterDeregister,
 		TargetDialFailureBreakerOpen:        m.targetDialFailBreakerOpen,
 		TargetDialFailureTimeout:            m.targetDialFailTimeout,
+		StreamResetsReceived:                m.streamResetsReceived,
+		BootstrapAcksReceived:               m.bootstrapAcksReceived,
 		RelayBytesRead:                      m.relayBytesRead,
 		RelayBytesWritten:                   m.relayBytesWritten,
 		RelayPendingHighBytes:               m.relayPendingHigh,
@@ -732,6 +760,9 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "sessions_clean_complete %d\n", s.SessionsCleanComplete)
 	fmt.Fprintf(&b, "target_dial_success %d\n", s.TargetDialSuccess)
 	fmt.Fprintf(&b, "target_dial_failure %d\n", s.TargetDialFailure)
+	// Issue #20 / #21: stream-level negative ack + bootstrap-result counters.
+	fmt.Fprintf(&b, "stream_resets_received %d\n", s.StreamResetsReceived)
+	fmt.Fprintf(&b, "bootstrap_acks_received %d\n", s.BootstrapAcksReceived)
 	// up-carrier drop-storm fix (Part 4): the re-fire + dial-outcome counters.
 	fmt.Fprintf(&b, "up_newstream_refired_after_deregister %d\n", s.UpNewStreamRefiredAfterDeregister)
 	fmt.Fprintf(&b, "down_newstream_refired_after_deregister %d\n", s.DownNewStreamRefiredAfterDeregister)

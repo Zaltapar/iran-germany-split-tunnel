@@ -41,9 +41,9 @@ existing `New(base, max)` (which now delegates to `NewBounded(base, max, 0, 0)`,
 so the pre-fix pure-exponential behavior is byte-for-byte reachable). The
 new fields:
 
-- `window` — the cumulative *nominal* sleep budget for one failure episode.
-- `clamp` — the per-attempt delay used once the window is exhausted.
-- `slept` — the running cumulative of nominal delays since the last `Reset`.
+- `window` — the cumulative *nominal* sleep threshold for one failure episode.
+- `clamp` — the per-attempt delay cap (`min(d, clamp)`) applied on every attempt *after* `slept >= window`.
+- `slept` — the running cumulative of nominal delays handed out since the last `Reset`.
 
 In `Next()`, after the existing exponential-doubling-then-cap computation of
 `d`, the schedule applies:
@@ -54,6 +54,8 @@ if b.window > 0 && b.clamp > 0 && b.slept >= b.window && b.clamp < d {
 }
 b.slept += d
 ```
+
+Note that `window` is a **pre-attempt threshold** (`b.slept >= b.window`), not a hard cap that truncates the attempt crossing the boundary: the call that pushes `slept` to or past `window` still returns its scheduled (max-capped) delay `d`, so cumulative nominal delay before clamping engages on the *next* call may overshoot `window` by up to one `max` delay (`< window + max`). Also, `b.clamp < d` ensures the clamp only ever reduces a delay and never inflates an early exponential step smaller than `clamp` (and `clamp > max` is sanitized down to `max` at construction).
 
 The NOMINAL `d` (not the jittered sleep) is accumulated so the schedule is
 deterministic and testable. The jitter in `Sleep()` is unchanged: it still

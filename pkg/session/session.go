@@ -330,6 +330,25 @@ type Session struct {
 	once       sync.Once
 	done       chan struct{}
 	onClose    []func()
+	// bootstrapC resolves the remote bootstrap result (Issue #21). The
+	// node layer (Iran) creates it via SetBootstrapChannel before the
+	// FrameHeader leaves this node; Germany's FrameBootstrapAck (or this
+	// session's teardown) resolves it exactly once. Nil = no bootstrap
+	// wait (e.g. a Germany-side session, which never waits).
+	bootstrapC chan byte
+	// clientConnGate (Issue #21 bootstrap gate) is closed exactly once,
+	// when the client conn becomes available to the relays: at construction
+	// (fire-and-forget StartSession, clientConn != nil) or by AdoptConn
+	// (StartSessionAndWait form). AwaitClientConn blocks on it so the
+	// down→client relay never writes target payload before the caller has
+	// written the SOCKS5 0x00 reply to clientConn. A session that never
+	// adopts a conn (teardown, or a Germany-side session with no client)
+	// stays open — and is released by teardown — so a waiter can never
+	// block past the session's lifetime.
+	clientConnGate chan struct{}
+	// clientConnClosed mirrors the gate's state (flag-guard so a second
+	// adopt cannot double-close). false while the gate is open.
+	clientConnClosed bool
 }
 
 // NewSession creates a session in StatePending. The session owns its
@@ -341,7 +360,7 @@ func NewSession(id SessionID, dest *Destination, clientConn, targetConn net.Conn
 	ctx, cancel := context.WithCancel(parent)
 	// OpenNanos stamps the stream-open instant (Phase 3 TTFB input). It is a
 	// diagnostic/telemetry value only (not secret, no peer data).
-	return &Session{
+	s := &Session{
 		ID:         id,
 		Dest:       dest,
 		ClientConn: clientConn,
@@ -352,6 +371,18 @@ func NewSession(id SessionID, dest *Destination, clientConn, targetConn net.Conn
 		state:      StatePending,
 		done:       make(chan struct{}),
 	}
+	// The client-conn availability gate (Issue #21 bootstrap gate). A
+	// session constructed WITH a client conn (the fire-and-forget
+	// StartSession form) has the gate pre-closed, so AwaitClientConn returns
+	// immediately; a session constructed WITHOUT one (the StartSessionAndWait
+	// form, where the caller retains the conn until the remote verdict) keeps
+	// the gate open until AdoptConn closes it.
+	s.clientConnGate = make(chan struct{})
+	if clientConn != nil {
+		close(s.clientConnGate)
+		s.clientConnClosed = true
+	}
+	return s
 }
 
 // Activate moves Pending → Active. It returns false for any other state
@@ -376,6 +407,104 @@ func (s *Session) State() State {
 
 // IsClosed reports whether teardown has completed.
 func (s *Session) IsClosed() bool { return s.State() == StateClosed }
+
+// BootstrapStatus is the result of the remote bootstrap (Issue #21).
+// The remote node (Germany) resolves the up-stream bootstrap outcome —
+// target dial success/failure, routing decision, down-carrier readiness —
+// and sends it back to the originator (Iran) via a control frame. The
+// originator waits for it (bounded) before deciding what to tell the
+// local SOCKS5 client. A session with no bootstrap channel (Germany-side
+// sessions, rebinds) is not expected to resolve one.
+type BootstrapStatus byte
+
+// BootstrapStatusOk reports whether the bootstrap succeeded.
+func (bs BootstrapStatus) Ok() bool { return bs == BootstrapSuccess }
+
+// BootstrapSuccess is the bootstrap-success status (remote target accepted).
+const BootstrapSuccess BootstrapStatus = 0
+
+// BootstrapEndedWithoutResult is the sentinel a WaitBootstrap returns when
+// the session was torn down LOCALLY before the remote bootstrap result
+// arrived (client abort, carrier-loss grace timeout, node shutdown). The
+// value is outside the RFC 1928 0x00-0x08 reply range, so it can never be
+// mistaken for a real remote failure. The SOCKS handler treats ANY non-zero
+// status as a bootstrap failure; this sentinel simply means "no remote
+// verdict reached us — the stream is over".
+const BootstrapEndedWithoutResult BootstrapStatus = 0xFF
+
+// SetBootstrapChannel installs the channel the remote bootstrap result
+// will resolve on. It must be called before any bootstrap wait and returns
+// false (leaving no channel) once the session started closing — a dead
+// session must not accumulate a pending waiter.
+func (s *Session) SetBootstrapChannel() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.state {
+	case StatePending, StateActive:
+	case StateClosing, StateClosed:
+		return false
+	}
+	if s.bootstrapC != nil {
+		return true // already installed
+	}
+	s.bootstrapC = make(chan byte, 1)
+	return true
+}
+
+// ResolveBootstrap commits the remote bootstrap result to the session's
+// persistent, capacity-1 bootstrap channel. It is called from the control-
+// frame handler (OnStreamBootstrapAck, the peer's verdict) and from teardown
+// (which commits BootstrapEndedWithoutResult as the backstop for a session
+// that died locally before any verdict arrived).
+//
+// The channel is created once (SetBootstrapChannel) and persists for the
+// session's lifetime — it is deliberately NOT nil-ed out on commit. This is
+// what makes the bootstrap wait deterministic in the fast-failure case: when
+// Germany's terminating verdict (the ack that precedes its FrameClose) lands
+// and commits the status BEFORE the originator's WaitBootstrap even runs, the
+// committed value is still retrievable — the classic lost-wakeup that a
+// "send-then-nil" design would produce (the wait found a nil channel and
+// returned a false 0xFF). The FIRST value to arrive wins; later duplicate
+// sends drop on the full buffer, so a resend/reorder of the ack is a no-op.
+func (s *Session) ResolveBootstrap(status byte) bool {
+	s.mu.Lock()
+	c := s.bootstrapC
+	if c == nil {
+		s.mu.Unlock()
+		return false
+	}
+	s.mu.Unlock()
+	select {
+	case c <- status:
+		return true // the verdict was committed (first value)
+	default:
+		// Already committed (a prior resolve filled the buffer); drop the
+		// duplicate.
+		return false
+	}
+}
+
+// WaitBootstrap blocks for the committed remote bootstrap result, bounded by
+// ctx. It returns the status byte and true once a verdict has been committed
+// (whether before or after this call — see ResolveBootstrap), or (0, false)
+// if ctx expired first or the session has no bootstrap channel (the caller
+// treats that as a bootstrap failure). Because the verdict is committed on
+// every terminal path (peer ack, or local teardown's backstop), this wait
+// always terminates and is never flaky on ordering.
+func (s *Session) WaitBootstrap(ctx context.Context) (byte, bool) {
+	s.mu.Lock()
+	c := s.bootstrapC
+	s.mu.Unlock()
+	if c == nil {
+		return 0, false
+	}
+	select {
+	case st := <-c:
+		return st, true
+	case <-ctx.Done():
+		return 0, false
+	}
+}
 
 // Reason returns the first close reason recorded ("" while open).
 func (s *Session) Reason() string {
@@ -497,7 +626,50 @@ func (s *Session) AdoptConn(c net.Conn) bool {
 		return false
 	}
 	s.ClientConn = c
+	// Release the bootstrap gate (Issue #21): the client conn is now
+	// session-owned and the caller has (or is about to) written the SOCKS5
+	// 0x00 reply, so the down→client relay may now deliver payload. Flag-
+	// guarded so a second adopt (idempotent) cannot double-close.
+	if s.clientConnGate != nil && !s.clientConnClosed {
+		close(s.clientConnGate)
+		s.clientConnClosed = true
+	}
 	return true
+}
+
+// ClientConnAdopted reports whether the client conn has been made available to
+// the relays (the bootstrap gate is closed): true for the fire-and-forget
+// StartSession form (pre-closed at construction) and, on the StartSessionAndWait
+// form, once the caller has written the SOCKS5 0x00 reply and adopted the conn.
+// It is false while the remote bootstrap verdict is still pending (the AndWait
+// path, before adoption). The up relay uses it to distinguish a client that
+// gave up DURING bootstrap (abort the whole session) from a client that finished
+// sending AFTER the 0x00 reply (a normal up half-close, the download continues).
+func (s *Session) ClientConnAdopted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clientConnClosed
+}
+
+// AwaitClientConn blocks until the session's client conn becomes available to
+// the relays — i.e. until the caller has adopted it (AdoptConn) after writing
+// the SOCKS5 0x00 reply (the StartSessionAndWait bootstrap gate, Issue #21) —
+// or until the session is torn down (which also releases the gate). It is the
+// single synchronization point that guarantees no downstream payload byte is
+// written to clientConn before the 0x00 reply. For a session constructed WITH
+// a client conn (fire-and-forget StartSession) the gate is pre-closed, so this
+// returns immediately and is a no-op. It is safe to call from the down→client
+// relay goroutine: teardown closes the gate, so a waiting relay unblocks
+// promptly instead of leaking when the session dies before adoption.
+func (s *Session) AwaitClientConn(ctx context.Context) {
+	if s.clientConnGate == nil {
+		return // no gate (legacy/zero-value session): nothing to wait on
+	}
+	select {
+	case <-s.clientConnGate:
+	case <-s.Done():
+	case <-ctx.Done():
+	}
 }
 
 // Close is the single authoritative teardown path for the session. It
@@ -528,6 +700,24 @@ func (s *Session) teardown() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// Release the bootstrap gate (Issue #21) exactly once so a down→
+		// client relay parked in AwaitClientConn unblocks promptly instead of
+		// leaking when the session is torn down before the caller ever adopts
+		// the conn (client abort, carrier-loss grace timeout, node shutdown).
+		// (AwaitClientConn also selects on s.Done(), closed below, so this is
+		// belt-and-suspenders; the flag guard prevents a double-close.)
+		s.mu.Lock()
+		if s.clientConnGate != nil && !s.clientConnClosed {
+			close(s.clientConnGate)
+			s.clientConnClosed = true
+		}
+		s.mu.Unlock()
+		// Resolve any pending bootstrap wait exactly once, so a
+		// WaitBootstrap caller (the originator's SOCKS handler, Issue #21)
+		// can never hang on a session that is being torn down locally
+		// (carrier loss, client abort, shutdown). The sentinel means "no
+		// remote verdict reached us" — never a false success (0).
+		s.ResolveBootstrap(byte(BootstrapEndedWithoutResult))
 		if s.ClientConn != nil {
 			s.ClientConn.Close()
 		}

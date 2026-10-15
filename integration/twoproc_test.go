@@ -294,9 +294,10 @@ func (p *proc) waitForLog(t *testing.T, marker string, d time.Duration) {
 
 // waitForLogAfter is the offset-aware variant: it waits for `marker` in
 // the log content written AT OR AFTER `after` (a byte offset returned by
-// logLen). Markers that legitimately repeat across the test ("carrier
-// up lost", "carrier down ready", "Down-carrier authenticated to") MUST
-// use this variant, or an earlier occurrence would satisfy the wait.
+// logLen). Markers that legitimately repeat across the test ("carrier up
+// lost", "carrier down (id down-reality-a) ready", "Down-carrier
+// down-reality-a authenticated to") MUST use this variant, or an earlier
+// occurrence would satisfy the wait.
 func (p *proc) waitForLogAfter(t *testing.T, marker string, after int, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -923,8 +924,8 @@ func TestTwoProcessLocal(t *testing.T) {
 	de.waitForLog(t, "germany-splitter started", 15*time.Second)
 	de.waitForLog(t, "Up-carrier authenticated", 25*time.Second)
 	iran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-	iran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-	de.waitForLog(t, "Down-carrier authenticated from", 25*time.Second)
+	iran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+	de.waitForLog(t, "Down-carrier down-reality-a authenticated from", 25*time.Second)
 	t.Log("topology up: both carriers authenticated through controllable proxies")
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
@@ -991,8 +992,8 @@ func TestTwoProcessLocal(t *testing.T) {
 			iran = startProc(t, root, "iran", iranBin, iranNoAuth)
 			iran.waitForLog(t, "iran-splitter started", 15*time.Second)
 			iran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-			iran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-			de.waitForLogAfter(t, "Down-carrier authenticated from", restOff, 25*time.Second)
+			iran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+			de.waitForLogAfter(t, "Down-carrier down-reality-a authenticated from", restOff, 25*time.Second)
 		}
 		// t.Fatal/t.Fatalf exits the subtest immediately, so ensure S1-S11
 		// still receive a no-auth Iran even when an S0a assertion fails.
@@ -1015,8 +1016,8 @@ func TestTwoProcessLocal(t *testing.T) {
 		// its re-handoff of Iran's down-carrier is offset-scoped.
 		authIran.waitForLog(t, "iran-splitter started", 15*time.Second)
 		authIran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-		authIran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-		de.waitForLogAfter(t, "Down-carrier authenticated from", deOff, 25*time.Second)
+		authIran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+		de.waitForLogAfter(t, "Down-carrier down-reality-a authenticated from", deOff, 25*time.Second)
 
 		// (i) wrong credentials must fail BEFORE any CONNECT, as a distinct
 		// *socks5.AuthError (never a silent success, never a CONNECT-stage
@@ -1296,10 +1297,11 @@ func TestTwoProcessLocal(t *testing.T) {
 		downProxy.Kill()
 		t.Log("S8: down carrier severed mid-response")
 
-		// "carrier down ready (gen 1)" already exists in the log from
-		// startup, so the post-flap readiness must be offset-scoped.
+		// "carrier down (id down-reality-a) ready (gen 1)" already exists in
+		// the log from startup, so the post-flap readiness must be
+		// offset-scoped.
 		de.waitForLogAfter(t, "carrier down lost", deOff, 10*time.Second)
-		de.waitForLogAfter(t, "carrier down ready", deOff, 30*time.Second)
+		de.waitForLogAfter(t, "carrier down (id down-reality-a) ready", deOff, 30*time.Second)
 
 		got := make([]byte, len(targetResp))
 		c.Conn().SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -1314,8 +1316,9 @@ func TestTwoProcessLocal(t *testing.T) {
 		c.Close()
 		settleBoth(t, mIran, mDe, 15*time.Second, "S8")
 		// Iran must have re-dialed the down carrier (its reconnect loop);
-		// the startup "Down-carrier authenticated to" must not satisfy it.
-		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 30*time.Second)
+		// the startup "Down-carrier down-reality-a authenticated to" must
+		// not satisfy it.
+		iran.waitForLogAfter(t, "Down-carrier down-reality-a authenticated to", irOff, 30*time.Second)
 		t.Log("S8 ok: session survived down-carrier loss; response intact")
 	})
 
@@ -1362,13 +1365,20 @@ func TestTwoProcessLocal(t *testing.T) {
 		if !errors.As(err, &se) {
 			t.Fatalf("expected *StatusError, got %T: %v", err, err)
 		}
-		if se.Code != 0x06 {
-			t.Fatalf("status = 0x%02x, want 0x06 (carriers not ready)", se.Code)
+		// Phase 2 contract: a carrier-loss / no-remote-verdict bootstrap
+		// outcome (Germany killed, both carriers lost, reconnect window
+		// exhausted within the 2 s bootstrap bound) returns 0x01 (general
+		// SOCKS failure) — NOT 0x06 (reserved for target-dial timeout).
+		// See cmd/iran-splitter/main.go:719-724 (BootstrapEndedWithoutResult
+		// → 0x01). The bounded bootstrap wait is still honored: elapsed
+		// must be ~2 s.
+		if se.Code != 0x01 {
+			t.Fatalf("status = 0x%02x, want 0x01 (no remote verdict: carrier loss, bounded bootstrap wait)", se.Code)
 		}
 		if elapsed < 1500*time.Millisecond || elapsed > 12*time.Second {
 			t.Fatalf("bootstrap wait took %v; want ~2 s (bounded, signal-driven)", elapsed)
 		}
-		t.Logf("S10 ok: SOCKS 0x06 after %v (bounded bootstrap wait honored over real sockets)", elapsed)
+		t.Logf("S10 ok: SOCKS 0x01 after %v (no-remote-verdict: carrier loss, bounded bootstrap wait honored)", elapsed)
 
 		// S10b: wrong-secret up-carrier. UpReady() is now deterministically
 		// false (Germany is dead), so a rogue WS client gets a real 101
@@ -1435,7 +1445,7 @@ func TestTwoProcessLocal(t *testing.T) {
 		// fresh process the moment S10 returns — before S11 runs.
 		de = startProc(t, root, "germany", deBin, deEnv)
 		de.waitForLog(t, "Up-carrier authenticated", 25*time.Second)
-		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 25*time.Second)
+		iran.waitForLogAfter(t, "Down-carrier down-reality-a authenticated to", irOff, 25*time.Second)
 		payload := make([]byte, 128)
 		rand.Read(payload)
 		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second, nil)

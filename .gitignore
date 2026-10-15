@@ -101,3 +101,7 @@ final-suite/
 
 # Local backup folder (pre-deploy snapshots, unit/binary copies). Never commit.
 backups/
+
+# Transient base64 transfer artifacts (cross-host binary transfer scratch).
+# NEVER commit: large binary blobs, not part of the Go module.
+.tmp-*.b64

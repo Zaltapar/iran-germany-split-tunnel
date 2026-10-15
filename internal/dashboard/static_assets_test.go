@@ -94,13 +94,36 @@ func TestStaticHasRequiredSections(t *testing.T) {
 	files := staticFiles(t)
 	html := files["static/index.html"]
 	for _, section := range []string{
-		"overview", "hosts", "tunnels", "routing", "outbounds", "network", "config", "logs",
+		"overview", "hosts", "tunnels", "routing", "outbounds",
+		"inbounds", "control", "network", "config", "logs",
 	} {
 		if !strings.Contains(html, `data-section="`+section+`"`) {
 			t.Errorf("index.html missing navigation for section %q", section)
 		}
+		if !strings.Contains(html, `data-view="`+section+`"`) {
+			t.Errorf("index.html missing data-view section %q", section)
+		}
 	}
 	if !strings.Contains(html, "Read-only mode") || !strings.Contains(html, "No secrets are displayed") {
 		t.Error("index.html must keep the read-only and no-secrets banner")
+	}
+}
+
+// TestNoDuplicateDataView asserts every data-view value in index.html is
+// unique. This is the regression test for the duplicate data-view="network"
+// bug that was introduced when the outbounds section was forgotten.
+func TestNoDuplicateDataView(t *testing.T) {
+	html := staticFiles(t)["static/index.html"]
+	if html == "" {
+		t.Fatal("static/index.html missing from embedded FS")
+	}
+	for _, section := range []string{
+		"overview", "hosts", "tunnels", "routing", "outbounds",
+		"inbounds", "control", "network", "config", "logs",
+	} {
+		n := strings.Count(html, `data-view="`+section+`"`)
+		if n != 1 {
+			t.Errorf("index.html data-view=%q appears %d times, want exactly 1", section, n)
+		}
 	}
 }

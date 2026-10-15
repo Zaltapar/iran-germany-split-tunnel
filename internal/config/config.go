@@ -56,31 +56,37 @@ const (
 
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen         = "SPLIT_SOCKS_LISTEN"               // Iran
-	EnvSocksUser           = "SPLIT_SOCKS_USER"                 // Iran — SOCKS5 RFC 1929 username
-	EnvSocksPass           = "SPLIT_SOCKS_PASS"                 // Iran — SOCKS5 RFC 1929 password (never logged)
-	EnvSocksAllowedSources = "SPLIT_SOCKS_ALLOWED_SOURCES"      // Iran — SOCKS5 source-IP allowlist (unset/empty = allow all)
-	EnvWsListen            = "SPLIT_WS_LISTEN"                  // Iran
-	EnvDownCarrier         = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
-	EnvUpWsUrl             = "SPLIT_UP_WS_URL"                  // Germany
-	EnvDownListen          = "SPLIT_DOWN_LISTEN"                // Germany
-	EnvSecret              = "SPLIT_SECRET"                     // both
-	EnvAllowWeak           = "SPLIT_ALLOW_WEAK_SECRET"          // both (bool)
-	EnvMetricsPort         = "SPLIT_METRICS_PORT"               // both
-	EnvRelayBuf            = "SPLIT_RELAY_BUF"                  // both
-	EnvQueueBytes          = "SPLIT_STREAM_QUEUE_BYTES"         // both
-	EnvQueueFrames         = "SPLIT_STREAM_QUEUE_FRAMES"        // both
-	EnvQueueTotal          = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
-	EnvOverflowMs          = "SPLIT_STREAM_OVERFLOW_MS"         // both
-	EnvCarrierGrace        = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
-	EnvReconnectBaseMs     = "SPLIT_RECONNECT_BASE_MS"          // both (ms) — carrier reconnect backoff base
-	EnvReconnectMaxMs      = "SPLIT_RECONNECT_MAX_MS"           // both (ms) — carrier reconnect backoff cap
-	EnvReconnectWindowMs   = "SPLIT_RECONNECT_WINDOW_MS"        // both (ms) — cumulative reconnect-sleep bound; 0 disables
-	EnvReconnectClampMs    = "SPLIT_RECONNECT_CLAMP_MS"         // both (ms) — per-attempt delay once the window is exhausted; 0 disables
-	EnvBootstrapWait       = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
-	EnvSessionBuf          = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
-	EnvSessionBufTotal     = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
-	EnvLivenessRounds      = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
+	EnvSocksListen         = "SPLIT_SOCKS_LISTEN"             // Iran
+	EnvSocksUser           = "SPLIT_SOCKS_USER"               // Iran — SOCKS5 RFC 1929 username
+	EnvSocksPass           = "SPLIT_SOCKS_PASS"               // Iran — SOCKS5 RFC 1929 password (never logged)
+	EnvSocksAllowedSources = "SPLIT_SOCKS_ALLOWED_SOURCES"    // Iran — SOCKS5 source-IP allowlist (unset/empty = allow all)
+	EnvWsListen            = "SPLIT_WS_LISTEN"                // Iran
+	EnvDownCarrier         = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
+	EnvUpWsUrl             = "SPLIT_UP_WS_URL"                // Germany
+	EnvDownListen          = "SPLIT_DOWN_LISTEN"              // Germany
+	EnvSecret              = "SPLIT_SECRET"                   // both
+	EnvAllowWeak           = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
+	EnvMetricsPort         = "SPLIT_METRICS_PORT"             // both
+	EnvRelayBuf            = "SPLIT_RELAY_BUF"                // both
+	EnvQueueBytes          = "SPLIT_STREAM_QUEUE_BYTES"       // both
+	EnvQueueFrames         = "SPLIT_STREAM_QUEUE_FRAMES"      // both
+	EnvQueueTotal          = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
+	EnvOverflowMs          = "SPLIT_STREAM_OVERFLOW_MS"       // both
+	EnvCarrierGrace        = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
+	EnvReconnectBaseMs     = "SPLIT_RECONNECT_BASE_MS"        // both (ms) — carrier reconnect backoff base
+	EnvReconnectMaxMs      = "SPLIT_RECONNECT_MAX_MS"         // both (ms) — carrier reconnect backoff cap
+	EnvReconnectWindowMs   = "SPLIT_RECONNECT_WINDOW_MS"      // both (ms) — cumulative reconnect-sleep bound; 0 disables
+	EnvReconnectClampMs    = "SPLIT_RECONNECT_CLAMP_MS"       // both (ms) — per-attempt delay once the window is exhausted; 0 disables
+	// Issue #19: kernel TCP keepalive probe period for the long-lived
+	// client / target / carrier TCP sockets (ms). A wedged or half-open
+	// socket is then torn down by the kernel within ~one probe period
+	// instead of the OS default (~2 h on Linux). 0 disables (use the OS
+	// default). Both roles.
+	EnvTCPKeepAlive    = "SPLIT_TCP_KEEPALIVE_MS"
+	EnvBootstrapWait   = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
+	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
+	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
+	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
 	// Phase B credit flow-control (Slices 4-8):
 	//
 	// SPLIT_CREDITS_ENABLED is the master on/off for the whole credit plane.
@@ -228,8 +234,14 @@ const (
 	DefaultDownCarrier = "127.0.0.1:10802"
 	// Placeholder URL: rejected by Validate so a fresh install fails
 	// fast instead of dialing a dead domain forever.
-	DefaultUpWsUrl    = "wss://cdn.example.com/upload"
-	DefaultDownListen = ":9002"
+	DefaultUpWsUrl = "wss://cdn.example.com/upload"
+	// DefaultDownListen is loopback-only: the down-carrier TCP listener is
+	// reached through the local VLESS+Reality Xray inbound, never directly
+	// from the Internet, so the default binds 127.0.0.1. Operators who need
+	// a non-loopback bind (e.g. a Reality front-end on another host) set
+	// SPLIT_DOWN_LISTEN explicitly — checkHostPort still accepts any
+	// host:port, so non-loopback binds remain supported.
+	DefaultDownListen = "127.0.0.1:9002"
 	// Placeholder secret: rejected by the Phase 6 policy.
 	DefaultSecret = "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING"
 	// RFC 1929 SOCKS5 credentials (Iran): empty means auth disabled,
@@ -268,7 +280,6 @@ const (
 	MaxReconnectWindowMs = 600000 // 10 min
 	MinReconnectClampMs  = 0
 	MaxReconnectClampMs  = 300000 // 5 min
-
 	// Carrier reconnect backoff defaults: a bounded reconnect window so a
 	// brief underlay blip cannot amplify into a multi-minute outage.
 	// Defaults: base 1s, cap 10s, window 30s, clamp 2s.
@@ -277,6 +288,12 @@ const (
 	DefaultReconnectWindowMs = 30000
 	DefaultReconnectClampMs  = 2000
 
+	// Issue #19 kernel TCP keepalive. Default (enabled) probe period 30s —
+	// a wedged / half-open socket is detected within one probe instead of
+	// the OS default (~2 h). Bounds: 0 disables, 1000..36000000 (30 min).
+	MinTCPKeepAliveMs   = 0
+	MaxTCPKeepAliveMs   = 36000000 // 30 min
+	DefaultTCPKeepAlive = 30000
 	// Issue #7 bootstrap wait bounds (ms). 0 = library default
 	// (node.defaultBootstrapWait, 30 s). The maximum keeps a
 	// misconfiguration from holding a new session hostage for hours;
@@ -453,6 +470,12 @@ type Config struct {
 	ReconnectMaxMs    int // SPLIT_RECONNECT_MAX_MS: exponential backoff cap (ms)
 	ReconnectWindowMs int // SPLIT_RECONNECT_WINDOW_MS: cumulative sleep bound per episode (ms; 0 disables)
 	ReconnectClampMs  int // SPLIT_RECONNECT_CLAMP_MS: per-attempt delay once the window is exhausted (ms; 0 disables)
+	// Issue #19: kernel TCP keepalive probe period for the long-lived
+	// client / target / carrier TCP sockets (ms; SPLIT_TCP_KEEPALIVE_MS).
+	// 0 = disabled (use the OS default). Applied at the node layer to the
+	// accepted client sockets, the egress target dials, and the carrier
+	// TCP transports so a wedged/half-open socket is reaped in ~one probe.
+	TCPKeepAliveMs int
 	// Issue #7 bootstrap wait (pkg/node engine).
 	BootstrapWaitMs int // SPLIT_BOOTSTRAP_WAIT_MS: bounded bootstrap wait for a down carrier (ms; 0 = library default)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
@@ -564,7 +587,9 @@ func Defaults() *Config {
 		ReconnectMaxMs:    DefaultReconnectMaxMs,
 		ReconnectWindowMs: DefaultReconnectWindowMs,
 		ReconnectClampMs:  DefaultReconnectClampMs,
-		SessionBufBytes:   DefaultSessionBuf,
+		// Issue #19: kernel TCP keepalive probe period (default 30s).
+		TCPKeepAliveMs:  DefaultTCPKeepAlive,
+		SessionBufBytes: DefaultSessionBuf,
 		// Phase B credit flow-control default (Slices 6-7): credits off.
 		CreditsEnabled: DefaultCreditsEnabled,
 		// Opt-in only-IPv4 target policy default (off: preserves the
@@ -656,7 +681,10 @@ func Load(role string) (*Config, error) {
 	c.ReconnectMaxMs = envInt(&problems, EnvReconnectMaxMs, DefaultReconnectMaxMs, MinReconnectMaxMs, MaxReconnectMaxMs)
 	c.ReconnectWindowMs = envInt(&problems, EnvReconnectWindowMs, DefaultReconnectWindowMs, MinReconnectWindowMs, MaxReconnectWindowMs) // 0 = disabled
 	c.ReconnectClampMs = envInt(&problems, EnvReconnectClampMs, DefaultReconnectClampMs, MinReconnectClampMs, MaxReconnectClampMs)      // 0 = disabled
-	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs)                              // 0 = library default
+	// Issue #19: kernel TCP keepalive probe period (ms). 0 = disabled
+	// (use the OS default keepalive); default 30s. Both roles.
+	c.TCPKeepAliveMs = envInt(&problems, EnvTCPKeepAlive, DefaultTCPKeepAlive, MinTCPKeepAliveMs, MaxTCPKeepAliveMs)
+	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs) // 0 = library default
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default

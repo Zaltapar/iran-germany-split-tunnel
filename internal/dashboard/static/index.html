@@ -9,7 +9,8 @@
 </head>
 <body>
 <div class="app" id="app">
-  <aside class="sidebar" id="sidebar">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <aside class="sidebar" id="sidebar" aria-label="Dashboard navigation">
     <div class="brand">
       <span class="brand-mark" aria-hidden="true">⬡</span>
       <span class="brand-name">Split-Tunnel</span>
@@ -31,14 +32,14 @@
 
   <div class="main">
     <header class="topbar">
-      <button type="button" class="icon-btn" id="menuBtn" aria-label="Toggle navigation">☰</button>
+      <button type="button" class="icon-btn" id="menuBtn" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar">☰</button>
       <h1 id="pageTitle">Overview</h1>
-      <div class="badges" id="globalBadges"></div>
+      <div class="badges" id="globalBadges" role="status" aria-live="polite" aria-label="Tunnel state"></div>
       <div class="spacer"></div>
       <label class="poll small">Every
-        <input id="pollSec" type="number" min="2" max="60" value="5"> s
+        <input id="pollSec" type="number" min="2" max="60" value="5" aria-label="Poll interval in seconds"> s
       </label>
-      <button type="button" class="icon-btn" id="refreshBtn" title="Refresh now">⟳</button>
+      <button type="button" class="icon-btn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">⟳</button>
       <button type="button" class="icon-btn" id="themeBtn" title="Toggle dark / light theme" aria-label="Toggle theme">◐</button>
     </header>
 
@@ -47,22 +48,23 @@
       No secrets are displayed.
     </div>
 
-    <main id="content">
-      <section class="view" data-view="overview"></section>
-      <section class="view" data-view="hosts" hidden></section>
-      <section class="view" data-view="tunnels" hidden></section>
-      <section class="view" data-view="routing" hidden></section>
-      <section class="view" data-view="inbounds" hidden></section>
-      <section class="view" data-view="control" hidden></section>
-      <section class="view" data-view="network" hidden></section>
-      <section class="view" data-view="network" hidden></section>
-      <section class="view" data-view="config" hidden></section>
-      <section class="view" data-view="logs" hidden></section>
+    <main id="content" aria-live="polite">
+      <section class="view" data-view="overview" aria-label="Overview"></section>
+      <section class="view" data-view="hosts" hidden aria-label="Hosts"></section>
+      <section class="view" data-view="tunnels" hidden aria-label="Tunnels and carriers"></section>
+      <section class="view" data-view="routing" hidden aria-label="Routing"></section>
+      <section class="view" data-view="outbounds" hidden aria-label="Outbounds"></section>
+      <section class="view" data-view="inbounds" hidden aria-label="Inbounds"></section>
+      <section class="view" data-view="control" hidden aria-label="Control"></section>
+      <section class="view" data-view="network" hidden aria-label="Network speed"></section>
+      <section class="view" data-view="config" hidden aria-label="Configuration"></section>
+      <section class="view" data-view="logs" hidden aria-label="Logs and events"></section>
     </main>
 
-    <footer class="footer small muted">
-      <span id="lastPoll"></span>
-      <span id="apiStatus"></span>
+    <footer class="footer small muted" role="contentinfo">
+      <span id="lastPoll">Last update: —</span>
+      <span id="apiStatus" role="status" aria-live="polite">API: —</span>
+      <button type="button" class="icon-btn" id="copyDiagnosticsBtn" aria-label="Copy diagnostics">⧉ Diagnostics</button>
     </footer>
   </div>
 </div>

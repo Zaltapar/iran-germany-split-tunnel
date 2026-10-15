@@ -109,6 +109,38 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+// TestDefaultDownListenIsLoopback (Section 7) pins the loopback-only down-
+// carrier listener default. The down carrier is reached through the local
+// VLESS+Reality Xray inbound, never directly from the Internet, so a bare
+// ":9002" (bind-all) default is a staging gap; the default must bind
+// 127.0.0.1 explicitly. Non-loopback binds remain supported (checkHostPort
+// accepts any host:port), but the loopback default is the one a fresh
+// install gets.
+func TestDefaultDownListenIsLoopback(t *testing.T) {
+	c := Defaults()
+	if c.DownListen != "127.0.0.1:9002" {
+		t.Fatalf("DefaultDownListen = %q, want loopback-only 127.0.0.1:9002 (Section 7)", c.DownListen)
+	}
+	if c.DownListen != DefaultDownListen {
+		t.Fatalf("DefaultDownListen drifted: Defaults()=%q, constant=%q", c.DownListen, DefaultDownListen)
+	}
+	// The loopback default must still pass Germany validation (host:port,
+	// loopback is a well-formed host). Use the validGermany() shape (a real
+	// UpWsUrl, not the rejected placeholder) so the only variable is
+	// DownListen.
+	cg := validGermany()
+	cg.DownListen = c.DownListen // the Defaults() loopback value
+	if err := cg.Validate(RoleGermany); err != nil {
+		t.Fatalf("loopback default DownListen must validate: %v", err)
+	}
+	// A non-loopback bind remains valid (supported, just not the default) —
+	// this is the "keep non-loopback supported" property of Section 7.
+	cg.DownListen = "0.0.0.0:9002"
+	if err := cg.Validate(RoleGermany); err != nil {
+		t.Fatalf("non-loopback DownListen must remain valid: %v", err)
+	}
+}
+
 func TestValidateRoleSpecificIran(t *testing.T) {
 	if err := validIran().Validate(RoleIran); err != nil {
 		t.Fatalf("valid Iran config rejected: %v", err)

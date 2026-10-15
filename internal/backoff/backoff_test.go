@@ -251,3 +251,62 @@ func TestSleepBoundedByClampAfterWindow(t *testing.T) {
 		}
 	}
 }
+
+// TestWindowThresholdSemanticsExactAndOvershoot verifies that window acts as a
+// pre-attempt cumulative threshold (b.slept >= b.window), NOT a hard cap that
+// truncates the attempt crossing the boundary:
+//   - Case A (exact boundary hit): base=5s, max=10s, window=15s, clamp=2s.
+//     Attempt 1 -> 5s (slept=5 < 15, not exhausted).
+//     Attempt 2 -> 10s (slept before call is 5 < 15, so full 10s is returned;
+//     slept after call is 15 == window, so WindowExhausted() is now true).
+//     Attempt 3 -> clamped to 2s.
+//   - Case B (clamp > scheduled d after window exhausted): base=2s, max=10s,
+//     window=1s, clamp=5s. Attempt 1 -> 2s (slept=2 >= 1). Attempt 2 has
+//     scheduled d=4s < clamp=5s, so it returns 4s (clamp never inflates d).
+//     Attempt 3 has scheduled d=8s > clamp=5s, so it clamps to 5s.
+func TestWindowThresholdSemanticsExactAndOvershoot(t *testing.T) {
+	bExact := NewBounded(5*time.Second, 10*time.Second, 15*time.Second, 2*time.Second)
+	if got := bExact.Next(); got != 5*time.Second || bExact.WindowExhausted() {
+		t.Fatalf("attempt 1 = %v, exhausted=%v; want 5s, false", got, bExact.WindowExhausted())
+	}
+	if got := bExact.Next(); got != 10*time.Second || !bExact.WindowExhausted() {
+		t.Fatalf("attempt 2 = %v, exhausted=%v; want 10s, true", got, bExact.WindowExhausted())
+	}
+	if got := bExact.Next(); got != 2*time.Second {
+		t.Fatalf("attempt 3 = %v, want 2s (clamped after exact boundary hit)", got)
+	}
+
+	bNoInflate := NewBounded(2*time.Second, 10*time.Second, time.Second, 5*time.Second)
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 5 * time.Second, 5 * time.Second}
+	for i, w := range want {
+		if got := bNoInflate.Next(); got != w {
+			t.Fatalf("no-inflate Next() #%d = %v, want %v", i+1, got, w)
+		}
+	}
+}
+
+// TestSanitizeEdgeCasesAndHighAttempts verifies constructor sanitization for
+// non-positive base/max, negative window/clamp, and shift-overflow guard at
+// >30 attempts.
+func TestSanitizeEdgeCasesAndHighAttempts(t *testing.T) {
+	bZero := New(0, 0)
+	if got := bZero.Next(); got != time.Millisecond {
+		t.Fatalf("New(0,0) Next() = %v, want 1ms sanitized base", got)
+	}
+
+	bMaxLess := NewBounded(10*time.Millisecond, 2*time.Millisecond, -5*time.Second, -1*time.Second)
+	if got := bMaxLess.Next(); got != 10*time.Millisecond {
+		t.Fatalf("max < base Next() = %v, want 10ms (max lifted to base)", got)
+	}
+	if bMaxLess.WindowExhausted() {
+		t.Fatal("negative window/clamp must disable the bound")
+	}
+
+	bHigh := New(time.Millisecond, 50*time.Millisecond)
+	for i := 0; i < 60; i++ {
+		got := bHigh.Next()
+		if got <= 0 || got > 50*time.Millisecond {
+			t.Fatalf("attempt #%d = %v, out of (0, 50ms] range", i+1, got)
+		}
+	}
+}

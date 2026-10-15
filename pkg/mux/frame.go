@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 )
@@ -70,6 +71,23 @@ const (
 	// The mux package parses and validates FrameCredit; no credit ledger
 	// state is maintained here (Phase B: pkg/node).
 	FrameCredit uint8 = 0x07
+	// FrameReset (Issue #20): stream-level negative acknowledgement.
+	// Sent by the receiver (Germany) to the originator (Iran) when a
+	// FrameRebind is refused (unknown_peer, session_closed, rebind_refused)
+	// so the originator terminates the stranded session instead of retrying
+	// indefinitely on every subsequent carrier drop. It is a CONTROL frame
+	// (terminal signal, not a half-close like FrameClose). Payload is a
+	// versioned 10-byte block (see EncodeReset / ParseReset below).
+	FrameReset uint8 = 0x08
+	// FrameBootstrapAck (Issue #21): bootstrap result from Germany to Iran.
+	// Sent on the up carrier after bootstrapUpStream completes the target
+	// dial + routing check (success OR failure). The 2-byte payload carries
+	// [version=1][status]. Status maps 1:1 to the RFC 1928 SOCKS5 reply
+	// byte so the Iran SOCKS5 handler can forward it directly. Iran's
+	// StartSession caller waits for this frame before sending the SOCKS5
+	// reply, so a premature 0x00 (success) is never sent when the target
+	// actually refused / timed out / was blocked.
+	FrameBootstrapAck uint8 = 0x09
 )
 
 // Frame is a single decoded frame.
@@ -294,4 +312,94 @@ func ValidateCreditPayload(p *CreditPayload) error {
 		return &CreditValidationErr{Rule: "reserved-flags"}
 	}
 	return nil
+}
+
+// ============================================================
+// FrameReset payload — Issue #20 (stream-level negative ack)
+// ============================================================
+//
+// Fixed 10-byte block:
+//
+//	Offset  Size  Field
+//	0       1     protocol version (must equal 1)
+//	1       1     reason code (ResetReason*)
+//	2:10    8     generation echo (uint64 BE) — the sender's carrier
+//	                generation for the direction, so the receiver can
+//	                verify the reset corresponds to the active stream and
+//	                not a stale control message.
+//
+// Reset reasons:
+const (
+	ResetReasonUnknownStream    byte = 1 // no session for this stream ID
+	ResetReasonSessionClosed    byte = 2 // session exists but is already closed
+	ResetReasonRebindRefused    byte = 3 // rebind refused (stale gen, carrier mismatch, attach failed)
+	ResetReasonTargetDialFailed byte = 4 // bootstrap target dial failed (Issue #21 variant)
+)
+
+// ResetPayloadSize is the fixed 10-byte size of the FrameReset payload.
+const ResetPayloadSize = 10
+
+// ResetVersion is the protocol version byte in the FrameReset payload.
+const ResetVersion byte = 1
+
+// EncodeResetPayload encodes a FrameReset payload.
+func EncodeResetPayload(reason byte, gen uint64) []byte {
+	out := make([]byte, ResetPayloadSize)
+	out[0] = ResetVersion
+	out[1] = reason
+	binary.BigEndian.PutUint64(out[2:10], gen)
+	return out
+}
+
+// ParseResetPayload decodes and validates a FrameReset payload.
+// It returns the reason and generation, or an error if malformed.
+func ParseResetPayload(payload []byte) (reason byte, gen uint64, err error) {
+	if len(payload) != ResetPayloadSize {
+		return 0, 0, fmt.Errorf("mux: reset: malformed payload length (want %d, got %d)", ResetPayloadSize, len(payload))
+	}
+	if payload[0] != ResetVersion {
+		return 0, 0, fmt.Errorf("mux: reset: unknown version %d", payload[0])
+	}
+	reason = payload[1]
+	gen = binary.BigEndian.Uint64(payload[2:10])
+	return reason, gen, nil
+}
+
+// ============================================================
+// FrameBootstrapAck payload — Issue #21 (SOCKS5 bootstrap result)
+// ============================================================
+//
+// Fixed 2-byte block:
+//
+//	Offset  Size  Field
+//	0       1     version (must equal 1)
+//	1       1     status (RFC 1928 SOCKS5 reply code: 0x00 success, 0x01-0x08 failures)
+//
+// The status byte maps directly to the SOCKS5 reply that the Iran
+// handler writes to the client. Germany sends this on the up carrier
+// after bootstrapUpStream completes (success or failure).
+
+// BootstrapAckPayloadSize is the fixed 2-byte size of the FrameBootstrapAck payload.
+const BootstrapAckPayloadSize = 2
+
+// BootstrapAckVersion is the protocol version byte in the FrameBootstrapAck payload.
+const BootstrapAckVersion byte = 1
+
+// EncodeBootstrapAckPayload encodes a FrameBootstrapAck payload.
+func EncodeBootstrapAckPayload(status byte) []byte {
+	out := make([]byte, BootstrapAckPayloadSize)
+	out[0] = BootstrapAckVersion
+	out[1] = status
+	return out
+}
+
+// ParseBootstrapAckPayload decodes and validates a FrameBootstrapAck payload.
+func ParseBootstrapAckPayload(payload []byte) (status byte, err error) {
+	if len(payload) != BootstrapAckPayloadSize {
+		return 0, fmt.Errorf("mux: bootstrap ack: malformed payload length (want %d, got %d)", BootstrapAckPayloadSize, len(payload))
+	}
+	if payload[0] != BootstrapAckVersion {
+		return 0, fmt.Errorf("mux: bootstrap ack: unknown version %d", payload[0])
+	}
+	return payload[1], nil
 }

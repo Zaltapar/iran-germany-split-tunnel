@@ -12,12 +12,15 @@
 // visible outage — with base 2s / cap 60s the first six failed attempts
 // sleep a cumulative 2+4+8+16+32+60 = 122 seconds in the worst case, so
 // the carrier keeps sitting in a 60-second sleep long after the
-// underlay has recovered. NewBounded additionally bounds the TOTAL
-// nominal sleeping within one failure episode by window; once the
-// cumulative nominal delay reaches window, every further delay is
-// clamped to clamp (when clamp > 0), guaranteeing the carrier is
-// retried at least every clamp seconds once an outage outlives the
-// window. The invariants hold: no reconnect storm, no busy-loop, and
+// underlay has recovered. NewBounded adds a THRESHOLD-triggered clamp:
+// once the cumulative nominal delay since the last Reset reaches window,
+// every further delay is clamped to clamp (when clamp > 0), guaranteeing
+// the carrier is retried at least every clamp seconds once an outage
+// outlives the window. Window is a threshold, NOT a hard cap on total
+// sleep — the cumulative may overshoot window by up to one max delay
+// before the clamp engages on the NEXT call (e.g. 1,2,4,8,10,10 sums to
+// 35 with window 30; the 6th delay is still 10, clamping starts at the
+// 7th). The invariants hold: no reconnect storm, no busy-loop, and
 // the cap is a real cap (the jitter still never exceeds the scheduled
 // delay, and clamp is itself capped at max at construction time).
 package backoff
@@ -52,16 +55,21 @@ func New(base, max time.Duration) *Backoff {
 	return NewBounded(base, max, 0, 0)
 }
 
-// NewBounded builds a reconnect schedule whose TOTAL sleeping within one
-// failure episode is bounded by window. Once the cumulative nominal delay
-// since the last Reset reaches window, every further delay is clamped to
-// clamp (when clamp > 0 and clamp < the scheduled delay). This guarantees
-// the carrier is retried at least every clamp seconds once an outage
-// outlives the window, so a transient underlay failure can never amplify
-// into a multi-minute user-visible outage.
+// NewBounded builds a reconnect schedule with a cumulative nominal-delay
+// threshold (window) per failure episode. Once the cumulative nominal delay
+// handed out by Next() since the last Reset reaches window (b.slept >= window),
+// every subsequent Next() call clamps its scheduled delay to min(d, clamp).
+//
+// Note that window is a threshold checked BEFORE adding the current attempt's
+// delay, NOT a hard cap on cumulative sleep: the attempt that crosses window
+// still receives its normal exponential (max-capped) delay, so cumulative
+// nominal sleep before clamping begins on the next attempt can reach at most
+// window - 1ns + max. Once exhausted, the carrier is retried at least every
+// clamp duration, preventing a brief underlay blip from amplifying into a
+// multi-minute outage.
 //
 // window <= 0 or clamp <= 0 disables the bound (pure exponential backoff,
-// the pre-fix behavior).
+// the pre-fix behavior). clamp > max is sanitized down to max.
 func NewBounded(base, max, window, clamp time.Duration) *Backoff {
 	if base <= 0 {
 		base = time.Millisecond

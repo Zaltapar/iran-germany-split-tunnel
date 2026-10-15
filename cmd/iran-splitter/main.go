@@ -238,8 +238,12 @@ func main() {
 		SessionBufferTotalBytes: cfg.SessionBufTotal,
 		RelayBufSize:            cfg.RelayBufSize,
 		KeepAliveInterval:       cfg.KeepAliveInterval,
-		LivenessRounds:          cfg.LivenessRounds,
-		StreamLimits:            streamLimits(cfg),
+		// Issue #19: kernel TCP keepalive probe period for the accepted
+		// client (SOCKS5) sockets and the down-carrier TCP transport
+		// (SPLIT_TCP_KEEPALIVE_MS; default 30s, 0 disables).
+		TCPKeepAliveMs: cfg.TCPKeepAliveMs,
+		LivenessRounds: cfg.LivenessRounds,
+		StreamLimits:   streamLimits(cfg),
 		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
 		CreditsEnabled: cfg.CreditsEnabled,
 		// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
@@ -697,29 +701,55 @@ func (s *Splitter) handleSOCKS5Conn(clientConn net.Conn) {
 		clientConn.Close()
 		return
 	}
-
 	s.logger.Printf("SOCKS5 CONNECT → %s:%d from %s", dest.Addr, dest.Port, clientConn.RemoteAddr())
+	// Issue #21: wait for the remote (Germany) bootstrap verdict before
+	// replying. StartSessionAndWait allocates the stream, writes the up
+	// FrameHeader, runs the relays (the up relay reads clientConn while
+	// we wait, so a client disconnect is detected there and half-closes
+	// the up direction so Germany frees its target socket), and BLOCKS
+	// — bounded by the bootstrap deadline and the session's own teardown,
+	// so it can never hang — for Germany's FrameBootstrapAck. It returns
+	// the RFC 1928 status byte: 0x00 only when the target actually
+	// accepted, 0x05/0x04/0x02/0x03/0x06 on refusal / DNS / ruleset /
+	// network-unreachable / timeout. It does NOT adopt the client conn
+	// (adoptConn=false), so on every path below we own the socket and can
+	// deliver the reply.
+	sess, status := s.node.StartSessionAndWait(clientConn, dest)
 
-	// Hand the session to the Phase 5 engine (pkg/node): it waits for
-	// both carriers (30 s), allocates the stream ID, runs the relays
-	// (with the bounded reconnect buffer) and rebinds the session
-	// across carrier losses. On success it ADOPTS the client conn (the
-	// session's Close becomes the only closer) and returns the session;
-	// on failure it tears the session down but returns the client conn
-	// to us still open, so the SOCKS error reply below is actually
-	// delivered.
-	sess, err := s.node.StartSession(clientConn, dest)
-	if err != nil {
-		s.logger.Printf("SOCKS5 %s:%d: %v", dest.Addr, dest.Port, err)
-		socksReply(clientConn, 0x06) // general SOCKS server failure
+	// Normalize the out-of-range local sentinel ("no remote verdict — the
+	// stream is over": node shutdown, carrier loss, client abort) to a
+	// general failure so the wire never carries 0xFF.
+	code := status
+	if code == byte(session.BootstrapEndedWithoutResult) {
+		code = 0x01
+	}
+
+	if code != 0x00 {
+		// Bootstrap did not establish (target refused, DNS failed,
+		// ruleset block, carrier not recovered in the window, or the
+		// session was torn down locally first). The client conn is still
+		// ours to close (the session never adopted it, or already tore
+		// down), so send the ACCURATE error reply and close — never a
+		// false 0x00. The session's OnClose has deregistered its streams
+		// and signalled Germany, so its target socket is not leaked.
+		s.logger.Printf("SOCKS5 %s:%d: bootstrap failed (0x%02x)", dest.Addr, dest.Port, code)
+		socksReply(clientConn, code)
 		clientConn.Close()
 		return
 	}
 
-	// SOCKS5 success reply. The conn may be read at any time now: from
-	// this point on the client is connected to the tunnel.
+	// Bootstrap SUCCEEDED (0x00): the target accepted. Hand the client
+	// conn to the session so its authoritative Close is the only closer,
+	// then send the SOCKS success reply — from here the client is
+	// connected to the tunnel. If a local teardown raced the ack and the
+	// adopt is refused, the session will not close the conn, so we do.
 	socksReply(clientConn, 0x00)
-	s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
+	if sess != nil && sess.AdoptConn(clientConn) {
+		s.logger.Printf("Session %s → %s:%d", sess.ID.String(), dest.Addr, dest.Port)
+		return
+	}
+	s.logger.Printf("SOCKS5 %s:%d: session already closing after success ack; closing conn", dest.Addr, dest.Port)
+	clientConn.Close()
 }
 
 // ============================================================

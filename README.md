@@ -235,7 +235,7 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_WS_LISTEN` | ✓ | | `127.0.0.1:9001` | Up-carrier WebSocket server (path `/upload`, front with nginx → CDN) |
 | `SPLIT_DOWN_CARRIER_ADDR` | ✓ | | `127.0.0.1:10802` | Down-carrier dial target (local Xray VLESS+Reality outbound) |
 | `SPLIT_UP_WS_URL` | | ✓ | `wss://cdn.example.com/upload` | Up-carrier WebSocket URL (CDN domain) |
-| `SPLIT_DOWN_LISTEN` | | ✓ | `:9002` | Down-carrier TCP listener |
+| `SPLIT_DOWN_LISTEN` | | ✓ | `127.0.0.1:9002` | Down-carrier TCP listener (loopback-only default; non-loopback supported, logged on bind) |
 | `SPLIT_SECRET` | ✓ | ✓ | placeholder | **Must match on both nodes** (min 32 chars; blocklisted placeholders rejected at startup) |
 | `SPLIT_ALLOW_WEAK_SECRET` | ✓ | ✓ | unset | `=1` bypasses the secret length check (development/test only; blocklist still enforced) |
 | `SPLIT_METRICS_PORT` | ✓ | ✓ | `0` (off) | Local HTTP metrics port |
@@ -249,6 +249,11 @@ sudo systemctl enable --now germany-splitter
 | `SPLIT_SESSION_BUFFER_BYTES` | ✓ | ✓ | `262144` (256 KiB) | Per-direction reconnect buffer per session (4 KiB..16 MiB) |
 | `SPLIT_SESSION_BUFFER_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Node-level aggregate session-buffer budget (`0` = library default) |
 | `SPLIT_LIVENESS_ROUNDS` | ✓ | ✓ | `0` (3) | Blackhole detection: consecutive unanswered keepalive pings before the carrier is torn down (`0` = library default, 0..20) |
+| `SPLIT_TCP_KEEPALIVE_MS` | ✓ | ✓ | `30000` | Kernel TCP keepalive probe period (ms) for the long-lived client / target / carrier TCP sockets; `0` disables (OS default keepalive, the pre-Phase-2 behavior). Ranges 0..36000000. |
+| `SPLIT_RECONNECT_BASE_MS` | ✓ | ✓ | `1000` | Carrier reconnect exponential backoff base (ms) |
+| `SPLIT_RECONNECT_MAX_MS` | ✓ | ✓ | `10000` | Carrier reconnect exponential backoff cap (ms) |
+| `SPLIT_RECONNECT_WINDOW_MS` | ✓ | ✓ | `30000` | Cumulative nominal reconnect-sleep threshold per failure episode (ms; `0` disables). See [`docs/carrier-reconnect-backoff.md`](docs/carrier-reconnect-backoff.md). |
+| `SPLIT_RECONNECT_CLAMP_MS` | ✓ | ✓ | `2000` | Per-attempt delay cap once the window is exhausted (ms; `0` disables) |
 | `SPLIT_TARGET_ADDR_POLICY` | ✓ | ✓ | `default` | Opt-in egress-target address-family policy: `default` (today's dual-stack dial) / `prefer-ipv4` (deterministic v4-first with v6 fallback, **recommended**) / `ipv4-only` (hard A-record filter; use with care — breaks AAAA-only endpoints). See `docs/target-ipv4-policy.md`. |
 | `SPLIT_TARGET_ONLY_IPV4` | ✓ | ✓ | `false` (off) | Opt-in **hard** only-IPv4 egress-target filter: when `true`, the node's default `TargetDial` resolves domain hosts to IPv4 (A) records only; AAAA-only domains are refused (no silent IPv6 fallback); literal IP addresses always dial as given. Use with care (breaks AAAA-only endpoints). See `docs/target-ipv4-policy.md`. |
 
@@ -524,7 +529,7 @@ their expected source:
 
 * Iran: `SPLIT_WS_LISTEN` (default `127.0.0.1:9001`) — via CDN/nginx only, never
   direct;
-* Germany: `SPLIT_DOWN_LISTEN` (default `:9002`) — from the download
+* Germany: `SPLIT_DOWN_LISTEN` (default `127.0.0.1:9002`) — from the download
   carrier transport (Xray inbound) only;
 * metrics port — local tools only.
 

@@ -1,0 +1,41 @@
+# Phase 2 Multi-Carrier Defect Register — 2026-10-14
+
+Prioritized defect register for the `feat/multi-carrier-phase2` audit.
+Companion to [`phase2-audit-2026-10-14.md`](./phase2-audit-2026-10-14.md).
+
+**Status values.**
+- **Confirmed+Fixed** — failure path proven in-tree, fix present, regression tests green on `go1.27.0 windows/amd64`.
+- **Confirmed+Unverified** — fix present and unit-verified, but the real-transport (L5) proof is still pending.
+- **Blocked** — cannot be completed on this host; requires the Linux CI / staging gate.
+- **Hypothesis-Rejected** — raised during the audit and disproven by evidence.
+- **Deferred** — assessed as a non-defect / out of scope this phase.
+
+| ID | Severity | Status | Component | Description | Evidence (test) | Notes |
+|---|---|---|---|---|---|---|
+| D20 | P1 | Confirmed+Unverified | `pkg/node` rebind / session | **Issue #20** — stranded session / refused rebind: `handleRebind` silently `Deregister`s a refused rebind with no negative ack, `att.Attach` can leave the stranded stream without a guaranteed grace close, and `onCarrierLost` `break`s after the first (possibly no-op) survivor, so the originator retries the rebind on every later carrier drop. | `pkg/node/issue20_test.go`, `pkg/node/issue20_e2e_test.go`, `pkg/mux/frame_reset_test.go`, `pkg/node/multicarrier_edge_test.go` (all PASS) | Fix: versioned `FrameReset` (0x08) with reason + generation echo, idempotent `handleStreamReset` with generation guard, `onCarrierLost` survivor fallback loop, exact-once close. Real-transport proof is L5 (blocked below). |
+| D21 | P1 | Confirmed+Unverified | `cmd/iran-splitter` SOCKS5 / `pkg/node` bootstrap | **Issue #21** — false SOCKS5 `0x00` success written before the remote (Germany) target dial result is known. | `cmd/iran-splitter/socks_handle_test.go`, `pkg/node/issue21_classifier_test.go`, `pkg/node/issue21_e2e_test.go`, `pkg/mux/frame_reset_test.go` (all PASS) | Fix: `FrameBootstrapAck` (0x09) status frame, `session.bootstrapC` + `WaitBootstrap`, `StartSessionAndWait`, pure `bootstrapAckStatus(err)` → RFC 1928 byte, `clientConnGate` ordering guarantee. `0x00` only after target accept. |
+| D19 | P2 | Confirmed+Fixed | `pkg/node` + `internal/config` keepalive | **Issue #19** — no OS TCP keepalive anywhere (`SetKeepAlive` = 0 occurrences). | `pkg/node/keepalive_test.go` (7 PASS) | Fix: `SPLIT_TCP_KEEPALIVE_MS` (default 30 s, `0` disables) → `node.Config.TCPKeepAliveMs` → `applyTCPKeepAlive` at client/target/carrier socket creation. No-op for non-TCP. |
+| D10 | P2 | Confirmed+Fixed | `internal/backoff` docs | **#10 / backoff** — imprecise `NewBounded` `window` semantics (documented as a hard cap; actually a pre-attempt threshold that may overshoot by one `max`). | `internal/backoff/backoff_test.go` (14 PASS, incl. `TestWindowThresholdSemanticsExactAndOvershoot`) | Fix: `window` documented as a threshold; `clamp` as the `min(d, clamp)` cap after `slept >= window`; operator doc `docs/carrier-reconnect-backoff.md` corrected. No runtime change. |
+| D7 | P2 | Confirmed+Fixed | `internal/config` exposure | **Section 7** — Germany `DefaultDownListen = ":9002"` (bare port) bound all interfaces, exposing the down-carrier auth endpoint beyond localhost. | `internal/config/config_test.go` `TestDefaultDownListenIsLoopback` (PASS) | Fix: default now `127.0.0.1:9002` (loopback, matches the Xray Reality topology); non-loopback still supported with a one-time journal warning. Operators relying on `0.0.0.0:9002` **must** set `SPLIT_DOWN_LISTEN` explicitly. |
+| D12 | P3 | Confirmed+Fixed | `.github/workflows/go.yml` CI | **Issue #12** — `install-oneclick.sh` / `install-oneclick.test.sh` absent from CI. | In-tree `bash -n` of both scripts PASS; full Linux gate is CI. | Fix: workflow `bash -n`s all installer scripts, executes the hermetic harness, and adds `feat/multi-carrier-phase2` to push triggers. |
+| D-UI | P3 | Confirmed+Fixed | `internal/dashboard/static` | **Dashboard UI defect** — duplicate `data-view="network"`; missing `data-view="outbounds"`; weak monitoring/error/accessibility affordances. | `internal/dashboard/ui_test.go` (10 PASS), `internal/dashboard/static_assets_test.go` (5 PASS) | Fix + modernization: fixed views, tunnel-state banner, stale-telemetry badge, carrier detail cards with explicit `unmeasured`, ARIA/skip-link/focus-visible, copy-diagnostics, distinct 401/403/503. `docs/tunneldash.md` updated. |
+| D-GATE | P2 | Confirmed+Fixed | `integration/twoproc_test.go` | Two-process L4 gate blocked on **every** platform: stale single-carrier-era marker strings no longer match the multi-carrier carrier-ID log lines; S10 still expected SOCKS `0x06` for carrier-loss. | `go test ./...` green in-tree; full two-process run is the Linux gate (BLOCKED below). | Fix: markers corrected to carrier-ID strings; S10 contract updated to `0x01` for `BootstrapEndedWithoutResult` (the bounded bootstrap wait is still asserted ~2 s). |
+| D-PR30 | — | Hypothesis-Rejected | divergence | **Hypothesis: "PR #30 up-read fix is missing from this branch."** Rejected: `feat/multi-carrier-phase2..origin/main` is only merge commit `fbe7604`; its code parent `fdd7cbc` is already an ancestor of HEAD. | `git merge-base --is-ancestor fdd7cbc HEAD` → success | Nothing to cherry-pick; PR #30 is already integrated. |
+| D-METRIC-EXP | — | Hypothesis-Rejected | `pkg/node` metrics listener | **Hypothesis: metrics endpoint exposed beyond loopback.** Rejected: the metrics listener is always loopback and **disabled by default** (`SPLIT_METRICS_PORT=0`). | code inspection of `internal/config` + `pkg/node` metrics bind | No exposure defect. |
+| D-ROUTE | — | Hypothesis-Rejected | `pkg/routing` | **Hypothesis: routing may pass traffic fail-open on a ruleset error.** Rejected: verified routing is **fail-closed** (blocked on error; `routing.ErrBlocked → SOCKS 0x02`). | `bootstrapAckStatus` + routing tests | Correct behavior confirmed. |
+| D-DASH-SEC | — | Hypothesis-Rejected | `internal/dashboard` | **Hypothesis: dashboard UI modernization weakened auth/CSRF/TLS/CSP.** Rejected: verified intact — Basic auth, CSRF header, TLS security headers, CSP, loopback bind, read-only default all preserved; `TestIndexSecurityInvariantsRecheck` + `TestCSPCompatibleMarkup` PASS. | `internal/dashboard/ui_test.go`, `static_assets_test.go` | No security regression. |
+| D-BOUNDED-RECOVERY | P3 | Deferred (non-defect) | `pkg/node` carrier recovery timing | **Section 6** — bounded-recovery timing of the carrier reconnect window. | `internal/backoff` tests | Assessed **correct as designed**: `SPLIT_RECONNECT_*` defaults (base 1 s / cap 10 s / window 30 s / clamp 2 s) bound the episode; no storm, no busy-loop. Documented in `docs/carrier-reconnect-backoff.md`. No change required. |
+| D-CREDIT-FC | P3 | Deferred (non-defect) | `pkg/node` credit flow control | **Section 8** — credit flow control (`FrameCredit`). | `pkg/mux` + `pkg/node` credit tests | Assessed **correct**: credit plane is inert unless `SPLIT_CREDITS_ENABLED` (default off). `handleRebind` deliberately does not emit the attach-time anchor on the down path (SUBTASK 25 fix) to avoid the reconnect storm. No change required this phase. |
+| D-STREAM-PIN | P3 | Deferred (non-defect) | `pkg/node` per-stream carrier selection | **Section 9** — per-stream carrier pinning semantics. | `pkg/node/multicarrier_edge_test.go` | Assessed **correct and intentional**: each stream is **pinned to a single carrier** (per-stream selection). **This is NOT bandwidth bonding** — a stream's bytes never span multiple carriers; the multi-carrier layer provides failover/priority, not parallel aggregation. No change required. |
+
+## Release-relevant subset (must be green before production)
+
+| Gate | Status |
+|---|---|
+| D20 real-transport `FrameReset` | **BLOCKED** — L5 staging matrix |
+| D21 real-transport `FrameBootstrapAck` + SOCKS status bytes | **BLOCKED** — L5 staging matrix |
+| D-GATE two-process L4 (`go test -race` on Linux) | **BLOCKED** — CI |
+| D19 keepalive, D7 loopback bind | Staged, verified in-tree; confirm via `ss`/journal post-rollout |
+| Full `integration/RUNBOOK.md` 20-scenario matrix ×2 (incl. race) | **BLOCKED** — staging |
+
+See [`phase2-deployment-rollback-2026-10-14.md`](./phase2-deployment-rollback-2026-10-14.md).

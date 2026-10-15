@@ -156,11 +156,28 @@ type CarrierConn struct {
 	// c.mu after each round.
 	livenessRounds int
 	sawPong        bool
-
 	// OnStreamTerminated, if non-nil, is called once when a stream is
 	// terminated by overflow pressure. The callback is keyed only by the
 	// stream ID and must not block.
 	OnStreamTerminated func(streamID uint32)
+
+	// OnStreamReset, if non-nil, is called (synchronously, in the
+	// dispatcher goroutine, OUTSIDE c.mu — mirroring OnStreamCredit) when a
+	// well-formed FrameReset (Issue #20) arrives on a registered stream.
+	// The node callback terminates the stranded logical session locally
+	// (closeSession) instead of retrying the rebind forever. It must not
+	// block. Unknown-stream / stale resets are still routed here; the
+	// node callback re-validates session existence + generation echo and
+	// makes them idempotent no-ops.
+	OnStreamReset func(streamID uint32, reason byte, gen uint64)
+
+	// OnStreamBootstrapAck, if non-nil, is called (in the dispatcher
+	// goroutine, outside c.mu) for every well-formed FrameBootstrapAck
+	// (Issue #21) on a registered stream. The node callback resolves the
+	// pending StartSession bootstrap wait with the status byte. Unknown-
+	// stream acks are dropped silently in Dispatch (no callback), which
+	// is correct: a stale ack for a dead stream has no waiter.
+	OnStreamBootstrapAck func(streamID uint32, status byte)
 
 	// OnStreamDataUndeliverable, if non-nil, is called once when a stream
 	// is terminated because an in-order DATA frame could not be delivered
@@ -1059,6 +1076,42 @@ func (c *CarrierConn) Dispatch() {
 				it = queueItem{payload: f.Payload}
 			}
 			c.deliver(s, it)
+		case FrameReset:
+			// Issue #20: stream-level negative acknowledgement. The node
+			// callback terminates the stranded local session; its OnClose
+			// hook deregisters the stream from every carrier, so a repeat
+			// or reordered reset for the same stream is an idempotent no-op
+			// here (the stream is already gone, or a new session owns the
+			// ID and its own generation check rejects the stale frame).
+			//
+			// These are CONTROL frames: they are NEVER delivered to the
+			// stream mailbox, so no OnNewStream fire is suppressed and no
+			// stream record is created (a reset for a stream unknown to this
+			// carrier is expected mid-loss-window and must not spawn a
+			// phantom stream or trigger a connection-level failure). The
+			// payload is parse-validated here (structural only) and the
+			// semantic validation (session existence, generation echo)
+			// happens in the node callback.
+			if c.OnStreamReset != nil {
+				if reason, gen, perr := ParseResetPayload(f.Payload); perr == nil {
+					c.OnStreamReset(f.StreamID, reason, gen)
+				}
+			}
+		case FrameBootstrapAck:
+			// Issue #21: bootstrap result from Germany. The originator
+			// pre-registers its up stream at StartSession, so a live wait
+			// implies the stream exists on this carrier; an unknown-stream
+			// ack (its session already closed, or a stale frame for a
+			// superseded stream) has no waiter and is dropped SILENTLY —
+			// never a protocol violation (duplicate/stale control frames
+			// are expected and must stay idempotent). No stream mailbox
+			// delivery: control-only, parsed structurally here and resolved
+			// semantically in the node callback.
+			if c.OnStreamBootstrapAck != nil {
+				if status, perr := ParseBootstrapAckPayload(f.Payload); perr == nil {
+					c.OnStreamBootstrapAck(f.StreamID, status)
+				}
+			}
 		case FramePing:
 			pong := make([]byte, HeaderSize+1)
 			pong[4] = FramePong

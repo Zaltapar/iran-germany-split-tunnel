@@ -358,20 +358,120 @@ the gate short-circuits and writes the 403 before delegating.
 
 ## Web UI
 
-The embedded UI (`/`) is a no-build HTML/CSS/JS dashboard:
+The embedded UI (`/`) is a no-build HTML/CSS/JS dashboard with the following
+sections, navigable from the sidebar:
 
-- **Overview cards** for Iran and Germany: status badge, active sessions,
-  bytes/s up/down, carrier loss events, last collection timestamp.
-- **Per-server detail view**: metric table with rates, queue pressure,
-  logs, safe config view.
-- **Polling**: configurable interval (default 5 s); manual refresh button.
-- **Stale / Unreachable / Unsupported badges** on each card.
-- **Dry-run plan form** for `SPLIT_TARGET_ADDR_POLICY`,
-  `SPLIT_TARGET_ONLY_IPV4`, `SPLIT_METRICS_PORT`, `SPLIT_RELAY_BUF`.
-- **Apply button** is disabled and nonfunctional; it is explicitly labeled
-  "disabled / read-only" and the server rejects any apply attempt.
-- **Warning banner**: "Local fixture / read-only mode. No production hosts
-  were contacted. No secrets are displayed."
+### Overview
+
+- **Tunnel state banner**: overall state (`healthy` / `degraded` / `recovering`
+  / `unavailable`) with a color-independent icon (●/◐/◔/○) plus text label.
+  The state is derived from real backend data: host freshness, carrier
+  eligibility, and unreached/stale badges.
+- **Stale telemetry indicator**: when any host snapshot is older than two
+  refresh intervals, a `⚠ stale telemetry` badge appears alongside the
+  state badge.
+- **Down-carrier summary cards**: one card per non-Iran host showing status
+  badge, active sessions, carrier losses, and collection age.
+- **KPI cards**: hosts (with stale/unreachable counts), collectors missing,
+  carriers (with eligible count), outbounds (with enabled count), routing
+  rules, active sessions, carrier losses, and buffer pressure (rendered as
+  `unmeasured` when not collected — never fabricated).
+- **Throughput chart**: upload/download MiB/s for the Iran host.
+- **Carrier detail cards**: per-carrier `state`, `score`, `goodput`,
+  `success ratio`, `stall rate`, `eligibility`, `cooldown`, `probe bytes`,
+  `losses`, `reconnects`, and `gate reason`. Fields not exported by the
+  backend are explicitly shown as `unmeasured` (e.g. TTFB p50, RTT, queue
+  usage, credit window) — the UI never displays a zero for a missing value.
+
+### Carriers (Tunnels / Carriers section)
+
+- **Summary table**: all carriers with state, score, goodput, success ratio,
+  stall rate, eligibility, cooldown, probe bytes, losses, and reconnects.
+- **Per-carrier detail cards**: same fields as the overview carrier cards,
+  plus an explicit operator-action guidance line (e.g. "Carrier is gated
+  (H2 flap). Check carrier connectivity and probe results.").
+- **Score and goodput time-series charts**: inline SVG, no external library.
+- **Unmeasured fields** are labelled explicitly; the `unavailable` array
+  from the API is rendered as a notice listing what the backend does not
+  export in this phase.
+
+### Hosts
+
+- Host table with status badges, active sessions, up/down MiB/s, memory,
+  disk, uptime, CPU (`—` when not collected), and carrier losses.
+- Per-host health cards with `collected at` timestamp and `age`.
+- **v1 host detail** (expandable): services, listeners, metrics, and a
+  dry-run config plan form (Apply is permanently disabled).
+
+### Routing
+
+- **Routing rules editor** (C4): default action selector, editable rules
+  table with live client-side validation, `Validate` and `Preview diff`
+  buttons (POST to `/api/v2/changes/germany/routing-validate`), and a
+  gated `Apply` button (disabled unless the `routingApply` flag is on;
+  requires typed `RESTART` confirmation).
+- All mutations are POST-only and carry the `X-Tunneldash-Request` CSRF
+  header; the server enforces the flag gate independently.
+
+### Outbounds
+
+- Read-only table of configured Reality/Xray outbounds: name, protocol,
+  port, SNI, transport, enabled, status, and validation issues.
+- No key material, UUIDs, or credentials are displayed.
+- Editing is disabled in this build.
+
+### Inbounds
+
+- Read-only cards for Germany Reality and Iran consumer inbounds (C3).
+- Key material is shown only as a 12-hex fingerprint (`keyRef`);
+  never editable.
+- `Validate` and `Apply` buttons are gated by per-role capability flags
+  (default off → buttons disabled with a tooltip naming the flag).
+- **Rotate-key affordance**: gated by the `keyRotation` flag; requires
+  typed `ROTATE` confirmation; the old key is always retained for rollback.
+
+### Control
+
+- **Multi-carrier control editor** (C4): master toggle, second-carrier
+  listener/dial/SNI fields, and policy knobs (`SPLIT_POLICY_MODE`,
+  `SPLIT_POLICY_TOP_K`, `SPLIT_PROBING_ENABLED`, probe URL, daily budget,
+  TTFB baseline).
+- `Validate` / `Preview diff` / `Apply` (gated by `multiCarrierApply`
+  flag; requires typed `RESTART` confirmation).
+
+### Network speed
+
+- Per-host throughput time-series charts (upload and download MiB/s)
+  derived from byte-counter deltas across consecutive collections.
+  History is in-memory only and resets when the dashboard restarts.
+
+### Configuration
+
+- Redacted key/value table of the current dashboard config. TLS basePath,
+  credential sources, key paths, and SSH identity paths are never shown.
+- Dry-run config plan form (v1) with the Apply button permanently disabled.
+
+### Logs / Events
+
+- Recent audit and collector events. Messages are redacted before display.
+- Empty state: "No events recorded yet."
+
+### Diagnostics & Accessibility
+
+- **Copy Diagnostics button** (footer): copies a clean, redacted JSON
+  snapshot of the current overview + carrier state to the clipboard.
+  No secrets, keys, or credentials are included.
+- **Error states**: 401/403 renders a "Permission denied" alert with an
+  action hint; 503 renders a "Control plane unavailable" notice; other
+  errors render a generic failure notice. All use `role="alert"`.
+- **Keyboard navigation**: `Escape` closes the mobile sidebar; `r`
+  refreshes the current section (ignored when focus is in an input).
+  `:focus-visible` outlines are visible on all interactive elements.
+- **ARIA**: `role="status"` + `aria-live="polite"` on the global badge
+  container; `role="contentinfo"` on the footer; skip-link to `#content`.
+- **Color-independent status**: every status indicator pairs a colour
+  badge with an icon (●/◐/◔/○) or text label; no state is conveyed by
+  colour alone.
 - No external CDN, no remote fonts, no remote scripts. All assets are
   embedded in the binary via `embed.FS`.
 

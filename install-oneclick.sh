@@ -474,7 +474,9 @@ export_role_env() {
 
   local ws_listen="${ONECLICK_WS_LISTEN:-127.0.0.1:9001}"
   local socks_listen="${ONECLICK_SOCKS_LISTEN:-127.0.0.1:10900}"
-  local down_listen="${ONECLICK_DOWN_LISTEN:-:9002}"
+  # Loopback-only default: the down-carrier listener is reached through the
+  # local VLESS+Reality Xray inbound, never directly from the Internet.
+  local down_listen="${ONECLICK_DOWN_LISTEN:-127.0.0.1:9002}"
 
   if [ "$ROLE" = "iran" ]; then
     export SPLIT_WS_LISTEN="$ws_listen"

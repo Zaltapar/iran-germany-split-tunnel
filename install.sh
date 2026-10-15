@@ -691,7 +691,7 @@ gather_params() {
     germany)
       if [ -z "$DOWN_LISTEN" ]; then
         ask_valid "Down-carrier TCP listen (Iran reaches it via the VLESS+Reality tunnel)" \
-          "0.0.0.0:9002" is_hostport "expected host:port, e.g. 127.0.0.1:9002 (private) or 0.0.0.0:9002"
+          "127.0.0.1:9002" is_hostport "expected host:port, e.g. 127.0.0.1:9002 (private, default) or 0.0.0.0:9002 (non-loopback)"
         DOWN_LISTEN="${REPLY_VALUE}"
       fi
       if [ -z "$UP_WS_URL" ]; then

@@ -326,8 +326,12 @@ func main() {
 		SessionBufferTotalBytes: cfg.SessionBufTotal,
 		RelayBufSize:            cfg.RelayBufSize,
 		KeepAliveInterval:       cfg.KeepAliveInterval,
-		LivenessRounds:          cfg.LivenessRounds,
-		StreamLimits:            streamLimits(cfg),
+		// Issue #19: kernel TCP keepalive probe period for the egress
+		// target sockets and the down-carrier TCP transport
+		// (SPLIT_TCP_KEEPALIVE_MS; default 30s, 0 disables).
+		TCPKeepAliveMs: cfg.TCPKeepAliveMs,
+		LivenessRounds: cfg.LivenessRounds,
+		StreamLimits:   streamLimits(cfg),
 		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
 		CreditsEnabled: cfg.CreditsEnabled,
 		// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
@@ -647,6 +651,18 @@ func (s *Splitter) runDownInstance(secondary bool) {
 		}
 	}
 	defer ln.Close()
+	// Section 7 / Issue #12: the down-carrier listener default is
+	// loopback (127.0.0.1:9002), reached only via the local VLESS+Reality
+	// Xray inbound. An operator who explicitly configured a NON-loopback
+	// bind exposes the auth endpoint beyond localhost; warn once so the
+	// intent is visible in the journal. Non-loopback binds remain fully
+	// supported — this is an advisory, not a refusal.
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+		if ip := ta.IP; ip != nil && !ip.IsLoopback() {
+			s.logger.Printf("Down-carrier %s: NON-LOOPBACK bind %s — the auth endpoint is reachable beyond localhost; confirm your firewall blocks direct inbound (only the Reality tunnel should reach it)",
+				id, ln.Addr().String())
+		}
+	}
 	// The gate is normally created by the spawning goroutine (see main),
 	// so its field write happens-before the accept loop reads it. Only
 	// create it here if the caller (a test) did not pre-create one.

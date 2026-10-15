@@ -47,16 +47,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
-
-	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
-	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 )
 
 // Role identifies which side of the tunnel a Node operates.
@@ -213,6 +216,17 @@ type Config struct {
 	// Mode (PolicyStatic | PolicyAdaptive) from the operator config; the
 	// zero value sanitizes to PolicyStatic (the Phase 2 rollback).
 	PolicyCfg PolicyConfig
+
+	// TCPKeepAliveMs is the kernel TCP keepalive probe period (ms) for
+	// this node's long-lived TCP sockets: the accepted client (SOCKS5)
+	// sockets, the egress target dials, and the carrier TCP transports
+	// (Issue #19, SPLIT_TCP_KEEPALIVE_MS). A wedged or half-open socket
+	// is then reaped by the kernel within ~one probe instead of the OS
+	// default (~2 h on Linux). Zero (unset) lifts to the 30s library
+	// default; the operator may disable it with SPLIT_TCP_KEEPALIVE_MS=0
+	// (the OS default keepalive then stands, byte-identical to the
+	// pre-Issue-#19 build).
+	TCPKeepAliveMs int
 }
 
 // Sanitize replaces zero/negative values with defaults. It returns a loud
@@ -254,7 +268,50 @@ func (c *Config) Sanitize() error {
 	if c.TargetDial == nil {
 		c.TargetDial = newDefaultTargetDial(onlyIPv4, preferIPv4)
 	}
+	// Issue #19: a negative keepalive period is a misconfiguration (0 is a
+	// valid "disabled" sentinel, so we only reject negatives here). 0
+	// means "leave the socket on the OS default keepalive" and is NOT lifted
+	// to a default — the operator reaches it explicitly via
+	// SPLIT_TCP_KEEPALIVE_MS=0 (config.Load defaults the knob to 30s, so a
+	// zero here comes from an intentional disable or a hand-built node.Config
+	// that opts out of kernel keepalive).
+	if c.TCPKeepAliveMs < 0 {
+		return fmt.Errorf("node: TCPKeepAliveMs must be >= 0, got %d", c.TCPKeepAliveMs)
+	}
 	return nil
+}
+
+// DefaultTCPKeepAliveMs is the library-default kernel TCP keepalive probe
+// period (30s) — the value internal/config defaults SPLIT_TCP_KEEPALIVE_MS to.
+const DefaultTCPKeepAliveMs = 30000
+
+// applyTCPKeepAlive enables kernel TCP keepalive on c with a probe period of
+// n.cfg.TCPKeepAliveMs/1000 seconds, when n.cfg.TCPKeepAliveMs > 0 and c is a
+// TCP socket. It is a no-op for non-TCP transports (in-memory test pipes,
+// WebSocket carrier transports, WARP SOCKS outbounds) and when the knob is
+// disabled (0): those keep the OS-default keepalive, byte-identical to the
+// pre-Issue-#19 build. The kernel probe is complementary to the application-
+// level mux keepalive pings (cfg.KeepAliveInterval), which detect a wedged
+// carrier regardless of transport; keepalive only reaps the OS-level socket
+// itself when the peer has vanished without a clean RST/FIN. Failure to set
+// an option on a live socket is logged but never aborts the session
+// (best-effort, availability over the keepalive nicety).
+func (n *Node) applyTCPKeepAlive(c net.Conn) {
+	kaSec := n.cfg.TCPKeepAliveMs / 1000
+	if kaSec <= 0 {
+		return // disabled (or too small to express a whole-second period)
+	}
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return // not a TCP socket — nothing to configure at the kernel level
+	}
+	if err := tc.SetKeepAlive(true); err != nil {
+		n.logger.Printf("keepalive: SetKeepAlive(true): %v", err)
+		return
+	}
+	if err := tc.SetKeepAlivePeriod(time.Duration(kaSec) * time.Second); err != nil {
+		n.logger.Printf("keepalive: SetKeepAlivePeriod(%ds): %v", kaSec, err)
+	}
 }
 
 // carrierHandle is one installed carrier transport. Its generation is
@@ -803,6 +860,14 @@ func (n *Node) installFor(id CarrierID, dir session.Direction, conn io.ReadWrite
 	// never be torn down on an impossible misconfiguration case).
 	_ = c.SetStreamLimits(n.cfg.StreamLimits)
 	c.SetQueueStats(n.QueueStats(dir))
+	// Issue #19: enable kernel TCP keepalive on the carrier transport.
+	// conn is io.ReadWriteCloser (the mux abstraction); we type-assert to
+	// net.Conn so the helper's *net.TCPConn check still applies. A non-net
+	// conn (in-memory test pipe, or the WebSocket carrier adapter) is a
+	// silent no-op — the helper's type assertion handles it.
+	if nc, ok := conn.(net.Conn); ok {
+		n.applyTCPKeepAlive(nc)
+	}
 	if n.cfg.LivenessRounds > 0 {
 		c.SetLivenessRounds(n.cfg.LivenessRounds)
 	}
@@ -814,6 +879,21 @@ func (n *Node) installFor(id CarrierID, dir session.Direction, conn io.ReadWrite
 	c.OnStreamDataUndeliverable = func(streamID uint32) {
 		if sess, ok := n.store.ByStream(streamID); ok {
 			sess.Stats.MarkDataUndeliverable()
+		}
+	}
+	// Issue #20: the receiver side of the peer's stream-level negative ack.
+	// The reset is a terminal CONTROL frame for the logical session: it
+	// runs OUTSIDE the stream mailbox (the session may be deregistered from
+	// the carrier), so Dispatch calls it directly with (id, reason, gen).
+	c.OnStreamReset = func(streamID uint32, reason byte, gen uint64) {
+		n.handleStreamReset(dir, streamID, reason, gen)
+	}
+	// Issue #21: the receiver side of the peer's bootstrap result. A stream
+	// with no active session drops the ack silently (its waiter is gone).
+	c.OnStreamBootstrapAck = func(streamID uint32, status byte) {
+		n.metrics.BootstrapAckReceived()
+		if sess, ok := n.store.ByStream(streamID); ok {
+			sess.ResolveBootstrap(status)
 		}
 	}
 
@@ -1022,11 +1102,23 @@ func (n *Node) onCarrierLost(dir session.Direction, h *carrierHandle) {
 		if dir == session.DirUp {
 			reg = n.upReg
 		}
+		// Issue #20: the rebind sweep is survivor-ordered (static priority).
+		// The HIGHEST-PRIORITY survivor is tried first (D1: K=2 static
+		// priority), and only the FIRST survivor that actually re-attaches
+		// at least one pinned stream is used — a survivor that rebinds
+		// nothing (every eligible attachment already moved, or a
+		// registration/write failure left them all in Rebinding) does not
+		// strand the pinned streams: the loop advances to the NEXT ready
+		// survivor so the pinned streams are not left dangling on a carrier
+		// that refused/failed to accept them. When no survivor takes any
+		// stream the loss sweep's grace timer remains the terminal
+		// backstop (the session closes on timeout, no indefinite retry).
 		for _, survivor := range reg.ReadyExcept(h.id) {
 			n.logger.Printf("carrier %s lost; failing over pinned streams to surviving carrier %s",
 				h.id, survivor.id)
-			n.rebindDirection(dir, survivor)
-			break
+			if n.rebindDirection(dir, survivor) {
+				break
+			}
 		}
 	}
 }
@@ -1039,7 +1131,7 @@ func (n *Node) onCarrierReady(dir session.Direction, h *carrierHandle) {
 	if n.cfg.Role != RoleIran {
 		return
 	}
-	n.rebindDirection(dir, h)
+	_ = n.rebindDirection(dir, h)
 }
 
 // encodeRebind builds the FrameRebind payload for carrier h. When the node
@@ -1061,10 +1153,20 @@ func (n *Node) encodeRebind(sessID session.SessionID, h *carrierHandle) []byte {
 // half-closed, attachment Unavailable (inside its grace window). The
 // logical stream ID is preserved — no new session, no duplicate active
 // session for one logical stream.
-func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
+//
+// Issue #20: returns true when AT LEAST ONE eligible session successfully
+// re-attached onto h (the carrier is now carrying a live stream). The
+// onCarrierLost survivor loop (the F1 "re-attach within grace" hot-
+// standby failover) uses this to decide whether the HIGHEST-PRIORITY
+// survivor actually accepted any of the pinned streams; when the first
+// survivor rebinding nothing (e.g. every attachment already moved, or a
+// registration/write failure left all in Rebinding), the loop advances
+// to the NEXT ready survivor so the pinned streams are not stranded.
+func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) bool {
+	recovered := 0
 	for _, sess := range n.store.Snapshot() {
 		if n.ctx.Err() != nil {
-			return
+			return recovered > 0
 		}
 		if sess.State() != session.StateActive {
 			continue
@@ -1130,6 +1232,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 			n.metrics.RebindRefusal("other")
 			continue
 		}
+		att.SetLastRebindGen(h.gen)
 		// Phase B (Slice 6): rebind-attach resets the credit plane for the
 		// down (data) direction. The sender-side ledger re-pins to the new
 		// carrier gen (re-entering the bounded UNLATCHED state) and the
@@ -1189,6 +1292,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 		}
 		n.metrics.Rebind()
 		n.metrics.SessionRecovered()
+		recovered++
 		// Phase 3: a stream that re-attached onto this down carrier after a
 		// loss on another carrier is a rebind/loss event on h.id (design
 		// §6.2). No-op in single-carrier nodes and on the up direction.
@@ -1198,6 +1302,7 @@ func (n *Node) rebindDirection(dir session.Direction, h *carrierHandle) {
 		n.logger.Printf("session %s: %s reattached to carrier gen %d",
 			shortID(sess.ID), dirName(dir), h.gen)
 	}
+	return recovered > 0
 }
 
 // failRebind abandons one rebind attempt (grace window keeps running).
@@ -1205,6 +1310,71 @@ func (n *Node) failRebind(sess *session.Session, dir session.Direction, att *ses
 	att.FailRebind()
 	n.metrics.RebindRefusal("other")
 	n.logger.Printf("session %s: %s rebind failed: %s", shortID(sess.ID), dirName(dir), why)
+}
+
+// handleStreamReset is the node-side handler for a peer FrameReset (Issue
+// #20). It runs in the mux dispatcher goroutine (outside c.mu, mirroring
+// OnStreamCredit), so it must be O(1) and non-blocking: it terminates the
+// stranded local session through the authoritative Close path and closes
+// its direction attachment so the rebind sweep never retries it again.
+//
+// Idempotency and stale-frame safety:
+//   - Repeated resets for the same stream resolve to the same already-closed
+//     session (store lookup fails after teardown), so a duplicate is a no-op.
+//   - A stale reset (mismatched generation, or targeting a newer session that
+//     re-bound past it) is dropped because the store no longer maps the stream
+//     to the session that sent the reset (stream IDs are monotonic per node
+//     and the store's unindex-on-close removes the mapping).
+//
+// The close reason is derived from the reset's reason code; it is always a
+// terminal carrier-timeout-class reason so the metrics bucket stays bounded.
+func (n *Node) handleStreamReset(dir session.Direction, streamID uint32, reason byte, gen uint64) {
+	n.metrics.ResetReceived()
+	sess, ok := n.store.ByStream(streamID)
+	if !ok || sess.State() != session.StateActive {
+		// No (active) session for this stream: the reset is stale or the
+		// session already closed. Idempotent no-op — nothing to terminate.
+		return
+	}
+	// Stale-reset guard (Issue #20): if the reset carries a generation
+	// (gen > 0) and the session's attachment on this direction has a
+	// STRICTLY NEWER lastRebindGen, the reset is from an older rebind
+	// attempt that has already been superseded. Ignore it: the session
+	// has moved past that generation and must not be terminated by a
+	// stale control frame.
+	if gen > 0 {
+		if att := sess.Att(dir); att != nil {
+			if att.LastRebindGen() > gen {
+				n.metrics.RebindRefusal("stale_generation")
+				n.logger.Printf("session %s: ignoring stale FrameReset (gen %d < lastRebindGen %d, dir %s)",
+					shortID(sess.ID), gen, att.LastRebindGen(), dirName(dir))
+				return
+			}
+		}
+	}
+	reasonStr := resetReasonName(reason)
+	// The reset is authoritative: terminate the logical session now. The
+	// session's Close closes BOTH direction attachments (the rebind sweep
+	// requires AttAttached/AttUnavailable, so a Closed attachment can never
+	// be re-bound — no further rebind storm).
+	sess.Close("peer reset (" + reasonStr + ")")
+}
+
+// resetReasonName maps a reset reason code to a stable, non-secret label
+// for the close reason / logs.
+func resetReasonName(reason byte) string {
+	switch reason {
+	case mux.ResetReasonUnknownStream:
+		return "unknown_stream"
+	case mux.ResetReasonSessionClosed:
+		return "session_closed"
+	case mux.ResetReasonRebindRefused:
+		return "rebind_refused"
+	case mux.ResetReasonTargetDialFailed:
+		return "target_dial_failed"
+	default:
+		return "unknown"
+	}
 }
 
 // hasChannelConsumer reports whether this node runs a per-carrier-epoch
@@ -1271,18 +1441,51 @@ func (n *Node) onDownNewStream(h *carrierHandle, id uint32, firstType uint8, ch 
 // A refused rebind is dropped — no FrameClose is sent, because a
 // refused rebind must not be mistaken for a peer half-close.
 func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, ch chan []byte) {
+	// gen is the sender's carrier generation, set once the rebind payload is
+	// parsed. It is echoed back in the FrameReset (Issue #20) so the
+	// originator can verify the reset corresponds to the rebind it sent and
+	// not a stale control message. Default 0 (pre-parse drops carry no echo).
+	var gen uint64
+	// drop records the refusal. For the SESSION-LEVEL refusals (no active
+	// session, half-closed, no attachment, stale generation, attach failed)
+	// it additionally emits a FrameReset on the SAME carrier that delivered
+	// the rebind: that carrier is bidirectional at the mux layer (Ping/Pong/
+	// Credit already flow back on it), so Germany can write the reset
+	// directly to Iran. The reset tells the originator to terminate the
+	// stranded session instead of retrying the rebind on every subsequent
+	// carrier drop. Early structural drops (malformed payload, carrier-id
+	// mismatch) carry no reliable generation and are not the stranded-
+	// session retry loop, so they Deregister without a reset.
 	drop := func(why string) {
 		reason := "other"
-		if why == "no active session for stream" {
+		var resetReason byte
+		switch {
+		case why == "no active session for stream":
 			reason = "unknown_peer"
-		} else if why == "stale sender carrier generation" {
+			resetReason = mux.ResetReasonUnknownStream
+		case why == "direction already half-closed", why == "session has no attachment for direction":
+			// The session EXISTS but the logical direction is done (half-
+			// closed or torn down). The originator's copy is the stranded
+			// one: it must terminate it, not rebind it again.
+			resetReason = mux.ResetReasonSessionClosed
+		case why == "stale sender carrier generation":
 			reason = "stale_generation"
+			resetReason = mux.ResetReasonRebindRefused
+		case strings.HasPrefix(why, "attach failed"):
+			reason = "stale_generation"
+			resetReason = mux.ResetReasonRebindRefused
 		}
 		n.metrics.RebindRefusal(reason)
 		n.logger.Printf("rebind refused: stream %d (%s): %s", id, dirName(dir), why)
+		if resetReason != 0 {
+			// Terminal negative ack to the originator (best-effort: a failed
+			// write just means the carrier is already dying, in which case
+			// the originator's own loss sweep + grace timeout still
+			// terminates the session, so no indefinite retry).
+			_ = h.carrier.WriteControlFrame(id, mux.FrameReset, mux.EncodeResetPayload(resetReason, gen))
+		}
 		h.carrier.Deregister(id)
 	}
-
 	p, ok := <-ch
 	if !ok {
 		return // carrier died before the rebind frame was delivered
@@ -1303,7 +1506,7 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 		drop("rebind carrier id mismatch (unknown for this carrier)")
 		return
 	}
-	gen := rb.Gen
+	gen = rb.Gen
 	sess, ok := n.store.GetByStream(id)
 	if !ok || sess.State() != session.StateActive {
 		drop("no active session for stream")
@@ -1433,7 +1636,15 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 
 // StartSession (RoleIran) starts a new logical session for clientConn
 // toward dest. It blocks while either carrier is down (up to 30s or
-// node shutdown).
+// node shutdown) and ADOPTS clientConn into the session so the session's
+// authoritative Close is the only closer.
+//
+// This is the fire-and-forget form (backward-compatible with all existing
+// callers). For the bootstrap-result form that BLOCKS until the remote
+// node has completed the target dial + routing check (Issue #21), use
+// StartSessionAndWait instead: it defers adopting the client conn until the
+// remote bootstrap result is in hand, so the caller can read the local
+// socket (client disconnect) while the remote bootstrap is in flight.
 //
 // Ownership of clientConn: the CALLER owns it until setup succeeds.
 // On success the connection is adopted by the session (through
@@ -1443,6 +1654,58 @@ func (n *Node) handleRebind(dir session.Direction, h *carrierHandle, id uint32, 
 // deliver the SOCKS error reply before closing it — a session-bound
 // conn closed during setup would swallow that reply.
 func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*session.Session, error) {
+	return n.startSessionCore(clientConn, dest, true)
+}
+
+// StartSessionAndWait (RoleIran, Issue #21) is the bootstrap-result form of
+// StartSession. It sets up the stream (waits for both carriers, allocates
+// the ID, writes the up FrameHeader, and starts the relays) but does NOT
+// adopt clientConn into the session; it then BLOCKS — bounded by the
+// node's BootstrapWait and the session's own teardown, so it can never
+// hang — for the remote (Germany) bootstrap verdict (the peer's
+// FrameBootstrapAck) and returns the RFC 1928 SOCKS5 status byte.
+//
+// Two guarantees vs the fire-and-forget StartSession:
+//
+//  1. The caller RETAINS clientConn through the whole wait. Because the
+//     conn is not session-owned, a local teardown in that window
+//     (carrier loss, node shutdown) cannot close it out from under the
+//     caller, so the final SOCKS reply is never swallowed. The up relay
+//     still reads clientConn during the wait, so a client disconnect is
+//     detected there and half-closes the up direction (freeing Germany's
+//     target socket). On success the caller adopts the conn with
+//     sess.AdoptConn; on any non-success it closes it itself.
+//  2. The status byte is the remote verdict: 0x00 ONLY when the target
+//     actually accepted, and 0x05/0x04/0x02/0x03/0x06/0x01 on refusal /
+//     DNS failure / routing block / network-unreachable / dial-timeout /
+//     general failure. The local sentinel session.BootstrapEndedWithoutResult
+//     (0xFF, returned when the session was torn down locally before any
+//     verdict arrived) is outside the 0x00-0x08 range, so it can never be
+//     mistaken for a real remote failure — the caller maps it to a general
+//     failure, never a false 0x00.
+func (n *Node) StartSessionAndWait(clientConn net.Conn, dest *session.Destination) (*session.Session, byte) {
+	sess, err := n.startSessionCore(clientConn, dest, false)
+	if err != nil || sess == nil {
+		// setup failed locally: no remote bootstrap ever happened. Return a
+		// general-failure status so the caller writes the correct SOCKS reply.
+		return sess, 0x01
+	}
+	// Bounded wait: the session's own teardown (carrier-loss grace timeout,
+	// client abort, node shutdown) resolves the bootstrap channel, so the
+	// wait is always finite. WaitBootstrap also watches the session ctx
+	// (cancelled by Close), so a local teardown cannot hang it.
+	if st, ok := sess.WaitBootstrap(n.ctx); ok {
+		return sess, st
+	}
+	return sess, byte(session.BootstrapEndedWithoutResult)
+}
+
+// startSessionCore is the shared setup path. adoptConn controls whether the
+// client conn is handed to the session NOW (adoptConn=true, the
+// fire-and-forget StartSession) or later (adoptConn=false, the
+// StartSessionAndWait form, which adopts only after the remote bootstrap
+// result resolves).
+func (n *Node) startSessionCore(clientConn net.Conn, dest *session.Destination, adoptConn bool) (*session.Session, error) {
 	// waitCarriers blocks until BOTH directions have a ready carrier. For
 	// the DOWN direction the "ready carrier" is the static-priority primary
 	// (Phase 2). In a multi-carrier node the Phase 3 policy chooses which
@@ -1482,6 +1745,12 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	sess.UpAtt = session.NewAttachment(n.cfg.Grace, func() { n.onGraceTimeout(sess, session.DirUp) })
 	sess.DownAtt = session.NewAttachment(n.cfg.Grace, func() { n.onGraceTimeout(sess, session.DirDown) })
 	sess.OnClose(func() { n.onSessionClosed(sess) })
+	// Issue #21: install the bootstrap-result channel so the caller
+	// (the SOCKS5 handler) can optionally block for Germany's
+	// FrameBootstrapAck before sending the SOCKS reply. The channel is
+	// resolved by OnStreamBootstrapAck (peer ack) OR by the session's
+	// own teardown (locally), so it can never hang.
+	sess.SetBootstrapChannel()
 
 	n.store.Add(sid, sess)
 	n.store.AddStream(sess)
@@ -1499,6 +1768,12 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 		return nil, errors.New("activation failed")
 	}
 
+	// Issue #19: enable kernel TCP keepalive on the accepted client (SOCKS5)
+	// socket so a wedged/half-open client connection is reaped by the kernel
+	// within ~one probe period instead of the OS default. No-op for non-TCP
+	// test clients (in-memory pipes are not *net.TCPConn).
+	n.applyTCPKeepAlive(clientConn)
+
 	// FrameHeader MUST be the first frame of the up stream — the peer
 	// bootstraps the target from it.
 	hdr := make([]byte, session.MaxHeaderSize)
@@ -1511,7 +1786,6 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 		sess.Close("up-carrier header write failed")
 		return nil, fmt.Errorf("up-carrier header write: %w", err)
 	}
-
 	// All setup failure points are behind us: hand the client conn over
 	// to the session so its authoritative Close is the only closer.
 	// This happens BEFORE the Attach calls on purpose: once attached, a
@@ -1522,9 +1796,22 @@ func (n *Node) StartSession(clientConn net.Conn, dest *session.Destination) (*se
 	// it with the other failure paths, after its SOCKS error reply) —
 	// the session's ClientConn is nil, so its teardown will not touch
 	// it.
-	if !sess.AdoptConn(clientConn) {
-		return nil, errors.New("client conn adopt refused (session closing)")
+	if adoptConn {
+		// Fire-and-forget path (StartSession): transfer ownership NOW.
+		if !sess.AdoptConn(clientConn) {
+			return nil, errors.New("client conn adopt refused (session closing)")
+		}
 	}
+	// Bootstrap-result path (adoptConn=false, StartSessionAndWait): the
+	// caller retains clientConn through the remote bootstrap wait and
+	// adopts it only on success. The up relay below still owns the READ
+	// side of clientConn during the wait; because the conn is not yet
+	// session-owned, a local teardown in that window cannot close it out
+	// from under the caller (teardown sees ClientConn==nil), so the
+	// caller's final SOCKS reply is never swallowed by a premature
+	// teardown. The relay/consumer startup below is unconditional: the
+	// SOCKS client sends no application data before the 0x00 reply, so
+	// the up relay simply blocks in a read that returns on disconnect.
 
 	sess.UpAtt.Attach(upH.gen)
 	sess.DownAtt.Attach(downH.gen)
@@ -1942,7 +2229,19 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 	// the recovery path. The rebind-anchor invariant is preserved: we only
 	// close/terminate a stream whose target failed to dial, so no credit/data
 	// is ever sent on a new carrier before the peer registers it.
-	drop := func(err error) {
+	//
+	// Issue #21: every terminal path reports its verdict to the originator.
+	// drop sends the bootstrap ack (a non-zero status) and THEN the
+	// terminating FrameClose. Both ride the up carrier's control plane
+	// (ctrlCh) and are serialized in enqueue order — WriteControlFrame
+	// blocks until the bytes are written — so the ack ALWAYS precedes the
+	// FrameClose on the wire. The originator resolves its bounded bootstrap
+	// wait on the ack (and never gets a false 0x00 on a failure); the
+	// FrameClose then tears down its end. Best-effort: if the up carrier is
+	// already dying the write fails and the originator's own teardown
+	// (which resolves the wait with BootstrapEndedWithoutResult) covers it.
+	drop := func(status byte, err error) {
+		_ = h.carrier.WriteControlFrame(id, mux.FrameBootstrapAck, mux.EncodeBootstrapAckPayload(status))
 		h.carrier.Terminate(id)
 		n.metrics.Error()
 		n.logger.Printf("up carrier stream %d: dropped: %v", id, err)
@@ -1957,7 +2256,7 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 	}
 	dest := session.ParseDestinationFromBuf(p)
 	if dest == nil {
-		drop(errors.New("invalid destination header"))
+		drop(0x01, errors.New("invalid destination header"))
 		return
 	}
 
@@ -1985,10 +2284,15 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 			n.metrics.TargetDialFailureTimeout()
 		}
 		n.metrics.TargetDialFailure()
-		drop(fmt.Errorf("target %s dial failed: %w", dest.Addr, err))
+		drop(bootstrapAckStatus(err), fmt.Errorf("target %s dial failed: %w", dest.Addr, err))
 		return
 	}
 	n.metrics.TargetDialSuccess()
+	// Issue #19: enable kernel TCP keepalive on the freshly-dialed egress
+	// target socket so a wedged target connection is reaped by the kernel
+	// rather than surviving on the OS default (~2 h) probe interval.
+	// No-op for non-TCP target conns (in-memory test pipes, WARP SOCKS).
+	n.applyTCPKeepAlive(targetConn)
 
 	// Bounded bootstrap wait for the down carrier (Issue #7): if it is
 	// down at FrameHeader arrival but reconnects within BootstrapWait
@@ -2009,7 +2313,7 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 	}
 	if err != nil {
 		targetConn.Close()
-		drop(fmt.Errorf("down carrier not ready: %w", err))
+		drop(0x01, fmt.Errorf("down carrier not ready: %w", err))
 		return
 	}
 
@@ -2027,7 +2331,7 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 	downCh := downH.carrier.Register(id)
 	if downCh == nil {
 		targetConn.Close()
-		drop(errors.New("down stream registration failed"))
+		drop(0x01, errors.New("down stream registration failed"))
 		return
 	}
 
@@ -2036,6 +2340,7 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 	n.metrics.SessionStarted()
 
 	if !sess.Activate() {
+		_ = h.carrier.WriteControlFrame(id, mux.FrameBootstrapAck, mux.EncodeBootstrapAckPayload(0x01))
 		sess.Close("activation failed")
 		return
 	}
@@ -2064,6 +2369,67 @@ func (n *Node) bootstrapUpStream(h *carrierHandle, id uint32, ch chan []byte) {
 
 	n.logger.Printf("up carrier stream %d: bootstrapped session %s → %s:%d",
 		id, shortID(sid), dest.Addr, dest.Port)
+
+	// Issue #21: the bootstrap SUCCEEDED (target accepted + down carrier
+	// ready + relays running). Send the 0x00 verdict so the originator can
+	// reply 0x00 to the SOCKS client and start relaying application data.
+	// This is the ONLY path that sends 0x00; every failure path above sends
+	// a non-zero RFC 1928 code. Best-effort (the up carrier may be dying in
+	// which case the originator's own teardown resolves the wait).
+	_ = h.carrier.WriteControlFrame(id, mux.FrameBootstrapAck, mux.EncodeBootstrapAckPayload(0x00))
+}
+
+// bootstrapAckStatus maps a target-dial / bootstrap outcome to the RFC 1928
+// SOCKS5 reply code the originator should return to the client (Issue #21).
+// A nil error means the target accepted (0x00). It never invents 0x00 for a
+// failure and maps each failure class to the most specific, non-leaking code
+// (the internal details stay in the log line, not on the wire).
+func bootstrapAckStatus(err error) byte {
+	if err == nil {
+		return 0x00
+	}
+	switch {
+	case errors.Is(err, routing.ErrBlocked):
+		return 0x02 // connection not allowed by ruleset
+	case errors.Is(err, ErrTargetDialTimeout):
+		return 0x06 // bounded dial ceiling exceeded (TTL expired / not established)
+	case errors.Is(err, ErrTargetBreakerOpen):
+		return 0x01 // per-target breaker open: fast, clean refusal
+	case errors.Is(err, routing.ErrWarpUnreachable):
+		return 0x01 // WARP egress endpoint unreachable: general failure
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return 0x06
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) && nerr.Timeout() {
+		return 0x06 // target dial timed out
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return 0x04 // host unreachable / DNS failure
+	}
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return 0x05 // target refused the connection
+	case errors.Is(err, syscall.ENETUNREACH):
+		return 0x03 // network unreachable
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return 0x04 // host unreachable
+	case errors.Is(err, syscall.ETIMEDOUT):
+		return 0x06
+	}
+	// The default dialer's own error strings: DNS resolution ("resolve …")
+	// and the IPv4-only / dual-stack "no usable address" paths are all
+	// host-unreachable (0x04). Anything unrecognized is a fail-closed 0x01.
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "no reachable A record"),
+		strings.Contains(msg, "no IPv4 or IPv6 address"),
+		strings.Contains(msg, "resolve "),
+		strings.Contains(msg, "no such host"):
+		return 0x04
+	}
+	return 0x01
 }
 
 // finalizeDrain arms the post-up-close drain timer (RoleGermany): if the
