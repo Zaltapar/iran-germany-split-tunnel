@@ -45,23 +45,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-scripts=(install.sh deploy.sh install-oneclick.sh)
-if [[ -f test-install.sh ]]; then
-  scripts+=(test-install.sh)
-fi
-if [[ -f install-oneclick.test.sh ]]; then
-  scripts+=(install-oneclick.test.sh)
-fi
-bash -n "${scripts[@]}"
+          scripts=(install.sh deploy.sh install-oneclick.sh)
+          if [[ -f test-install.sh ]]; then
+            scripts+=(test-install.sh)
+          fi
+          if [[ -f install-oneclick.test.sh ]]; then
+            scripts+=(install-oneclick.test.sh)
+          fi
+          bash -n "${scripts[@]}"
 
-# shellcheck is advisory tooling for this gate: use the runner's
-# preinstalled version when present, but never install or download
-# it in CI. Syntax validation above remains mandatory.
-if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck --shell=bash --severity=warning "${scripts[@]}"
-else
-  echo "shellcheck unavailable; bash -n remains enforced"
-fi
+          # shellcheck is advisory tooling for this gate: use the runner's
+          # preinstalled version when present, but never install or download
+          # it in CI. Syntax validation above remains mandatory.
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck --shell=bash --severity=warning "${scripts[@]}"
+          else
+            echo "shellcheck unavailable; bash -n remains enforced"
           fi
 
           # Help/config checks are deliberately read-only. Do not run the
