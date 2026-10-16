@@ -134,6 +134,25 @@ type CarrierConn struct {
 	// never happens; no Add can follow the Wait, and no worker can
 	// start without having been counted (the Add precedes the go).
 	workerWait sync.WaitGroup
+	// termWG counts public Terminate calls that are still running their
+	// terminateStream handoff (the s.ch <- nil send). It is the third,
+	// UNTRACKED-elsewhere sender on s.ch: Terminate is a public API that the
+	// node calls from spawned goroutines (e.g. bootstrapUpStream's dial-drop
+	// path), which neither workerWait (stream workers) nor dispatchDone (the
+	// dispatcher) covers. Close's step (b3) waits on termWG before step (c)
+	// closes s.ch, so no Terminate-originated send can race the close — this
+	// is exactly the "send on closed channel" panic / -race the bootstrap
+	// dial-refused teardown hit.
+	//
+	// Add/Wait ordering: Terminate Add's under c.mu only when the carrier is
+	// NOT yet closing (a closing carrier lets Close close s.ch as the wake,
+	// so it Adds nothing). Close latches closing=true under the SAME c.mu in
+	// step 1, and reaches termWG.Wait in step (b3). So any Add that observed
+	// closing==false is mutex-ordered before the latch, hence before the
+	// Wait — the Wait always sees it and blocks until its Done. The handoff
+	// is bounded (its select unblocks on c.closed, closed at step 2), so the
+	// Wait can never hang.
+	termWG sync.WaitGroup
 	// allStreams tracks every stream record this carrier has EVER
 	// created. It is an append-only slice (not a map) and is never
 	// shrunk: neither Deregister nor re-Register of the same ID may
@@ -834,6 +853,11 @@ func (c *CarrierConn) Deregister(id uint32) {
 // retransmit on the id is dropped silently; on a closing carrier it is a
 // quiet no-op.
 func (c *CarrierConn) Terminate(id uint32) {
+	// tracked latches (under c.mu) whether this call is counted on termWG.
+	// It is set in the SAME critical section as the Add so Done is called
+	// if and only if Add was — never on a closing carrier, where Close
+	// closes s.ch as the consumer wake instead.
+	tracked := false
 	c.mu.Lock()
 	s, ok := c.streams[id]
 	if !ok && !c.closing {
@@ -842,13 +866,22 @@ func (c *CarrierConn) Terminate(id uint32) {
 		// arrive is dropped silently by the dispatcher, not re-opened).
 		s = c.createStreamLocked(id, false)
 	}
+	if s != nil && !c.closing {
+		tracked = true
+		c.termWG.Add(1)
+	}
 	c.mu.Unlock()
 	if s == nil {
 		return // closing carrier, or stream 0
 	}
 	// signalPeer=true: best-effort FrameClose over the control plane so the
-	// remote side tears down its end of the stream too.
+	// remote side tears down its end of the stream too. The handoff's
+	// consumer send is bounded by c.closed (Closed at step 2), so a racing
+	// Close cannot hang on this Done.
 	c.terminateStream(s, true)
+	if tracked {
+		c.termWG.Done()
+	}
 }
 
 // WriteFrame encodes and sends one frame. Serialized via writeCh.
@@ -1506,7 +1539,7 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 //  4. wait for in-flight write callers, then fail every still-queued
 //     write with ErrCarrierClosed — after Close returns, no WriteFrame
 //     caller is still waiting;
-//  5. shut down the streams, in three sub-steps:
+//  5. shut down the streams, in four sub-steps:
 //     (a) close EVERY stream mailbox — allStreams, which also includes
 //     streams removed by Deregister — reclaiming discarded bytes
 //     from the aggregate budget; closing the mailbox is the only
@@ -1517,6 +1550,11 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 //     gone, or (it cannot exist) it would have to hold a mailbox
 //     item, which requires a Pop from a still-open mailbox, and all
 //     mailboxes are now closed;
+//     (b2) wait for the dispatcher's own terminate handoffs (covered by
+//     dispatchDone);
+//     (b3) wait for every in-flight PUBLIC Terminate (termWG) — the
+//     third sender on s.ch, running in node-spawned goroutines that
+//     neither workerWait nor dispatchDone covers;
 //     (c) close every stream channel, waking stream consumers. No send
 //     on s.ch can ever race this close, so "send on closed channel"
 //     is impossible.
@@ -1590,6 +1628,24 @@ func (c *CarrierConn) Close() {
 		if c.dispatched.Load() { // skip carriers that never ran Dispatch (shutdown/unit-test paths)
 			<-c.dispatchDone
 		}
+
+		// (b3) Wait for any in-flight PUBLIC Terminate to finish its
+		// terminateStream handoff (the s.ch <- nil send) before closing
+		// s.ch: Terminate is called from node-spawned goroutines
+		// (bootstrapUpStream's dial-drop, handleRebind's drop, the
+		// onUpNewStream/onDownNewStream default branches) that neither
+		// workerWait (stream workers) nor dispatchDone (the dispatcher
+		// itself) covers — the dispatcher spawns them and returns without
+		// waiting. This is the untracked third sender on s.ch that the
+		// original close-safety proof did not account for. Bounded: every
+		// tracked handoff's consumer send is released by c.closed (step 2),
+		// so the Wait can never hang; and termWG.Add is mutex-ordered under
+		// c.mu before the closing latch, so this Wait sees every in-flight
+		// call (and no call started AFTER the latch can Add — see the
+		// field doc). Without this wait, step (c) could close an s.ch that
+		// a racing Terminate is about to send on — "send on closed
+		// channel" / the -race between close(s.ch) and s.ch <- nil.
+		c.termWG.Wait()
 
 		// (c) Now — and only now — close every stream channel, waking
 		// the consumers. No worker can be sending when this runs.
