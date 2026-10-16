@@ -853,30 +853,51 @@ func (c *CarrierConn) Deregister(id uint32) {
 // retransmit on the id is dropped silently; on a closing carrier it is a
 // quiet no-op.
 func (c *CarrierConn) Terminate(id uint32) {
-	// tracked latches (under c.mu) whether this call is counted on termWG.
-	// It is set in the SAME critical section as the Add so Done is called
-	// if and only if Add was — never on a closing carrier, where Close
-	// closes s.ch as the consumer wake instead.
+	// tracked and closingNow are latched in the SAME critical section as
+	// the termWG.Add (so Done is called if and only if Add was) and the
+	// closing check. Two distinct outcomes:
+	//
+	//  - closingNow false: the call is tracked on termWG and runs the full
+	//    terminateStream. Close (steps 1->b3->c) latches closing under the
+	//    same c.mu, so any Add that observed closing==false is
+	//    mutex-ordered before that latch, and Close's termWG.Wait (b3)
+	//    always sees it before it closes s.ch.
+	//  - closingNow true: Close has already started and OWNS the consumer
+	//    wake (it closes every s.ch in step c, which consumers read as
+	//    "carrier died" — the same outcome the nil handoff would give a
+	//    stream whose carrier is tearing down). Close's termWG.Wait does
+	//    NOT cover this call (its Add came after the latch, so it is never
+	//    counted — WaitGroups must not Add after the closing-side Wait has
+	//    started), so the only safe behavior here is to skip terminateStream
+	//    ENTIRELY: its s.ch <- nil handoff would otherwise be an untracked
+	//    third sender racing close(s.ch) — exactly the "send on closed
+	//    channel" / -race this fix exists to eliminate. The skip loses
+	//    nothing observable: the dispatcher already refuses OnNewStream
+	//    re-fires while closing (the c.closing gate in Dispatch), and the
+	//    best-effort peer FrameClose would be rejected by
+	//    WriteControlFrame on a closing carrier anyway.
 	tracked := false
+	closingNow := false
 	c.mu.Lock()
+	closingNow = c.closing
 	s, ok := c.streams[id]
-	if !ok && !c.closing {
+	if !ok && !closingNow {
 		// Not yet registered: install a terminated tombstone. callback=false
 		// so OnNewStream can NEVER fire for this id (a retransmit that does
 		// arrive is dropped silently by the dispatcher, not re-opened).
 		s = c.createStreamLocked(id, false)
 	}
-	if s != nil && !c.closing {
+	if s != nil && !closingNow {
 		tracked = true
 		c.termWG.Add(1)
 	}
 	c.mu.Unlock()
-	if s == nil {
-		return // closing carrier, or stream 0
+	if s == nil || closingNow {
+		return // closing carrier (or stream 0): Close owns the consumer wake
 	}
 	// signalPeer=true: best-effort FrameClose over the control plane so the
 	// remote side tears down its end of the stream too. The handoff's
-	// consumer send is bounded by c.closed (Closed at step 2), so a racing
+	// consumer send is bounded by c.closed (closed at step 2), so a racing
 	// Close cannot hang on this Done.
 	c.terminateStream(s, true)
 	if tracked {
