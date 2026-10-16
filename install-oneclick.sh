@@ -538,9 +538,9 @@ secure_unlink() {
   if command -v shred >/dev/null 2>&1; then
     shred -u -z -n 3 "$f" 2>/dev/null && return 0
   fi
-  local sz i
+  local sz
   sz="$(wc -c < "$f" 2>/dev/null || echo 4096)"
-  for i in 1 2 3; do head -c "$sz" /dev/zero > "$f" 2>/dev/null || true; done
+  for _ in 1 2 3; do head -c "$sz" /dev/zero > "$f" 2>/dev/null || true; done
   rm -f "$f"
 }
 
