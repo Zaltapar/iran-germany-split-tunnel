@@ -1,0 +1,57 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/split-tunnel/xray-consumer.error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "to-germany",
+      "listen": "127.0.0.1",
+      "port": 10802,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "reality-germany",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "91.107.152.1",
+            "port": 443,
+            "users": [
+              {
+                "id": "123e4567-e89b-42d3-a456-426614174000",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.lovelive123.com:443",
+          "serverName": "www.lovelive123.com",
+          "publicKey": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+          "shortId": "0123456789abcdef"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "to-germany"
+        ],
+        "outboundTag": "reality-germany"
+      }
+    ]
+  }
+}

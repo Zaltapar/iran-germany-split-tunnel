@@ -103,6 +103,36 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			}
 		}
 
+		// Phase B credit gate (design §5, Slice 5): an ADVISORY gate that
+		// paces how much target data may be ISSUED against the receiver's
+		// granted window, sitting ABOVE the pending >= capacity buffer gate
+		// (the two are independent: the credit gate gates issuing, the
+		// pending gate gates buffering). Enforced ONLY on the DirDown
+		// DATA-sender leg of the Germany role — the exact relayShapeA that
+		// fills the downstream mailbox. The clamp limit is the SENDER's
+		// CARRIER's live MaxBytesPerStream (S1/SF-4: c.limits, via the
+		// lock-correct Limits() accessor), NOT the node config — so it can
+		// never silently exceed the mailbox cap that SetStreamLimits moved
+		// the carrier to. The hard cap remains fullLocked/rejectAggregate
+		// in mux/queue.go; this gate merely paces ahead of it. Inert when
+		// credits are disabled (n.creditGate is nil): behaviour is
+		// byte-identical to the pending-gate-only path.
+		if n.creditGate != nil && dir == session.DirDown && n.cfg.Role == RoleGermany {
+			if h := n.current(dir); h != nil {
+				capBytes := uint64(h.carrier.Limits().MaxBytesPerStream) // SF-4
+				l := n.creditGate.ledger(h.gen, streamIDOf(sess, dir))
+				if !l.canSend(uint64(mux.MaxPayload), capBytes) {
+					// The CREDIT gate engaged (park here, not the pending
+					// gate) — the counter D4's relay_credit_block was blind
+					// to. B4: a live credit un-parks within ~µs; the 2 s
+					// CreditSafeTimeout is only the fallback.
+					n.metrics.CreditGatePark()
+					l.creditPark(sess.Ctx, uint64(mux.MaxPayload), capBytes)
+					continue
+				}
+			}
+		}
+
 		if len(pending) >= capacity {
 			// Backpressure: the bounded reconnect buffer is full; stop
 			// reading the socket until the carrier can absorb data.
@@ -116,6 +146,11 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 			n.metrics.AddRelayBytesRead(int64(nread))
 			if sess.Stats.MarkFirstByte() {
 				n.metrics.SessionFirstByteSeen()
+				// Phase 3 (G3): stamp the first-byte instant so the
+				// stream's TTFB (open to first DATA byte) is measurable
+				// for the carrier health model. Inert when the open
+				// instant was not stamped (OpenNanos <= 0).
+				sess.Stats.MarkFirstByteNanos(time.Now().UnixNano())
 			}
 			if dir == session.DirUp {
 				n.metrics.AddUp(int64(nread))
@@ -145,6 +180,22 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
 				socketEOF = true
+				// Issue #21: on the StartSessionAndWait path the caller has
+				// not yet adopted the client conn (the 0x00 reply is still
+				// pending), so ClientConnAdopted() is false. If the client
+				// closed the socket BEFORE the remote bootstrap verdict, it
+				// gave up waiting — abort the whole session now so the
+				// bounded WaitBootstrap resolves immediately (via teardown's
+				// backstop) instead of outliving the client. For the
+				// fire-and-forget StartSession path the conn was adopted at
+				// construction (gate pre-closed), so this is a no-op.
+				if dir == session.DirUp && !sess.ClientConnAdopted() {
+					n.metrics.Error()
+					n.logger.Printf("session %s: client disconnected before bootstrap completed; closing",
+						shortID(sess.ID))
+					sess.Close("client disconnected before bootstrap")
+					return
+				}
 			} else {
 				// Non-EOF socket read error.
 				//
@@ -165,7 +216,14 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 						// Closing/Closed, or os.ErrClosed/net.ErrClosed):
 						// not a client abort. No counter, no re-close
 						// (teardown already owns it); just log and exit.
-						n.logger.Printf("session %s: up read closed (benign, session %s): %v",
+						// The line says "suppressed artifact", NOT "closed":
+						// this read error is a byproduct of the teardown that
+						// ALREADY closed the ClientConn — it is not itself the
+						// close event. (A genuine target drop is logged
+						// separately as "up stream closed by peer" / "target ...
+						// dial failed", so a reader does not mistake this
+						// artifact for the cause of a dropped session.)
+						n.logger.Printf("session %s: up read error suppressed as benign teardown artifact (session already %s, not a client abort): %v",
 							shortID(sess.ID), sess.State().String(), rerr)
 						return
 					case upReadHalfClose:
@@ -181,6 +239,19 @@ func (n *Node) relayShapeA(sess *session.Session, dir session.Direction, sock ne
 						// live journal records RST-vs-teardown-artifact.
 						n.metrics.Error()
 						n.metrics.RelaySocketReadError()
+						// Issue #21: if the bootstrap gate is still open
+						// (StartSessionAndWait path, the client has not yet
+						// been adopted), an RST means the client gave up
+						// before the 0x00 reply was sent — abort the whole
+						// session so WaitBootstrap unblocks immediately
+						// instead of waiting for the target dial to
+						// complete on Germany.
+						if dir == session.DirUp && !sess.ClientConnAdopted() {
+							n.logger.Printf("session %s: client RST before bootstrap completed; closing: %v",
+								shortID(sess.ID), rerr)
+							sess.Close("client disconnected before bootstrap")
+							return
+						}
 						n.logger.Printf("session %s: up read non-EOF error (tolerated as up half-close): %v",
 							shortID(sess.ID), rerr)
 						socketEOF = true // run the uncapped flush + FrameClose path
@@ -270,9 +341,14 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 	if st != session.AttAttached {
 		return false
 	}
-	h := n.current(dir)
-	if h == nil || h.gen != gen {
-		return false // being superseded — treat as unavailable
+	// Multi-carrier (Phase 2): resolve the EXACT carrier the attachment is
+	// pinned to (by its generation token), not the direction's primary —
+	// a stream may be pinned to the standby down carrier. Generations are
+	// node-global and unique, so at most one handle matches. A handle whose
+	// read loop has died is not writable, so treat it as unavailable.
+	h := n.handleForGen(gen)
+	if h == nil || h.gen != gen || !h.carrier.Ready() {
+		return false // being superseded or lost — treat as unavailable
 	}
 	for len(*pending) > 0 {
 		chunk := *pending
@@ -289,6 +365,23 @@ func (n *Node) flushPending(sess *session.Session, dir session.Direction, pendin
 		}
 		*pending = (*pending)[len(chunk):]
 		n.metrics.AddRelayBytesWritten(int64(len(chunk)))
+		// Phase 3 (G3): passive goodput feed — application bytes actually
+		// delivered through this carrier. Feeds the policy's per-carrier
+		// goodput EWMA (design §6.2). No-op in single-carrier nodes.
+		n.noteCarrierDelivery(h.id, int64(len(chunk)))
+		// Phase B (Slice 5, S3): charge the credit ledger PER CHUNK
+		// (n = len(chunk)), NEVER per flushPending call — a 256 KiB flush
+		// would otherwise overshoot the 64 KiB-granular gate by up to 4×.
+		// The condition mirrors the gate above exactly (DirDown DATA
+		// sender, Germany), so a ledger is only charged on the path the
+		// gate paces and credits are wired for. Inert when credits are
+		// disabled (n.creditGate is nil).
+		if n.creditGate != nil && dir == session.DirDown && n.cfg.Role == RoleGermany {
+			if l := n.creditGate.ledger(h.gen, streamIDOf(sess, dir)); l != nil {
+				l.recordSent(uint64(len(chunk)))
+				n.metrics.AddCreditSentBytes(int64(len(chunk)))
+			}
+		}
 		if r := n.buf.refund(bk, len(chunk)); r > 0 {
 			n.metrics.AddSessionBufferReclaimed(r)
 		}
@@ -305,9 +398,11 @@ func (n *Node) sendCloseFrame(sess *session.Session, dir session.Direction) bool
 	if st != session.AttAttached {
 		return false
 	}
-	h := n.current(dir)
-	if h == nil || h.gen != gen {
-		return false
+	// Multi-carrier (Phase 2): the close frame must go on the carrier the
+	// attachment is pinned to (by generation), not the direction's primary.
+	h := n.handleForGen(gen)
+	if h == nil || h.gen != gen || !h.carrier.Ready() {
+		return false // being superseded or lost — treat as unavailable
 	}
 	if err := h.carrier.WriteFrame(streamIDOf(sess, dir), mux.FrameClose, nil); err != nil {
 		att.Detach(gen)
@@ -433,6 +528,29 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 	att.SetEpochDone(done)
 	go func() {
 		defer close(done)
+		// Issue #21 bootstrap gate: the down→client relay must not write any
+		// target payload byte to clientConn before the caller has written the
+		// SOCKS5 0x00 reply (which happens right before AdoptConn). Await the
+		// gate so the 0x00 reply is guaranteed to precede every payload byte.
+		// For the fire-and-forget StartSession path the gate is pre-closed, so
+		// this returns immediately and the happy path is unchanged. On the
+		// AndWait path the gate closes when the caller adopts the conn, or on
+		// session teardown / ctx cancellation — so a client that disconnects
+		// while the bootstrap is in flight unblocks this promptly and the
+		// relay exits without writing to a dead socket.
+		if dir == session.DirDown && n.cfg.Role == RoleIran {
+			sess.AwaitClientConn(sess.Ctx)
+			// The AndWait path captured `sock` before the caller adopted the
+			// client conn (it was nil at relay start). Now that the gate
+			// has released, re-resolve the socket so the relay writes to the
+			// adopted conn, not the nil captured at start. If the session
+			// tore down before adoption (teardown released the gate),
+			// ClientConn is still nil and we exit below.
+			sock = sess.ClientConn
+			if sock == nil {
+				return
+			}
+		}
 		for {
 			select {
 			case <-sess.Ctx.Done():
@@ -456,6 +574,14 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 					if st, g := att.State(); st == session.AttAttached && g == h.gen {
 						sess.Stats.MarkCleanHalfClose()
 					}
+					// Phase B (Slice 4): on half-close, force-flush any
+					// remaining pending credit bytes with CreditFlagsFinal.
+					// A dropped finalize is safe (cumulative-absolute): the
+					// last credit carries the running total. Inert when
+					// credits are disabled (n.creditEmitter is nil).
+					if n.creditEmitter != nil && dir == session.DirDown {
+						n.creditEmitter.finalize(carrierKey{carrier: h.carrier, streamID: streamIDOf(sess, dir)})
+					}
 					n.peerEOF(sess, dir)
 					return
 				}
@@ -464,7 +590,35 @@ func (n *Node) startStreamRelay(sess *session.Session, dir session.Direction, h 
 				} else {
 					n.metrics.AddDown(int64(len(frame)))
 				}
-				if _, err := sock.Write(frame); err != nil {
+				// Phase B (Slice 4, B1): enforce the exact write/credit
+				// shape. Credit ONLY the bytes the socket actually accepted
+				// (nw), and ONLY on a full, error-free write. A partial
+				// write (nw < len(frame), err == nil) or a full failure
+				// credits NOTHING and terminates the stream — a half-
+				// written frame must never continue (the session is
+				// closing). This is the invariant that forbids over-ack:
+				// Sigma(bytesConsumed) <= Sigma(bytes actually written).
+				nw, werr := sock.Write(frame)
+				if werr == nil && nw == len(frame) {
+					// Authoritative release point: the byte is accepted by
+					// the client kernel TCP stack, so it is "consumed" and
+					// the receiver may tell the sender more may be issued.
+					// Scoped to the down receiver path; inert when credits
+					// are disabled (n.creditEmitter is nil).
+					if n.creditEmitter != nil && dir == session.DirDown {
+						key := carrierKey{carrier: h.carrier, streamID: streamIDOf(sess, dir)}
+						if n.creditEmitter.recordConsumed(key, uint64(nw)) {
+							n.metrics.AddCreditConsumedBytes(int64(nw))
+							if n.creditEmitter.emit(key, false) {
+								n.metrics.CreditEmitted()
+							} else {
+								n.metrics.CreditDropped()
+							}
+						}
+					}
+				} else {
+					// failed OR partial write: no credit; the session is
+					// closing (never continue with a half-written frame).
 					n.metrics.Error()
 					n.metrics.RelaySocketWriteError()
 					sess.Close(sockWriteErr(dir))

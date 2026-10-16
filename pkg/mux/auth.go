@@ -14,16 +14,26 @@ import (
 )
 
 // ============================================================
-// Carrier authentication protocol v1 (Phase 6)
+// Carrier authentication protocol v2 (Phase 6 + Phase A credit wire)
 // ============================================================
 //
 // v0 (pre-Phase-6) sent the derived shared secret itself as the
 // authentication token; anyone who captured a valid handshake could
-// replay it forever. v1 is a three-message challenge/response exchange
-// that authenticates BOTH ends, binds the CARRIER ROLE and the protocol
-// VERSION into the MAC transcript, and is replay-resistant through
-// fresh random nonces. The raw secret (or any function of it) is NEVER
-// put on the wire — only HMAC-SHA256 tags over fresh per-handshake data.
+// replay it forever. v1 (Phase 6) introduced a three-message
+// challenge/response exchange that authenticates BOTH ends, binds the
+// CARRIER ROLE and the protocol VERSION into the MAC transcript, and
+// is replay-resistant through fresh random nonces. The raw secret (or
+// any function of it) is NEVER put on the wire — only HMAC-SHA256 tags
+// over fresh per-handshake data.
+//
+// v2 (Phase A, credit-capable wire format) bumps AuthVersion to 2 so
+// that a v1 peer (AuthVersion=1) is rejected at authentication
+// (fail-closed, before any MAC verification). This prevents the
+// mixed-generation deployment hazard described in the design doc
+// §5.2: a v2 peer that silently drops FrameCredit frames on a v1 peer
+// would stall or degrade to SAFELY_CAPPED. By requiring both peers to
+// use AuthVersion=2, the credit wire format is only used when both
+// ends understand it.
 //
 // All three messages are FrameAuth frames on stream 0:
 //
@@ -78,8 +88,24 @@ import (
 // and the connection is closed on expiry, which interrupts the blocked
 // read.
 
-// AuthVersion is the current authentication protocol version.
-const AuthVersion = 1
+// AuthVersion is the current carrier authentication protocol version.
+//
+// History:
+//   - 1: the original Phase 6 challenge/response exchange.
+//   - 2 (Phase A, credit-capable wire format): introduced together with
+//     the FrameCredit (0x07) frame type and its 32-byte payload. Bumping
+//     the version here is the operator's fail-closed compatibility
+//     mechanism for the credit wire format: a v1 peer (AuthVersion = 1)
+//     is rejected at authentication (ErrAuthVersion, before any MAC
+//     verification) so that the two ends never enter a mixed-version
+//     state in which one peer silently drops FrameCredit frames
+//     (design doc §5.2 atomic-upgrade requirement).
+//
+// Both ends of a carrier MUST agree on this value; it is baked into
+// every auth message via buildChallenge/buildResponse/buildConfirm and
+// checked before MAC verification in verifyResponse and in the client
+// path of CarrierAuth.
+const AuthVersion = 2
 
 // CarrierRole identifies which carrier a handshake establishes. Both
 // ends of a given carrier use the SAME role, and the role is bound into

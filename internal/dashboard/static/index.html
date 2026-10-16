@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Split-Tunnel Dashboard</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+<div class="app" id="app">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <aside class="sidebar" id="sidebar" aria-label="Dashboard navigation">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">⬡</span>
+      <span class="brand-name">Split-Tunnel</span>
+    </div>
+    <nav class="nav" aria-label="Sections">
+      <a href="#overview" data-section="overview" class="nav-link">Overview</a>
+      <a href="#hosts" data-section="hosts" class="nav-link">Hosts</a>
+      <a href="#tunnels" data-section="tunnels" class="nav-link">Tunnels / Carriers</a>
+      <a href="#routing" data-section="routing" class="nav-link">Routing</a>
+      <a href="#outbounds" data-section="outbounds" class="nav-link">Outbounds</a>
+      <a href="#inbounds" data-section="inbounds" class="nav-link">Inbounds</a>
+      <a href="#control" data-section="control" class="nav-link">Control</a>
+      <a href="#network" data-section="network" class="nav-link">Network speed</a>
+      <a href="#config" data-section="config" class="nav-link">Configuration</a>
+      <a href="#logs" data-section="logs" class="nav-link">Logs / Events</a>
+    </nav>
+    <div class="sidebar-foot muted small">Read-only build</div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button type="button" class="icon-btn" id="menuBtn" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar">☰</button>
+      <h1 id="pageTitle">Overview</h1>
+      <div class="badges" id="globalBadges" role="status" aria-live="polite" aria-label="Tunnel state"></div>
+      <div class="spacer"></div>
+      <label class="poll small">Every
+        <input id="pollSec" type="number" min="2" max="60" value="5" aria-label="Poll interval in seconds"> s
+      </label>
+      <button type="button" class="icon-btn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">⟳</button>
+      <button type="button" class="icon-btn" id="themeBtn" title="Toggle dark / light theme" aria-label="Toggle theme">◐</button>
+    </header>
+
+    <div class="banner" role="note">
+      ⚠ <strong>Read-only mode.</strong> Editing is disabled in this build; no host is changed by this dashboard.
+      No secrets are displayed.
+    </div>
+
+    <main id="content" aria-live="polite">
+      <section class="view" data-view="overview" aria-label="Overview"></section>
+      <section class="view" data-view="hosts" hidden aria-label="Hosts"></section>
+      <section class="view" data-view="tunnels" hidden aria-label="Tunnels and carriers"></section>
+      <section class="view" data-view="routing" hidden aria-label="Routing"></section>
+      <section class="view" data-view="outbounds" hidden aria-label="Outbounds"></section>
+      <section class="view" data-view="inbounds" hidden aria-label="Inbounds"></section>
+      <section class="view" data-view="control" hidden aria-label="Control"></section>
+      <section class="view" data-view="network" hidden aria-label="Network speed"></section>
+      <section class="view" data-view="config" hidden aria-label="Configuration"></section>
+      <section class="view" data-view="logs" hidden aria-label="Logs and events"></section>
+    </main>
+
+    <footer class="footer small muted" role="contentinfo">
+      <span id="lastPoll">Last update: —</span>
+      <span id="apiStatus" role="status" aria-live="polite">API: —</span>
+      <button type="button" class="icon-btn" id="copyDiagnosticsBtn" aria-label="Copy diagnostics">⧉ Diagnostics</button>
+    </footer>
+  </div>
+</div>
+<script src="static/app.js"></script>
+</body>
+</html>

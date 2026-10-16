@@ -1,495 +1,284 @@
-# Iran-Germany Asymmetric Split-Tunnel
+# Iran–Germany Asymmetric Split-Tunnel
 
-Dual-carrier frame-multiplexed relay for Xray/3x-ui with shared secret authentication.
-Uploads ride a WebSocket carrier through a CDN; downloads ride a direct TCP carrier
-tunneled over VLESS+Reality. One direction per carrier — no cross-traffic.
+A dual-carrier, frame-multiplexed relay that tunnels client traffic from
+Iran to Germany with asymmetric upload/download paths. The Iran node exposes a
+local SOCKS5 ingress on `127.0.0.1:10900`; each client connection is multiplexed
+as a logical stream over a **WebSocket up-carrier** (upload bytes, riding a CDN
+edge to avoid the asymmetric underlay) and a **TCP down-carrier** (download
+bytes, tunneled under VLESS+Reality on the German host). One direction per
+carrier—no cross-traffic. Phase 2 multi-carrier support adds a second,
+hot-standby down-carrier with bounded carrier-reconnect semantics so a brief
+underlay blip cannot amplify into a multi-minute outage.
 
 ## Architecture
 
 ```
-                                    Iran node                                        Germany node
-┌──────────────────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
-│ Client → local Xray → iran-splitter (SOCKS5 :10900)  │        │ germany-splitter                             │
-│        │                                             │        │   │                                         │
-│        ├─ Up-carrier (upload): WS server :9001       │ nginx  │   │ dials wss://<cdn>/upload                │
-│        │     (nginx → CDN /upload path) ─────────────┼───────►├───┘                                         │
-│        │                                             │        │   │                                         │
-│        └─ Down-carrier (download): dials             │  Xray  │   │                                         │
-│             127.0.0.1:10802 (VLESS+Reality) ─────────┼───────►├──► TCP listener :9002                       │
-└──────────────────────────────────────────────────────┘        │   │                                         │
-                                                                 │   ▼ net.DialTimeout → real destination      │
-                                                                 │ Internet                                   │
-                                                                 └──────────────────────────────────────────────┘
+Client (Iran)
+  │
+  ▼
+Iran SOCKS5 ingress  127.0.0.1:10900   (RFC 1928 + RFC 1929 auth)
+  │  (StreamID per connection)
+  │
+  ├─► Up-carrier: WebSocket  127.0.0.1:9001  →  nginx / CDN  →  wss://<cdn>/upload
+  │       (upload bytes, FrameHeader, control frames)
+  │
+  └─► Down-carrier: TCP  127.0.0.1:9002  (behind VLESS+Reality Xray inbound)
+          (download bytes, response data)
+          │
+          ▼
+      germany-splitter  dials real target → Internet
+
+Metrics:
+  ├─ Iran   node  127.0.0.1:<SPLIT_METRICS_PORT>  /metrics
+  ├─ Germany node  127.0.0.1:<SPLIT_METRICS_PORT>  /metrics
+  └─ tunneldash  127.0.0.1:8080/  (loopback + TLS + basePath + Basic auth)
 ```
 
-- **Up-carrier** (Iran `:9001` → CDN → Germany): client upload bytes, `FrameHeader`, control.
-- **Down-carrier** (Iran via local Xray → Germany `:9002`): target response bytes only.
-- **Frame protocol**: 7-byte header (`StreamID 4B BE | Type 1B | Length 2B BE`) + payload (max 65535 B).
-- **Auth**: symmetric `FrameAuth` with SHA-256-derived secret + constant-time comparison.
-- **Stream model**: one `StreamID` per session, shared by both carriers. The first frame of a
-  stream on the up-carrier is `FrameHeader` (encoded destination); Germany dials the target and
-  echoes response bytes back on the down-carrier with the same `StreamID`.
+The German egress node (`germany-splitter`) dials `wss://<cdn>/upload` to
+complete the up-carrier handshake and listens on the down-carrier loopback port
+reached via the local VLESS+Reality Xray inbound. When `SPLIT_MULTI_CARRIER_ENABLED`
+is set a second down-carrier pair (`SPLIT_DOWN_LISTEN_2` /
+`SPLIT_DOWN_CARRIER_ADDR_2`) is added; the routing engine selects the best
+carrier per stream (hot-standby failover, never cross-stream bonding).
 
-## Quick Start
+## Key Features
 
-### Self-contained deployment — `splitterctl` (T8)
+- **Bounded carrier reconnect** (`SPLIT_RECONNECT_*`) — a cumulative sleep window
+  (default 30 s) with per-attempt clamp (default 2 s) so a persistent underlay
+  outage does not keep the node in a multi-minute reconnect loop.
+- **TCP keepalive** (`SPLIT_TCP_KEEPALIVE_MS`, default 30 s) — kernel probes on
+  client, target, and carrier sockets detect half-open connections within one
+  probe instead of the OS default (~2 h).
+- **Loopback-only down-carrier default** — `DefaultDownListen` is
+  `127.0.0.1:9002`; the down-carrier is reached only through the local
+  VLESS+Reality Xray inbound, never directly from the Internet. Non-loopback
+  binds remain supported by setting `SPLIT_DOWN_LISTEN` explicitly.
+- **Accurate SOCKS5 connection-result semantics** (RFC 1928) — status byte
+  `0x00` is returned to the client **only after** the German node confirms the
+  remote target connection succeeded (`FrameBootstrapAck`, 0x09, Issue #21).
+  All other failure cases return the correct non-zero status byte.
+- **Explicit stream reset** (`FrameReset`, 0x08, Issue #20) — when a rebind is
+  refused the German node sends a versioned `FrameReset` carrying a generation
+  echo and reason code; the Iran node handles it idempotently (stale-generation
+  guard) so the stranded session is terminated exactly once.
+- **Multi-carrier selection with hot-standby failover** —
+  `SPLIT_MULTI_CARRIER_ENABLED` adds a second down-carrier; the routing engine
+  pins each stream to one carrier and fails over to the standby on loss,
+  never spanning bytes across carriers.
+- **tunneldash** — loopback-only, read-only monitoring dashboard (TLS + random
+  basePath + HTTP Basic auth when server-hosted). No production mutations.
+- **Secret redaction & fail-closed routing** — all log output and dashboard JSON
+  redact `SPLIT_SECRET`, SOCKS passwords, and key material; the routing engine
+  refuses every unmatched destination when no default rule is set (fail-closed).
 
-`splitterctl` is the project's transactional deployment CLI. It manages
-the deployment through `internal/deploy` (state, planner, journal,
-controller, Linux adapter) on the canonical state root `/etc/split-tunnel`
-(`systemd.StateDir`); every mutation command is Linux-root only and
-delegates host work to the T2–T6 packages (Xray, origin/Caddy, systemd,
-firewall) rather than duplicating their policy.
+## Protocol Overview
+
+Frame header (7 bytes):
 
 ```
-usage: splitterctl <install|pair|status|doctor|upgrade|rollback|uninstall|recover|config>
-  status                              show persisted deployment state (SPLITTERCTL_STATE_ROOT)
-  doctor                              run read-only deployment checks
-  install iran|germany                install a role (Linux root; env contract in package docs)
-  pair generate|apply|finalize        exchange pairing blobs (Germany apply also emits the return Blob B)
-  upgrade [--xray|--origin|--splitter]  upgrade one component (or re-apply) from the environment (Linux root)
-  rollback --to state-id              converge the host to a retained revision (Linux root)
-  uninstall [--purge]                 remove the deployment (Linux root)
-  recover                             execute journal-driven post-crash recovery (Linux root)
-  recover --ack                       force-clear the journal without host changes (Linux root)
-  config show                         show the committed deployment config
-  config set KEY=VALUE ...            apply configuration changes transactionally (Linux root)
+Offset  Size  Field
+0       4     StreamID (uint32, BE)
+4       1     Type     (uint8)
+5       2     Length   (uint16, BE, payload size, max 65535)
+7       Len   Payload
 ```
 
-**Roles.**
+Frame catalog (full documentation in
+[`docs/protocol-frames.md`](docs/protocol-frames.md)):
 
-* **Iran** — manages the splitter, the origin (Caddy or the CDN
-  sub-modes) where configured, systemd units, firewall and deployment
-  state. **Iran's external Xray/3x-ui or xray-consumer is operator-owned
-  and is not managed**: the splitter exposes the SOCKS5 service and that
-  external consumer routes into it (see [Xray Config (Iran)](#xray-config-iran)).
-* **Germany** — `splitterctl` manages the splitter and the project-managed
-  pinned Xray-core/Reality transport. A separately installed external
-  Xray/3x-ui or xray-consumer is not part of the supported Germany contract.
+| Type | Name | Purpose |
+|------|------|---------|
+| `0x00` | `FrameData` | user payload |
+| `0x01` | `FrameAuth` | shared-secret handshake (SHA-256-derived, constant-time) |
+| `0x02` | `FramePing` | keepalive ping |
+| `0x03` | `FramePong` | keepalive pong |
+| `0x04` | `FrameClose` | stream close / half-close |
+| `0x05` | `FrameHeader` | stream header: encoded target destination |
+| `0x06` | `FrameRebind` | re-attach an existing session to a new carrier |
+| `0x07` | `FrameCredit` | receiver-side flow-control credit (inert unless enabled) |
+| `0x08` | `FrameReset` | stream-level negative ack (Phase 2, Issue #20) |
+| `0x09` | `FrameBootstrapAck` | bootstrap target-dial result (Phase 2, Issue #21) |
 
-**State root.** `/etc/split-tunnel` (`systemd.StateDir`); the read-only
-commands honor `SPLITTERCTL_STATE_ROOT`.
+## Configuration Reference
 
-**Pairing.** The only cross-host human step: `pair generate` on Iran emits
-Blob A once (tunnel secret + public upload domain); `pair apply` on Germany
-consumes Blob A AND emits the return Blob B — built from the host's
-INSTALLED Reality configuration (public key derived from the installed
-private key, never a fresh pair) plus the public down host/port, so a
-re-run while already `a-applied` (e.g. Blob B was lost) deterministically
-re-emits the SAME Blob B without regenerating anything; `pair finalize` on
-Iran consumes Blob B. Blob B carries only public Reality parameters + host
-and port. The down host is taken from `SPLITTERCTL_PAIR_DOWN_HOST`
-(otherwise auto-detected from the host's public interface address) and the
-inbound port from the installed config. Emitted blobs go to stdout as the
-last line; `SPLITTERCTL_PAIR_BLOB_OUT` (absolute path) additionally writes
-the blob 0600 for a non-display relay (scp). Raw blobs and tunnel secrets
-are never persisted — only fingerprints.
+All variables are read by `internal/config` at startup. Unset / empty means
+"use the default". The defaults below are the current audited values
+(verified against `internal/config/config.go` `Defaults()`).
 
-**Crash recovery.** If a transaction is interrupted, the ownership journal
-is retained and install/rollback/uninstall refuse until recovery is done.
-`splitterctl recover` (no flags) **executes** journal-driven recovery from
-the persisted journal (bounded to the journal's pre-state); `recover --ack`
-is the explicit manual force-clear that deletes the journal **without
-touching the host** and must only be used after the operator has verified
-the host. `--ack` fails closed on an unreadable/tampered committed state or
-a journal/committed role mismatch.
+### Iran node (`iran-splitter`)
 
-> **Status:** the CLI is implemented and its local test suite is green, but
-> **no staging acceptance run has been performed** — T8 is not claimed
-> complete until a clean-Ubuntu L5 acceptance run exists. See
-> [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) and
-> [`docs/self-contained-deployment-architecture.md`](docs/self-contained-deployment-architecture.md).
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPLIT_SOCKS_LISTEN` | `127.0.0.1:10900` | SOCKS5 ingress listener |
+| `SPLIT_SOCKS_USER` | *(empty)* | RFC 1929 username (empty = auth off) |
+| `SPLIT_SOCKS_PASS` | *(empty)* | RFC 1929 password (never logged) |
+| `SPLIT_SOCKS_ALLOWED_SOURCES` | *(empty)* | source-IP allowlist (empty = allow all) |
+| `SPLIT_WS_LISTEN` | `127.0.0.1:9001` | up-carrier WebSocket listener |
+| `SPLIT_DOWN_CARRIER_ADDR` | `127.0.0.1:10802` | down-carrier dial target (local VLESS+Reality Xray outbound) |
+| `SPLIT_UP_WS_URL` | *(placeholder)* | CDN WebSocket URL (must be set in production) |
+| `SPLIT_SECRET` | *(placeholder)* | shared secret (must be set; strength-validated) |
+| `SPLIT_METRICS_PORT` | `0` (off) | Prometheus `/metrics` listener (loopback) |
+| `SPLIT_RELAY_BUF` | `32768` (32 KiB) | socket read chunk size |
+| `SPLIT_CARRIER_GRACE` | `5000` ms | grace window per direction after carrier loss |
+| `SPLIT_RECONNECT_BASE_MS` | `1000` | exponential backoff base |
+| `SPLIT_RECONNECT_MAX_MS` | `10000` | exponential backoff cap |
+| `SPLIT_RECONNECT_WINDOW_MS` | `30000` | cumulative reconnect-sleep bound (0 = disabled) |
+| `SPLIT_RECONNECT_CLAMP_MS` | `2000` | per-attempt delay once window exhausted (0 = disabled) |
+| `SPLIT_TCP_KEEPALIVE_MS` | `30000` (30 s) | kernel TCP keepalive probe period (0 = off) |
+| `SPLIT_BOOTSTRAP_WAIT_MS` | `0` (lib. 30 s) | bounded bootstrap wait for a down carrier |
+| `SPLIT_SESSION_BUFFER_BYTES` | `262144` (256 KiB) | per-direction reconnect buffer |
+| `SPLIT_SESSION_BUFFER_TOTAL_BYTES` | `0` (lib. 32 MiB) | node-level aggregate session buffer |
+| `SPLIT_LIVENESS_ROUNDS` | `0` (lib. 3) | consecutive unanswered pings before carrier is dead |
+| `SPLIT_STREAM_QUEUE_BYTES` | `0` (lib. default) | per-stream queue bound |
+| `SPLIT_STREAM_QUEUE_FRAMES` | `0` (lib. default) | per-stream frame count bound |
+| `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | `0` (lib. 256 MiB cap) | aggregate queue bound |
+| `SPLIT_STREAM_OVERFLOW_MS` | `0` (lib. 30 s) | max time to wait for overflow credit |
+| `SPLIT_CREDITS_ENABLED` | `false` | credit-plane master on/off |
+| `SPLIT_MULTI_CARRIER_ENABLED` | `false` | second down-carrier + routing engine on/off |
+| `SPLIT_DOWN_CARRIER_ADDR_2` | *(empty, host required)* | second down-carrier dial target |
 
-### Deprecated path — interactive installer (`install.sh`)
+### Germany node (`germany-splitter`)
 
-> **Status relative to the CLI:** `splitterctl` is the supported deployment
-> path. `install.sh` is the **legacy/non-production** path: deprecated and
-> retained only as a historical/development fallback; it predates the transactional state,
-> journal, doctor, revision, and rollback semantics. Do not use it for a
-> production deployment. `deploy.sh` is also deprecated.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPLIT_DOWN_LISTEN` | `127.0.0.1:9002` | down-carrier listener |
+| `SPLIT_UP_WS_URL` | *(placeholder)* | CDN WebSocket URL (must be set) |
+| `SPLIT_SECRET` | *(placeholder)* | shared secret |
+| `SPLIT_METRICS_PORT` | `0` (off) | Prometheus `/metrics` |
+| `SPLIT_MULTI_CARRIER_ENABLED` | `false` | enable second down-carrier |
+| `SPLIT_DOWN_LISTEN_2` | *(empty)* | second down-carrier listener |
+| `SPLIT_DOWN_CARRIER2_SNI` | *(empty)* | TLS 1.3 SNI for second Xray inbound |
+| `SPLIT_ROUTING_RULES_FILE` | *(empty = routing off)* | JSON rules file path |
+| `SPLIT_ROUTING_DEFAULT` | *(empty = use file)* | `direct` or `warp` fallback |
+| `SPLIT_WARP_SOCKS_ADDR` | `127.0.0.1:40000` | WARP SOCKS5 forwarder address |
+| `SPLIT_ROUTING_DEBUG` | `false` | per-dial debug log |
 
-The deprecated installer asks for every setting (role, shared secret, ports,
-CDN domain, Xray inbound tag, nginx, metrics) with sensible defaults. Its
-behavior is not the production support contract. For supported deployments,
-build or obtain `splitterctl`, configure the documented environment, and use
-its transactional commands. The old script's pre-install configuration gate
-(`<role>-splitter --validate-config`, the same `internal/config` validation
-the production binary uses at startup) and only writes/starts the systemd
-service if that gate passes. On the Iran role it also merges the Xray config
-and configures nginx, then prints the exact next steps for the other node.
+### Shared (both nodes)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPLIT_POLICY_MODE` | `static` | carrier-intelligence policy (`static` or `adaptive`) |
+| `SPLIT_POLICY_TOPK` | `2` | top-K carriers to score (1–8) |
+| `SPLIT_PROBING_ENABLED` | `false` | active carrier probing on/off |
+| `SPLIT_PROBE_URL` | *(empty, required when enabled)* | probe target URL |
+| `SPLIT_PROBE_DAILY_BUDGET` | `100663296` (96 MiB) | daily byte cap for probes |
+| `SPLIT_TTFB_BASELINE_MS` | `0` (lib. 500 ms) | TTFB baseline for adaptive scoring |
+| `SPLIT_TARGET_ONLY_IPV4` | `false` | resolve targets to A records only |
+| `SPLIT_TARGET_ADDR_POLICY` | `default` | egress address-family policy |
+| `SPLIT_TARGET_DIAL_BOUND_MS` | `0` | per-dial ceiling (0 = no extra ceiling) |
+| `SPLIT_TARGET_BREAKER_ENABLED` | `false` | per-target dial circuit breaker |
+| `SPLIT_TARGET_DIAL_BACKOFF_ENABLED` | `false` | jittered backoff on target dial |
+
+## Quick Start / Deployment
+
+`install-oneclick.sh` is the supported production installer for both roles:
 
 ```bash
-# Iran node (the installer generates the shared secret for you)
-sudo bash install.sh
-# or remotely:
-curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s
+# On the Iran host:
+./install-oneclick.sh --role iran
+
+# On the Germany host:
+./install-oneclick.sh --role germany
 ```
 
-**Secret handling.** Without `--secret` the installer generates a 256-bit
-secret (`openssl rand -hex 32`), stores it at `/root/.split-tunnel-secret`
-(mode 600), and shows it MASKED in the summary (use `--show-secret` to
-reveal). Transfer the secret to the other node as a FILE, not a command-line
-argument:
+`install.sh` is the **legacy / non-production** interactive variant, kept for
+existing hosts; it is not the recommended deployment path (its firewall
+mutation is gated behind `--legacy-firewall`, off by default). `splitterctl`
+is the transactional
+deployment CLI (state root `/etc/split-tunnel`):
+
+```
+splitterctl status
+splitterctl doctor
+splitterctl pair generate
+splitterctl rollback --to <state-id>
+```
+
+The full deployment/rollback runbook is at
+[`docs/reviews/phase2-deployment-rollback-2026-10-14.md`](docs/reviews/phase2-deployment-rollback-2026-10-14.md).
+
+## Dashboard
+
+`tunneldash` is a read-only monitoring panel. It never contacts, mutates, or
+deploys to a production host.
+
+**Local development (fixture mode, no config):**
 
 ```bash
-# on the Iran node, after the install:
-scp /root/.split-tunnel-secret root@<germany>:~/.split-tunnel-secret
-
-# Germany node (non-interactive; the secret never appears on the command line)
-curl -fsSL https://raw.githubusercontent.com/Zaltapar/iran-germany-split-tunnel/main/install.sh | sudo bash -s \
-  -- germany --yes --up-ws-url wss://<cdn-domain>/upload --secret-file ~/.split-tunnel-secret
+go build -o tunneldash ./cmd/tunneldash
+./tunneldash
+# → UI at http://127.0.0.1:8080/
+# → API at http://127.0.0.1:8080/api/v1/
 ```
 
-Every question also has a flag (see `install.sh --help`), but this deprecated
-path is not production-ready. Re-running the installer on an
-existing installation is an **upgrade**: it pre-fills the current unit's
-values as prompt defaults, backs up the old unit
-(`<unit>.service.bak.<ts>`) and binary (`<role>-splitter.bak`), and keeps the
-existing shared secret unless you supply a new one. To remove the service,
-binary and managed nginx config: `sudo bash install.sh uninstall
-[iran|germany]` (rollback backups are kept and listed in the output;
-`ufw` rules are NOT removed automatically — see the printed hints).
+**Server-hosted (TLS + basePath + Basic auth):** when the config carries a
+complete TLS section (`tls.enabled`, `certFile`, `keyFile`, and a 32-hex
+`basePath`) the dashboard binds over TLS on a public port, mounts all routes
+under `/<basePath>/`, and requires HTTP Basic auth. The basePath is an access
+secret, not a substitute for authentication.
 
-### Manual build & deploy (without the installer)
+See [`docs/tunneldash.md`](docs/tunneldash.md) for the full reference.
+
+## Testing
+
+Unit tests (all packages):
 
 ```bash
-go build -o iran-splitter ./cmd/iran-splitter
-go build -o germany-splitter ./cmd/germany-splitter
+go test ./...
 ```
 
-### Deploy Iran Server
-
-> **Deprecated/non-production reference only.** The checked-in
-  `systemd/*.service` units and manual copy commands below are historical
-  examples. They contain startup-rejected placeholders and are not a
-  supported production deployment path. Use `splitterctl` instead; do not
-  invoke `deploy.sh`, `install.sh`, or these manual commands on a real host.
+Two-process integration harness (L4 gate, requires two processes;
+`RUN_TWOPROC=1` opts in):
 
 ```bash
-sudo cp iran-splitter /usr/local/bin/
-sudo cp systemd/iran-splitter.service /etc/systemd/system/
-# EDIT: set SPLIT_SECRET (match on both nodes) before enabling
-sudo systemctl daemon-reload
-sudo systemctl enable --now iran-splitter
+RUN_TWOPROC=1 go test ./integration/
 ```
 
-### Deploy Germany Server
+The L5 real-transport acceptance matrix (21 checks covering SOCKS5 egress
+identity, carrier reconnect, `FrameReset`, `FrameBootstrapAck`,
+`FrameBootstrapAck` status bytes, and multi-carrier failover) was executed
+against the staging build `0e60a34` on 2026-10-15 and passed **21/21**
+(0 FAIL, 0 BLOCKED, 0 SKIP). The matrix is documented in
+[`integration/RUNBOOK.md`](integration/RUNBOOK.md) and the evidence is in
+[`docs/reviews/phase2-final-report-2026-10-14.md`](docs/reviews/phase2-final-report-2026-10-14.md).
 
-```bash
-sudo cp germany-splitter /usr/local/bin/
-sudo cp systemd/germany-splitter.service /etc/systemd/system/
-# EDIT: set SPLIT_SECRET + SPLIT_UP_WS_URL (your real CDN URL) before enabling
-sudo systemctl daemon-reload
-sudo systemctl enable --now germany-splitter
-```
+## Security Posture
 
-## Configuration
+- **Loopback-only listeners** — SOCKS5, WebSocket, down-carrier, metrics, and
+  tunneldash all bind to `127.0.0.1` by default. The down-carrier is reached
+  only through the local VLESS+Reality Xray inbound, never directly from the
+  Internet.
+- **Mutual authentication** — the shared `SPLIT_SECRET` is derived to a
+  SHA-256 key and compared in constant time; the `FrameAuth` handshake
+  authenticates both directions.
+- **Fail-closed routing** — when no routing rule matches a destination and
+  `SPLIT_ROUTING_DEFAULT` is empty the routing engine refuses the dial rather
+  than falling back to `direct`.
+- **Secret redaction** — `SPLIT_SECRET`, SOCKS passwords, and key material are
+  never written to logs. The dashboard redacts all sensitive fields before
+  rendering.
+- **Dashboard security model** — loopback-only bind (fail-closed at startup);
+  `readOnly=true` by default (all POST mutations refused); no CORS; no
+  inline styles/scripts; CSP headers; pinned host keys (SSH collector);
+  fixed-argv command allowlist (no shell injection).
 
-| Variable | Iran | Germany | Default | Description |
-|----------|:----:|:-------:|---------|-------------|
-| `SPLIT_SOCKS_LISTEN` | ✓ | | `127.0.0.1:10900` | SOCKS5 listener (local Xray connects here) |
-| `SPLIT_WS_LISTEN` | ✓ | | `127.0.0.1:9001` | Up-carrier WebSocket server (path `/upload`, front with nginx → CDN) |
-| `SPLIT_DOWN_CARRIER_ADDR` | ✓ | | `127.0.0.1:10802` | Down-carrier dial target (local Xray VLESS+Reality outbound) |
-| `SPLIT_UP_WS_URL` | | ✓ | `wss://cdn.example.com/upload` | Up-carrier WebSocket URL (CDN domain) |
-| `SPLIT_DOWN_LISTEN` | | ✓ | `:9002` | Down-carrier TCP listener |
-| `SPLIT_SECRET` | ✓ | ✓ | placeholder | **Must match on both nodes** (min 32 chars; blocklisted placeholders rejected at startup) |
-| `SPLIT_ALLOW_WEAK_SECRET` | ✓ | ✓ | unset | `=1` bypasses the secret length check (development/test only; blocklist still enforced) |
-| `SPLIT_METRICS_PORT` | ✓ | ✓ | `0` (off) | Local HTTP metrics port |
-| `SPLIT_RELAY_BUF` | ✓ | ✓ | `32768` | Relay buffer size in bytes |
-| `SPLIT_STREAM_QUEUE_BYTES` | ✓ | ✓ | `1048576` (1 MiB) | Max payload bytes buffered per stream before that stream (not the carrier) is terminated |
-| `SPLIT_STREAM_QUEUE_FRAMES` | ✓ | ✓ | `16` | Max frames buffered per stream |
-| `SPLIT_STREAM_QUEUE_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Aggregate queued bytes across all streams per carrier (`0` = library default) |
-| `SPLIT_STREAM_OVERFLOW_MS` | ✓ | ✓ | `0` (100) | How long a stalled stream may hold its buffer (ms; `0` = library default) |
-| `SPLIT_CARRIER_GRACE` | ✓ | ✓ | `5000` | Carrier-loss grace window in ms: how long a session survives a carrier blip before being torn down (500..600000) |
-| `SPLIT_BOOTSTRAP_WAIT_MS` | ✓ | ✓ | `0` (30000) | Bounded wait for a temporarily down carrier at session bootstrap (ms; `0` = library default 30 s, explicit values 500..120000) |
-| `SPLIT_SESSION_BUFFER_BYTES` | ✓ | ✓ | `262144` (256 KiB) | Per-direction reconnect buffer per session (4 KiB..16 MiB) |
-| `SPLIT_SESSION_BUFFER_TOTAL_BYTES` | ✓ | ✓ | `0` (32 MiB) | Node-level aggregate session-buffer budget (`0` = library default) |
-| `SPLIT_LIVENESS_ROUNDS` | ✓ | ✓ | `0` (3) | Blackhole detection: consecutive unanswered keepalive pings before the carrier is torn down (`0` = library default, 0..20) |
+## Status & Documentation Index
 
-### Configuration validation
+| Document | Path |
+|----------|------|
+| Phase 2 audit report | [`docs/reviews/phase2-audit-2026-10-14.md`](docs/reviews/phase2-audit-2026-10-14.md) |
+| Defect register | [`docs/reviews/phase2-defect-register-2026-10-14.md`](docs/reviews/phase2-defect-register-2026-10-14.md) |
+| Deployment / rollback runbook | [`docs/reviews/phase2-deployment-rollback-2026-10-14.md`](docs/reviews/phase2-deployment-rollback-2026-10-14.md) |
+| Final report (incl. L5 21/21 evidence) | [`docs/reviews/phase2-final-report-2026-10-14.md`](docs/reviews/phase2-final-report-2026-10-14.md) |
+| Protocol frame catalog | [`docs/protocol-frames.md`](docs/protocol-frames.md) |
+| SOCKS5 usage & status-byte semantics | [`docs/socks5-usage.md`](docs/socks5-usage.md) |
+| tunneldash reference | [`docs/tunneldash.md`](docs/tunneldash.md) |
+| Carrier reconnect backoff | [`docs/carrier-reconnect-backoff.md`](docs/carrier-reconnect-backoff.md) |
+| Key-rotation runbook | [`docs/key-rotation-runbook.md`](docs/key-rotation-runbook.md) |
+| Integration test runbook | [`integration/RUNBOOK.md`](integration/RUNBOOK.md) |
+| Implementation status | [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) |
 
-Both binaries share one centralized configuration layer
-(`internal/config`): **load (env → defaults) → parse → validate →
-construct**. A node never opens a listener or starts a goroutine until
-`config.Load` succeeds, and a startup failure reports **every** problem
-at once (aggregated list) instead of one-at-a-time:
-
-* empty / unset variable = "use the default";
-* integers are strictly parsed (`abc`, negatives and out-of-range values
-  are config errors, never silent zeros); `SPLIT_ALLOW_WEAK_SECRET`
-  must be a real boolean (`1/0/true/false`);
-* addresses must be `host:port` (bare `:port` allowed for listeners,
-  bracketed IPv6 like `[::1]:9001`, explicit host required for dial
-  targets);
-* `SPLIT_UP_WS_URL` must be `ws(s)://host/upload` — the placeholder
-  `wss://cdn.example.com/upload` is rejected, as are wrong paths;
-* port collisions between the app's own listeners (and the metrics
-  port) are detected at config time;
-* `SPLIT_STREAM_QUEUE_*` / `SPLIT_STREAM_OVERFLOW_MS` values of `0`
-  keep the library defaults; the aggregate budget must cover at least
-  one stream's share;
-* the Phase 6 secret policy applies (blocklist always, length minimum
-  unless `SPLIT_ALLOW_WEAK_SECRET=1`); error messages never contain the
-  secret value.
-
-`SPLIT_STREAM_QUEUE_*` and `SPLIT_STREAM_OVERFLOW_MS` ship the value `0`
-by default, which the runtime resolves to `mux.DefaultStreamLimits`
-(16 frames / 1 MiB per stream, 32 MiB per carrier, 100 ms) via
-`mux.SanitizeLimits`.
-
-**Pre-install dry-run.** Both binaries accept `--validate-config` as their
-first argument: they run the full load→parse→validate path above, print the
-result, and exit WITHOUT opening any listener. `install.sh` uses this as its
-configuration gate (the exact environment values that go into the systemd
-unit are passed in), and it is also a convenient manual dry-run:
-
-```bash
-SPLIT_SECRET=... SPLIT_UP_WS_URL=wss://cdn.example.org/upload \
-  ./germany-splitter --validate-config
-```
-
-## Xray Config (Iran)
-
-**Xray/3x-ui is a CONSUMER of this project, not a managed component.** The
-Iran splitter exposes a SOCKS5 service (`SPLIT_SOCKS_LISTEN`, default
-`127.0.0.1:10900`); your existing Xray installation routes client traffic
-into it with a SOCKS outbound. This project does not manage, generate or
-validate Xray inbounds/outbounds/routing beyond the snippet below (the
-installer's Iran Xray-merge adds only the `to-splitter` outbound and the one
-routing rule shown here).
-
-**Conceptual flow:** Xray inbound → existing Xray routing → SOCKS5 outbound
-(`to-splitter`) → Iran splitter → asymmetric multiplexed tunnel → Germany
-splitter → target Internet.
-
-```json
-{
-  "outbounds": [
-    {"tag": "up-cdn"},
-    {"tag": "down-direct"},
-    {
-      "tag": "to-splitter",
-      "protocol": "socks",
-      "settings": {"servers": [{"address": "127.0.0.1", "port": 10900}]}
-    }
-  ],
-  "routing": {
-    "rules": [
-      {"type": "field", "inboundTag": ["your-inbound-tag"], "outboundTag": "to-splitter"}
-    ]
-  }
-}
-```
-
-> `config/iran-xray-config.json` is a full, labeled **template** for the Iran
-> node (placeholders for your UUID/SNI/Reality key). The Germany node needs
-> no local SOCKS wiring: the up-carrier does not use Xray at all (the
-  germany-splitter dials your CDN `wss://` URL directly). Germany's
-  project-managed Xray/Reality inbound delivers the down-carrier's tunneled
-  TCP bytes to `127.0.0.1:9002` (`SPLIT_DOWN_LISTEN`). Public DNS/CDN/TLS/NAT
-  and WebSocket checks remain operator/external prerequisites.
->
-> **Germany inbound (generated by this project):** `internal/xray` generates
-> the Reality keypair locally on Germany (the pinned Xray binary's own
-> `xray x25519`), renders the deterministic inbound/routing/outbound JSON,
-> gates it with the pinned binary's own `xray run -test`, and activates it
-> atomically (0600 permissions, previous config kept as a `.prev` rollback).
-> The Reality **private key never leaves Germany** (0600 file, never logged,
-> never in a pairing blob); only the public parameters (public key, SNI,
-> shortId, UUID) cross to Iran via the T1 pairing blob B. The Iran-side
-> Xray/3x-ui wiring above remains operator-managed.
-
-## Frame Protocol
-
-Header (7 bytes): `StreamID uint32 BE | Type uint8 | Length uint16 BE` — payload max 65535 bytes. StreamID 0 is reserved for control traffic (auth/ping/pong) and can never be registered as a stream.
-
-| Type | Value | Description |
-|------|-------|-------------|
-| Data | 0x00 | User data payload |
-| Auth | 0x01 | v1 challenge/response authentication (StreamID 0, handshake phase only) |
-| Ping | 0x02 | Keepalive ping (StreamID 0) |
-| Pong | 0x03 | Keepalive pong (StreamID 0) |
-| Close | 0x04 | Stream close / half-close |
-| Header | 0x05 | Stream destination (first frame of a new stream, up-carrier only) |
-| Rebind | 0x06 | Re-attach an existing session after a carrier loss (generation-checked; never creates sessions) |
-
-**Carrier handshake** (both directions, v1 — see below): a three-message
-HMAC challenge/response. The raw secret (or any function of it) is never
-sent on the wire; both ends prove possession of the shared secret with
-fresh per-handshake nonces, and the carrier ROLE and protocol VERSION are
-bound into the MACs. The whole handshake is bounded by a 15 s timeout.
-After auth, both sides run `CarrierConn` (single read loop, single
-dispatcher, serialized writes, keepalive pings). No application frame is
-accepted before authentication completes.
-
-**Session lifecycle**:
-1. Iran accepts a SOCKS5 `CONNECT`, waits for both carriers — **bounded by
-   `SPLIT_BOOTSTRAP_WAIT_MS`** (signal-driven, cancelable on shutdown, default
-   30 s) — then sends `FrameHeader(destination)` on the up-carrier and relays
-   client bytes as `FrameData` (upload only). A carrier that is down at the
-   moment of the `CONNECT` but reconnects within the window is observed
-   without polling; if the window expires, the SOCKS connection fails with
-   `0x06` (documented drop, never an infinite wait).
-2. Germany's dispatcher creates the stream on the first `FrameHeader`
-   (`OnNewStream`), dials the target (`net.DialTimeout` 10 s), and — if the
-   down-carrier is down at that instant — **waits for it, bounded by the same
-   `SPLIT_BOOTSTRAP_WAIT_MS`**; on success the session attaches to the
-   current carrier generation, on expiry the stream is dropped exactly once
-   (`FrameClose` + deregister + target conn closed + one `errors` metric).
-   The session then registers and starts:
-   - up relay: up-carrier `FrameData` → target socket
-   - down relay: target socket → down-carrier `FrameData` (download only)
-3. Target refusal after SOCKS success is asynchronous: if Germany has already
-   returned SOCKS `0x00`, a later target-dial/refusal outcome is delivered as
-   bounded EOF and cleanup on the established tunnel, not as a second SOCKS
-   reply. SOCKS `0x06` is reserved for pre-establishment carrier/setup
-   failures. No pre-success target-dial handshake is implemented.
-4. Teardown: each session runs an explicit state machine
-   (`Pending → Active → Closing → Closed` with per-direction half-close).
-   Client EOF → Iran `FrameClose` (up) + up half-close: the target's
-   in-flight response keeps flowing. Target EOF → Germany `FrameClose`
-   (down) + down half-close. Any hard failure (carrier loss, socket
-   error, cancellation) tears the session down through one authoritative
-   `Session.Close(reason)`: socket close, stream deregistration, store
-   unindex and metric decrement each run exactly once, no matter how
-   many directions request termination at once. `FrameClose` for an
-   unknown/late stream is a no-op.
-
-## Local end-to-end test
-
-`go run ./e2e-pipe-test` runs the full protocol (auth on both carriers, header bootstrap,
-upload/download relays, teardown) in-process over `net.Pipe` — no real network needed.
-
-### Two-process local integration (L4) and two-server acceptance (L5)
-
-`go run ./e2e-pipe-test` is the fast in-process gate. On top of it,
-`integration/` adds two levels for production acceptance (Issue #9):
-
-* **L4 — two-process local gate** (`integration/twoproc_test.go`): builds
-  and runs the ACTUAL `iran-splitter` and `germany-splitter` binaries as two
-  OS processes over real 127.0.0.1 sockets — real WebSocket upgrade, real
-  SOCKS5 client, real echo target — and injects carrier failure through
-  controllable stand-in proxies. Run it explicitly on a POSIX host (Linux/
-  macOS; not part of the automatic CI gate):
-
-  ```bash
-  RUN_TWOPROC=1 go test -count=1 -timeout 10m -run TestTwoProcessLocal ./integration/
-  # optional: build the splitters with -race for the run
-  RUN_TWOPROC=1 TWOPROC_RACE=1 go test -count=1 -timeout 10m -run TestTwoProcessLocal ./integration/
-  ```
-
-  It is also available on demand from GitHub Actions (workflow_dispatch,
-  "L4 two-process local gate").
-
-* **L5 — real two-server acceptance**: the full 20-scenario matrix over two
-  real staging endpoints (real CDN/Reality carrier paths, real Xray
-  consumer, blackhole, repeated flapping, host-level resource settling).
-  See **[`integration/RUNBOOK.md`](integration/RUNBOOK.md)** for the staging
-  topology, firewall, the objective acceptance matrix, and the required
-  results record. The issue stays open until L5 has actually been executed
-  on staging (twice, once with race builds) and the results are recorded in
-  `IMPLEMENTATION_STATUS.md`.
-
-## Security
-
-**Shared secret.** Set `SPLIT_SECRET` identically on both nodes. Generate it with
-`openssl rand -hex 32` (256 bits) and never reuse secrets across deployments.
-At startup the splitters **fail fast** on:
-
-* empty secrets;
-* known insecure placeholder values (`password`, `test`, `CHANGE-ME-SECRET…`,
-  `YOUR-SECRET-HERE…`, …) — this blocklist is always enforced;
-* values shorter than 32 characters, unless `SPLIT_ALLOW_WEAK_SECRET=1`
-  is set explicitly for development/test.
-
-The secret is never logged; auth-failure logs never reveal *which* check
-failed to the remote peer (the connection is simply closed; details are
-local-only).
-
-**Authentication protocol (v1).** A three-message mutual HMAC-SHA256
-challenge/response, all on `FrameAuth`/StreamID 0:
-
-1. **Challenge** (responder → initiator): `version | role | timestamp | nonce_s(16B)`
-2. **Response** (initiator → responder): `version | role | ts_c | echo(ts_s, nonce_s) | nonce_c(16B) | HMAC-SHA256(secret, challenge ‖ ts_c ‖ nonce_c)`
-3. **Confirmation** (responder → initiator): `version | role | nonce_s2(16B) | HMAC-SHA256(secret, challenge ‖ response ‖ nonce_s2)`
-
-Properties:
-
-* **Mutual** — both ends prove the secret (the initiator via the response
-  MAC, the responder via the confirmation MAC);
-* **Replay-resistant** — every handshake uses fresh 128-bit nonces covered
-  by both MACs, and the response must echo the *current* challenge
-  (no nonce store needed, hence nothing unbounded to maintain);
-* **Role-bound** — the carrier role (`U` upload / `D` download) is inside
-  both MAC transcripts: a valid secret cannot authenticate the wrong
-  carrier direction;
-* **Versioned** — `AuthVersion = 1`; unknown versions are rejected before
-  MAC verification. **v0 (pre-hardening) peers are NOT compatible: upgrade
-  both nodes together.**
-* **Freshness** — both ends accept peer timestamps within ±60 s
-  (defense in depth on top of the nonce replay protection);
-* **Bounded** — a hard 15 s handshake timeout (socket deadline) applies
-  even when the caller has no deadline, so a silent peer cannot hold a
-  connection forever.
-
-**Frame-context enforcement.** After auth, `FrameAuth` is rejected, and
-application frames (`Data`/`Header`/`Rebind`/`Close`) on the reserved
-control StreamID 0 terminate the carrier. StreamID 0 can never be
-registered as a stream. Oversized/truncated frames, unknown frame types
-and malformed rebind payloads are dropped or the stream is terminated —
-never a panic.
-
-**WebSocket exposure (Iran `/upload`).** The up-carrier endpoint is a
-machine-to-machine endpoint: path is restricted to `/upload` (everything
-else is 404), non-GET methods get 405, unauthenticated requests are
-bounded by `ReadHeaderTimeout`, concurrent handshakes are capped (16,
-HTTP 503 when saturated), and after 10 auth failures within 60 s the
-endpoint returns HTTP 429 until the window lapses. The permissive
-`CheckOrigin` policy is deliberate (carrier dialers send no Origin;
-browsers are not legitimate clients) — the security boundary is the v1
-authentication plus TLS/Reality in the transport.
-
-**Down-carrier exposure (Germany `:9002`).** The down-carrier TCP listener
-is the Internet-exposed carrier endpoint. Concurrent *unauthenticated*
-handshakes are capped at 16 (a non-blocking gate acquired before
-`CarrierAuth`): connections beyond the cap are closed immediately in the
-accept loop — no auth goroutine is spawned for them — so the bound is
-enforced without ever blocking the accept loop. The slot is held only while
-the connection is unauthenticated, so an installed carrier never consumes a
-slot and a legitimate reconnect is never starved (a real carrier can only
-authenticate while no carrier is installed). The single-carrier `DownReady()`
-rejection and the 15 s handshake bound are unchanged.
-
-**Metrics.** The metrics endpoint binds to `127.0.0.1` only and exposes
-counts and byte totals — no secrets, tokens or destination details. Rebind
-refusal and grace-timeout observability is limited to fixed, non-secret counters
-(`carrier_rebind_unknown_peer`, `carrier_rebind_stale_generation`,
-`carrier_rebind_other_refusal`, and
-`carrier_grace_timeout_terminal_close`); no session IDs or peer incarnation
-values are exported. These counters do not change the safe rebind protocol,
-bounded grace timeout, or `Session.Close` authority.
-
-**Firewall.** Only these inbound ports should be reachable, and only from
-their expected source:
-
-* Iran: `SPLIT_WS_LISTEN` (default `127.0.0.1:9001`) — via CDN/nginx only, never
-  direct;
-* Germany: `SPLIT_DOWN_LISTEN` (default `:9002`) — from the download
-  carrier transport (Xray inbound) only;
-* metrics port — local tools only.
-
-**Rebind security.** `FrameRebind` can only re-attach an EXISTING active
-session: it is authenticated by the v1 handshake, direction-bound,
-requires the attachment to be in a rebindable state, and the sender's
-carrier generation must be strictly greater than the last accepted one
-(stale/replay protection). Rebinds never create sessions.
-
-## Metrics
-
-```bash
-curl http://127.0.0.1:9100/metrics
-```
-
-## License
-
-Internal use.
+**L5 real-transport acceptance matrix: 21/21 PASS on staging, build `0e60a34`,
+2026-10-15.** Production acceptance is contingent on the operator completing
+the L6 soak test (24–48 h on staging post-rollout) as described in the
+deployment/rollback runbook.

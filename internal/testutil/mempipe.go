@@ -3,6 +3,11 @@
 // MemPipe is an unbounded in-memory bidirectional byte stream pair that
 // implements io.ReadWriteCloser plus SetDeadline. Unlike net.Pipe it never
 // blocks writers, which makes protocol tests deterministic.
+//
+// Blocking reads use a sync.Cond (not a 1 ms sleep poll), so the harness
+// does not artificially cap throughput. A reader that blocks on an empty
+// queue is woken by the writer's push (or by deadline expiry), giving
+// effective line-rate delivery on in-memory pipes.
 package testutil
 
 import (
@@ -16,11 +21,18 @@ import (
 
 type queue struct {
 	mu            sync.Mutex
+	cond          *sync.Cond
 	buf           []byte
 	closed        bool
 	blackhole     bool      // swallow writes; reads block until closed (see Blackhole)
 	readDeadline  time.Time // enforced by take (the peer's read side)
 	writeDeadline time.Time // enforced by push (the writer's write side)
+}
+
+func newQueue() *queue {
+	q := &queue{}
+	q.cond = sync.NewCond(&q.mu)
+	return q
 }
 
 func (q *queue) push(p []byte) (int, error) {
@@ -36,52 +48,71 @@ func (q *queue) push(p []byte) (int, error) {
 		return 0, os.ErrDeadlineExceeded
 	}
 	q.buf = append(q.buf, p...)
+	q.cond.Broadcast() // wake any blocked reader
 	return len(p), nil
 }
 
 func (q *queue) take(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	for {
-		q.mu.Lock()
 		if q.blackhole {
 			// A blackholed read blocks forever (no error, no EOF) —
 			// exactly like a dropped network path. Close() ends the
 			// block (the carrier's liveness teardown relies on this).
 			if q.closed {
-				q.mu.Unlock()
 				return 0, io.EOF
 			}
-			q.mu.Unlock()
-			time.Sleep(time.Millisecond)
+			q.cond.Wait()
 			continue
 		}
 		if len(q.buf) > 0 {
 			n := copy(p, q.buf)
 			q.buf = q.buf[n:]
-			q.mu.Unlock()
 			return n, nil
 		}
 		if q.closed {
-			q.mu.Unlock()
 			return 0, io.EOF
 		}
-		if !q.readDeadline.IsZero() && !time.Now().Before(q.readDeadline) {
-			q.mu.Unlock()
-			return 0, os.ErrDeadlineExceeded
+		if !q.readDeadline.IsZero() {
+			if !time.Now().Before(q.readDeadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
+			// Block until data arrives, the queue is closed, or the
+			// deadline expires. The timer's Broadcast wakes the Wait;
+			// the loop re-checks all conditions. A timer that already
+			// fired but is still waiting on q.mu (held by this goroutine)
+			// will complete harmlessly after the unlock.
+			remaining := time.Until(q.readDeadline)
+			timer := time.AfterFunc(remaining, func() {
+				q.mu.Lock()
+				q.cond.Broadcast()
+				q.mu.Unlock()
+			})
+			q.cond.Wait()
+			timer.Stop()
+			// Re-loop: data may have arrived, or the deadline may now
+			// have passed (handled at the top of the next iteration).
+			continue
 		}
-		q.mu.Unlock()
-		time.Sleep(time.Millisecond)
+		// No data, not closed, no deadline: block until woken.
+		q.cond.Wait()
 	}
 }
 
 func (q *queue) setReadDeadline(t time.Time) {
 	q.mu.Lock()
 	q.readDeadline = t
+	if !t.IsZero() {
+		q.cond.Broadcast() // wake any blocked reader to re-check the new deadline
+	}
 	q.mu.Unlock()
 }
 
 func (q *queue) setBlackhole() {
 	q.mu.Lock()
 	q.blackhole = true
+	q.cond.Broadcast() // wake any blocked reader into the blackhole loop
 	q.mu.Unlock()
 }
 
@@ -94,6 +125,7 @@ func (q *queue) setWriteDeadline(t time.Time) {
 func (q *queue) markClosed() {
 	q.mu.Lock()
 	q.closed = true
+	q.cond.Broadcast() // wake any blocked reader
 	q.mu.Unlock()
 }
 
@@ -108,7 +140,7 @@ type MemConn struct {
 // NewMemPipe returns a connected pair of MemConns: writes on a are readable
 // on b and vice versa. Closing either end ends both directions.
 func NewMemPipe() (*MemConn, *MemConn) {
-	a, b := &queue{}, &queue{}
+	a, b := newQueue(), newQueue()
 	return &MemConn{in: a, out: b}, &MemConn{in: b, out: a}
 }
 
@@ -146,7 +178,7 @@ func (m *MemConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline bounds writes from this end.
+// SetWriteDeadline bounds writes on this end.
 func (m *MemConn) SetWriteDeadline(t time.Time) error {
 	m.out.setWriteDeadline(t)
 	return nil

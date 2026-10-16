@@ -279,3 +279,93 @@ func TestApplyAGermanyStateHasNoSecrets(t *testing.T) {
 		t.Fatal("committed fingerprints do not match [blobA, blobB]")
 	}
 }
+
+// TestApplyAGermanyReEmitsAcrossRealityRotation pins the D5 contract that the
+// one-click installer's Germany pair step relies on: when the installed Germany
+// Reality config ROTATES (a new public keypair / short-id / UUID), `pair apply`
+// re-emits Blob B deterministically from the CURRENT on-disk config — it does
+// not leave a stale pairing and does not refuse to run. This is what makes the
+// installer idempotent across a Reality keypair change: the pair step regenerates
+// Blob B consistently, so the operator only has to re-carry the fresh Blob B to
+// Iran. No secret material is involved — only public Reality params and digests.
+func TestApplyAGermanyReEmitsAcrossRealityRotation(t *testing.T) {
+	oldParams := xray.RealityParams{SNI: installedSNI, ShortID: installedShortID, UUID: installedUUID}
+	// A rotated keypair: different public params, and a config whose on-disk
+	// private key derives a DIFFERENT public key than oldParams'.
+	newParams := xray.RealityParams{
+		SNI:     "rotated.example.org",
+		ShortID: "fedcba0987654321",
+		// Valid RFC 4122 version-4 UUID (version nibble 4, variant 0e...) —
+		// the renderer validates UUIDs against the strict v4 shape.
+		UUID: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+	}
+
+	p := Pairing{}
+	secret := strings.Repeat("g", 64)
+	blobA, _, err := p.GenerateA(secret, "upload.example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 1: the pre-rotation config is committed + installed; apply emits
+	// Blob B_old (public params == oldParams).
+	oldCfg := installedConfigPath(t, oldParams)
+	storeOld := germanyStoreWith(t, realityFingerprint(oldParams))
+	blobBOld, stateOld, err := (Pairing{Store: storeOld}).ApplyAGermany(blobA, installedDownHost, oldCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateOld.State != "a-applied" {
+		t.Fatalf("pre-rotation apply state = %q, want a-applied", stateOld.State)
+	}
+	parsedOld, err := pairing.ParseBlobB(blobBOld)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsedOld.Public.ShortID != oldParams.ShortID || parsedOld.Public.UUID != oldParams.UUID {
+		t.Fatalf("Blob B_old public = %+v, want old params", parsedOld.Public)
+	}
+
+	// Phase 2: the Reality keypair rotates. The on-disk config now carries the
+	// NEW public params and the committed manifest's xray fingerprint was updated
+	// to the new params by the config-rotating commit, with the pairing flagged
+	// stale. `pair apply` must still run and re-emit Blob B from the NEW config.
+	newCfg := installedConfigPath(t, newParams)
+	storeNew := germanyStoreWith(t, realityFingerprint(newParams))
+	m, err := storeNew.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Pairing = PairingState{State: "a-applied", PeerRole: RoleIran, PairingStale: true}
+	if _, err := storeNew.Commit(m, "config-rotate"); err != nil {
+		t.Fatal(err)
+	}
+	blobBNew, stateNew, err := (Pairing{Store: storeNew}).ApplyAGermany(blobA, installedDownHost, newCfg)
+	if err != nil {
+		t.Fatalf("post-rotation apply must re-emit (idempotent), got: %v", err)
+	}
+	if stateNew.State != "a-applied" {
+		t.Fatalf("post-rotation apply state = %q, want a-applied", stateNew.State)
+	}
+	parsedNew, err := pairing.ParseBlobB(blobBNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fresh Blob B reflects the CURRENT installed (rotated) params.
+	if parsedNew.Public.ShortID != newParams.ShortID || parsedNew.Public.UUID != newParams.UUID || parsedNew.Public.SNI != newParams.SNI {
+		t.Fatalf("Blob B_new public = %+v, want the rotated params", parsedNew.Public)
+	}
+	// A rotation must change Blob B (the public key/params differ).
+	if blobBNew == blobBOld {
+		t.Fatal("Blob B is unchanged across a Reality rotation; the re-emit did not pick up the new config")
+	}
+	// Determinism: re-applying with the same live config re-emits the SAME Blob B
+	// (Blob B lost-in-transit recovery + idempotent re-pair).
+	again, _, err := (Pairing{Store: storeNew}).ApplyAGermany(blobA, installedDownHost, newCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != blobBNew {
+		t.Fatal("post-rotation re-apply must re-emit the identical Blob B (deterministic)")
+	}
+}

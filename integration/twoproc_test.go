@@ -35,6 +35,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -293,9 +294,10 @@ func (p *proc) waitForLog(t *testing.T, marker string, d time.Duration) {
 
 // waitForLogAfter is the offset-aware variant: it waits for `marker` in
 // the log content written AT OR AFTER `after` (a byte offset returned by
-// logLen). Markers that legitimately repeat across the test ("carrier
-// up lost", "carrier down ready", "Down-carrier authenticated to") MUST
-// use this variant, or an earlier occurrence would satisfy the wait.
+// logLen). Markers that legitimately repeat across the test ("carrier up
+// lost", "carrier down (id down-reality-a) ready", "Down-carrier
+// down-reality-a authenticated to") MUST use this variant, or an earlier
+// occurrence would satisfy the wait.
 func (p *proc) waitForLogAfter(t *testing.T, marker string, after int, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -736,6 +738,60 @@ func wsWriteBinary(c net.Conn, payload []byte) error {
 }
 
 // ============================================================
+// raw WebSocket upgrade client (S12)
+// ============================================================
+//
+// wsUpgradeRaw performs a genuine RFC 6455 "Upgrade: websocket" HTTP
+// request at addr+path, returning the post-upgrade conn and the HTTP
+// status line. Used by S12 to drive the REAL cmd/iran-splitter /upload
+// endpoint (101 assertion) and the real http.ServeMux 404 (wrong path).
+// It is a RAW client: it writes the HTTP request bytes, reads the
+// response header byte-by-byte (no over-consumption), and returns the
+// conn in post-101 state.
+
+func wsUpgradeRaw(addr, path string, timeout time.Duration) (net.Conn, string, error) {
+	c, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return nil, "", err
+	}
+	key := make([]byte, 16)
+	rand.Read(key)
+	keyB64 := base64.StdEncoding.EncodeToString(key)
+	req := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + addr + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + keyB64 + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+	c.SetDeadline(time.Now().Add(timeout))
+	if _, err := c.Write([]byte(req)); err != nil {
+		c.Close()
+		return nil, "", err
+	}
+	var hdr []byte
+	one := make([]byte, 1)
+	for {
+		if _, err := c.Read(one); err != nil {
+			c.Close()
+			return nil, "", err
+		}
+		hdr = append(hdr, one[0])
+		if len(hdr) >= 4 && hdr[len(hdr)-4] == '\r' && hdr[len(hdr)-3] == '\n' &&
+			hdr[len(hdr)-2] == '\r' && hdr[len(hdr)-1] == '\n' {
+			break
+		}
+	}
+	var status string
+	for i, b := range hdr {
+		if b == '\n' {
+			status = strings.TrimSpace(string(hdr[:i]))
+			break
+		}
+	}
+	return c, status, nil
+}
+
+// ============================================================
 // scenario helpers
 // ============================================================
 
@@ -868,8 +924,8 @@ func TestTwoProcessLocal(t *testing.T) {
 	de.waitForLog(t, "germany-splitter started", 15*time.Second)
 	de.waitForLog(t, "Up-carrier authenticated", 25*time.Second)
 	iran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-	iran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-	de.waitForLog(t, "Down-carrier authenticated from", 25*time.Second)
+	iran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+	de.waitForLog(t, "Down-carrier down-reality-a authenticated from", 25*time.Second)
 	t.Log("topology up: both carriers authenticated through controllable proxies")
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
@@ -936,8 +992,8 @@ func TestTwoProcessLocal(t *testing.T) {
 			iran = startProc(t, root, "iran", iranBin, iranNoAuth)
 			iran.waitForLog(t, "iran-splitter started", 15*time.Second)
 			iran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-			iran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-			de.waitForLogAfter(t, "Down-carrier authenticated from", restOff, 25*time.Second)
+			iran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+			de.waitForLogAfter(t, "Down-carrier down-reality-a authenticated from", restOff, 25*time.Second)
 		}
 		// t.Fatal/t.Fatalf exits the subtest immediately, so ensure S1-S11
 		// still receive a no-auth Iran even when an S0a assertion fails.
@@ -960,8 +1016,8 @@ func TestTwoProcessLocal(t *testing.T) {
 		// its re-handoff of Iran's down-carrier is offset-scoped.
 		authIran.waitForLog(t, "iran-splitter started", 15*time.Second)
 		authIran.waitForLog(t, "Up-carrier authenticated from", 25*time.Second)
-		authIran.waitForLog(t, "Down-carrier authenticated to", 25*time.Second)
-		de.waitForLogAfter(t, "Down-carrier authenticated from", deOff, 25*time.Second)
+		authIran.waitForLog(t, "Down-carrier down-reality-a authenticated to", 25*time.Second)
+		de.waitForLogAfter(t, "Down-carrier down-reality-a authenticated from", deOff, 25*time.Second)
 
 		// (i) wrong credentials must fail BEFORE any CONNECT, as a distinct
 		// *socks5.AuthError (never a silent success, never a CONNECT-stage
@@ -1241,10 +1297,11 @@ func TestTwoProcessLocal(t *testing.T) {
 		downProxy.Kill()
 		t.Log("S8: down carrier severed mid-response")
 
-		// "carrier down ready (gen 1)" already exists in the log from
-		// startup, so the post-flap readiness must be offset-scoped.
+		// "carrier down (id down-reality-a) ready (gen 1)" already exists in
+		// the log from startup, so the post-flap readiness must be
+		// offset-scoped.
 		de.waitForLogAfter(t, "carrier down lost", deOff, 10*time.Second)
-		de.waitForLogAfter(t, "carrier down ready", deOff, 30*time.Second)
+		de.waitForLogAfter(t, "carrier down (id down-reality-a) ready", deOff, 30*time.Second)
 
 		got := make([]byte, len(targetResp))
 		c.Conn().SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -1259,8 +1316,9 @@ func TestTwoProcessLocal(t *testing.T) {
 		c.Close()
 		settleBoth(t, mIran, mDe, 15*time.Second, "S8")
 		// Iran must have re-dialed the down carrier (its reconnect loop);
-		// the startup "Down-carrier authenticated to" must not satisfy it.
-		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 30*time.Second)
+		// the startup "Down-carrier down-reality-a authenticated to" must
+		// not satisfy it.
+		iran.waitForLogAfter(t, "Down-carrier down-reality-a authenticated to", irOff, 30*time.Second)
 		t.Log("S8 ok: session survived down-carrier loss; response intact")
 	})
 
@@ -1307,13 +1365,20 @@ func TestTwoProcessLocal(t *testing.T) {
 		if !errors.As(err, &se) {
 			t.Fatalf("expected *StatusError, got %T: %v", err, err)
 		}
-		if se.Code != 0x06 {
-			t.Fatalf("status = 0x%02x, want 0x06 (carriers not ready)", se.Code)
+		// Phase 2 contract: a carrier-loss / no-remote-verdict bootstrap
+		// outcome (Germany killed, both carriers lost, reconnect window
+		// exhausted within the 2 s bootstrap bound) returns 0x01 (general
+		// SOCKS failure) — NOT 0x06 (reserved for target-dial timeout).
+		// See cmd/iran-splitter/main.go:719-724 (BootstrapEndedWithoutResult
+		// → 0x01). The bounded bootstrap wait is still honored: elapsed
+		// must be ~2 s.
+		if se.Code != 0x01 {
+			t.Fatalf("status = 0x%02x, want 0x01 (no remote verdict: carrier loss, bounded bootstrap wait)", se.Code)
 		}
 		if elapsed < 1500*time.Millisecond || elapsed > 12*time.Second {
 			t.Fatalf("bootstrap wait took %v; want ~2 s (bounded, signal-driven)", elapsed)
 		}
-		t.Logf("S10 ok: SOCKS 0x06 after %v (bounded bootstrap wait honored over real sockets)", elapsed)
+		t.Logf("S10 ok: SOCKS 0x01 after %v (no-remote-verdict: carrier loss, bounded bootstrap wait honored)", elapsed)
 
 		// S10b: wrong-secret up-carrier. UpReady() is now deterministically
 		// false (Germany is dead), so a rogue WS client gets a real 101
@@ -1380,13 +1445,90 @@ func TestTwoProcessLocal(t *testing.T) {
 		// fresh process the moment S10 returns — before S11 runs.
 		de = startProc(t, root, "germany", deBin, deEnv)
 		de.waitForLog(t, "Up-carrier authenticated", 25*time.Second)
-		iran.waitForLogAfter(t, "Down-carrier authenticated to", irOff, 25*time.Second)
+		iran.waitForLogAfter(t, "Down-carrier down-reality-a authenticated to", irOff, 25*time.Second)
 		payload := make([]byte, 128)
 		rand.Read(payload)
 		c := transfer(t, socksAddr, "127.0.0.1", target.Port(), payload, 10*time.Second, nil)
 		c.Close()
 		settleBoth(t, mIran, mDe, 10*time.Second, "S10c")
 		t.Log("S10c ok: Germany restart → carriers re-established → sessions flow again")
+	})
+
+	// ---------- S12: real /upload handler upgrade surface (no mock origin) ----------
+	// The previous S12 stood in for the "real CDN up-route" with two local
+	// mocks (a hand-rolled raw-TCP WS origin that mirrored bytes, and a raw-
+	// TCP proxy that hand-performed the 101 handshake between them), so it
+	// only proved "a WS-upgrade proxy can get 101 from another mock" — it
+	// exercised NO production code. That tautology is removed.
+	//
+	// Instead this scenario stands up a FRESH, ISOLATED real iran-splitter
+	// binary (the very binary the other scenarios run) and drives its REAL
+	// /upload HTTP endpoint over real sockets. That endpoint is the actual
+	// production path: cmd/iran-splitter's uploadHandler (main.go:279)
+	// behind a real http.ServeMux (main.go:247-250) + a real gorilla
+	// websocket.Upgrader + the real single-carrier rule (s.node.UpReady(),
+	// main.go:300). No carrier is installed on this isolated node, so
+	// UpReady() is false and a genuine "Upgrade: websocket" reaches the 101.
+	//
+	// What this honestly proves:
+	//   (a) a real WS upgrade on /upload returns "101 Switching Protocols"
+	//       from the REAL handler's upgrader (a real client drives it),
+	//   (c) a wrong path (/nope) returns a REAL 404 from the actual
+	//       http.ServeMux (only /upload is registered), NOT a hand-written
+	//       mock string.
+	// What it deliberately does NOT prove:
+	//   - the v1 carrier-auth challenge/response handshake, and
+	//   - end-to-end tunnel data flow through pkg/node.
+	// Those are covered by S10b (the real v1 handshake over the main
+	// up-proxy) and the cmd/iran-splitter + pkg/node unit tests. So this is
+	// a routing/upgrade-surface check of the production /upload endpoint,
+	// not an "e2e through pkg/node" claim — the log line below says so.
+	t.Run("S12_real_upload_upgrade_404", func(t *testing.T) {
+		// Isolated instance: its own ports, no carriers installed, and the
+		// down-carrier aimed at a dead port (the reconnect loop just backs
+		// off — harmless). startProc is subtest-scoped, so this instance is
+		// killed when S12 returns and cannot leak into S11.
+		s12Ws := freePort(t)
+		s12Socks := freePort(t)
+		s12M := freePort(t)
+		s12Dead := freePort(t) // nothing listens here -> down-carrier stays down
+		s12Iran := startProc(t, t, "s12-iran", iranBin, map[string]string{
+			"SPLIT_SECRET":            secretHex,
+			"SPLIT_SOCKS_LISTEN":      fmt.Sprintf("127.0.0.1:%d", s12Socks),
+			"SPLIT_WS_LISTEN":         fmt.Sprintf("127.0.0.1:%d", s12Ws),
+			"SPLIT_DOWN_CARRIER_ADDR": fmt.Sprintf("127.0.0.1:%d", s12Dead),
+			"SPLIT_METRICS_PORT":      strconv.Itoa(s12M),
+			"SPLIT_BOOTSTRAP_WAIT_MS": "2000",
+		})
+		// The REAL up-carrier WS server (the /upload endpoint) is up. This
+		// marker is logged by runUpCarrier after the real listener is bound
+		// (cmd/iran-splitter/main.go:260).
+		s12Iran.waitForLog(t, "Up-carrier WS server listening", 20*time.Second)
+
+		wsAddr := fmt.Sprintf("127.0.0.1:%d", s12Ws)
+
+		// (a) genuine "Upgrade: websocket" on the REAL /upload endpoint -> 101.
+		uc, ustat, err := wsUpgradeRaw(wsAddr, "/upload", 5*time.Second)
+		if err != nil {
+			t.Fatalf("S12(a) real /upload upgrade: %v", err)
+		}
+		uc.Close()
+		if !strings.Contains(ustat, "101") {
+			t.Fatalf("S12(a): real /upload upgrade expected 101, got: %s", ustat)
+		}
+
+		// (c) a wrong path gets a REAL 404 from the real http.ServeMux.
+		bad, bstat, err := wsUpgradeRaw(wsAddr, "/nope", 5*time.Second)
+		if err != nil {
+			t.Fatalf("S12(c) wrong-path dial: %v", err)
+		}
+		bad.Close()
+		if !strings.Contains(bstat, "404") {
+			t.Fatalf("S12(c): wrong path /nope expected a real 404 from http.ServeMux, got: %s", bstat)
+		}
+		t.Log("S12 ok: real cmd/iran-splitter /upload endpoint — WS upgrade -> 101, wrong path -> real 404 " +
+			"(routing/upgrade-surface check only; the v1 carrier-auth handshake and tunnel data " +
+			"flow are NOT proven here — see S10b + pkg/node)")
 	})
 
 	// ---------- S11: graceful shutdown of both nodes ----------

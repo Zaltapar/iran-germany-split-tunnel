@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -55,8 +56,15 @@ type CarrierConn struct {
 	bufMu sync.Mutex
 	buf   *bufio.Reader
 
-	frames    chan Frame
-	writeCh   chan writeReq
+	frames  chan Frame
+	writeCh chan writeReq
+	// ctrlCh carries the ordering-INSENSITIVE control frames (Credit, Close,
+	// Ping, Pong) so a control frame is never queued behind up to 256 DATA
+	// frames on writeCh. Consumed by the same single writeLoop as writeCh
+	// (Phase B, control plane). Cap 64 — the per-stream fairness analysis in
+	// the design (Section 4 O1) bounds any one stream's stall, and credits
+	// are cumulative-absolute so a drop is pure delay, never loss.
+	ctrlCh    chan writeReq
 	readErr   error
 	readDone  chan struct{}
 	closed    chan struct{}
@@ -68,6 +76,12 @@ type CarrierConn struct {
 	// Wait cannot deadlock on a write whose resolution it is still
 	// responsible for (see drainWrites).
 	writeWG sync.WaitGroup
+	// ctrlWG counts control-frame writers still allowed to enqueue on
+	// ctrlCh. Exact mirror of writeWG for the control plane (Phase B):
+	// Done runs as soon as the request is enqueued or the call is aborted,
+	// so Close's Wait cannot deadlock on a control write whose resolution it
+	// is still responsible for (see drainCtrl).
+	ctrlWG sync.WaitGroup
 	// shutdownDone is closed when every carrier-owned goroutine
 	// (readLoop, writeLoop, keepalive) has exited.
 	shutdownDone chan struct{}
@@ -120,6 +134,25 @@ type CarrierConn struct {
 	// never happens; no Add can follow the Wait, and no worker can
 	// start without having been counted (the Add precedes the go).
 	workerWait sync.WaitGroup
+	// termWG counts public Terminate calls that are still running their
+	// terminateStream handoff (the s.ch <- nil send). It is the third,
+	// UNTRACKED-elsewhere sender on s.ch: Terminate is a public API that the
+	// node calls from spawned goroutines (e.g. bootstrapUpStream's dial-drop
+	// path), which neither workerWait (stream workers) nor dispatchDone (the
+	// dispatcher) covers. Close's step (b3) waits on termWG before step (c)
+	// closes s.ch, so no Terminate-originated send can race the close — this
+	// is exactly the "send on closed channel" panic / -race the bootstrap
+	// dial-refused teardown hit.
+	//
+	// Add/Wait ordering: Terminate Add's under c.mu only when the carrier is
+	// NOT yet closing (a closing carrier lets Close close s.ch as the wake,
+	// so it Adds nothing). Close latches closing=true under the SAME c.mu in
+	// step 1, and reaches termWG.Wait in step (b3). So any Add that observed
+	// closing==false is mutex-ordered before the latch, hence before the
+	// Wait — the Wait always sees it and blocks until its Done. The handoff
+	// is bounded (its select unblocks on c.closed, closed at step 2), so the
+	// Wait can never hang.
+	termWG sync.WaitGroup
 	// allStreams tracks every stream record this carrier has EVER
 	// created. It is an append-only slice (not a map) and is never
 	// shrunk: neither Deregister nor re-Register of the same ID may
@@ -142,11 +175,28 @@ type CarrierConn struct {
 	// c.mu after each round.
 	livenessRounds int
 	sawPong        bool
-
 	// OnStreamTerminated, if non-nil, is called once when a stream is
 	// terminated by overflow pressure. The callback is keyed only by the
 	// stream ID and must not block.
 	OnStreamTerminated func(streamID uint32)
+
+	// OnStreamReset, if non-nil, is called (synchronously, in the
+	// dispatcher goroutine, OUTSIDE c.mu — mirroring OnStreamCredit) when a
+	// well-formed FrameReset (Issue #20) arrives on a registered stream.
+	// The node callback terminates the stranded logical session locally
+	// (closeSession) instead of retrying the rebind forever. It must not
+	// block. Unknown-stream / stale resets are still routed here; the
+	// node callback re-validates session existence + generation echo and
+	// makes them idempotent no-ops.
+	OnStreamReset func(streamID uint32, reason byte, gen uint64)
+
+	// OnStreamBootstrapAck, if non-nil, is called (in the dispatcher
+	// goroutine, outside c.mu) for every well-formed FrameBootstrapAck
+	// (Issue #21) on a registered stream. The node callback resolves the
+	// pending StartSession bootstrap wait with the status byte. Unknown-
+	// stream acks are dropped silently in Dispatch (no callback), which
+	// is correct: a stale ack for a dead stream has no waiter.
+	OnStreamBootstrapAck func(streamID uint32, status byte)
 
 	// OnStreamDataUndeliverable, if non-nil, is called once when a stream
 	// is terminated because an in-order DATA frame could not be delivered
@@ -166,6 +216,19 @@ type CarrierConn struct {
 	// first item delivered on ch. The callback must return quickly (spawn
 	// a goroutine for slow work such as a target dial).
 	OnNewStream func(streamID uint32, firstType uint8, ch chan []byte)
+
+	// OnStreamCredit, if non-nil, is invoked (in the dispatcher goroutine,
+	// OUTSIDE c.mu — mirroring OnNewStream/OnStreamTerminated) for every
+	// VALID, accepted FrameCredit on a registered stream. Phase A left this
+	// a no-op ("valid credit: no-op"); Phase B wires it to the node credit
+	// ledger (Section 4 of the design). The payload is already
+	// connection-level-validated by readLoop (length) and stream-level by
+	// ValidateCreditPayload; a stream-level reject terminates the stream
+	// before this callback runs, so the callback only ever sees a credit
+	// that passed validation. It must not block (the ledger accounting it
+	// performs is O(1); a credit's emission is never enqueued from here —
+	// see Section 4's no-block invariant B3).
+	OnStreamCredit func(streamID uint32, p CreditPayload)
 }
 
 // newCarrierConn constructs a CarrierConn and starts its loops. If br is
@@ -178,6 +241,7 @@ func newCarrierConn(rwc io.ReadWriteCloser, pingInterval time.Duration, br *bufi
 		rwc:          rwc,
 		frames:       make(chan Frame, 256),
 		writeCh:      make(chan writeReq, 256),
+		ctrlCh:       make(chan writeReq, 64),
 		readDone:     make(chan struct{}),
 		closed:       make(chan struct{}),
 		shutdownDone: make(chan struct{}),
@@ -256,6 +320,36 @@ func (c *CarrierConn) readLoop() {
 			c.mu.Unlock()
 			return
 		}
+
+		// Post-auth FrameCredit context rules (Phase A, design doc §5.3).
+		// A credit frame must (a) carry the fixed 32-byte payload and
+		// (b) reference a stream this carrier actually has. A peer that
+		// violates either is mixed-version or actively attacking, so both
+		// are CONNECTION-level failures (the carrier is terminated, the
+		// frame is never silently dropped):
+		//   - malformed length  -> ErrCreditMalformedLength
+		//   - unregistered stream -> ErrCreditUnknownStream
+		// (Stream-0 credits are already fatal via the rule above, as
+		// ErrProtocolViolation.) Semantic content — creditVersion, creditGen,
+		// reserved fields, flags — is validated per-stream in Dispatch (the
+		// FrameCredit case), where a bad value is a STREAM-level reject.
+		if f.Type == FrameCredit {
+			c.mu.Lock()
+			_, known := c.streams[f.StreamID]
+			c.mu.Unlock()
+			if len(f.Payload) != CreditPayloadSize {
+				c.mu.Lock()
+				c.readErr = ErrCreditMalformedLength
+				c.mu.Unlock()
+				return
+			}
+			if !known {
+				c.mu.Lock()
+				c.readErr = ErrCreditUnknownStream
+				c.mu.Unlock()
+				return
+			}
+		}
 		select {
 		case c.frames <- f:
 		case <-c.closed:
@@ -264,37 +358,69 @@ func (c *CarrierConn) readLoop() {
 	}
 }
 
-// writeLoop serializes every write through a single goroutine. It exits
-// as soon as the carrier is closed — it never blocks on an uncancelled
-// channel receive. Failing the requests still queued at that moment is
-// Close's job (drainWrites), so no write caller is ever left waiting on a
-// dead writer.
+// writeLoop serializes every write through a single goroutine that drains
+// BOTH the user-data queue (writeCh) and the control-plane queue (ctrlCh).
+// It exits as soon as the carrier is closed — it never blocks on an
+// uncancelled channel receive. Failing the requests still queued at that
+// moment is Close's job (drainWrites / drainCtrl), so no write caller is
+// ever left waiting on a dead writer.
+//
+// Scheduling (Phase B, Section 4, REV 2 "E"): the loop FIRST peeks ctrlCh
+// under a non-blocking default. When a control frame is READY it is written
+// ahead of the next DATA frame. When no control frame is ready, the loop
+// enters a blocking select over closed/ctrlCh/writeCh — and Go RESOLVES a
+// blocking select with multiple ready channels by UNIFORM RANDOM CHOICE,
+// not by priority. So the accurate statement is: priority peek for the
+// ready-control case, arbitrary (fair) hand-off when both channels are
+// simultaneously ready. We do NOT claim strict priority: a DATA burst with
+// no credit in flight is not starved behind a perpetually-queued control
+// frame, because the blocking arm alternates fairly between the two
+// producers.
 func (c *CarrierConn) writeLoop() {
 	defer c.goroutineStopped()
 	for {
+		// 1. Priority PEEK: a READY control frame preempts the next DATA.
+		select {
+		case req := <-c.ctrlCh:
+			c.writeOne(req)
+			continue
+		default:
+		}
+		// 2. No control ready: service ctrl or DATA, or exit on close.
+		// Both channels ready here => Go picks uniformly at random:
+		// DATA cannot be starved by a full ctrl queue.
 		select {
 		case <-c.closed:
-			return
+			return // Close's drainCtrl()/drainWrites() resolve anything in flight
+		case req := <-c.ctrlCh:
+			c.writeOne(req)
 		case req := <-c.writeCh:
-			_, err := c.rwc.Write(req.data)
-			if err != nil {
-				c.mu.Lock()
-				stats := c.stats
-				c.mu.Unlock()
-				stats.writeFailure()
-			}
-			select {
-			case <-c.closed:
-				// Close has started: report the shutdown error so a
-				// write that lands around the close reports a
-				// deterministic result, whatever the underlying
-				// connection error was.
-				err = ErrCarrierClosed
-			default:
-			}
-			req.done <- err
+			c.writeOne(req)
 		}
 	}
+}
+
+// writeOne performs one serialized rwc.Write for a request and resolves
+// req.done. It is the single write path shared by both queues (writeCh and
+// ctrlCh), so DATA and control frames can never interleave mid-frame.
+// On a write error it records the failure on the (optional) stats and, if
+// Close has started, reports the deterministic ErrCarrierClosed instead of
+// whatever the underlying connection error was — so a write that lands
+// around the close reports a stable result.
+func (c *CarrierConn) writeOne(req writeReq) {
+	_, err := c.rwc.Write(req.data)
+	if err != nil {
+		c.mu.Lock()
+		stats := c.stats
+		c.mu.Unlock()
+		stats.writeFailure()
+	}
+	select {
+	case <-c.closed:
+		err = ErrCarrierClosed
+	default:
+	}
+	req.done <- err
 }
 
 // write is the serialized write primitive: it enqueues the raw encoded
@@ -344,6 +470,99 @@ func (c *CarrierConn) drainWrites() {
 	}
 }
 
+// writeControl is the blocking control-plane enqueue primitive: the exact
+// mirror of write (carrier.go:364) for the ordering-insensitive control
+// queue (ctrlCh). Once Close has started it fails immediately with
+// ErrCarrierClosed; a request that enqueued before the shutdown is
+// guaranteed to be resolved either by the writer or by Close's drainCtrl.
+// Used internally for keepalive Ping/Pong and terminal FrameClose.
+func (c *CarrierConn) writeControl(data []byte) error {
+	req := writeReq{data: data, done: make(chan error, 1)}
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return ErrCarrierClosed
+	}
+	// The Add happens under the same lock Close uses to set closing —
+	// identical to the writeWG discipline (see write): every Add is ordered
+	// before Close's ctrlWG.Wait, and no Add can follow closing=true.
+	c.ctrlWG.Add(1)
+	c.mu.Unlock()
+	select {
+	case c.ctrlCh <- req:
+		c.ctrlWG.Done()
+	case <-c.closed:
+		c.ctrlWG.Done()
+		return ErrCarrierClosed
+	}
+	return <-req.done
+}
+
+// drainCtrl fails every control-frame request still queued on ctrlCh. It
+// runs in Close immediately after ctrlWG.Wait() (and, per the Section 4
+// ordering, BEFORE writeWG.Wait()/drainWrites), so no further control
+// request can be enqueued; it is safe to run while the writer is exiting
+// because each request is received exactly once (by the writer or by this
+// drain) and done is buffered. A FrameClose stranded on ctrlCh is thus
+// never held up behind a still-draining DATA queue.
+func (c *CarrierConn) drainCtrl() {
+	for {
+		select {
+		case req := <-c.ctrlCh:
+			req.done <- ErrCarrierClosed
+		default:
+			return
+		}
+	}
+}
+
+// WriteControlFrame encodes and enqueues one ordering-insensitive control
+// frame (Credit, Close, Ping, Pong) on the control plane. It is the
+// BLOCKING variant (mirror of write), reserved for terminal signals that
+// must not be dropped (FrameClose) and for keepalive Ping/Pong. It returns
+// once the write is complete (or the carrier has closed).
+func (c *CarrierConn) WriteControlFrame(streamID uint32, typ uint8, payload []byte) error {
+	return c.writeControl(encodeControlFrame(streamID, typ, payload))
+}
+
+// TryWriteControlFrame encodes and enqueues one control frame on ctrlCh
+// WITHOUT blocking. On a full ctrlCh it DROPS and returns (false, nil);
+// once Close has started it returns (false, ErrCarrierClosed). This is the
+// entry point used by the credit emitter (Section 3), whose no-deadlock
+// proof rests on this being non-blocking (drop-on-full). Done is called in
+// BOTH arms so ctrlWG.Wait() in Close can never stall on a dropped or
+// aborted request.
+func (c *CarrierConn) TryWriteControlFrame(streamID uint32, typ uint8, payload []byte) (bool, error) {
+	req := writeReq{data: encodeControlFrame(streamID, typ, payload), done: make(chan error, 1)}
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return false, ErrCarrierClosed
+	}
+	c.ctrlWG.Add(1)
+	c.mu.Unlock()
+	select {
+	case c.ctrlCh <- req:
+		c.ctrlWG.Done()
+		return true, nil
+	default:
+		c.ctrlWG.Done()
+		return false, nil
+	}
+}
+
+// encodeControlFrame builds the 7-byte-header frame buffer for one control
+// frame (the same layout WriteFrame uses). Small helper so the blocking
+// and non-blocking control-frame enqueues share one encoding path.
+func encodeControlFrame(streamID uint32, typ uint8, payload []byte) []byte {
+	buf := make([]byte, HeaderSize+len(payload))
+	binary.BigEndian.PutUint32(buf[0:4], streamID)
+	buf[4] = typ
+	binary.BigEndian.PutUint16(buf[5:7], uint16(len(payload)))
+	copy(buf[HeaderSize:], payload)
+	return buf
+}
+
 // goroutineStopped records that one carrier-owned goroutine has exited;
 // the last one to exit closes shutdownDone.
 func (c *CarrierConn) goroutineStopped() {
@@ -371,8 +590,8 @@ func (c *CarrierConn) ShutdownDone() <-chan struct{} {
 // most MaxBytesPerStream payload bytes — whichever bound is hit first.
 // (With MaxFramesPerStream = MaxFrames = 16 the frame bound alone can
 // never exceed 16 × MaxPayload = 1 MiB, so the two bounds align by
-// default; raising MaxFramesPerStream without MaxBytesPerStream makes the
-// frame bound the larger ceiling.)
+// default; raising MaxFramesPerStream without MaxBytesPerStream makes
+// the frame bound the larger ceiling.)
 //
 // MaxBytesTotal is the carrier-wide aggregate budget across ALL streams'
 // mailboxes, so hundreds of slow streams cannot multiply per-stream
@@ -381,29 +600,66 @@ func (c *CarrierConn) ShutdownDone() <-chan struct{} {
 // OverflowWait is how long a stream may be unable to accept data (full
 // mailbox or a consumer that stopped reading) before the carrier
 // terminates that stream — not the carrier.
+//
+// ConsumerStall (SUBTASK 30) is the CONSUMER-side backpressure bound: how
+// long the per-stream worker may hold a popped item on its cap-1 handoff
+// channel waiting for the consumer (the node relay that writes the socket)
+// to drain it, before terminating THAT stream. It is deliberately DECOUPLED
+// from OverflowWait (the sender/dispatcher mailbox bound) because the two
+// measure different things: OverflowWait paces the SENDER against a full
+// mailbox, while ConsumerStall absorbs a SLOW but ALIVE consumer (a remote
+// client whose socket write takes far longer than 100 ms over the internet).
+// A dead consumer (relay exited, session closed) is still reclaimed, but
+// only after ConsumerStall — bounded, and never a hang (the carrier's Close
+// also releases the handoff via c.closed).
 type StreamLimits struct {
 	MaxFramesPerStream int
 	MaxBytesPerStream  int
 	MaxBytesTotal      int
 	OverflowWait       time.Duration
+	ConsumerStall      time.Duration
 }
 
-// DefaultStreamLimits: 16 frames / 1 MiB per stream, 32 MiB per carrier,
-// 100 ms overflow wait.
+// DefaultStreamLimits: 16 frames / 704 KiB per stream, 16 MiB per carrier,
+// 100 ms overflow wait, 30 s consumer stall.
+//
+// The 704 KiB per-stream bound (NOT 1 MiB) and the 16 MiB aggregate are the
+// Phase B credit-plane sizing (design §5 / B5 amendment): the memory bound
+// Σ_streams min(MaxBytesPerStream, creditWindow) <= MaxBytesTotal holds at
+// 23 full mailboxes (704 KiB × 23 ≈ 16 MiB), so the credit gate (which caps
+// a live stream at creditWindowMax ≈ 512 KiB in flight) can never drive the
+// mailbox past the aggregate budget under the pre-latch bound.
+//
+// ConsumerStall defaults to 30 s: a remote client's socket write over the
+// internet (TCP window + RTT) is far slower than the 100 ms OverflowWait,
+// so a slow-but-alive consumer must not trigger a per-item stream
+// termination mid-transfer. 30 s is generous enough to absorb a real
+// internet stall, and a dead consumer is still reclaimed (bounded, no
+// hang — Close also releases the handoff).
 var DefaultStreamLimits = StreamLimits{
 	MaxFramesPerStream: MaxFrames,
-	MaxBytesPerStream:  1 << 20,  // 1 MiB
-	MaxBytesTotal:      32 << 20, // 32 MiB
+	MaxBytesPerStream:  704 << 10, // 704 KiB
+	MaxBytesTotal:      16 << 20,  // 16 MiB
 	OverflowWait:       100 * time.Millisecond,
+	ConsumerStall:      30 * time.Second,
 }
 
 // MaxFrames is the maximum number of frames a stream mailbox can hold.
 const MaxFrames = 16
 
-// SanitizeLimits normalizes a limit set: zero or negative fields fall
-// back to the defaults (a "0 limit" must never mean unbounded or
-// instant-kill), and the frame bound is clamped to MaxFrames.
-func SanitizeLimits(l StreamLimits) StreamLimits {
+// SanitizeLimits normalizes a limit set: zero or negative fields fall back
+// to the defaults (a "0 limit" must never mean unbounded or instant-kill),
+// and the frame bound is clamped to MaxFrames.
+//
+// It returns a LOUD error when MaxBytesTotal < MaxBytesPerStream (both
+// positive): the aggregate carrier-wide budget must cover at least one
+// stream's share, and silently resetting it to the default would mask a
+// misconfiguration that would just push the defect back into the runtime
+// (a per-stream mailbox that can never be admitted). The caller (the two
+// cmd/*/main.go streamLimits() helpers do NOT call this — only the
+// Config.Sanitize path) must surface the error; this is the Phase B B5
+// amendment that replaces the old silent-reset behaviour.
+func SanitizeLimits(l StreamLimits) (StreamLimits, error) {
 	d := DefaultStreamLimits
 	if l.MaxFramesPerStream <= 0 || l.MaxFramesPerStream > MaxFrames {
 		l.MaxFramesPerStream = d.MaxFramesPerStream
@@ -411,13 +667,21 @@ func SanitizeLimits(l StreamLimits) StreamLimits {
 	if l.MaxBytesPerStream <= 0 {
 		l.MaxBytesPerStream = d.MaxBytesPerStream
 	}
-	if l.MaxBytesTotal <= 0 || l.MaxBytesTotal < l.MaxBytesPerStream {
+	if l.MaxBytesTotal <= 0 {
 		l.MaxBytesTotal = d.MaxBytesTotal
 	}
 	if l.OverflowWait <= 0 {
 		l.OverflowWait = d.OverflowWait
 	}
-	return l
+	if l.ConsumerStall <= 0 {
+		l.ConsumerStall = d.ConsumerStall
+	}
+	if l.MaxBytesTotal < l.MaxBytesPerStream {
+		return l, fmt.Errorf(
+			"mux: MaxBytesTotal (%d) < MaxBytesPerStream (%d); raise MaxBytesTotal to >= N_max*MaxBytesPerStream",
+			l.MaxBytesTotal, l.MaxBytesPerStream)
+	}
+	return l, nil
 }
 
 // SetStreamLimits configures the per-stream mailbox bounds. Values are
@@ -448,20 +712,35 @@ func (c *CarrierConn) QueueStats() *QueueStats {
 	return c.stats
 }
 
-func (c *CarrierConn) SetStreamLimits(l StreamLimits) {
+// SetStreamLimits configures the per-stream mailbox bounds. Values are
+// sanitized (see SanitizeLimits, which returns a loud error when
+// MaxBytesTotal < MaxBytesPerStream). Call it before starting Dispatch or
+// calling Register, like SetReadBuffer. Changing MaxBytesTotal also
+// re-syncs the aggregate limit of every already-created mailbox. It
+// returns the SanitizeLimits error so a misconfigured aggregate is
+// surfaced at the call site (Phase B B5 amendment) instead of being
+// silently reset to the default.
+func (c *CarrierConn) SetStreamLimits(l StreamLimits) error {
+	s, err := SanitizeLimits(l)
+	if err != nil {
+		return err
+	}
 	c.mu.Lock()
-	c.limits = SanitizeLimits(l)
+	c.limits = s
 	limit := int64(c.limits.MaxBytesTotal)
+	overflowCap := c.limits.MaxBytesPerStream
 	qs := make([]*StreamQueue, 0, len(c.allStreams))
 	for _, s := range c.allStreams {
 		qs = append(qs, s.q)
 	}
 	c.mu.Unlock()
-	// SetBudgetLimit takes each mailbox's own lock — never c.mu — so
-	// calling it outside c.mu keeps the lock ordering acyclic.
+	// Budget and overflow cap updates take each mailbox's own lock — never
+	// c.mu — so calling them outside c.mu keeps lock ordering acyclic.
 	for _, q := range qs {
 		q.SetBudgetLimit(limit)
+		q.SetOverflowCap(overflowCap)
 	}
+	return nil
 }
 
 // streamRec is one multiplexed stream: its bounded mailbox, its consumer
@@ -476,7 +755,9 @@ type streamRec struct {
 	// this stream (on its first frame, outside c.mu). Dispatcher-owned.
 	callback bool
 	// pressureStart is owned by the dispatcher goroutine alone: it marks
-	// when this stream first started rejecting data.
+	// when a refused FrameClose first started pressuring this stream (the
+	// legacy close pressure path; see applyPressure). DATA retry-grace is
+	// held by StreamQueue and does not add dispatcher-owned state here.
 	pressureStart time.Time
 	stopOnce      sync.Once
 }
@@ -502,6 +783,7 @@ func (c *CarrierConn) createStreamLocked(id uint32, callback bool) *streamRec {
 		ch:       make(chan []byte, 1),
 		callback: callback,
 	}
+	s.q.SetOverflowCap(c.limits.MaxBytesPerStream)
 	s.q.SetStats(c.stats)
 	s.q.setQueuedItems(&c.queuedItems)
 	c.streams[id] = s
@@ -542,6 +824,85 @@ func (c *CarrierConn) Deregister(id uint32) {
 	c.mu.Lock()
 	delete(c.streams, id)
 	c.mu.Unlock()
+}
+
+// Terminate ends the stream id with TERMINATING semantics (the up-carrier
+// drop-storm fix, Part 1). It is the safe replacement for Deregister at any
+// "this destination is dead, do not re-open it" drop path.
+//
+// Unlike Deregister (which is quiet and lets a later peer retransmit on the
+// SAME id re-open it as a brand-new stream and re-fire OnNewStream — the
+// 0x00/0x04 re-drop storm), Terminate keeps the stream record registered and
+// marks it terminated. Every subsequent frame the peer retransmits on that id
+// (FrameData 0x00, FrameClose 0x04, ...) is therefore dropped SILENTLY by the
+// dispatcher (the terminated record is still in c.streams, so the dispatcher
+// never re-creates it and OnNewStream does not re-fire), and the peer is
+// signalled a best-effort FrameClose over the control plane so it tears its
+// end down too. This matches the documented invariant pinned by
+// TestTerminatedStreamStaysRegistered: a dead stream stays registered so it
+// does NOT re-open and re-dial a dead destination.
+//
+// A brand-NEW stream with a NEW id for the same destination is UNaffected:
+// that is the recovery path, and it is the ONLY way the peer re-establishes a
+// session after a termination.
+//
+// Safe to call from the dispatcher goroutine (mirrors the overflow
+// applyPressure path that already calls terminateStream) or from a spawned
+// consumer goroutine. If the id is already unknown (deregistered, or the
+// carrier is closing) it installs a terminated tombstone so any in-flight
+// retransmit on the id is dropped silently; on a closing carrier it is a
+// quiet no-op.
+func (c *CarrierConn) Terminate(id uint32) {
+	// tracked and closingNow are latched in the SAME critical section as
+	// the termWG.Add (so Done is called if and only if Add was) and the
+	// closing check. Two distinct outcomes:
+	//
+	//  - closingNow false: the call is tracked on termWG and runs the full
+	//    terminateStream. Close (steps 1->b3->c) latches closing under the
+	//    same c.mu, so any Add that observed closing==false is
+	//    mutex-ordered before that latch, and Close's termWG.Wait (b3)
+	//    always sees it before it closes s.ch.
+	//  - closingNow true: Close has already started and OWNS the consumer
+	//    wake (it closes every s.ch in step c, which consumers read as
+	//    "carrier died" — the same outcome the nil handoff would give a
+	//    stream whose carrier is tearing down). Close's termWG.Wait does
+	//    NOT cover this call (its Add came after the latch, so it is never
+	//    counted — WaitGroups must not Add after the closing-side Wait has
+	//    started), so the only safe behavior here is to skip terminateStream
+	//    ENTIRELY: its s.ch <- nil handoff would otherwise be an untracked
+	//    third sender racing close(s.ch) — exactly the "send on closed
+	//    channel" / -race this fix exists to eliminate. The skip loses
+	//    nothing observable: the dispatcher already refuses OnNewStream
+	//    re-fires while closing (the c.closing gate in Dispatch), and the
+	//    best-effort peer FrameClose would be rejected by
+	//    WriteControlFrame on a closing carrier anyway.
+	tracked := false
+	closingNow := false
+	c.mu.Lock()
+	closingNow = c.closing
+	s, ok := c.streams[id]
+	if !ok && !closingNow {
+		// Not yet registered: install a terminated tombstone. callback=false
+		// so OnNewStream can NEVER fire for this id (a retransmit that does
+		// arrive is dropped silently by the dispatcher, not re-opened).
+		s = c.createStreamLocked(id, false)
+	}
+	if s != nil && !closingNow {
+		tracked = true
+		c.termWG.Add(1)
+	}
+	c.mu.Unlock()
+	if s == nil || closingNow {
+		return // closing carrier (or stream 0): Close owns the consumer wake
+	}
+	// signalPeer=true: best-effort FrameClose over the control plane so the
+	// remote side tears down its end of the stream too. The handoff's
+	// consumer send is bounded by c.closed (closed at step 2), so a racing
+	// Close cannot hang on this Done.
+	c.terminateStream(s, true)
+	if tracked {
+		c.termWG.Done()
+	}
 }
 
 // WriteFrame encodes and sends one frame. Serialized via writeCh.
@@ -614,7 +975,9 @@ func (c *CarrierConn) liveness(interval time.Duration) {
 			c.mu.Lock()
 			rounds := c.livenessRounds
 			c.mu.Unlock()
-			_ = c.write(ping) // best effort; see the method doc
+			// Keepalive Ping rides the control plane (ctrlCh): a Ping is
+			// ordering-insensitive and must not queue behind DATA frames.
+			_ = c.writeControl(ping) // best effort; see the method doc
 			c.mu.Lock()
 			if c.sawPong {
 				c.sawPong = false
@@ -672,6 +1035,18 @@ func (c *CarrierConn) ReadErr() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.readErr
+}
+
+// Closing reports whether the carrier's Close has started (the closing flag
+// is latched at step 1 of Close, before closed is closed). Callers use it
+// to distinguish a PARKED PUSH that was released by a clean carrier teardown
+// (which must NOT be classified as a data-integrity failure) from one
+// released by a worker's consumer-stall reclaim (a genuine stream failure).
+// SUBTASK 30.
+func (c *CarrierConn) Closing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closing
 }
 
 // Ready reports whether the carrier read loop is still alive.
@@ -755,18 +1130,87 @@ func (c *CarrierConn) Dispatch() {
 				it = queueItem{payload: f.Payload}
 			}
 			c.deliver(s, it)
+		case FrameReset:
+			// Issue #20: stream-level negative acknowledgement. The node
+			// callback terminates the stranded local session; its OnClose
+			// hook deregisters the stream from every carrier, so a repeat
+			// or reordered reset for the same stream is an idempotent no-op
+			// here (the stream is already gone, or a new session owns the
+			// ID and its own generation check rejects the stale frame).
+			//
+			// These are CONTROL frames: they are NEVER delivered to the
+			// stream mailbox, so no OnNewStream fire is suppressed and no
+			// stream record is created (a reset for a stream unknown to this
+			// carrier is expected mid-loss-window and must not spawn a
+			// phantom stream or trigger a connection-level failure). The
+			// payload is parse-validated here (structural only) and the
+			// semantic validation (session existence, generation echo)
+			// happens in the node callback.
+			if c.OnStreamReset != nil {
+				if reason, gen, perr := ParseResetPayload(f.Payload); perr == nil {
+					c.OnStreamReset(f.StreamID, reason, gen)
+				}
+			}
+		case FrameBootstrapAck:
+			// Issue #21: bootstrap result from Germany. The originator
+			// pre-registers its up stream at StartSession, so a live wait
+			// implies the stream exists on this carrier; an unknown-stream
+			// ack (its session already closed, or a stale frame for a
+			// superseded stream) has no waiter and is dropped SILENTLY —
+			// never a protocol violation (duplicate/stale control frames
+			// are expected and must stay idempotent). No stream mailbox
+			// delivery: control-only, parsed structurally here and resolved
+			// semantically in the node callback.
+			if c.OnStreamBootstrapAck != nil {
+				if status, perr := ParseBootstrapAckPayload(f.Payload); perr == nil {
+					c.OnStreamBootstrapAck(f.StreamID, status)
+				}
+			}
 		case FramePing:
 			pong := make([]byte, HeaderSize+1)
 			pong[4] = FramePong
 			binary.BigEndian.PutUint16(pong[5:7], 1)
 			pong[7] = 0
-			_ = c.write(pong)
+			// Keepalive Pong replies ride the control plane (ctrlCh); the
+			// pong is ordering-insensitive vs DATA (Section 4 routing table).
+			_ = c.writeControl(pong)
 		case FramePong:
 			// keepalive ack: latch for the liveness loop, which reads
 			// and clears it under c.mu after each ping round.
 			c.mu.Lock()
 			c.sawPong = true
 			c.mu.Unlock()
+		case FrameCredit:
+			// Phase A (design doc §5.3): parse and validate the credit.
+			// Connection-level rejects (malformed payload length, stream
+			// 0, unregistered stream) are enforced in readLoop before
+			// the frame reaches the dispatcher; the stream here is
+			// always registered and the payload is always 32 bytes.
+			//
+			// STREAM-level reject: a credit whose semantic content
+			// (version, generation, reserved fields) violates §5.3
+			// terminates the target stream (the credit itself is the
+			// signal; a FrameClose would be semantically wrong).
+			p, _ := DecodeCreditPayload(f.Payload) // length guaranteed by readLoop
+			if vErr := ValidateCreditPayload(&p); vErr != nil {
+				c.mu.Lock()
+				s, known := c.streams[f.StreamID]
+				c.mu.Unlock()
+				if known {
+					c.terminateStream(s, false)
+				}
+				continue
+			}
+			// Valid credit (Phase B, Section 4): hand it to OnStreamCredit
+			// — OUTSIDE c.mu (mirroring OnNewStream/OnStreamTerminated), so
+			// the ledger leaf lock taken inside the callback is never nested
+			// under c.mu (the Section 9 lock-ordering proof, point 3). The
+			// callback only records state; it never enqueues a credit
+			// (the no-block invariant B3). A nil callback is a no-op, which
+			// keeps the control plane inert until a later slice wires it.
+			if c.OnStreamCredit != nil {
+				c.OnStreamCredit(f.StreamID, p)
+			}
 		default:
 			// unknown frame type: drop
 		}
@@ -781,61 +1225,181 @@ func (c *CarrierConn) limitsLocked() StreamLimits {
 	return c.limits
 }
 
-// deliver routes one item into a stream's mailbox without ever blocking.
-// Called by the dispatcher goroutine only (it owns s.pressureStart).
+// Limits returns a copy of the carrier's current stream limits, suitable
+// for lock-free use by the caller (SF-4). It acquires c.mu, copies the
+// StreamLimits struct, and releases before returning; no c.mu is held
+// across the return. This is the accessor Phase B Slices 4-5 use for
+// the sender credit gate clamp (the hot path must read the CARRIER's
+// live MaxBytesPerStream, not the node config, so SetStreamLimits
+// (carrier.go:633, under c.mu) cannot race the reader).
+func (c *CarrierConn) Limits() StreamLimits {
+	c.mu.Lock()
+	l := c.limits
+	c.mu.Unlock()
+	return l
+}
+
+// deliver routes one item into a stream's mailbox. Called by the dispatcher
+// goroutine only (it owns s.pressureStart; the queue owns and synchronizes
+// its primary and carry regions).
 //
-// Overflow policy (Phase 3): a stream whose mailbox cannot accept data is
-// under pressure; the dispatcher drops its frames but keeps going — other
-// streams are never affected. If the pressure lasts longer than
-// OverflowWait, the stream is terminated (not the carrier).
+// Overflow policy (Phase 3 + retry-grace + SUBTASK 30 backpressure): a
+// stream whose primary mailbox cannot accept data may carry the refused
+// frame in the queue's bounded FIFO overflow region. The worker drains the
+// primary first and then the carry region, so a transient consumer stall
+// no longer loses an in-order byte or strands a tail at end-of-data.
+//
+// SUBTASK 30 — real backpressure: when BOTH the primary and the carry are
+// full (or the aggregate budget is exhausted), the dispatcher BLOCKS in
+// PushPark until the consumer drains the mailbox (a Pop frees space and
+// wakes the parked pusher) or the queue is closed (carrier teardown /
+// stream termination). This propagates backpressure through the entire
+// chain: dispatcher → c.frames → readLoop → TCP read → peer's WriteFrame
+// → peer's relay → target/client socket. A slow consumer paces the sender
+// instead of triggering a stream termination.
+//
+// The dispatcher never reorders anything: the mailbox is FIFO, the carry
+// region is FIFO, and the single worker serves the primary and only then
+// the carry region, so per-stream order holds end-to-end.
+//
+// Deadlock analysis: PushPark holds no locks while parked (it waits on
+// the free channel after releasing q.mu). The consumer (worker) holds no
+// locks while blocked on s.ch (a channel send). The sender (readLoop)
+// holds no locks while blocked on c.frames (a channel send). No lock is
+// held across any blocking wait, so no lock-ordering cycle can form.
+// The only external dependency is the consumer's socket write (a kernel
+// call that will complete or error), and the carrier's c.closed channel
+// (closed by Close, which also closes q, waking any parked pusher).
 func (c *CarrierConn) deliver(s *streamRec, it queueItem) {
 	if s.terminated.Load() {
 		return // stream already over: drop
 	}
 	if it.isClose {
-		// FrameClose (0 bytes). If the mailbox is full the stream will
-		// be terminated by the pressure rule anyway, and termination
-		// notifies the consumer of stream end the same way.
-		if s.q.TryPush(it) {
-			s.pressureStart = time.Time{}
-		} else {
-			c.applyPressure(s)
+		c.deliverClose(s, it)
+		return
+	}
+	// DATA / HEADER / REBIND — the survivable retry-grace path. A refused
+	// frame is CARRIED (in the queue's bounded carry region), not killed on
+	// the first refusal.
+	ok, reason := s.q.TryPushReason(it)
+	if ok {
+		return
+	}
+	if s.terminated.Load() {
+		// A concurrent termination raced us: the mailbox closed and the
+		// nil is on its way; this frame dies with the clean abort.
+		return
+	}
+	if reason == rejectStreamFrames || reason == rejectStreamBytes {
+		// A per-stream bound (frame count or stream byte cap): a genuine
+		// consumer STALL — the exact slow-client path (SUBTASK 30). First
+		// carry the frame in the bounded carry region (headroom), and when
+		// the carry is also full, BLOCK the dispatcher in PushPark until
+		// the consumer drains the mailbox (a Pop frees space and wakes the
+		// parked pusher). This paces the upstream sender — never a silent
+		// truncation, never a per-item termination of a live stream.
+		if ok, _ := s.q.TryCarry(it); ok {
+			return
+		}
+		if s.terminated.Load() {
+			return // a concurrent termination raced us
+		}
+		if s.q.PushPark(it) {
+			return // accepted after the consumer drained space
+		}
+		// PushPark returned false: the queue was closed while we parked.
+		// Two distinct causes, both of which lose the in-order byte:
+		//   - a concurrent worker CONSUMER-STALL reclaim (terminateStream):
+		//     a genuine data-integrity failure -> classify it;
+		//   - a clean CARRIER teardown (Close, rebind/loss): the frame dies
+		//     with the carrier's clean abort -> do NOT classify it as
+		//     data_undeliverable (that would mislabel a normal rebind as a
+		//     data loss).
+		// terminated=true is already set on both reclaim paths, so a
+		// terminated stream never double-classifies.
+		if !s.terminated.Load() && !c.Closing() {
+			c.failUndeliverableData(s, true)
 		}
 		return
 	}
-	// TryPush atomically checks the per-stream bounds AND the carrier-wide
-	// aggregate byte budget (all under the mailbox lock — see
-	// StreamQueue), adds the accepted bytes to the aggregate, and reports
-	// false if the push was refused for any reason. A refused DATA (or
-	// HEADER/REBIND) frame is handled by the deliver-or-fail policy below;
-	// a refused FrameClose still uses the pressure rule (the isClose
-	// branch above).
+	// An aggregate carrier-wide byte budget (or a closed mailbox) is NOT a
+	// per-stream consumer stall: it means the CARRIER is saturated across
+	// all its streams. Blocking the single dispatcher on it would stall
+	// every other stream on this carrier (head-of-line) with no single
+	// consumer that can drain it, so we preserve deliver-or-fail by ending
+	// only THIS stream, never silently dropping an in-order byte.
+	c.failUndeliverableData(s, true)
+}
+
+// deliverClose handles a FrameClose. A close must follow every preceding
+// DATA frame in FIFO order, so when the primary (or the carry) is full the
+// dispatcher CARRIES it behind the data (Pop drains the primary first and
+// only then the carry region).
+//
+// SUBTASK 30: if both the carry cap and the aggregate budget are exhausted,
+// BLOCK in PushPark until the consumer drains the mailbox, so the ordered
+// half-close is delivered rather than the stream being terminated. A close
+// carries no payload bytes, so it fits the carry cap by byte-count (0 B);
+// PushPark's park waits for the carry frame cap or the aggregate budget to
+// free up.
+func (c *CarrierConn) deliverClose(s *streamRec, it queueItem) {
 	if s.q.TryPush(it) {
 		s.pressureStart = time.Time{}
 		return
 	}
-	// A DATA frame that cannot be queued would, under the old policy, be
-	// silently dropped while the stream stayed alive — leaving an in-order
-	// byte hole no receiver can detect (frames carry no sequence number)
-	// that corrupts every byte stream (e.g. TLS) downstream. The dispatcher
-	// must never block on a slow consumer (Phase 3), so it cannot retry
-	// this frame in place; the deliver-or-fail invariant applies instead:
-	// fail the stream cleanly so the consumer sees a clean stream end, not
-	// corrupted bytes.
-	c.failUndeliverableData(s)
+	if s.terminated.Load() {
+		return
+	}
+	if ok, _ := s.q.TryCarry(it); ok {
+		return
+	}
+	if s.terminated.Load() {
+		return
+	}
+	// Both the primary and the carry are full: block until the consumer
+	// drains the mailbox so the close can be delivered in order.
+	if s.q.PushPark(it) {
+		return
+	}
+	// Queue was closed while we parked. A clean CARRIER teardown (Close)
+	// loses the close with the abort and must NOT be classified as
+	// data_undeliverable; a worker CONSUMER-STALL reclaim (terminated
+	// already set) is. terminated=true covers the reclaim, so only a
+	// live, non-closing stream can be mislabelled — suppress it there.
+	if !s.terminated.Load() && !c.Closing() {
+		c.failUndeliverableData(s, false)
+	}
 }
 
 // failUndeliverableData records that an in-order DATA frame is undeliverable
 // to this live stream and terminates the stream cleanly. It is the
-// dispatcher-side replacement for the old silent-drop: an in-order DATA frame
-// is either DELIVERED (queued by the TryPush above) or the STREAM IS CLEANLY
-// FAILED — never silently dropped while the stream stays healthy.
+// dispatcher-side terminal of the retry-grace: a DATA byte that could not be
+// queued or carried is either DELIVERED (mailbox/carry) or the STREAM IS
+// CLEANLY FAILED — never silently dropped while the stream stays healthy.
 // Dispatcher goroutine only; takes c.mu solely to read the stats pointer.
-func (c *CarrierConn) failUndeliverableData(s *streamRec) {
+// triggerLostData reports whether the triggering frame itself is a lost DATA
+// frame (true) or a FrameClose (false — a close carries no bytes).
+func (c *CarrierConn) failUndeliverableData(s *streamRec, triggerLostData bool) {
+	// Count every DATA frame the consumer will never get: frames still in
+	// the primary mailbox, frames in the carry region, and the triggering
+	// frame if it is DATA. Close reclaims the bytes; we credit the drops.
+	if s.terminated.Load() {
+		return
+	}
+	lost := int64(s.q.QueueDataLen())
+	if triggerLostData {
+		lost++
+	}
+	if lost == 0 {
+		// No DATA bytes were actually lost (e.g. a close-only escalation on
+		// an empty queue): still terminate, but skip the drop loop.
+	}
 	c.mu.Lock()
 	stats := c.stats
 	c.mu.Unlock()
-	stats.droppedDataFrame()
+	for i := int64(0); i < lost; i++ {
+		stats.droppedDataFrame()
+	}
 	// terminateStream(s, true) delivers nil to the consumer and signals the
 	// peer with a best-effort FrameClose, so both ends tear the stream down
 	// deterministically (no half-alive stream, no byte hole).
@@ -891,7 +1455,11 @@ func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 		// q.mu, so a concurrent Pop cannot reclaim them again).
 		s.q.Close()
 		if signalPeer {
-			_ = c.WriteFrame(s.id, FrameClose, nil) // best effort; ErrCarrierClosed if closing
+			// FrameClose is a terminal signal that must not be dropped, so it
+			// rides the control plane (ctrlCh) via the BLOCKING variant
+			// (Section 4 routing table). Best effort: ErrCarrierClosed if the
+			// carrier is already closing.
+			_ = c.WriteControlFrame(s.id, FrameClose, nil)
 		}
 		select {
 		case s.ch <- nil:
@@ -913,11 +1481,20 @@ func (c *CarrierConn) terminateStream(s *streamRec, signalPeer bool) {
 // s.ch. Close waits for every worker to exit (workerWait) before it
 // closes any s.ch, so a send on a closed channel is structurally
 // impossible — no select arm here can ever mask one.
-//
 // Per-stream ordering is preserved: single mailbox (FIFO) → single worker
 // → single consumer channel. A worker blocked on a full consumer channel
-// for longer than OverflowWait terminates its own stream — the slow
-// consumer's deadline.
+// for longer than ConsumerStall terminates its own stream — the slow
+// consumer's deadline (SUBTASK 30).
+//
+// SUBTASK 30: the handoff deadline is now ConsumerStall, NOT OverflowWait.
+// The old code used OverflowWait (100 ms) for the CONSUMER-side handoff,
+// which is the exact bug: a remote client whose socket write takes longer
+// than 100 ms (TCP window + RTT over the internet) caused the worker to
+// terminate the stream mid-download — the ~2–3.5 MB truncation signature.
+// ConsumerStall (default 30 s) absorbs a slow-but-alive consumer; a dead
+// consumer (relay exited / session closed) is still reclaimed after
+// ConsumerStall, so the worker never blocks forever (Close's c.closed also
+// releases the handoff, and Close closes s.ch after workerWait).
 func (c *CarrierConn) streamWorker(s *streamRec) {
 	defer c.goroutineStopped()
 	defer c.workerWait.Done()
@@ -928,12 +1505,13 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		}
 		if it.isClose {
 			// FrameClose: hand the nil (half-close) to the consumer and
-			// exit. Bounded: a consumer that stopped reading ends the
-			// stream silently (Close closes the channel later).
+			// exit. Bounded by ConsumerStall: a consumer that stopped
+			// reading ends the stream silently (Close closes the channel
+			// later; c.closed also aborts this handoff on teardown).
 			select {
 			case s.ch <- nil:
 			case <-c.closed:
-			case <-time.After(c.limitsLocked().OverflowWait):
+			case <-time.After(c.limitsLocked().ConsumerStall):
 				c.mu.Lock()
 				stats := c.stats
 				c.mu.Unlock()
@@ -950,10 +1528,15 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 		// NOT touch queuedBytes here again.
 		select {
 		case s.ch <- it.payload:
+			// Delivered: this is the real backpressure release point. The
+			// consumer (the node relay) has taken the frame and will write
+			// it to the socket, which paces the upstream sender via the
+			// dispatcher's PushPark (deliver). Nothing to do on success.
 		case <-c.closed:
 			return
-		case <-time.After(c.limitsLocked().OverflowWait):
-			// consumer stopped reading: end this stream, not the carrier.
+		case <-time.After(c.limitsLocked().ConsumerStall):
+			// consumer stopped reading for ConsumerStall: end this stream,
+			// not the carrier. Bounded — a dead consumer is reclaimed.
 			c.mu.Lock()
 			stats := c.stats
 			c.mu.Unlock()
@@ -977,7 +1560,7 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 //  4. wait for in-flight write callers, then fail every still-queued
 //     write with ErrCarrierClosed — after Close returns, no WriteFrame
 //     caller is still waiting;
-//  5. shut down the streams, in three sub-steps:
+//  5. shut down the streams, in four sub-steps:
 //     (a) close EVERY stream mailbox — allStreams, which also includes
 //     streams removed by Deregister — reclaiming discarded bytes
 //     from the aggregate budget; closing the mailbox is the only
@@ -988,6 +1571,11 @@ func (c *CarrierConn) streamWorker(s *streamRec) {
 //     gone, or (it cannot exist) it would have to hold a mailbox
 //     item, which requires a Pop from a still-open mailbox, and all
 //     mailboxes are now closed;
+//     (b2) wait for the dispatcher's own terminate handoffs (covered by
+//     dispatchDone);
+//     (b3) wait for every in-flight PUBLIC Terminate (termWG) — the
+//     third sender on s.ch, running in node-spawned goroutines that
+//     neither workerWait nor dispatchDone covers;
 //     (c) close every stream channel, waking stream consumers. No send
 //     on s.ch can ever race this close, so "send on closed channel"
 //     is impossible.
@@ -1011,6 +1599,14 @@ func (c *CarrierConn) Close() {
 		// Best effort: the peer may already be gone; the close also
 		// interrupts any read/write blocked in the network layer.
 		_ = c.rwc.Close()
+
+		// Phase B control-plane drain, sequenced FIRST (Section 4): resolve
+		// in-flight + queued control frames before the DATA frames, so a
+		// FrameClose stranded on ctrlCh is never held up behind a still-
+		// draining writeCh. ctrlWG.Add happens under c.mu exactly like
+		// writeWG.Add, so every Add is mutex-ordered before closing=true.
+		c.ctrlWG.Wait()
+		c.drainCtrl()
 
 		c.writeWG.Wait()
 		c.drainWrites()
@@ -1053,6 +1649,24 @@ func (c *CarrierConn) Close() {
 		if c.dispatched.Load() { // skip carriers that never ran Dispatch (shutdown/unit-test paths)
 			<-c.dispatchDone
 		}
+
+		// (b3) Wait for any in-flight PUBLIC Terminate to finish its
+		// terminateStream handoff (the s.ch <- nil send) before closing
+		// s.ch: Terminate is called from node-spawned goroutines
+		// (bootstrapUpStream's dial-drop, handleRebind's drop, the
+		// onUpNewStream/onDownNewStream default branches) that neither
+		// workerWait (stream workers) nor dispatchDone (the dispatcher
+		// itself) covers — the dispatcher spawns them and returns without
+		// waiting. This is the untracked third sender on s.ch that the
+		// original close-safety proof did not account for. Bounded: every
+		// tracked handoff's consumer send is released by c.closed (step 2),
+		// so the Wait can never hang; and termWG.Add is mutex-ordered under
+		// c.mu before the closing latch, so this Wait sees every in-flight
+		// call (and no call started AFTER the latch can Add — see the
+		// field doc). Without this wait, step (c) could close an s.ch that
+		// a racing Terminate is about to send on — "send on closed
+		// channel" / the -race between close(s.ch) and s.ch <- nil.
+		c.termWG.Wait()
 
 		// (c) Now — and only now — close every stream channel, waking
 		// the consumers. No worker can be sending when this runs.

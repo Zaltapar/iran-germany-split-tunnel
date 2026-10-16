@@ -44,12 +44,15 @@ import (
 // end state removes the scheduler dependence without weakening the
 // assertion: a spinner still fails, on the window timeout.
 func TestWaitCarriersNoBusySpin(t *testing.T) {
-	n := NewNode(Config{
+	n, err := NewNode(Config{
 		Role: RoleIran, Grace: time.Second,
 		RelayBufSize: 4096, BufferBytes: 64 << 10,
 		BootstrapWait:     3 * time.Second, // long: the waiter outlives the probe
 		KeepAliveInterval: time.Hour,
 	}, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer n.Close()
 	a, _ := pipePair(t)
 	n.InstallUp(a, nil) // up ready (closed channel), down absent -> the spin scenario

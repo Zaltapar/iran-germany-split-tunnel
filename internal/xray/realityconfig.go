@@ -74,6 +74,17 @@ const (
 	tagSplitDown    = "split-down"
 	tagToSplitter   = "to-splitter"
 	xrayErrorLog    = "/var/log/split-tunnel/xray-germany.error.log"
+
+	// Phase 2 multi-carrier (D1/D3): the SECOND VLESS+Reality instance.
+	// Instance b listens on its own public port with its own SNI/shortId/UUID
+	// and keypair, and its routing points to its own loopback splitter
+	// down-carrier listener (127.0.0.1:9003), distinct from instance a's
+	// 127.0.0.1:9002. The public port is D3 (2053, never the dashboard-reserved
+	// 8443). These constants are topology-fixed like the primary's.
+	secondDownPublicPort = 2053
+	secondSplitterPort   = 9003
+	tagSplitDownB        = "split-down-b"
+	tagToSplitterB       = "to-splitter-b"
 )
 
 // ValidateRealityParams exposes pure Reality input validation to deployment
@@ -259,10 +270,163 @@ func RenderGermanyConfig(p RealityParams, kp *Keypair) ([]byte, error) {
 			}},
 		},
 	}
-
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("xray: reality config: render: %w", err)
+	}
+	return append(b, '\n'), nil
+}
+
+// RealityInstance describes ONE VLESS+Reality instance. Instance a uses the
+// primary topology constants; instance b (Phase 2, D1/D3) uses the second's
+// public port + loopback listener. Each instance carries its own SNI, shortId,
+// UUID, and (for the Germany side) Reality keypair.
+type RealityInstance struct {
+	RealityParams
+	// PubPort is the public listen port for this instance. Omitted (0) renders
+	// the topology-fixed primary port (germanyPort) for instance a; instance
+	// b must set it explicitly (e.g. secondDownPublicPort).
+	PubPort int
+	// SplitPort is the loopback splitter down-carrier port this instance's
+	// outbound freedom-redirect points at. Omitted (0) renders splitterPort.
+	SplitPort int
+	// Tags are the Xray inbound/outbound/route tags for this instance. Omitted
+	// tags render the primary constants; instance b must set distinct ones.
+	InboundTag  string
+	OutboundTag string
+	// Keypair is the per-instance Reality key material (Germany side only).
+	// It is required for the Germany multi-renderer.
+	Keypair *Keypair
+}
+
+// MultiInstanceParams is the validated input for the multi-carrier Germany
+// render: instance a (primary) plus instance b (second). Both are fully
+// validated with the single-instance rules; b additionally requires its own
+// public port (≠ a's, ≠ 8443) and a distinct SNI (D3).
+type MultiInstanceParams struct {
+	A RealityInstance
+	B RealityInstance
+}
+
+// ValidateMultiInstanceParams validates both instances for the multi-carrier
+// Germany config. It enforces the single-instance rules for each, plus the
+// Phase 2 instance-b invariants: b's public port is set, not 8443 (dashboard-
+// reserved), and differs from a's; b's SNI is a valid TLS 1.3 domain; and b
+// carries its own keypair. Errors name fields, never values.
+func ValidateMultiInstanceParams(p MultiInstanceParams) error {
+	if err := p.A.RealityParams.validate(); err != nil {
+		return fmt.Errorf("xray: reality config: instance a: %w", err)
+	}
+	if err := p.B.RealityParams.validate(); err != nil {
+		return fmt.Errorf("xray: reality config: instance b: %w", err)
+	}
+	if err := checkKeypair(p.A.Keypair); err != nil {
+		return fmt.Errorf("xray: reality config: instance a keypair: %w", err)
+	}
+	if err := checkKeypair(p.B.Keypair); err != nil {
+		return fmt.Errorf("xray: reality config: instance b keypair: %w", err)
+	}
+	var problems []string
+	if p.B.PubPort < 1 || p.B.PubPort > 65535 {
+		problems = append(problems, "instance b: pubPort must be 1..65535")
+	}
+	if p.B.PubPort == 8443 {
+		problems = append(problems, "instance b: pubPort 8443 is reserved for the dashboard TLS listener")
+	}
+	if p.B.PubPort == p.A.PubPort {
+		problems = append(problems, "instance b: pubPort must differ from instance a (distinct listener)")
+	}
+	if p.B.SNI == p.A.SNI {
+		problems = append(problems, "instance b: sni must differ from instance a (a distinct TLS 1.3 SNI, D3)")
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidParams, strings.Join(problems, "; "))
+}
+
+// renderInstance builds the (inbound, outbound, route) triplet for one
+// Reality instance, honoring its topology overrides.
+func renderInstance(in RealityInstance) (germanyInbound, germanyOutbound, germanyRoutingRule) {
+	pubPort := in.PubPort
+	if pubPort == 0 {
+		pubPort = germanyPort
+	}
+	splitPort := in.SplitPort
+	if splitPort == 0 {
+		splitPort = splitterPort
+	}
+	inboundTag := in.InboundTag
+	if inboundTag == "" {
+		inboundTag = tagSplitDown
+	}
+	outTag := in.OutboundTag
+	if outTag == "" {
+		outTag = tagToSplitter
+	}
+	inb := germanyInbound{
+		Tag:      inboundTag,
+		Listen:   germanyListen,
+		Port:     pubPort,
+		Protocol: "vless",
+		Settings: vlessInboundSettings{
+			Clients:    []vlessClient{{ID: in.UUID}},
+			Decryption: "none",
+		},
+		StreamSettings: germanyStreamSettings{
+			Network:  "tcp",
+			Security: "reality",
+			Reality: &germanyRealitySettings{
+				Dest:        in.SNI + ":443",
+				ServerNames: []string{in.SNI},
+				PrivateKey:  in.Keypair.PrivateRaw,
+				ShortIds:    []string{in.ShortID},
+			},
+		},
+	}
+	ob := germanyOutbound{
+		Tag:      outTag,
+		Protocol: "freedom",
+		Settings: freedomSettings{
+			Redirect: splitterAddress + ":" + strconv.Itoa(splitPort),
+		},
+	}
+	rule := germanyRoutingRule{
+		InboundTag:  []string{inboundTag},
+		OutboundTag: outTag,
+	}
+	return inb, ob, rule
+}
+
+// RenderGermanyMultiConfig renders the two-instance Germany Xray config
+// (Phase 2, D1/D3): two VLESS+Reality inbounds (instance a on 443, instance
+// b on its public port), each routing to its own loopback splitter listener
+// (9002 / 9003). It is a pure, deterministic function: fixed struct field
+// order, 2-space indent, trailing newline; the same input always yields the
+// same bytes (golden-pinned). The single-carrier golden is UNCHANGED — this
+// is a distinct function that only the multi-carrier path calls.
+func RenderGermanyMultiConfig(p MultiInstanceParams) ([]byte, error) {
+	if err := ValidateMultiInstanceParams(p); err != nil {
+		return nil, err
+	}
+	inA, obA, ruleA := renderInstance(p.A)
+	inB, obB, ruleB := renderInstance(p.B)
+
+	cfg := germanyConfig{
+		Log: germanyLog{
+			LogLevel: "warning",
+			Error:    xrayErrorLog,
+		},
+		Inbounds:  []germanyInbound{inA, inB},
+		Outbounds: []germanyOutbound{obA, obB},
+		Routing: germanyRouting{
+			Rules: []germanyRoutingRule{ruleA, ruleB},
+		},
+	}
+
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("xray: reality config: render multi: %w", err)
 	}
 	return append(b, '\n'), nil
 }

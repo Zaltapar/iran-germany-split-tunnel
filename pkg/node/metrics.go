@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 )
@@ -59,7 +60,9 @@ func closeReasonClass(s *session.Session) CloseReason {
 		strings.Contains(reason, "grace") ||
 		strings.Contains(reason, "stream registration failed") ||
 		strings.Contains(reason, "up-carrier header write failed") ||
-		strings.Contains(reason, "closed by peer") {
+		strings.Contains(reason, "closed by peer") ||
+		strings.Contains(reason, "peer reset") ||
+		strings.Contains(reason, "bootstrap") {
 		return ReasonCarrier
 	}
 	if strings.Contains(reason, "client EOF") || strings.Contains(reason, "client socket EOF") {
@@ -110,6 +113,21 @@ type Metrics struct {
 	sessionCleanComplete  int64
 	targetDialOK          int64
 	targetDialFail        int64
+	// up-carrier drop-storm fix (Part 4): observability for the re-fire
+	// condition the bootstrap drop() is blind to. The 0x00/0x04 re-fired
+	// OnNewStream drops do NOT increment Error() (that is why the live
+	// "errors" 8,930 did not match the 31,432 log lines). These counters
+	// make the re-fire noise measurable and separable from genuine
+	// bootstrap drops.
+	upNewStreamRefiredAfterDeregister   int64
+	downNewStreamRefiredAfterDeregister int64
+	// Issue #20 / #21: stream-level negative ack (FrameReset) and
+	// bootstrap-result (FrameBootstrapAck) counters.
+	streamResetsReceived  int64
+	bootstrapAcksReceived int64
+	// Part 4: target-dial failure by outcome (cheap, fixed-cardinality).
+	targetDialFailBreakerOpen int64 // refused fast (breaker open, no dial spent)
+	targetDialFailTimeout     int64 // bounded dial hit its ceiling
 
 	// Shape-A relay accounting and bounded-buffer observations.
 	relayBytesRead       int64
@@ -131,10 +149,113 @@ type Metrics struct {
 	// data_undeliverable: a stream ended by the deliver-or-fail policy (an
 	// in-order DATA frame could not be queued for a live stream).
 	closeReasonDataUndeliverable int64
+
+	// Phase B credit flow-control (design §13) — fixed-cardinality,
+	// node-local, NO attacker-controlled labels. These are the Slice 4-5
+	// counters; later slices add the remaining §13 family.
+	relayCreditEmittedTotal       int64 // credits successfully written (emitter)
+	relayCreditDroppedTotal       int64 // TryWriteControlFrame drop-on-full (ctrlCh pressure)
+	relayCreditGateParkTotal      int64 // credit-gate PARK events (the missing D4 counter)
+	relayCreditSentBytesTotal     int64 // bytes charged via recordSent (sender gate)
+	relayCreditConsumedBytesTotal int64 // bytes credited via recordConsumed (receiver)
+
+	// Phase 2 multi-carrier (D1): per-CarrierID loss/reconnect counters.
+	// The direction aggregate above (carrierLossEvents / carrierReconnects)
+	// is ALWAYS kept, so the single-carrier /metrics output is byte-identical
+	// to the pre-Phase-2 build. When the node is multi-carrier, per-carrier
+	// names are additionally enabled (SetMultiCarrier) and rendered as
+	// carrier_loss_events{carrier="..."} / carrier_reconnects{carrier="..."}.
+	// The maps are bounded to the configured carrier set (no open-ended
+	// cardinality); ordering for deterministic rendering is carrierOrder.
+	multiCarrier         bool
+	carrierOrder         []CarrierID
+	carrierLossByID      map[CarrierID]int64
+	carrierReconnectByID map[CarrierID]int64
+
+	// Phase 3 (G3, design §7.5): the node's carrier-intelligence policy,
+	// set only when multi-carrier is enabled. Render emits one bounded,
+	// non-secret per-carrier health line family from this snapshot when
+	// policy != nil; it is nil in single-carrier nodes, so /metrics stays
+	// byte-identical.
+	policy *Policy
 }
 
 // NewMetrics creates a zeroed metrics set.
 func NewMetrics() *Metrics { return &Metrics{} }
+
+// SetMultiCarrier enables per-carrier metric names for the given static
+// down-carrier set. The direction aggregate counters are unaffected; when
+// enabled, Render additionally emits one
+// carrier_loss_events{carrier="..."} and one
+// carrier_reconnects{carrier="..."} line per known carrier. In single-carrier
+// deployments this is never called, so /metrics is byte-identical to the
+// pre-Phase-2 build.
+func (m *Metrics) SetMultiCarrier(ids []CarrierID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.multiCarrier = true
+	m.carrierOrder = append([]CarrierID(nil), ids...)
+	m.carrierLossByID = make(map[CarrierID]int64, len(ids))
+	m.carrierReconnectByID = make(map[CarrierID]int64, len(ids))
+}
+
+// IsMultiCarrier reports whether per-carrier metric names are enabled.
+func (m *Metrics) IsMultiCarrier() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.multiCarrier
+}
+
+// SetPolicy associates the node's Phase 3 carrier-intelligence policy with
+// this metrics set so Render can emit per-carrier health gauges. It is called
+// only when multi-carrier is enabled (multi-carrier nodes always have a
+// policy). In single-carrier nodes it is never called, so /metrics stays
+// byte-identical.
+func (m *Metrics) SetPolicy(p *Policy) {
+	m.mu.Lock()
+	m.policy = p
+	m.mu.Unlock()
+}
+
+// CarrierLossEventOn counts a carrier death for a specific CarrierID, in
+// addition to the direction aggregate. Inert (no-op beyond the aggregate)
+// unless multi-carrier is enabled.
+func (m *Metrics) CarrierLossEventOn(id CarrierID) {
+	m.mu.Lock()
+	if m.multiCarrier {
+		m.carrierLossByID[id]++
+	}
+	m.mu.Unlock()
+}
+
+// CarrierReconnectOn counts a carrier (re)establishment for a specific
+// CarrierID, in addition to the direction aggregate. Inert unless
+// multi-carrier is enabled.
+func (m *Metrics) CarrierReconnectOn(id CarrierID) {
+	m.mu.Lock()
+	if m.multiCarrier {
+		m.carrierReconnectByID[id]++
+	}
+	m.mu.Unlock()
+}
+
+// CarrierLossCount returns the per-CarrierID loss count for id (0 when
+// multi-carrier metrics are not enabled or no losses have been recorded).
+// It is a point-in-time read of the per-carrier map; the direction aggregate
+// (CarrierLossEvents) is independent of this value.
+func (m *Metrics) CarrierLossCount(id CarrierID) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.carrierLossByID[id]
+}
+
+// CarrierReconnectCount returns the per-CarrierID reconnect count for id (0
+// when multi-carrier metrics are not enabled or no reconnects recorded).
+func (m *Metrics) CarrierReconnectCount(id CarrierID) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.carrierReconnectByID[id]
+}
 
 // SessionStarted counts a new session (active +1, total +1).
 func (m *Metrics) SessionStarted() {
@@ -286,6 +407,58 @@ func (m *Metrics) TargetDialFailure() {
 	m.mu.Unlock()
 }
 
+// UpNewStreamRefiredAfterDeregister counts a re-fired OnNewStream on the up
+// carrier whose stream ID had already been terminated/deregistered: the
+// 0x00/0x04 retransmit-after-drop condition (Part 4). This is the counter
+// that was missing, which is why the live "errors" (Error()) undercounted the
+// re-fire log storm.
+func (m *Metrics) UpNewStreamRefiredAfterDeregister() {
+	m.mu.Lock()
+	m.upNewStreamRefiredAfterDeregister++
+	m.mu.Unlock()
+}
+
+// DownNewStreamRefiredAfterDeregister is the down-carrier equivalent of
+// UpNewStreamRefiredAfterDeregister (Part 4).
+func (m *Metrics) DownNewStreamRefiredAfterDeregister() {
+	m.mu.Lock()
+	m.downNewStreamRefiredAfterDeregister++
+	m.mu.Unlock()
+}
+
+// TargetDialFailureBreakerOpen counts a target dial refused fast because the
+// per-target circuit breaker was open (Part 4): no dial was spent.
+func (m *Metrics) TargetDialFailureBreakerOpen() {
+	m.mu.Lock()
+	m.targetDialFailBreakerOpen++
+	m.mu.Unlock()
+}
+
+// TargetDialFailureTimeout counts a target dial that hit its bounded ceiling
+// (Part 4).
+func (m *Metrics) TargetDialFailureTimeout() {
+	m.mu.Lock()
+	m.targetDialFailTimeout++
+	m.mu.Unlock()
+}
+
+// ResetReceived counts a peer FrameReset (Issue #20) received on this node:
+// the stream-level negative ack that terminates a stranded local session.
+func (m *Metrics) ResetReceived() {
+	m.mu.Lock()
+	m.streamResetsReceived++
+	m.mu.Unlock()
+}
+
+// BootstrapAckReceived counts a peer FrameBootstrapAck (Issue #21) received
+// on this node: the remote bootstrap verdict that resolves a pending
+// StartSession wait.
+func (m *Metrics) BootstrapAckReceived() {
+	m.mu.Lock()
+	m.bootstrapAcksReceived++
+	m.mu.Unlock()
+}
+
 // AddRelayBytesRead adds shape-A socket-read bytes.
 func (m *Metrics) AddRelayBytesRead(n int64) {
 	if n <= 0 {
@@ -352,6 +525,47 @@ func (m *Metrics) RelaySocketWriteError() {
 	m.mu.Unlock()
 }
 
+// Credit metrics (Phase B, design §13). Unlabeled node-local counters; no
+// value may be attacker-controlled. relay_credit_gate_park_total is the
+// counter that proves the credit gate ENGAGED (the D4 blind-counter fix).
+
+// CreditEmitted records a credit successfully written by the emitter.
+func (m *Metrics) CreditEmitted() {
+	m.mu.Lock()
+	m.relayCreditEmittedTotal++
+	m.mu.Unlock()
+}
+
+// CreditDropped records a control-frame drop-on-full (ctrlCh pressure).
+func (m *Metrics) CreditDropped() {
+	m.mu.Lock()
+	m.relayCreditDroppedTotal++
+	m.mu.Unlock()
+}
+
+// CreditGatePark records one credit-gate park event (distinct from the
+// pending gate — the counter D4's relay_credit_block was blind to).
+func (m *Metrics) CreditGatePark() {
+	m.mu.Lock()
+	m.relayCreditGateParkTotal++
+	m.mu.Unlock()
+}
+
+// AddCreditSentBytes charges n bytes issued through the sender gate.
+func (m *Metrics) AddCreditSentBytes(n int64) {
+	m.mu.Lock()
+	m.relayCreditSentBytesTotal += n
+	m.mu.Unlock()
+}
+
+// AddCreditConsumedBytes charges n socket-written bytes credited on the
+// receiver side.
+func (m *Metrics) AddCreditConsumedBytes(n int64) {
+	m.mu.Lock()
+	m.relayCreditConsumedBytesTotal += n
+	m.mu.Unlock()
+}
+
 // SessionClosed records exactly one fixed close-reason class. Values outside
 // the enum are deliberately collapsed into other.
 func (m *Metrics) SessionClosed(r CloseReason) {
@@ -403,64 +617,90 @@ type Snapshot struct {
 	SessionsCleanComplete         int64
 	TargetDialSuccess             int64
 	TargetDialFailure             int64
-	RelayBytesRead                int64
-	RelayBytesWritten             int64
-	RelayPendingHighBytes         int64
-	RelayBufferHighBytes          int64
-	RelayWriteFailures            int64
-	RelayBufferFull               int64
-	RelaySocketReadErrors         int64
-	RelaySocketWriteErrors        int64
-	CloseReasonClientEOF          int64
-	CloseReasonTargetEOF          int64
-	CloseReasonCarrier            int64
-	CloseReasonOverflow           int64
-	CloseReasonTimeout            int64
-	CloseReasonDataUndeliverable  int64
-	CloseReasonOther              int64
+	// up-carrier drop-storm fix (Part 4) observability.
+	UpNewStreamRefiredAfterDeregister   int64
+	DownNewStreamRefiredAfterDeregister int64
+	TargetDialFailureBreakerOpen        int64
+	TargetDialFailureTimeout            int64
+	// Issue #20 / #21 observability.
+	StreamResetsReceived         int64
+	BootstrapAcksReceived        int64
+	RelayBytesRead               int64
+	RelayBytesWritten            int64
+	RelayPendingHighBytes        int64
+	RelayBufferHighBytes         int64
+	RelayWriteFailures           int64
+	RelayBufferFull              int64
+	RelaySocketReadErrors        int64
+	RelaySocketWriteErrors       int64
+	CloseReasonClientEOF         int64
+	CloseReasonTargetEOF         int64
+	CloseReasonCarrier           int64
+	CloseReasonOverflow          int64
+	CloseReasonTimeout           int64
+	CloseReasonDataUndeliverable int64
+	CloseReasonOther             int64
+
+	// Phase B credit flow-control counters (design §13, Slices 4-5).
+	RelayCreditEmittedTotal       int64
+	RelayCreditDroppedTotal       int64
+	RelayCreditGateParkTotal      int64
+	RelayCreditSentBytesTotal     int64
+	RelayCreditConsumedBytesTotal int64
 }
 
 func (m *Metrics) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Snapshot{
-		ActiveSessions:                m.activeSessions,
-		TotalSessions:                 m.totalSessions,
-		TotalBytesUp:                  m.bytesUp,
-		TotalBytesDown:                m.bytesDown,
-		Errors:                        m.errs,
-		CarrierLossEvents:             m.carrierLossEvents,
-		CarrierReconnects:             m.carrierReconnects,
-		CarrierRebinds:                m.carrierRebinds,
-		CarrierRebindFailures:         m.carrierRebindFailures,
-		RebindUnknownPeer:             m.rebindUnknownPeer,
-		RebindStaleGeneration:         m.rebindStaleGeneration,
-		RebindOtherRefusal:            m.rebindOtherRefusal,
-		SessionsRecovered:             m.sessionsRecovered,
-		SessionsLostAfterCarF:         m.sessionsLostAfterCarF,
-		GraceTimeoutTerminalClose:     m.graceTimeoutTerminalClose,
-		SessionBufferReclaimed:        m.sessionBufferReclaimed,
-		SessionsFirstByteSeen:         m.sessionFirstByteSeen,
-		SessionsClosedBeforeFirstByte: m.sessionClosedPreFirst,
-		SessionsMidTransfer:           m.sessionMidTransfer,
-		SessionsCleanComplete:         m.sessionCleanComplete,
-		TargetDialSuccess:             m.targetDialOK,
-		TargetDialFailure:             m.targetDialFail,
-		RelayBytesRead:                m.relayBytesRead,
-		RelayBytesWritten:             m.relayBytesWritten,
-		RelayPendingHighBytes:         m.relayPendingHigh,
-		RelayBufferHighBytes:          m.relayBufferHighBytes,
-		RelayWriteFailures:            m.relayWriteFail,
-		RelayBufferFull:               m.relayBufferFull,
-		RelaySocketReadErrors:         m.relaySocketReadErr,
-		RelaySocketWriteErrors:        m.relaySocketWriteErr,
-		CloseReasonClientEOF:          m.closeReasonClientEOF,
-		CloseReasonTargetEOF:          m.closeReasonTargetEOF,
-		CloseReasonCarrier:            m.closeReasonCarrier,
-		CloseReasonOverflow:           m.closeReasonOverflow,
-		CloseReasonTimeout:            m.closeReasonTimeout,
-		CloseReasonDataUndeliverable:  m.closeReasonDataUndeliverable,
-		CloseReasonOther:              m.closeReasonOther,
+		ActiveSessions:                      m.activeSessions,
+		TotalSessions:                       m.totalSessions,
+		TotalBytesUp:                        m.bytesUp,
+		TotalBytesDown:                      m.bytesDown,
+		Errors:                              m.errs,
+		CarrierLossEvents:                   m.carrierLossEvents,
+		CarrierReconnects:                   m.carrierReconnects,
+		CarrierRebinds:                      m.carrierRebinds,
+		CarrierRebindFailures:               m.carrierRebindFailures,
+		RebindUnknownPeer:                   m.rebindUnknownPeer,
+		RebindStaleGeneration:               m.rebindStaleGeneration,
+		RebindOtherRefusal:                  m.rebindOtherRefusal,
+		SessionsRecovered:                   m.sessionsRecovered,
+		SessionsLostAfterCarF:               m.sessionsLostAfterCarF,
+		GraceTimeoutTerminalClose:           m.graceTimeoutTerminalClose,
+		SessionBufferReclaimed:              m.sessionBufferReclaimed,
+		SessionsFirstByteSeen:               m.sessionFirstByteSeen,
+		SessionsClosedBeforeFirstByte:       m.sessionClosedPreFirst,
+		SessionsMidTransfer:                 m.sessionMidTransfer,
+		SessionsCleanComplete:               m.sessionCleanComplete,
+		TargetDialSuccess:                   m.targetDialOK,
+		TargetDialFailure:                   m.targetDialFail,
+		UpNewStreamRefiredAfterDeregister:   m.upNewStreamRefiredAfterDeregister,
+		DownNewStreamRefiredAfterDeregister: m.downNewStreamRefiredAfterDeregister,
+		TargetDialFailureBreakerOpen:        m.targetDialFailBreakerOpen,
+		TargetDialFailureTimeout:            m.targetDialFailTimeout,
+		StreamResetsReceived:                m.streamResetsReceived,
+		BootstrapAcksReceived:               m.bootstrapAcksReceived,
+		RelayBytesRead:                      m.relayBytesRead,
+		RelayBytesWritten:                   m.relayBytesWritten,
+		RelayPendingHighBytes:               m.relayPendingHigh,
+		RelayBufferHighBytes:                m.relayBufferHighBytes,
+		RelayWriteFailures:                  m.relayWriteFail,
+		RelayBufferFull:                     m.relayBufferFull,
+		RelaySocketReadErrors:               m.relaySocketReadErr,
+		RelaySocketWriteErrors:              m.relaySocketWriteErr,
+		CloseReasonClientEOF:                m.closeReasonClientEOF,
+		CloseReasonTargetEOF:                m.closeReasonTargetEOF,
+		CloseReasonCarrier:                  m.closeReasonCarrier,
+		CloseReasonOverflow:                 m.closeReasonOverflow,
+		CloseReasonTimeout:                  m.closeReasonTimeout,
+		CloseReasonDataUndeliverable:        m.closeReasonDataUndeliverable,
+		CloseReasonOther:                    m.closeReasonOther,
+		RelayCreditEmittedTotal:             m.relayCreditEmittedTotal,
+		RelayCreditDroppedTotal:             m.relayCreditDroppedTotal,
+		RelayCreditGateParkTotal:            m.relayCreditGateParkTotal,
+		RelayCreditSentBytesTotal:           m.relayCreditSentBytesTotal,
+		RelayCreditConsumedBytesTotal:       m.relayCreditConsumedBytesTotal,
 	}
 }
 
@@ -476,6 +716,34 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "errors %d\n", s.Errors)
 	fmt.Fprintf(&b, "carrier_loss_events %d\n", s.CarrierLossEvents)
 	fmt.Fprintf(&b, "carrier_reconnects %d\n", s.CarrierReconnects)
+	// Phase 2 multi-carrier: per-carrier names, emitted ONLY when enabled
+	// (single-carrier /metrics stays byte-identical — no lines here).
+	if m.IsMultiCarrier() {
+		m.mu.Lock()
+		for _, id := range m.carrierOrder {
+			fmt.Fprintf(&b, "carrier_loss_events{carrier=%q} %d\n", string(id), m.carrierLossByID[id])
+			fmt.Fprintf(&b, "carrier_reconnects{carrier=%q} %d\n", string(id), m.carrierReconnectByID[id])
+		}
+		// Phase 3 (G3, design §7.5): per-carrier health gauges, emitted ONLY
+		// when multi-carrier AND a policy is attached (both true only in
+		// multi-carrier nodes). Fixed label format (carrier only); integer or
+		// fixed-point values; no secrets (gate/state reasons are code-owned
+		// ordinals, not caller input).
+		if p := m.policy; p != nil {
+			for _, cs := range p.HealthSnapshotNow(time.Now()).Carriers {
+				fmt.Fprintf(&b, "carrier_health_state{carrier=%q} %d\n", cs.ID, stateOrdinal(cs.State))
+				fmt.Fprintf(&b, "carrier_health_score{carrier=%q} %.4f\n", cs.ID, cs.Score)
+				fmt.Fprintf(&b, "carrier_health_goodput_mibps{carrier=%q} %.4f\n", cs.ID, cs.GoodputMiBps)
+				fmt.Fprintf(&b, "carrier_health_success_ratio{carrier=%q} %.4f\n", cs.ID, cs.SuccessRatio)
+				fmt.Fprintf(&b, "carrier_health_stall_rate_per_100_mib{carrier=%q} %.4f\n", cs.ID, cs.StallRatePer100MiB)
+				fmt.Fprintf(&b, "carrier_health_eligible{carrier=%q} %d\n", cs.ID, cs.EligibleMetric())
+				fmt.Fprintf(&b, "carrier_health_gate_reason{carrier=%q} %d\n", cs.ID, gateReasonOrdinal(cs.GateReason))
+				fmt.Fprintf(&b, "carrier_health_cooldown_remaining_sec{carrier=%q} %d\n", cs.ID, cs.CooldownRemainingSec)
+				fmt.Fprintf(&b, "carrier_health_probe_bytes_today{carrier=%q} %d\n", cs.ID, cs.ProbeBytesToday)
+			}
+		}
+		m.mu.Unlock()
+	}
 	fmt.Fprintf(&b, "carrier_rebinds %d\n", s.CarrierRebinds)
 	fmt.Fprintf(&b, "carrier_rebind_failures %d\n", s.CarrierRebindFailures)
 	fmt.Fprintf(&b, "carrier_rebind_unknown_peer %d\n", s.RebindUnknownPeer)
@@ -492,6 +760,14 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "sessions_clean_complete %d\n", s.SessionsCleanComplete)
 	fmt.Fprintf(&b, "target_dial_success %d\n", s.TargetDialSuccess)
 	fmt.Fprintf(&b, "target_dial_failure %d\n", s.TargetDialFailure)
+	// Issue #20 / #21: stream-level negative ack + bootstrap-result counters.
+	fmt.Fprintf(&b, "stream_resets_received %d\n", s.StreamResetsReceived)
+	fmt.Fprintf(&b, "bootstrap_acks_received %d\n", s.BootstrapAcksReceived)
+	// up-carrier drop-storm fix (Part 4): the re-fire + dial-outcome counters.
+	fmt.Fprintf(&b, "up_newstream_refired_after_deregister %d\n", s.UpNewStreamRefiredAfterDeregister)
+	fmt.Fprintf(&b, "down_newstream_refired_after_deregister %d\n", s.DownNewStreamRefiredAfterDeregister)
+	fmt.Fprintf(&b, "target_dial_failure_breaker_open %d\n", s.TargetDialFailureBreakerOpen)
+	fmt.Fprintf(&b, "target_dial_failure_timeout %d\n", s.TargetDialFailureTimeout)
 	fmt.Fprintf(&b, "relay_bytes_read %d\n", s.RelayBytesRead)
 	fmt.Fprintf(&b, "relay_bytes_written %d\n", s.RelayBytesWritten)
 	fmt.Fprintf(&b, "relay_pending_high_bytes %d\n", s.RelayPendingHighBytes)
@@ -507,5 +783,10 @@ func (m *Metrics) Render() string {
 	fmt.Fprintf(&b, "session_close_reason{reason=\"timeout\"} %d\n", s.CloseReasonTimeout)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"data_undeliverable\"} %d\n", s.CloseReasonDataUndeliverable)
 	fmt.Fprintf(&b, "session_close_reason{reason=\"other\"} %d\n", s.CloseReasonOther)
+	fmt.Fprintf(&b, "relay_credit_emitted_total %d\n", s.RelayCreditEmittedTotal)
+	fmt.Fprintf(&b, "relay_credit_dropped_total %d\n", s.RelayCreditDroppedTotal)
+	fmt.Fprintf(&b, "relay_credit_gate_park_total %d\n", s.RelayCreditGateParkTotal)
+	fmt.Fprintf(&b, "relay_credit_sent_bytes_total %d\n", s.RelayCreditSentBytesTotal)
+	fmt.Fprintf(&b, "relay_credit_consumed_bytes_total %d\n", s.RelayCreditConsumedBytesTotal)
 	return b.String()
 }

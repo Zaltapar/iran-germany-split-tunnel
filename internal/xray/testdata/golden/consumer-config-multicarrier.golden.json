@@ -1,0 +1,100 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "error": "/var/log/split-tunnel/xray-consumer.error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "to-germany",
+      "listen": "127.0.0.1",
+      "port": 10802,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "to-germany-b",
+      "listen": "127.0.0.1",
+      "port": 10803,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "reality-germany",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "91.107.152.1",
+            "port": 443,
+            "users": [
+              {
+                "id": "123e4567-e89b-42d3-a456-426614174000",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.lovelive123.com:443",
+          "serverName": "www.lovelive123.com",
+          "publicKey": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+          "shortId": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "tag": "reality-germany-b",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "91.107.152.1",
+            "port": 2053,
+            "users": [
+              {
+                "id": "9f8e7d6c-5b4a-4321-9876-543210fedcba",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.example-sni-b.com:443",
+          "serverName": "www.example-sni-b.com",
+          "publicKey": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+          "shortId": "abcdef0123456789"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "to-germany"
+        ],
+        "outboundTag": "reality-germany"
+      },
+      {
+        "inboundTag": [
+          "to-germany-b"
+        ],
+        "outboundTag": "reality-germany-b"
+      }
+    ]
+  }
+}

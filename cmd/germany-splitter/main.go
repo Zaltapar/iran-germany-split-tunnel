@@ -18,9 +18,15 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/config"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/node"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/session"
 	"github.com/gorilla/websocket"
 )
+
+// buildInfo is stamped at build time by the reproducible build script
+// (scripts/build-linux.sh) via -ldflags "-X main.buildInfo=<git-commit>". It is
+// empty in local/dev builds. It carries only a non-secret build identity.
+var buildInfo = ""
 
 // ============================================================
 // WebSocket io.ReadWriteCloser adapter
@@ -88,9 +94,10 @@ type Splitter struct {
 	node   *node.Node
 	logger *log.Logger
 
-	lnMu   sync.Mutex
-	downLn net.Listener
-	mLn    net.Listener
+	lnMu    sync.Mutex
+	downLn  net.Listener
+	downLn2 net.Listener // second down instance (multi-carrier only, Phase 2)
+	mLn     net.Listener
 
 	// Down-carrier unauthenticated-handshake gate (Issue #5): a buffered
 	// semaphore bounding how many v1 handshakes may run concurrently on
@@ -116,14 +123,131 @@ type Splitter struct {
 func (s *Splitter) closeListeners() {
 	s.lnMu.Lock()
 	defer s.lnMu.Unlock()
-	for _, ln := range []net.Listener{s.downLn, s.mLn} {
+	for _, ln := range []net.Listener{s.downLn, s.downLn2, s.mLn} {
 		if ln != nil {
 			ln.Close()
 		}
 	}
 }
 
+// activeTargetAddrPolicy computes the ACTIVE egress-target address-family
+// policy for operator logging: the strictest of the legacy hard filter and
+// the enum, mirroring the precedence Config.Sanitize enforces at the
+// node. "ipv4-only" beats "prefer-ipv4", which beats "default".
+func activeTargetAddrPolicy(onlyIPv4 bool, policy string) string {
+	if onlyIPv4 || policy == "ipv4-only" {
+		return "ipv4-only"
+	}
+	if policy == "prefer-ipv4" {
+		return "prefer-ipv4"
+	}
+	return "default"
+}
+
+// downCarrierIDs returns the node's static down-carrier priority order for the
+// split node's constructor. Multi-carrier is always OFF in single-carrier
+// deployments (the default), so this returns the single-instance set; when
+// enabled it returns the two-instance set (primary first).
+func downCarrierIDs(cfg *config.Config) []node.CarrierID {
+	if cfg.MultiCarrierEnabled {
+		return []node.CarrierID{node.DefaultDownCarrierID, node.SecondDownCarrierID}
+	}
+	return []node.CarrierID{node.DefaultDownCarrierID}
+}
+
+// nodePolicyConfig maps the operator-configurable Phase 3 fields onto a copy of
+// the documented starting values (node.PolicyConfigDefaults). Only the knobs
+// exposed as environment variables are overridden; every other field keeps the
+// library default. The result is inert in single-carrier nodes: the policy
+// engine is only constructed when DownCarrierIDs has two or more entries.
+func nodePolicyConfig(cfg *config.Config) node.PolicyConfig {
+	pc := node.PolicyConfigDefaults()
+	pc.Mode = cfg.PolicyMode
+	pc.TopK = cfg.PolicyTopK
+	pc.ProbingEnabled = cfg.ProbingEnabled
+	pc.ProbeURL = cfg.ProbeURL
+	// 0 is the "disable the daily budget gate" sentinel; a non-negative value
+	// (bytes) is a hard cap. Negative values are rejected by config validation.
+	pc.ProbeDailyBudgetBytes = cfg.ProbeDailyBudget
+	if cfg.TTFBBaselineMs > 0 {
+		pc.TTFBBaseline = time.Duration(cfg.TTFBBaselineMs) * time.Millisecond
+	}
+	return pc
+}
+
+// buildRoutingEngine constructs the GERMANY OUTBOUND ROUTING ENGINE (§22)
+// from the operator's config. It loads and validates the rules file,
+// applies the SPLIT_ROUTING_DEFAULT override (when set) to the rules
+// file's default_action, and wires the "direct" outbound to the node's
+// policy-aware dial (byte-identical to the pre-routing dial).
+//
+// The returned engine's Dial method is the node's TargetDial when routing
+// is ON; when routing is OFF (RoutingRulesFile empty) this function is not
+// called and the node uses its default dial.
+func buildRoutingEngine(cfg *config.Config, logger *log.Logger) (*routing.Engine, error) {
+	rs, err := routing.LoadRulesFile(cfg.RoutingRulesFile)
+	if err != nil {
+		return nil, err
+	}
+	// SPLIT_ROUTING_DEFAULT, when explicitly set by the operator, OVERRIDES
+	// the rules file's default_action. When empty the rules file's value
+	// (lifted to "direct" by Sanitize when omitted) stands.
+	if cfg.RoutingDefault != "" {
+		rs.DefaultAction = cfg.RoutingDefault
+		// Re-validate after the override (the override must still be a
+		// legal default; "block" was already rejected by config.Load).
+		if err := rs.Sanitize(); err != nil {
+			return nil, fmt.Errorf("routing: default_action override %q: %w", cfg.RoutingDefault, err)
+		}
+	}
+
+	// The "direct" outbound is the node's policy-aware dial, built with the
+	// SAME merged flags Config.Sanitize derives, so routing ON keeps the
+	// pre-routing dial behavior byte-identical for direct/warp-fallback.
+	activePolicy := activeTargetAddrPolicy(cfg.TargetOnlyIPv4, cfg.TargetAddrPolicy)
+	var onlyIPv4, preferIPv4 bool
+	switch activePolicy {
+	case "ipv4-only":
+		onlyIPv4 = true
+	case "prefer-ipv4":
+		preferIPv4 = true
+	}
+	directDial := node.DefaultTargetDial(onlyIPv4, preferIPv4)
+
+	var debugSink func(format string, args ...any)
+	if cfg.RoutingDebug {
+		debugSink = logger.Printf
+	}
+
+	return routing.New(routing.Config{
+		Rules:        rs,
+		Direct:       directDial,
+		WARPAddr:     cfg.WarpSocksAddr,
+		DebugLogging: debugSink,
+	})
+}
+
+// secondListenSuffix renders the optional second down-carrier listener suffix
+// for the startup log line (empty when multi-carrier is disabled).
+func secondListenSuffix(cfg *config.Config) string {
+	if cfg.MultiCarrierEnabled {
+		return fmt.Sprintf(" | Down-carrier #2 (multi-carrier) listen: %s", cfg.DownListen2)
+	}
+	return ""
+}
+
 func main() {
+	// --version / -version: print the reproducible-build commit stamp
+	// (scripts/build-linux.sh embeds it via -X main.buildInfo). No other
+	// behavior changes; it exits before any listener or unit work.
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		commit := buildInfo
+		if commit == "" {
+			commit = "dev"
+		}
+		fmt.Println("germany-splitter buildInfo:", commit)
+		return
+	}
 	// Phase 8 (installer): `--validate-config` runs the Phase 7
 	// load→parse→validate→construct path and exits BEFORE any listener
 	// is opened or goroutine started. install.sh uses this as a
@@ -131,10 +255,39 @@ func main() {
 	// the systemd unit is written. No other argument is interpreted;
 	// normal startup is unchanged.
 	if len(os.Args) > 1 && os.Args[1] == "--validate-config" {
-		if _, err := config.Load(config.RoleGermany); err != nil {
+		vcfg, err := config.Load(config.RoleGermany)
+		if err != nil {
 			log.Fatalf("germany-splitter: %v", err)
 		}
 		log.Printf("germany-splitter: configuration OK (role: %s)", config.RoleGermany)
+		// Operator visibility for the opt-in egress-target address-family
+		// policy: surface it here so --validate-config reports the exact
+		// dial behavior the deployment will run with.
+		// Operator visibility for the egress-target address-family policy:
+		// surface the ACTIVE policy so --validate-config reports the exact
+		// dial behavior the deployment will run with. The active policy is
+		// the strictest set among the legacy hard filter and the enum.
+		activePolicy := activeTargetAddrPolicy(vcfg.TargetOnlyIPv4, vcfg.TargetAddrPolicy)
+		log.Printf("germany-splitter: target dial policy = %s (SPLIT_TARGET_ADDR_POLICY=%q, SPLIT_TARGET_ONLY_IPV4=%v)",
+			activePolicy, vcfg.TargetAddrPolicy, vcfg.TargetOnlyIPv4)
+		switch activePolicy {
+		case "ipv4-only":
+			log.Printf("germany-splitter: egress targets resolve to IPv4 (A) only; AAAA-only domains are refused, literal IPs dial as given (USE WITH CARE)")
+		case "prefer-ipv4":
+			log.Printf("germany-splitter: egress targets dial IPv4 first, fall back to IPv6 when no IPv4 candidate succeeds; AAAA-only domains still succeed; literal IPs dial as given")
+		default:
+			log.Printf("germany-splitter: egress targets use the default dual-stack dial (OS address-family preference)")
+		}
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): operator visibility.
+		// When ON the routing engine owns the egress TargetDial; when OFF
+		// the node's default policy dial is used (byte-identical to the
+		// no-routing build).
+		if vcfg.RoutingRulesFile != "" {
+			log.Printf("germany-splitter: outbound routing = ON (rules file %s; default=%q; WARP=%s; debug=%v)",
+				vcfg.RoutingRulesFile, vcfg.RoutingDefault, vcfg.WarpSocksAddr, vcfg.RoutingDebug)
+		} else {
+			log.Printf("germany-splitter: outbound routing = OFF (node default policy dial)")
+		}
 		return
 	}
 
@@ -147,7 +300,21 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "[germany-splitter] ", log.LstdFlags)
-	n := node.NewNode(node.Config{
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): when SPLIT_ROUTING_RULES_FILE
+	// is set, the routing engine owns the egress TargetDial (per-stream
+	// outbound selection: direct / warp / block, fail-closed by default).
+	// When unset, routingEngine is nil and the node's default policy dial
+	// is used — byte-identical to the no-routing build.
+	var routingEngine *routing.Engine
+	if cfg.RoutingRulesFile != "" {
+		routingEngine, err = buildRoutingEngine(cfg, logger)
+		if err != nil {
+			log.Fatalf("germany-splitter: routing engine: %v", err)
+		}
+	}
+
+	nodeCfg := node.Config{
 		Role:  node.RoleGermany,
 		Grace: time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		// Issue #7: bounded bootstrap wait for a temporarily down carrier
@@ -159,9 +326,89 @@ func main() {
 		SessionBufferTotalBytes: cfg.SessionBufTotal,
 		RelayBufSize:            cfg.RelayBufSize,
 		KeepAliveInterval:       cfg.KeepAliveInterval,
-		LivenessRounds:          cfg.LivenessRounds,
-		StreamLimits:            streamLimits(cfg),
-	}, logger, mux.DeriveSecret(cfg.Secret))
+		// Issue #19: kernel TCP keepalive probe period for the egress
+		// target sockets and the down-carrier TCP transport
+		// (SPLIT_TCP_KEEPALIVE_MS; default 30s, 0 disables).
+		TCPKeepAliveMs: cfg.TCPKeepAliveMs,
+		LivenessRounds: cfg.LivenessRounds,
+		StreamLimits:   streamLimits(cfg),
+		// Phase B: credit flow-control master flag (SPLIT_CREDITS_ENABLED).
+		CreditsEnabled: cfg.CreditsEnabled,
+		// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
+		// Set for both roles (keeps config symmetric; only the Germany
+		// role currently dials egress targets, so this is inert on Iran).
+		TargetOnlyIPv4: cfg.TargetOnlyIPv4,
+		// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+		// SUBTASK 42): "default" (today's behavior) | "prefer-ipv4" (v4-first
+		// with v6 fallback, recommended) | "ipv4-only" (hard filter).
+		TargetAddrPolicy: cfg.TargetAddrPolicy,
+		// up-carrier drop-storm fix (Parts 2 & 3): bounded target-dial ceiling
+		// + per-target dial-failure circuit breaker + jittered retry backoff.
+		// All ship default-OFF (zero/off), so the dial path is byte-identical
+		// to the pre-fix build unless the operator opts in. Germany is the role
+		// that actually dials egress targets; the governor is built for both
+		// roles for config symmetry and is inert on Iran.
+		TargetDialBoundedMs:     cfg.TargetDialBoundMs,
+		TargetBreakerEnabled:    cfg.TargetBreakerEnabled,
+		TargetBreakerWindowMs:   cfg.TargetBreakerWindowMs,
+		TargetBreakerThreshold:  cfg.TargetBreakerThreshold,
+		TargetBreakerCooldownMs: cfg.TargetBreakerCooldownMs,
+		TargetBreakerMaxTargets: cfg.TargetBreakerMaxTargets,
+		TargetBackoffEnabled:    cfg.TargetBackoffEnabled,
+		TargetBackoffBaseMs:     cfg.TargetBackoffBaseMs,
+		TargetBackoffMaxMs:      cfg.TargetBackoffMaxMs,
+		// Phase 2 multi-carrier down plane: when enabled, the node's down
+		// registry holds the static-priority two-instance set (primary first),
+		// which enables the v2 rebind wire and per-carrier pinning.
+		DownCarrierIDs: downCarrierIDs(cfg),
+		// Phase 3 carrier-intelligence policy (inert when single-carrier; the
+		// engine is constructed only when DownCarrierIDs has two or more
+		// entries). Operator-configurable fields override the documented
+		// starting values (node.PolicyConfigDefaults).
+		PolicyCfg: nodePolicyConfig(cfg),
+	}
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): when routing is ON the
+	// engine's Dial replaces the node's default TargetDial (the per-
+	// stream egress outbound selection: direct / warp / block). When
+	// OFF the node's default policy dial is used — byte-identical to
+	// the no-routing build.
+	if routingEngine != nil {
+		nodeCfg.TargetDial = routingEngine.Dial
+	}
+	n, err := node.NewNode(nodeCfg, logger, mux.DeriveSecret(cfg.Secret))
+	if err != nil {
+		log.Fatalf("germany-splitter: node construction: %v", err)
+	}
+	// Phase 3: start the 10 s policy evaluation ticker. No-op when the node
+	// is single-carrier (n.policy is nil).
+	n.StartPolicyTicker()
+	// Startup guardrail: one line making the ACTIVE egress-target
+	// address-family policy explicit in the operator's log, matching the
+	// other startup config lines below.
+	activePolicy := activeTargetAddrPolicy(cfg.TargetOnlyIPv4, cfg.TargetAddrPolicy)
+	switch activePolicy {
+	case "ipv4-only":
+		logger.Printf("target dial policy: IPv4-only active — domains resolve to A records; AAAA-only domains REFUSED (use with care)")
+	case "prefer-ipv4":
+		logger.Printf("target dial policy: prefer-IPv4 active — domains dial v4 first, fall back to v6 when no v4 candidate succeeds; AAAA-only domains still succeed")
+	default:
+		logger.Printf("target dial policy: default dual-stack dial (OS address-family preference)")
+	}
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22): operator visibility for the
+	// routing status. When ON, the per-stream egress outbound is selected
+	// by the routing engine (direct / warp / block); when OFF the node's
+	// default policy dial is used. The destination is logged ONLY when
+	// SPLIT_ROUTING_DEBUG is on.
+	if routingEngine != nil {
+		logger.Printf("outbound routing: ON (%d rule(s)) | default outbound=%q | WARP=%s | debug=%v",
+			len(routingEngine.Rules().Rules),
+			routingEngine.Rules().DefaultAction,
+			cfg.WarpSocksAddr,
+			cfg.RoutingDebug)
+	} else {
+		logger.Printf("outbound routing: OFF (node default policy dial)")
+	}
 
 	s := &Splitter{
 		config: cfg,
@@ -190,7 +437,18 @@ func main() {
 	wg.Add(1)
 	go func() { defer wg.Done(); s.runDownCarrier() }()
 
-	s.logger.Printf("Up-carrier (WS) dial: %s | Down-carrier (TCP) listen: %s", cfg.UpWsUrl, cfg.DownListen)
+	// Phase 2 multi-carrier: when enabled, a SECOND down-carrier instance
+	// listens on DownListen2 and is installed under the secondary CarrierID
+	// (down-reality-b). The primary instance above keeps its DownReady()
+	// rejection untouched; the secondary gates on its own instance.
+	if cfg.MultiCarrierEnabled {
+		s.logger.Printf("Down-carrier #2 (multi-carrier) listen: %s", cfg.DownListen2)
+		wg.Add(1)
+		go func() { defer wg.Done(); s.runDownCarrier2() }()
+	}
+
+	s.logger.Printf("Up-carrier (WS) dial: %s | Down-carrier (TCP) listen: %s%s",
+		cfg.UpWsUrl, cfg.DownListen, secondListenSuffix(cfg))
 	s.logger.Println("germany-splitter started")
 
 	<-sigCh
@@ -220,30 +478,43 @@ func streamLimits(cfg *config.Config) mux.StreamLimits {
 
 // ============================================================
 // Up-Carrier: WebSocket client → wss://<cdn-domain>/upload
-// Reconnect loop with internal/backoff (2s → 60s, jittered, reset on
-// a successfully authenticated carrier; shutdown-cancellable via the
-// node context).
+// Reconnect loop with a configurable, bounded internal/backoff schedule
+// (exponential base → cap, plus a cumulative reconnect window so a brief
+// underlay blip cannot amplify into a multi-minute outage; jittered, reset
+// on a successfully authenticated carrier; shutdown-cancellable via the node
+// context). See docs/carrier-reconnect-backoff.md.
 // ============================================================
 
-// runUpCarrier is the reconnect loop (exponential backoff, reset on a
-// successfully authenticated carrier, shutdown-cancellable). Each
-// iteration runs one full connection attempt via runUpCarrierOnce.
+// runUpCarrier is the reconnect loop (bounded exponential backoff, reset on
+// a successfully authenticated carrier, shutdown-cancellable). Each
+// iteration runs one full connection attempt via runUpCarrierOnce. The
+// schedule is built from config (the SPLIT_RECONNECT_* knobs) via
+// reconnectBackoff; once the cumulative reconnect window is exhausted the
+// carrier is probed at the per-attempt clamp cadence.
 func (s *Splitter) runUpCarrier() {
-	b := backoff.New(2*time.Second, 60*time.Second)
+	b := s.reconnectBackoff()
+	windowExhaustedLogged := false
 	for {
 		if s.node.Shutdown() {
 			return
 		}
 		err := s.runUpCarrierOnce(s.config.UpWsUrl)
 		if err != nil {
+			if b.WindowExhausted() && !windowExhaustedLogged {
+				s.logger.Printf("Up-carrier reconnect window exhausted; probing every %v",
+					time.Duration(s.config.ReconnectClampMs)*time.Millisecond)
+				windowExhaustedLogged = true
+			}
 			if s.backoffSleep(b) {
 				return
 			}
 			continue
 		}
 		// A full authenticated carrier session ran (or was torn down
-		// after installing): reset the backoff and reconnect.
+		// after installing): reset the backoff and reconnect. A fresh
+		// failure episode restarts the (new) reconnect window.
 		b.Reset()
+		windowExhaustedLogged = false
 		if s.backoffSleep(b) {
 			return
 		}
@@ -287,6 +558,20 @@ func (s *Splitter) runUpCarrierOnce(url string) error {
 	return nil
 }
 
+// reconnectBackoff builds the carrier reconnect schedule from config:
+// exponential base → max, with the cumulative reconnect window bounded so a
+// transient underlay failure cannot amplify into a multi-minute outage.
+// The old hardcoded 2s→60s schedule summed to 122s across six attempts.
+// See docs/carrier-reconnect-backoff.md.
+func (s *Splitter) reconnectBackoff() *backoff.Backoff {
+	return backoff.NewBounded(
+		time.Duration(s.config.ReconnectBaseMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectMaxMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectWindowMs)*time.Millisecond,
+		time.Duration(s.config.ReconnectClampMs)*time.Millisecond,
+	)
+}
+
 // backoffSleep waits for the next jittered delay; returns true when the
 // node is shutting down and the loop must stop.
 func (s *Splitter) backoffSleep(b *backoff.Backoff) bool {
@@ -322,31 +607,69 @@ const maxDownHandshakes = 16
 // unthrottled log would itself become a resource-exhaustion vector.
 const downAuthLogInterval = time.Second
 
-// runDownCarrier is the down-carrier accept loop. It gates each accepted
-// connection through a non-blocking handshake semaphore (maxDownHandshakes)
-// BEFORE spawning a handler: the gate is acquired in the accept loop and is
-// never blocked on, so saturation closes the connection immediately without
-// consuming an auth goroutine and the accept loop itself stays responsive.
-func (s *Splitter) runDownCarrier() {
-	ln := s.downLn // may be pre-configured (tests); production leaves it nil
+// runDownCarrier is the PRIMARY down-carrier accept loop (D1 instance A).
+// Phase 2 multi-carrier keeps this loop byte-for-byte for the single-
+// carrier case; a second instance runs on runDownCarrier2 when enabled.
+func (s *Splitter) runDownCarrier() { s.runDownInstance(false) }
+
+// runDownCarrier2 is the SECOND down-carrier accept loop (D1 instance B,
+// D3: listens on DownListen2 with the second instance's SNI).
+func (s *Splitter) runDownCarrier2() { s.runDownInstance(true) }
+
+// runDownInstance is the down-carrier accept loop for one named instance.
+// It gates each accepted connection through a non-blocking handshake
+// semaphore (maxDownHandshakes) BEFORE spawning a handler: the gate is
+// acquired in the accept loop and is never blocked on, so saturation closes
+// the connection immediately without consuming an auth goroutine and the
+// accept loop itself stays responsive.
+func (s *Splitter) runDownInstance(secondary bool) {
+	// Which named instance this loop serves.
+	var id node.CarrierID
+	listen := s.config.DownListen
+	var ln net.Listener
+	if secondary {
+		id = s.node.SecondaryDownCarrierID()
+		listen = s.config.DownListen2
+		ln = s.downLn2
+	} else {
+		ids := s.node.DownCarrierIDs()
+		id = ids[0]   // primary (index 0 = static priority)
+		ln = s.downLn // may be pre-configured (tests); production leaves it nil
+	}
 	if ln == nil {
 		var err error
-		ln, err = net.Listen("tcp", s.config.DownListen)
+		ln, err = net.Listen("tcp", listen)
 		if err != nil {
 			s.logger.Fatalf("Down-carrier listener: %v", err)
 		}
-		s.lnMu.Lock()
-		s.downLn = ln
-		s.lnMu.Unlock()
+		if secondary {
+			s.downLn2 = ln
+		} else {
+			s.lnMu.Lock()
+			s.downLn = ln
+			s.lnMu.Unlock()
+		}
 	}
 	defer ln.Close()
+	// Section 7 / Issue #12: the down-carrier listener default is
+	// loopback (127.0.0.1:9002), reached only via the local VLESS+Reality
+	// Xray inbound. An operator who explicitly configured a NON-loopback
+	// bind exposes the auth endpoint beyond localhost; warn once so the
+	// intent is visible in the journal. Non-loopback binds remain fully
+	// supported — this is an advisory, not a refusal.
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+		if ip := ta.IP; ip != nil && !ip.IsLoopback() {
+			s.logger.Printf("Down-carrier %s: NON-LOOPBACK bind %s — the auth endpoint is reachable beyond localhost; confirm your firewall blocks direct inbound (only the Reality tunnel should reach it)",
+				id, ln.Addr().String())
+		}
+	}
 	// The gate is normally created by the spawning goroutine (see main),
 	// so its field write happens-before the accept loop reads it. Only
 	// create it here if the caller (a test) did not pre-create one.
 	if s.downAuthGate == nil {
 		s.downAuthGate = make(chan struct{}, maxDownHandshakes)
 	}
-	s.logger.Printf("Down-carrier listening on %s (max %d concurrent handshakes)", ln.Addr(), cap(s.downAuthGate))
+	s.logger.Printf("Down-carrier instance %s listening on %s (max %d concurrent handshakes)", id, ln.Addr(), cap(s.downAuthGate))
 	var lastSatLog time.Time
 	for {
 		conn, err := ln.Accept()
@@ -354,44 +677,47 @@ func (s *Splitter) runDownCarrier() {
 			return
 		}
 		// Gate the UNAUTHENTICATED handshake. The slot is held only while
-		// the connection is unauthenticated (handleDownConn releases it as
-		// soon as auth completes or fails), so a long-lived installed
+		// the connection is unauthenticated (handleDownConnOn releases it
+		// as soon as auth completes or fails), so a long-lived installed
 		// carrier never occupies a slot and a legitimate reconnect can
-		// never be starved by the gate: a legit carrier can only begin
-		// authenticating when DownReady() is false, i.e. when no carrier
-		// is installed holding a slot.
+		// never be starved by the gate.
 		select {
 		case s.downAuthGate <- struct{}{}:
 			s.downH.Add(1)
-			go s.handleDownConn(conn, func() { <-s.downAuthGate })
+			go s.handleDownConnOn(id, conn, func() { <-s.downAuthGate })
 		default:
 			// Saturated: close promptly. Rate-limited log (the TCP
 			// analogue of the WS endpoint's 429/503 backoff).
 			now := time.Now()
 			if now.Sub(lastSatLog) >= downAuthLogInterval {
 				lastSatLog = now
-				s.logger.Printf("Down-carrier: rejected %s (max %d concurrent handshakes)", conn.RemoteAddr(), cap(s.downAuthGate))
+				s.logger.Printf("Down-carrier %s: rejected %s (max %d concurrent handshakes)", id, conn.RemoteAddr(), cap(s.downAuthGate))
 			}
 			conn.Close()
 		}
 	}
 }
 
-// handleDownConn processes one accepted down-carrier connection: the
-// single-carrier DownReady() check, the bounded v1 authentication
-// handshake, and installation of the authenticated carrier on the node.
-// releaseSlot frees the accept-loop handshake slot; it is invoked exactly
-// once per connection, as soon as the connection is no longer
-// unauthenticated (auth success or failure) so the installed carrier holds
-// no slot.
-func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
+// handleDownConnOn processes one accepted down-carrier connection for the
+// named instance id: the per-instance ready check, the bounded v1
+// authentication handshake, and installation of the authenticated carrier on
+// the node under id. releaseSlot frees the accept-loop handshake slot; it is
+// invoked exactly once per connection, as soon as the connection is no
+// longer unauthenticated (auth success or failure) so the installed carrier
+// holds no slot.
+//
+// In single-carrier mode (multi-carrier disabled) DownCarrierReady(id) is
+// the unchanged DownReady() rule: a second connection is rejected once a
+// carrier is installed. In multi-carrier mode each instance gates on its
+// OWN slot, so a live primary never rejects a connection to the secondary
+// listener (and vice versa) — only a duplicate connection to the same
+// instance is rejected.
+func (s *Splitter) handleDownConnOn(id node.CarrierID, conn net.Conn, releaseSlot func()) {
 	defer s.downH.Done()
 
-	// Only one down-carrier at a time — reject secondaries cleanly
-	// (the node's DownReady() reports whether one is installed).
-	if s.node.DownReady() {
+	if s.node.DownCarrierReady(id) {
 		releaseSlot()
-		s.logger.Printf("Down-carrier: rejected %s (already connected)", conn.RemoteAddr())
+		s.logger.Printf("Down-carrier %s: rejected %s (instance already connected)", id, conn.RemoteAddr())
 		conn.Close()
 		return
 	}
@@ -403,15 +729,25 @@ func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
 	// handshake slot. The carrier must not keep it for its lifetime.
 	releaseSlot()
 	if err != nil {
-		s.logger.Printf("Down-carrier auth failed from %s: %v", conn.RemoteAddr(), err)
+		s.logger.Printf("Down-carrier %s auth failed from %s: %v", id, conn.RemoteAddr(), err)
 		conn.Close()
 		return
 	}
-	s.logger.Printf("Down-carrier authenticated from %s", conn.RemoteAddr())
+	s.logger.Printf("Down-carrier %s authenticated from %s", id, conn.RemoteAddr())
 
-	h := s.node.InstallDown(conn, br)
+	h, err := s.node.InstallDownOn(id, conn, br)
+	if err != nil {
+		s.logger.Printf("Down-carrier %s install failed from %s: %v", id, conn.RemoteAddr(), err)
+		return
+	}
 	<-h.Done()
-	s.logger.Printf("Down-carrier torn down (waiting for reconnect)")
+	s.logger.Printf("Down-carrier %s torn down (waiting for reconnect)", id)
+}
+
+// handleDownConn is the primary-instance entry point kept for tests that
+// call it directly. It installs under the primary CarrierID.
+func (s *Splitter) handleDownConn(conn net.Conn, releaseSlot func()) {
+	s.handleDownConnOn(s.node.DownCarrierIDs()[0], conn, releaseSlot)
 }
 
 // ============================================================

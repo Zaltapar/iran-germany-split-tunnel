@@ -282,18 +282,43 @@ func (a *Attachment) startTimerLocked() {
 // FrameRebind payload codec (versioned)
 // ============================================================
 //
+// v1 (Phase 5, single-carrier):
+//
 //	[0]     RebindVersion (1)
 //	[1:17]  SessionID (16 bytes)
 //	[17:25] sender carrier generation (uint64, big-endian)
+//
+// v2 (Phase 2, multi-carrier; decision D9): adds the CARRIER ID the stream
+// is being (re)attached to, so a receiver with several down carriers knows
+// exactly which registry slot to attach to. Explicit negotiation: a
+// single-carrier peer sends v1 (unchanged bytes); a multi-carrier peer sends
+// v2. A receiver decodes BOTH, so a v1 peer keeps working against a v2
+// receiver and vice-versa. v2 layout:
+//
+//	[0]     RebindVersionV2 (2)
+//	[1:17]  SessionID (16 bytes)
+//	[17]    carrierIDLen (uint8, 0..RebindMaxCarrierIDLen)
+//	[18]    carrierID (carrierIDLen bytes, a stable non-secret id)
+//	[...]:   sender carrier generation (uint64, big-endian)
 
-// RebindVersion is the current FrameRebind payload version.
+// RebindVersion is the v1 FrameRebind payload version (single-carrier).
 const RebindVersion = 1
 
-// RebindPayloadSize is the exact FrameRebind payload length.
+// RebindVersionV2 is the v2 FrameRebind payload version (multi-carrier, D9).
+// It carries the transport's CarrierID so a receiver holding several down
+// carriers can route the rebind to the correct slot.
+const RebindVersionV2 = 2
+
+// RebindPayloadSize is the exact v1 FrameRebind payload length.
 const RebindPayloadSize = 1 + SessionIDLen + 8
 
-// EncodeRebind builds a FrameRebind payload for the session with the
-// given sender carrier generation.
+// RebindMaxCarrierIDLen bounds the v2 carrier-id field (a stable, non-secret
+// identifier; 32 chars is ample for "<direction>.<family>.<instance>").
+const RebindMaxCarrierIDLen = 32
+
+// EncodeRebind builds a v1 FrameRebind payload for the session with the
+// given sender carrier generation (the single-carrier wire, byte-identical
+// to the pre-Phase-2 build).
 func EncodeRebind(sid SessionID, gen uint64) []byte {
 	b := make([]byte, RebindPayloadSize)
 	b[0] = RebindVersion
@@ -302,8 +327,36 @@ func EncodeRebind(sid SessionID, gen uint64) []byte {
 	return b
 }
 
-// ParseRebind validates and decodes a FrameRebind payload. It returns
-// ok=false for wrong size or unknown version — receivers must drop the
+// EncodeRebindV2 builds a v2 FrameRebind payload naming the target carrier.
+// carrierID is a stable, non-secret identifier bounded by
+// RebindMaxCarrierIDLen; a longer value is truncated to the bound (it still
+// must be unique within the bound for the peer to resolve it).
+func EncodeRebindV2(sid SessionID, carrierID string, gen uint64) []byte {
+	if len(carrierID) > RebindMaxCarrierIDLen {
+		carrierID = carrierID[:RebindMaxCarrierIDLen]
+	}
+	n := len(carrierID)
+	b := make([]byte, 1+SessionIDLen+1+n+8)
+	b[0] = RebindVersionV2
+	copy(b[1:], sid[:])
+	b[1+SessionIDLen] = byte(n)
+	copy(b[2+SessionIDLen:], carrierID)
+	binary.BigEndian.PutUint64(b[2+SessionIDLen+n:], gen)
+	return b
+}
+
+// Rebind is a decoded FrameRebind payload (either version).
+type Rebind struct {
+	Version   byte
+	SessionID SessionID
+	// CarrierID is empty for a v1 payload (single-carrier) and the target
+	// carrier for a v2 payload.
+	CarrierID string
+	Gen       uint64
+}
+
+// ParseRebind validates and decodes a v1 FrameRebind payload. It returns
+// ok=false for wrong size or a non-v1 version — receivers must drop the
 // rebind (and log) when ok is false.
 func ParseRebind(payload []byte) (sid SessionID, gen uint64, ok bool) {
 	if len(payload) != RebindPayloadSize || payload[0] != RebindVersion {
@@ -312,4 +365,41 @@ func ParseRebind(payload []byte) (sid SessionID, gen uint64, ok bool) {
 	copy(sid[:], payload[1:1+SessionIDLen])
 	gen = binary.BigEndian.Uint64(payload[1+SessionIDLen:])
 	return sid, gen, true
+}
+
+// ParseRebindAny decodes a v1 OR v2 FrameRebind payload. It returns ok=false
+// for a wrong size, a malformed carrier-id length, or an unknown version.
+// For a v1 payload, CarrierID is "" (the single-carrier default).
+func ParseRebindAny(payload []byte) (Rebind, bool) {
+	if len(payload) == 0 {
+		return Rebind{}, false
+	}
+	switch payload[0] {
+	case RebindVersion:
+		if len(payload) != RebindPayloadSize {
+			return Rebind{}, false
+		}
+		var sid SessionID
+		copy(sid[:], payload[1:1+SessionIDLen])
+		gen := binary.BigEndian.Uint64(payload[1+SessionIDLen:])
+		return Rebind{Version: RebindVersion, SessionID: sid, Gen: gen}, true
+	case RebindVersionV2:
+		if len(payload) < 1+SessionIDLen+1 {
+			return Rebind{}, false
+		}
+		idLen := int(payload[1+SessionIDLen])
+		if idLen > RebindMaxCarrierIDLen {
+			return Rebind{}, false
+		}
+		if len(payload) != 1+SessionIDLen+1+idLen+8 {
+			return Rebind{}, false
+		}
+		var sid SessionID
+		copy(sid[:], payload[1:1+SessionIDLen])
+		carrierID := string(payload[2+SessionIDLen : 2+SessionIDLen+idLen])
+		gen := binary.BigEndian.Uint64(payload[2+SessionIDLen+idLen:])
+		return Rebind{Version: RebindVersionV2, SessionID: sid, CarrierID: carrierID, Gen: gen}, true
+	default:
+		return Rebind{}, false
+	}
 }

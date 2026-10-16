@@ -19,6 +19,77 @@ resolved and recorded.
 Latest recorded implementation commit: `2927f847` (historical T8-B M5
 record; not the current remote tip)
 
+## Bounded carrier reconnect window — 2026-10-14
+
+The carrier reconnect loop amplified a brief underlay/egress blip into a
+~2-minute user-visible outage (2026-10-13, 01:29–01:31 Iran time). Root
+cause: the reconnect backoff was hardcoded as
+[`backoff.New(2*time.Second, 60*time.Second)`](internal/backoff/backoff.go)
+in both roles (Germany up-carrier WS→CDN dial loop, Iran down-carrier TCP→Xray
+dial loop). With base 2s / cap 60s, six consecutive failed attempts slept a
+cumulative **2+4+8+16+32+60 = 122 seconds** in the worst case, so after the
+underlay recovered the loop was still sitting in a 60-second sleep and the
+carrier was not re-probed for up to a further 60s.
+
+The fix adds a **bounded cumulative reconnect window** to
+[`internal/backoff`](internal/backoff/backoff.go):
+
+- `NewBounded(base, max, window, clamp)` — new constructor. The cumulative
+  NOMINAL delay within one failure episode is bounded by `window`; once
+  reached, every further delay is clamped to `clamp` (itself capped at
+  `max`). `New(base, max)` now delegates to `NewBounded(base, max, 0, 0)` —
+  the pre-fix pure-exponential behavior is byte-for-byte unchanged.
+- `Reset()` zeroes both the attempt counter and the cumulative window; a
+  fresh failure episode gets a fresh window.
+- `WindowExhausted()` reports the bound state (used for logging/tests).
+- Jitter is unchanged: `Sleep()` still maps the delay into `[d/2, d]`, so
+  the cap stays a real cap (no reconnect storm, no busy-loop).
+
+Four new operator tunables, wired in the role-agnostic part of
+[`config.Load()`](internal/config/config.go) for **both roles** (both hosts
+run a reconnect loop):
+
+| Env var | Default | min | max |
+|---|---|---|---|
+| `SPLIT_RECONNECT_BASE_MS` | `1000` | `100` | `60000` |
+| `SPLIT_RECONNECT_MAX_MS` | `10000` | `100` | `300000` |
+| `SPLIT_RECONNECT_WINDOW_MS` | `30000` | `0` | `600000` |
+| `SPLIT_RECONNECT_CLAMP_MS` | `2000` | `0` | `300000` |
+
+Delivered through the existing `EnvironmentFile=` entries
+(`/etc/split-tunnel/germany.env`, `/etc/split-tunnel/iran.env`) — no unit
+file change. Setting `SPLIT_RECONNECT_WINDOW_MS=0` or
+`SPLIT_RECONNECT_CLAMP_MS=0` restores the pre-fix pure exponential
+schedule (escape hatch).
+
+Each binary gains a `reconnectBackoff()` helper (reads the four `Config`
+fields, returns `backoff.NewBounded(...)`) and logs
+`"reconnect window exhausted; probing every <clamp>"` **once per failure
+episode** (per-loop bool, cleared on `b.Reset()`) so operators can see it in
+the journal without spam.
+
+With the defaults the nominal schedule is `1, 2, 4, 8, 10, 10` (cumulative
+35 ≥ 30 → window exhausted at the 6th attempt) then `2, 2, 2, ...` —
+worst-case cumulative sleep to the 7th attempt ≈ **35s** vs **122s** before
+the fix. Full operator documentation, the schedule arithmetic, and the
+`journalctl` command for confirming a reconnect storm:
+[`docs/carrier-reconnect-backoff.md`](docs/carrier-reconnect-backoff.md).
+
+New tests in [`internal/backoff/backoff_test.go`](internal/backoff/backoff_test.go):
+`TestWindowClamp`, `TestNewBoundedDisabledIsPureExponential`,
+`TestNewDelegatesToNewBounded`, `TestResetZeroesWindow`,
+`TestWindowExhaustedFlips`, `TestClampCappedAtMax`,
+`TestSleepBoundedByClampAfterWindow` (small-duration `Sleep` bounds with the
+existing `TestSleepJitterBounds` wall-clock tolerance convention). All
+pre-existing tests pass unmodified.
+
+### Verification
+
+- `gofmt -l .` — clean.
+- `go vet ./...` — clean.
+- `go build ./...` — green.
+- `go test ./...` — green (all packages).
+
 ## Iran2/3xui investigation, DNS-only Reality hostname, durable TCP matrices, and nftables calibration — 2026-09-23
 
 Sanitized final operational evidence from the Iran2/3xui investigation, the

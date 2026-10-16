@@ -30,7 +30,11 @@ func newTopoLiveness(t *testing.T) *topo {
 		RelayBufSize: 4096, BufferBytes: 64 << 10,
 		KeepAliveInterval: 10 * time.Millisecond, LivenessRounds: 3,
 	}
-	iran := node.NewNode(iranCfg, discardLogger("IRAN "), secret)
+	var err error
+	iran, err := node.NewNode(iranCfg, discardLogger("IRAN "), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tp := &topo{t: t, secret: secret}
 	deCfg := node.Config{
 		Role: node.RoleGermany, Grace: grace,
@@ -49,7 +53,10 @@ func newTopoLiveness(t *testing.T) *topo {
 			return c, nil
 		},
 	}
-	de := node.NewNode(deCfg, discardLogger("DE   "), secret)
+	de, err := node.NewNode(deCfg, discardLogger("DE   "), secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tp.iran = iran
 	tp.de = de
 	t.Cleanup(func() {

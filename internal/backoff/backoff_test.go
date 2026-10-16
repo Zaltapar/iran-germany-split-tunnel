@@ -102,3 +102,211 @@ func TestSleepRespectsCtxAlreadyDone(t *testing.T) {
 		t.Fatal("Sleep with pre-cancelled ctx blocked")
 	}
 }
+
+// TestWindowClamp verifies the bounded reconnect window: base 1s / cap 10s /
+// window 30s / clamp 2s yields nominal delays 1, 2, 4, 8, 10, 10 (the
+// cumulative reaches 35 >= 30 here) and then clamps to 2, 2, 2, ... so the
+// carrier keeps being retried at the clamp cadence once the outage outlives
+// the window.
+func TestWindowClamp(t *testing.T) {
+	b := NewBounded(time.Second, 10*time.Second, 30*time.Second, 2*time.Second)
+	want := []time.Duration{1, 2, 4, 8, 10, 10, 2, 2, 2, 2}
+	for i, w := range want {
+		if got := b.Next(); got != w*time.Second {
+			t.Fatalf("Next() #%d = %v, want %v", i+1, got, w*time.Second)
+		}
+	}
+}
+
+// TestNewBoundedDisabledIsPureExponential proves the pre-fix pure-exponential
+// behavior is reachable: window=0, or clamp=0, disables the bound and the
+// schedule is byte-for-byte the exponential-doubling-with-cap form.
+func TestNewBoundedDisabledIsPureExponential(t *testing.T) {
+	want := []time.Duration{1, 2, 4, 8, 10, 10}
+	for name, bb := range map[string]*Backoff{
+		"window=0":       NewBounded(time.Second, 10*time.Second, 0, 0),
+		"clamp=0":        NewBounded(time.Second, 10*time.Second, 30*time.Second, 0),
+		"window=0,clamp": NewBounded(time.Second, 10*time.Second, 0, 2*time.Second),
+	} {
+		for i, w := range want {
+			if got := bb.Next(); got != w*time.Second {
+				t.Fatalf("%s: Next() #%d = %v, want %v", name, i+1, got, w*time.Second)
+			}
+		}
+	}
+}
+
+// TestNewDelegatesToNewBounded proves New(base, max) is NewBounded(base, max,
+// 0, 0): the pre-fix constructor's behavior is unchanged.
+func TestNewDelegatesToNewBounded(t *testing.T) {
+	want := []time.Duration{2, 4, 8, 16, 32, 60, 60}
+	b := New(2*time.Second, 60*time.Second)
+	for i, w := range want {
+		if got := b.Next(); got != w*time.Second {
+			t.Fatalf("New Next() #%d = %v, want %v", i+1, got, w*time.Second)
+		}
+	}
+}
+
+// TestResetZeroesWindow verifies a successful carrier establishment (Reset)
+// zeroes BOTH the attempt counter and the cumulative window, so a fresh
+// failure episode gets a full new reconnect window.
+func TestResetZeroesWindow(t *testing.T) {
+	b := NewBounded(time.Second, 10*time.Second, 30*time.Second, 2*time.Second)
+	for i := 0; i < 6; i++ {
+		b.Next()
+	}
+	if !b.WindowExhausted() {
+		t.Fatalf("WindowExhausted = false, want true after six Next() calls (cumulative 35 >= 30)")
+	}
+	if b.Attempts() != 6 {
+		t.Fatalf("Attempts = %d, want 6", b.Attempts())
+	}
+	b.Reset()
+	if b.Attempts() != 0 {
+		t.Fatalf("Attempts after Reset = %d, want 0", b.Attempts())
+	}
+	if got := b.Next(); got != time.Second {
+		t.Fatalf("Next after Reset = %v, want 1s", got)
+	}
+	if b.WindowExhausted() {
+		t.Fatalf("WindowExhausted after Reset = true, want false (window restarted)")
+	}
+}
+
+// TestWindowExhaustedFlips verifies WindowExhausted() is false until the
+// cumulative nominal delay reaches the window (here after the 6th call), true
+// thereafter, and always false when the bound is disabled.
+func TestWindowExhaustedFlips(t *testing.T) {
+	b := NewBounded(time.Second, 10*time.Second, 30*time.Second, 2*time.Second)
+	for i := 0; i < 5; i++ {
+		b.Next()
+	}
+	if b.WindowExhausted() {
+		t.Fatalf("WindowExhausted after five Next() calls = true, want false (cumulative 25 < 30)")
+	}
+	b.Next() // sixth: cumulative 35 >= 30
+	if !b.WindowExhausted() {
+		t.Fatalf("WindowExhausted after six Next() calls = false, want true (cumulative 35 >= 30)")
+	}
+
+	// Disabled bound: window present but clamp=0 — never exhausted.
+	b2 := NewBounded(time.Second, 10*time.Second, 30*time.Second, 0)
+	for i := 0; i < 20; i++ {
+		b2.Next()
+	}
+	if b2.WindowExhausted() {
+		t.Fatalf("disabled bound (clamp=0) reported WindowExhausted, want false")
+	}
+}
+
+// TestClampCappedAtMax verifies a clamp requested above the cap is capped at
+// max: even with a huge clamp, no Next() delay ever exceeds max once the
+// window is exhausted (the cap stays a real cap).
+func TestClampCappedAtMax(t *testing.T) {
+	b := NewBounded(time.Second, 10*time.Second, 30*time.Second, 100*time.Second)
+	for i := 0; i < 10; i++ {
+		if got := b.Next(); got > 10*time.Second {
+			t.Fatalf("Next() #%d = %v, exceeds cap 10s (clamp must be capped at max)", i+1, got)
+		}
+	}
+}
+
+// TestSleepBoundedByClampAfterWindow verifies that once the window is
+// exhausted, each jittered Sleep() is bounded by the per-attempt clamp. The
+// wall-clock tolerance mirrors TestSleepJitterBounds (the jitter is
+// inclusive of the clamp, so measuring exactly-the-clamp on a loaded host can
+// overshoot a few milliseconds; a 2x regression would still fail).
+func TestSleepBoundedByClampAfterWindow(t *testing.T) {
+	const (
+		base, max, window = 10 * time.Millisecond, 40 * time.Millisecond, 100 * time.Millisecond
+		clamp             = 20 * time.Millisecond
+		// tolerance: wall-clock measurement error for a timer whose
+		// legitimate worst case is exactly the clamp.
+		tolerance = 20 * time.Millisecond
+	)
+	b := NewBounded(base, max, window, clamp)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Burn through the nominal window: the first four Next() calls push the
+	// cumulative nominal delay to 10+20+40+40 = 110ms >= 100ms window.
+	for i := 0; i < 4; i++ {
+		b.Next()
+	}
+	if !b.WindowExhausted() {
+		t.Fatalf("WindowExhausted = false, want true after four Next() calls")
+	}
+	// Every subsequent sleep is clamped to 20ms (jitter [10ms, 20ms]).
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		if err := b.Sleep(ctx); err != nil {
+			t.Fatalf("Sleep #%d: %v", i+1, err)
+		}
+		elapsed := time.Since(start)
+		if elapsed > clamp+tolerance {
+			t.Fatalf("Sleep #%d returned after %v, clamp 20ms (+%v tolerance) violated", i+1, elapsed, tolerance)
+		}
+		if elapsed < clamp/2-5*time.Millisecond {
+			t.Fatalf("Sleep #%d returned after %v, jitter lower bound ~10ms violated", i+1, elapsed)
+		}
+	}
+}
+
+// TestWindowThresholdSemanticsExactAndOvershoot verifies that window acts as a
+// pre-attempt cumulative threshold (b.slept >= b.window), NOT a hard cap that
+// truncates the attempt crossing the boundary:
+//   - Case A (exact boundary hit): base=5s, max=10s, window=15s, clamp=2s.
+//     Attempt 1 -> 5s (slept=5 < 15, not exhausted).
+//     Attempt 2 -> 10s (slept before call is 5 < 15, so full 10s is returned;
+//     slept after call is 15 == window, so WindowExhausted() is now true).
+//     Attempt 3 -> clamped to 2s.
+//   - Case B (clamp > scheduled d after window exhausted): base=2s, max=10s,
+//     window=1s, clamp=5s. Attempt 1 -> 2s (slept=2 >= 1). Attempt 2 has
+//     scheduled d=4s < clamp=5s, so it returns 4s (clamp never inflates d).
+//     Attempt 3 has scheduled d=8s > clamp=5s, so it clamps to 5s.
+func TestWindowThresholdSemanticsExactAndOvershoot(t *testing.T) {
+	bExact := NewBounded(5*time.Second, 10*time.Second, 15*time.Second, 2*time.Second)
+	if got := bExact.Next(); got != 5*time.Second || bExact.WindowExhausted() {
+		t.Fatalf("attempt 1 = %v, exhausted=%v; want 5s, false", got, bExact.WindowExhausted())
+	}
+	if got := bExact.Next(); got != 10*time.Second || !bExact.WindowExhausted() {
+		t.Fatalf("attempt 2 = %v, exhausted=%v; want 10s, true", got, bExact.WindowExhausted())
+	}
+	if got := bExact.Next(); got != 2*time.Second {
+		t.Fatalf("attempt 3 = %v, want 2s (clamped after exact boundary hit)", got)
+	}
+
+	bNoInflate := NewBounded(2*time.Second, 10*time.Second, time.Second, 5*time.Second)
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 5 * time.Second, 5 * time.Second}
+	for i, w := range want {
+		if got := bNoInflate.Next(); got != w {
+			t.Fatalf("no-inflate Next() #%d = %v, want %v", i+1, got, w)
+		}
+	}
+}
+
+// TestSanitizeEdgeCasesAndHighAttempts verifies constructor sanitization for
+// non-positive base/max, negative window/clamp, and shift-overflow guard at
+// >30 attempts.
+func TestSanitizeEdgeCasesAndHighAttempts(t *testing.T) {
+	bZero := New(0, 0)
+	if got := bZero.Next(); got != time.Millisecond {
+		t.Fatalf("New(0,0) Next() = %v, want 1ms sanitized base", got)
+	}
+
+	bMaxLess := NewBounded(10*time.Millisecond, 2*time.Millisecond, -5*time.Second, -1*time.Second)
+	if got := bMaxLess.Next(); got != 10*time.Millisecond {
+		t.Fatalf("max < base Next() = %v, want 10ms (max lifted to base)", got)
+	}
+	if bMaxLess.WindowExhausted() {
+		t.Fatal("negative window/clamp must disable the bound")
+	}
+
+	bHigh := New(time.Millisecond, 50*time.Millisecond)
+	for i := 0; i < 60; i++ {
+		got := bHigh.Next()
+		if got <= 0 || got > 50*time.Millisecond {
+			t.Fatalf("attempt #%d = %v, out of (0, 50ms] range", i+1, got)
+		}
+	}
+}

@@ -1,0 +1,40 @@
+# control-agent.service
+[Unit]
+Description=Split-tunnel control agent (C2 apply plane, root-owned)
+Requires=control-agent.socket
+After=network.target control-agent.socket
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=root
+Group=root
+ExecStart=/opt/split-tunnel/splitterctl control-agent --store-root /var/lib/split-tunnel-ctl --log-dir /var/log/split-tunnel/control-agent
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/split-tunnel-ctl /var/log/split-tunnel/control-agent /run/split-tunnel-ctl /etc/split-tunnel
+SupplementaryGroups=tunneldash-ctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=control-agent
+
+[Install]
+WantedBy=multi-user.target

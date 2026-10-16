@@ -67,6 +67,12 @@ type LinuxAdapter struct {
 	// the plan converges to a no-op.
 	convergeStateDir func(ctx context.Context) error
 
+	// ensureKeyGroup is the C5 D3 seam for provisioning the key-isolation
+	// group (systemd.EnsureKeyGroup). nil → no-op, so struct-literal test
+	// adapters never call the real groupadd. ONLY NewLinuxAdapter wires the
+	// real systemd.EnsureKeyGroup over the adapter's executor.
+	ensureKeyGroup func(ctx context.Context) error
+
 	// liveAudit is the test seam for the DEFECT-2 live-state drift audit
 	// (AuditLiveDrift). nil → no audit: the no-op early return stands, and
 	// struct-literal test adapters never read the host's real /etc. ONLY
@@ -241,6 +247,12 @@ func NewLinuxAdapter(request InstallRequest, serviceExec systemd.SystemdExecutor
 		Xray:             &xray.Installer{Prefix: systemd.BinaryPrefix + "/xray"},
 		convergeStateDir: systemd.EnsureStateDir,
 	}
+	// C5 D3: the production constructor wires the real key-group provisioning
+	// over the adapter's own executor; struct-literal test adapters leave it
+	// nil (no-op) so they never call groupadd.
+	adapter.ensureKeyGroup = func(ctx context.Context) error {
+		return systemd.EnsureKeyGroup(ctx, serviceExec)
+	}
 	// The production live-drift audit (DEFECT-2). Struct-literal adapters
 	// leave the seam nil; only the production constructor wires the real
 	// read-only audit.
@@ -327,6 +339,13 @@ func BuildJournal(root string, previous Manifest, desired DesiredState) (Artifac
 func (a *LinuxAdapter) Prepare(ctx context.Context, desired DesiredState) error {
 	if err := systemd.EnsureUser(ctx, a.Services.Ex); err != nil {
 		return err
+	}
+	// C5 D3: provision the key-isolation group. The nil seam (test adapters)
+	// is a no-op; the production constructor wires the real EnsureKeyGroup.
+	if a.ensureKeyGroup != nil {
+		if err := a.ensureKeyGroup(ctx); err != nil {
+			return err
+		}
 	}
 	if err := systemd.EnsureStateDir(ctx); err != nil {
 		return err

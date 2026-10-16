@@ -83,13 +83,20 @@ func TestRenderGolden(t *testing.T) {
 			seen[name] = true
 		})
 	}
-	// Every committed golden must be produced by a spec (no orphans).
+	// Every committed golden must be produced by a spec (no orphans). The
+	// extra_units goldens (xray-consumer, tunneldash) are rendered by
+	// RenderExtraUnit, not RenderUnit, so they are excluded from this
+	// spec-keyed orphan check.
+	extra := map[string]bool{"xray-consumer": true, "tunneldash": true, "control-agent": true, "control-agent.socket": true}
 	entries, err := os.ReadDir(filepath.Join("testdata", "golden"))
 	if err != nil {
 		t.Fatalf("read golden dir: %v", err)
 	}
 	for _, e := range entries {
 		name := strings.TrimSuffix(e.Name(), ".golden.service")
+		if extra[name] {
+			continue
+		}
 		if _, ok := specified[name]; !ok {
 			t.Errorf("golden %s has no spec (orphan golden)", e.Name())
 		}

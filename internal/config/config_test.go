@@ -34,6 +34,16 @@ func isolatedEnv(t *testing.T) {
 		// RFC 1929 SOCKS credentials: pinning them makes "unset or empty"
 		// deterministic (plans/socks5-auth-design.md §7.2).
 		EnvSocksUser, EnvSocksPass,
+		// SOCKS5 source-IP allowlist: pin to empty (allow-all default).
+		EnvSocksAllowedSources,
+		// Opt-in only-IPv4 target policy: pin unset (false default).
+		EnvTargetOnlyIPv4,
+		// Opt-in address-family policy (SUBTASK 42): pin unset ("default").
+		EnvTargetAddrPolicy,
+		// Multi-carrier down-plane (Phase 2): pin unset (off; empty _2 values).
+		EnvMultiCarrierEnabled, EnvDownListen2, EnvDownCarrierAddr2, EnvDownSNI2,
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): pin unset (routing OFF).
+		EnvRoutingRulesFile, EnvRoutingDefault, EnvWarpSocksAddr, EnvRoutingDebug,
 	} {
 		t.Setenv(name, "")
 	}
@@ -96,6 +106,38 @@ func TestDefaults(t *testing.T) {
 	// sentinel (node lifts it in Sanitize).
 	if c.BootstrapWaitMs != 0 {
 		t.Fatalf("BootstrapWaitMs must default to 0 (library default sentinel): %+v", c)
+	}
+}
+
+// TestDefaultDownListenIsLoopback (Section 7) pins the loopback-only down-
+// carrier listener default. The down carrier is reached through the local
+// VLESS+Reality Xray inbound, never directly from the Internet, so a bare
+// ":9002" (bind-all) default is a staging gap; the default must bind
+// 127.0.0.1 explicitly. Non-loopback binds remain supported (checkHostPort
+// accepts any host:port), but the loopback default is the one a fresh
+// install gets.
+func TestDefaultDownListenIsLoopback(t *testing.T) {
+	c := Defaults()
+	if c.DownListen != "127.0.0.1:9002" {
+		t.Fatalf("DefaultDownListen = %q, want loopback-only 127.0.0.1:9002 (Section 7)", c.DownListen)
+	}
+	if c.DownListen != DefaultDownListen {
+		t.Fatalf("DefaultDownListen drifted: Defaults()=%q, constant=%q", c.DownListen, DefaultDownListen)
+	}
+	// The loopback default must still pass Germany validation (host:port,
+	// loopback is a well-formed host). Use the validGermany() shape (a real
+	// UpWsUrl, not the rejected placeholder) so the only variable is
+	// DownListen.
+	cg := validGermany()
+	cg.DownListen = c.DownListen // the Defaults() loopback value
+	if err := cg.Validate(RoleGermany); err != nil {
+		t.Fatalf("loopback default DownListen must validate: %v", err)
+	}
+	// A non-loopback bind remains valid (supported, just not the default) —
+	// this is the "keep non-loopback supported" property of Section 7.
+	cg.DownListen = "0.0.0.0:9002"
+	if err := cg.Validate(RoleGermany); err != nil {
+		t.Fatalf("non-loopback DownListen must remain valid: %v", err)
 	}
 }
 
@@ -823,5 +865,343 @@ func TestConflict(t *testing.T) {
 		if got := conflict(tc.a, tc.b); got != tc.want {
 			t.Errorf("conflict(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPLIT_SOCKS_ALLOWED_SOURCES (opt-in source-IP allowlist)
+//
+// Semantics: unset or empty = allow all (backward-compatible default);
+// set = only listed sources may proceed; invalid entries fail validation.
+// ---------------------------------------------------------------------------
+
+// TestSocksAllowedSourcesParse pins ParseAllowedSources behavior for every
+// input class: empty sentinel, single IPs, CIDRs, IPv6, and the invalid
+// cases that MUST error (so a typo'd allowlist can never silently open up).
+func TestSocksAllowedSourcesParse(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantLen int // -1 = parse error expected
+	}{
+		{"empty string is allow-all sentinel", "", 0},
+		{"whitespace-only is allow-all sentinel", "   ", 0},
+		{"single IPv4", "10.0.0.1", 1},
+		{"single IPv6", "fe80::1", 1},
+		{"IPv4 CIDR", "10.0.0.0/8", 1},
+		{"IPv6 CIDR", "fe80::/64", 1},
+		{"mixed list", "10.0.0.0/8,192.168.1.0/24,203.0.113.7", 3},
+		{"whitespace around entries", " 10.0.0.0/8 , 8.8.8.8 ", 2},
+		{"invalid bare word", "not-a-cidr", -1},
+		{"stray comma produces empty entry", "10.0.0.0/8,,8.8.8.8", -1},
+		{"trailing comma produces empty entry", "10.0.0.0/8,", -1},
+		{"CIDR with bad prefix", "10.0.0.0/33", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nets, err := ParseAllowedSources(tc.raw)
+			if tc.wantLen < 0 {
+				if err == nil {
+					t.Fatalf("ParseAllowedSources(%q) = %v, want error", tc.raw, nets)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseAllowedSources(%q) error: %v", tc.raw, err)
+			}
+			if len(nets) != tc.wantLen {
+				t.Fatalf("ParseAllowedSources(%q) len = %d, want %d", tc.raw, len(nets), tc.wantLen)
+			}
+		})
+	}
+}
+
+// TestSocksAllowedSourcesMatch is the table-driven membership check: for a
+// given raw allowlist, which source IPs are admitted?
+func TestSocksAllowedSourcesMatch(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		clientIP string
+		want     bool
+	}{
+		// UNSET / EMPTY = allow all (the safety property the user requires).
+		{"unset allows all (empty)", "", "91.107.152.1", true},
+		{"unset allows all (IPv6)", "", "fe80::1", true},
+		// Single IP match / no-match.
+		{"single IP match", "91.107.152.1", "91.107.152.1", true},
+		{"single IP no-match", "91.107.152.1", "8.8.8.8", false},
+		// CIDR match / no-match.
+		{"CIDR match", "10.0.0.0/8", "10.1.2.3", true},
+		{"CIDR no-match", "10.0.0.0/8", "11.0.0.1", false},
+		// IPv6 CIDR.
+		{"IPv6 CIDR match", "fe80::/64", "fe80::1", true},
+		{"IPv6 CIDR no-match", "fe80::/64", "2001:db8::1", false},
+		// Unparseable client with a set allowlist: rejected (fail closed).
+		{"unparseable client rejected when set", "10.0.0.0/8", "garbage", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AllowedSourcesMatch(tc.raw, tc.clientIP); got != tc.want {
+				t.Fatalf("AllowedSourcesMatch(%q, %q) = %v, want %v", tc.raw, tc.clientIP, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateSocksAllowedSourcesInvalidFailsClosed pins the "invalid
+// entries fail validation, not silent allow" rule at the pure Validate
+// level (no env): Iran role with a bad entry produces a problem naming the
+// variable.
+func TestValidateSocksAllowedSourcesInvalidFailsClosed(t *testing.T) {
+	cases := []string{"not-a-cidr", "10.0.0.0/33", "10.0.0.0/8,,8.8.8.8"}
+	for _, raw := range cases {
+		t.Run("invalid:"+raw, func(t *testing.T) {
+			c := validIran()
+			c.SocksAllowedSources = raw
+			ps := problemsOf(t, c.Validate(RoleIran))
+			joined := joinedProblems(ps)
+			if !strings.Contains(joined, EnvSocksAllowedSources) {
+				t.Fatalf("want problem naming %s, got: %v", EnvSocksAllowedSources, ps)
+			}
+		})
+	}
+}
+
+// TestValidateSocksAllowedSourcesValid passes: unset, a single IP, a CIDR,
+// and an IPv6 entry all validate cleanly under the Iran role.
+func TestValidateSocksAllowedSourcesValid(t *testing.T) {
+	for _, raw := range []string{"", "91.107.152.1", "10.0.0.0/8", "fe80::1", "10.0.0.0/8,8.8.8.8"} {
+		c := validIran()
+		c.SocksAllowedSources = raw
+		if err := c.Validate(RoleIran); err != nil {
+			t.Fatalf("Validate(%q) = %v, want nil", raw, err)
+		}
+	}
+}
+
+// TestSocksAllowedSourcesGermanyIgnored: the allowlist is an Iran-only
+// field; a Germany role must not add a problem for it (the field is not
+// Germany's to enforce), mirroring the credential-pair precedent.
+func TestSocksAllowedSourcesGermanyIgnored(t *testing.T) {
+	c := validGermany()
+	c.SocksAllowedSources = "91.107.152.1"
+	if err := c.Validate(RoleGermany); err != nil {
+		t.Fatalf("Validate(RoleGermany) rejected an Iran-only allowlist: %v", err)
+	}
+}
+
+// TestLoadSocksAllowedSourcesFromEnv exercises the Load (env) path: a valid
+// value round-trips; an invalid value fails naming the variable; unset
+// round-trips to the empty (allow-all) default.
+func TestLoadSocksAllowedSourcesFromEnv(t *testing.T) {
+	// Valid value round-trips.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksAllowedSources, "10.0.0.0/8,91.107.152.1")
+	cfg, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(valid allowlist): %v", err)
+	}
+	if cfg.SocksAllowedSources != "10.0.0.0/8,91.107.152.1" {
+		t.Fatalf("SocksAllowedSources = %q, want round-trip", cfg.SocksAllowedSources)
+	}
+
+	// Invalid value fails, naming the variable, never silently allowing.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvSocksAllowedSources, "not-a-cidr")
+	_, err = Load(RoleIran)
+	if err == nil {
+		t.Fatal("Load(invalid allowlist) must fail")
+	}
+	if !strings.Contains(err.Error(), EnvSocksAllowedSources) {
+		t.Fatalf("error did not name %s: %v", EnvSocksAllowedSources, err)
+	}
+
+	// Unset = allow-all default (empty), and Load succeeds.
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	cfg2, err := Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(unset allowlist): %v", err)
+	}
+	if cfg2.SocksAllowedSources != "" {
+		t.Fatalf("unset SocksAllowedSources = %q, want empty (allow all)", cfg2.SocksAllowedSources)
+	}
+}
+
+// TestLoadTargetOnlyIPv4FromEnv covers the opt-in only-IPv4 target policy
+// (SPLIT_TARGET_ONLY_IPV4): unset = false (pre-policy default preserved),
+// "true"/"1" = true, "false"/"0" = false, and an invalid value is a
+// config error naming the variable (the EnvAllowWeak boolean convention).
+//
+// loadGermanyForTargetPolicy builds a Germany Load with every role-required
+// field valid, then applies the target-policy value AFTER isolation (isolatedEnv
+// pins the variable to "", so the under-test value must be set post-isolation).
+func loadGermanyForTargetPolicy(t *testing.T, targetValue string) (*Config, error) {
+	t.Helper()
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	if targetValue != "" {
+		t.Setenv(EnvTargetOnlyIPv4, targetValue)
+	}
+	return Load(RoleGermany)
+}
+
+func TestLoadTargetOnlyIPv4FromEnv(t *testing.T) {
+	// Unset: default is false (policy off, dual-stack behavior preserved).
+	cfg, err := loadGermanyForTargetPolicy(t, "")
+	if err != nil {
+		t.Fatalf("Load(unset %s): %v", EnvTargetOnlyIPv4, err)
+	}
+	if cfg.TargetOnlyIPv4 {
+		t.Fatalf("unset %s must default to false, got true", EnvTargetOnlyIPv4)
+	}
+
+	// "true" and "1" both enable the policy.
+	for _, raw := range []string{"true", "1", "TRUE", "t"} {
+		cfg, err := loadGermanyForTargetPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetOnlyIPv4, raw, err)
+		}
+		if !cfg.TargetOnlyIPv4 {
+			t.Fatalf("%s=%q must enable the policy", EnvTargetOnlyIPv4, raw)
+		}
+	}
+
+	// "false" and "0" keep it off.
+	for _, raw := range []string{"false", "0", "FALSE", "f"} {
+		cfg, err := loadGermanyForTargetPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetOnlyIPv4, raw, err)
+		}
+		if cfg.TargetOnlyIPv4 {
+			t.Fatalf("%s=%q must leave the policy off", EnvTargetOnlyIPv4, raw)
+		}
+	}
+
+	// Invalid value: aggregated config error naming the variable.
+	_, err = loadGermanyForTargetPolicy(t, "maybe")
+	if err == nil {
+		t.Fatalf("Load(invalid %s) must fail", EnvTargetOnlyIPv4)
+	}
+	if !strings.Contains(err.Error(), EnvTargetOnlyIPv4) {
+		t.Fatalf("error did not name %s: %v", EnvTargetOnlyIPv4, err)
+	}
+
+	// The Iran role parses the same variable (config symmetry).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvTargetOnlyIPv4, "true")
+	cfg, err = Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(Iran, %s=true): %v", EnvTargetOnlyIPv4, err)
+	}
+	if !cfg.TargetOnlyIPv4 {
+		t.Fatalf("Iran role must parse %s too (symmetric config)", EnvTargetOnlyIPv4)
+	}
+}
+
+// TestDefaultsTargetOnlyIPv4False pins the zero-value default of the new
+// Config field so a future change cannot silently flip the policy on.
+func TestDefaultsTargetOnlyIPv4False(t *testing.T) {
+	if c := Defaults(); c.TargetOnlyIPv4 {
+		t.Fatalf("Defaults().TargetOnlyIPv4 must be false (opt-in policy, off by default)")
+	}
+}
+
+// TestLoadTargetAddrPolicyFromEnv covers the opt-in egress-target
+// address-family POLICY (SPLIT_TARGET_ADDR_POLICY, SUBTASK 42): unset =
+// "default" (byte-identical dual-stack behavior preserved), each allowed
+// value parses correctly, and an unknown value is a config error naming
+// the allowed set.
+//
+// loadGermanyForAddrPolicy builds a Germany Load with every role-required
+// field valid, then applies the policy value AFTER isolation (isolatedEnv
+// pins the variable to "", so the under-test value must be set post-isolation).
+func loadGermanyForAddrPolicy(t *testing.T, policyValue string) (*Config, error) {
+	t.Helper()
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	if policyValue != "" {
+		t.Setenv(EnvTargetAddrPolicy, policyValue)
+	}
+	return Load(RoleGermany)
+}
+
+func TestLoadTargetAddrPolicyFromEnv(t *testing.T) {
+	// Unset: default is "default" (byte-identical dual-stack behavior).
+	cfg, err := loadGermanyForAddrPolicy(t, "")
+	if err != nil {
+		t.Fatalf("Load(unset %s): %v", EnvTargetAddrPolicy, err)
+	}
+	if cfg.TargetAddrPolicy != "default" {
+		t.Fatalf("unset %s must default to %q, got %q", EnvTargetAddrPolicy, "default", cfg.TargetAddrPolicy)
+	}
+
+	// Each allowed value parses correctly.
+	for _, raw := range []string{"default", "prefer-ipv4", "ipv4-only"} {
+		cfg, err := loadGermanyForAddrPolicy(t, raw)
+		if err != nil {
+			t.Fatalf("Load(%s=%q): %v", EnvTargetAddrPolicy, raw, err)
+		}
+		if cfg.TargetAddrPolicy != raw {
+			t.Fatalf("%s=%q must be stored verbatim, got %q", EnvTargetAddrPolicy, raw, cfg.TargetAddrPolicy)
+		}
+	}
+
+	// Invalid value: aggregated config error naming the variable AND the
+	// allowed set.
+	_, err = loadGermanyForAddrPolicy(t, "prefer-v6")
+	if err == nil {
+		t.Fatalf("Load(invalid %s) must fail", EnvTargetAddrPolicy)
+	}
+	if !strings.Contains(err.Error(), EnvTargetAddrPolicy) {
+		t.Fatalf("error did not name %s: %v", EnvTargetAddrPolicy, err)
+	}
+	if !strings.Contains(err.Error(), "prefer-ipv4") || !strings.Contains(err.Error(), "ipv4-only") {
+		t.Fatalf("error must name the allowed values: %v", err)
+	}
+
+	// The Iran role parses the same variable (config symmetry).
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvTargetAddrPolicy, "prefer-ipv4")
+	cfg, err = Load(RoleIran)
+	if err != nil {
+		t.Fatalf("Load(Iran, %s=prefer-ipv4): %v", EnvTargetAddrPolicy, err)
+	}
+	if cfg.TargetAddrPolicy != "prefer-ipv4" {
+		t.Fatalf("Iran role must parse %s too (symmetric config)", EnvTargetAddrPolicy)
+	}
+}
+
+// TestTargetAddrPolicyContradictionProves the explicit contradiction
+// (SPLIT_TARGET_ONLY_IPV4=true + SPLIT_TARGET_ADDR_POLICY=prefer-ipv4) is
+// rejected at config load so an operator cannot unknowingly mix a hard
+// filter and a soft preference.
+func TestTargetAddrPolicyContradictionRejected(t *testing.T) {
+	isolatedEnv(t)
+	t.Setenv(EnvSecret, strongSecret)
+	t.Setenv(EnvUpWsUrl, "wss://cdn.example.org/upload")
+	t.Setenv(EnvTargetOnlyIPv4, "true")
+	t.Setenv(EnvTargetAddrPolicy, "prefer-ipv4")
+	_, err := Load(RoleGermany)
+	if err == nil {
+		t.Fatal("contradictory TargetOnlyIPv4=true + TargetAddrPolicy=prefer-ipv4 must fail")
+	}
+	if !strings.Contains(err.Error(), EnvTargetOnlyIPv4) || !strings.Contains(err.Error(), EnvTargetAddrPolicy) {
+		t.Fatalf("error must name both the conflicting variables: %v", err)
+	}
+}
+
+// TestDefaultsTargetAddrPolicyPinned pins the zero-value default of the
+// new Config field so a future change cannot silently flip the policy.
+func TestDefaultsTargetAddrPolicyPinned(t *testing.T) {
+	if c := Defaults(); c.TargetAddrPolicy != "default" {
+		t.Fatalf("Defaults().TargetAddrPolicy must be %q, got %q", "default", c.TargetAddrPolicy)
 	}
 }

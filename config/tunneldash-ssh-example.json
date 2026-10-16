@@ -1,0 +1,57 @@
+{
+  "listenAddr": "127.0.0.1:8080",
+  "readOnly": true,
+  "refreshSec": 30,
+  "maxLogEntries": 200,
+  "maxAudit": 500,
+  "servers": [
+    {
+      "id": "iran",
+      "name": "Iran Splitter",
+      "role": "iran",
+      "address": "188.121.111.122",
+      "sourceType": "ssh",
+      "maxLogEntries": 200,
+      "allowMutations": false,
+      "ssh": {
+        "user": "monitor",
+        "address": "188.121.111.122",
+        "port": 22,
+        "identityFile": "/home/operator/.ssh/monitor_key",
+        "knownHosts": "/home/operator/.ssh/pinned_kh",
+        "pinnedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePinnedHostKeyFingerprint==",
+        "connectTimeoutSec": 10,
+        "commandTimeoutSec": 15,
+        "metricsPort": 9101,
+        "statePath": "/etc/split-tunnel/state.json",
+        "maxJournalLines": 200,
+        "maxJournalSinceSec": 600,
+        "services": ["iran-splitter", "xray-consumer"]
+      }
+    },
+    {
+      "id": "germany",
+      "name": "Germany Splitter",
+      "role": "germany",
+      "address": "91.107.152.1",
+      "sourceType": "ssh",
+      "maxLogEntries": 200,
+      "allowMutations": false,
+      "ssh": {
+        "user": "monitor",
+        "address": "91.107.152.1",
+        "port": 22,
+        "identityFile": "/home/operator/.ssh/monitor_key",
+        "knownHosts": "/home/operator/.ssh/pinned_kh",
+        "pinnedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePinnedHostKeyFingerprint==",
+        "connectTimeoutSec": 10,
+        "commandTimeoutSec": 15,
+        "metricsPort": 9101,
+        "statePath": "/etc/split-tunnel/state.json",
+        "maxJournalLines": 200,
+        "maxJournalSinceSec": 600,
+        "services": ["germany-splitter", "xray-germany"]
+      }
+    }
+  ]
+}

@@ -41,9 +41,13 @@ type StateDirAudit struct {
 	GID        int         // group gid (-1 when not measurable)
 	GroupWant  int         // numeric id of ServiceGroup (-1 when unresolvable)
 	GroupKnown bool        // GroupWant resolved through NSS
-	Configs    []ConfigAudit
-	WantDir    os.FileMode // the converged contract: 0750
-	WantFile   os.FileMode // the converged contract: 0640
+	// C5 D3: the key-bearing xray config is group-owned by XrayKeyGroup,
+	// not ServiceGroup. These carry the second (key-group) contract.
+	KeyGroupWant  int  // numeric id of XrayKeyGroup (-1 when unresolvable)
+	KeyGroupKnown bool // KeyGroupWant resolved through NSS
+	Configs       []ConfigAudit
+	WantDir       os.FileMode // the converged contract: 0750
+	WantFile      os.FileMode // the converged contract: 0640
 }
 
 // ConfigAudit is the read-only snapshot of one live service-readable config
@@ -53,6 +57,9 @@ type ConfigAudit struct {
 	Mode os.FileMode
 	Uid  int
 	GID  int
+	// KeyFile marks the C5 key-bearing config (xray-germany.json), whose
+	// group expectation is XrayKeyGroup rather than ServiceGroup.
+	KeyFile bool
 }
 
 // ProblemKind classifies one audit finding so consumers can pick a severity
@@ -93,13 +100,14 @@ func AuditStateDir() (StateDirAudit, error) { return AuditStateDirAt(stateDir) }
 // It never mutates anything.
 func AuditStateDirAt(dir string) (StateDirAudit, error) {
 	a := StateDirAudit{
-		Path:      dir,
-		Linux:     runtime.GOOS == "linux",
-		Uid:       -1,
-		GID:       -1,
-		GroupWant: -1,
-		WantDir:   0o750,
-		WantFile:  0o640,
+		Path:         dir,
+		Linux:        runtime.GOOS == "linux",
+		Uid:          -1,
+		GID:          -1,
+		GroupWant:    -1,
+		KeyGroupWant: -1,
+		WantDir:      0o750,
+		WantFile:     0o640,
 	}
 	st, err := os.Lstat(dir)
 	switch {
@@ -124,10 +132,22 @@ func AuditStateDirAt(dir string) (StateDirAudit, error) {
 	if gid, gerr := lookupGroupGID(ServiceGroup); gerr == nil {
 		a.GroupWant, a.GroupKnown = gid, true
 	}
+	// C5 D3: the key group is a SEPARATE NSS lookup so a host that has the
+	// service group but not the key group reports the key contract as not yet
+	// provisioned rather than a false finding (EnsureKeyGroup is the fix).
+	if gid, gerr := lookupGroupGID(XrayKeyGroup); gerr == nil {
+		a.KeyGroupWant, a.KeyGroupKnown = gid, true
+	}
 	if a.Linux {
 		a.Uid, a.GID = uidOf(st.Sys()), gidOf(st.Sys())
 	}
-	for _, name := range liveStateFiles {
+	keySet := map[string]bool{}
+	for _, name := range keyStateFiles {
+		keySet[name] = true
+	}
+	// Report live service-readable configs (liveStateFiles) AND the
+	// key-bearing config (keyStateFiles). Only files that EXIST are reported.
+	for _, name := range append(append([]string{}, liveStateFiles...), keyStateFiles...) {
 		p := dir + "/" + name
 		fst, ferr := os.Lstat(p)
 		if ferr != nil {
@@ -136,7 +156,7 @@ func AuditStateDirAt(dir string) (StateDirAudit, error) {
 			}
 			return a, fmt.Errorf("systemd: audit: stat %s: %w", p, ferr)
 		}
-		f := ConfigAudit{Path: p, Mode: fst.Mode().Perm(), Uid: -1, GID: -1}
+		f := ConfigAudit{Path: p, Mode: fst.Mode().Perm(), Uid: -1, GID: -1, KeyFile: keySet[name]}
 		if a.Linux {
 			f.Uid, f.GID = uidOf(fst.Sys()), gidOf(fst.Sys())
 		}
@@ -185,7 +205,17 @@ func (a StateDirAudit) Problems() []Problem {
 			out = append(out, Problem{Kind: ProblemOwner, Path: f.Path,
 				Detail: fmt.Sprintf("%s is owned by uid %d, want root (uid 0)", f.Path, f.Uid)})
 		}
-		if a.GroupKnown && f.GID != a.GroupWant {
+		// C5 D3: per-file group expectation. The key-bearing config must be
+		// group-owned by XrayKeyGroup (NOT ServiceGroup, the dashboard's
+		// group); every other live config must be group-owned by
+		// ServiceGroup. When the expected group is unresolvable on this
+		// host the element is not applicable (no false finding).
+		if f.KeyFile {
+			if a.KeyGroupKnown && f.GID != a.KeyGroupWant {
+				out = append(out, Problem{Kind: ProblemGroup, Path: f.Path,
+					Detail: fmt.Sprintf("%s group is gid %d, want %s (gid %d); the key config must NOT be group-readable by %s (the dashboard group)", f.Path, f.GID, XrayKeyGroup, a.KeyGroupWant, ServiceGroup)})
+			}
+		} else if a.GroupKnown && f.GID != a.GroupWant {
 			out = append(out, Problem{Kind: ProblemGroup, Path: f.Path,
 				Detail: fmt.Sprintf("%s group is gid %d, want %s (gid %d)", f.Path, f.GID, ServiceGroup, a.GroupWant)})
 		}

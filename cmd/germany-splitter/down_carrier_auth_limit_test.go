@@ -55,7 +55,7 @@ func newTestDownNode(t *testing.T) *node.Node {
 	t.Helper()
 	cfg := config.Defaults()
 	logger := log.New(io.Discard, "", 0)
-	n := node.NewNode(node.Config{
+	n, err := node.NewNode(node.Config{
 		Role:              node.RoleGermany,
 		Grace:             time.Duration(cfg.CarrierGraceMs) * time.Millisecond,
 		BufferBytes:       cfg.SessionBufBytes,
@@ -63,6 +63,9 @@ func newTestDownNode(t *testing.T) *node.Node {
 		KeepAliveInterval: cfg.KeepAliveInterval,
 		StreamLimits:      streamLimits(cfg),
 	}, logger, mux.DeriveSecret(defaultSecret))
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(n.Close)
 	return n
 }

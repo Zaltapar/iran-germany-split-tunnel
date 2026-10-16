@@ -7,6 +7,7 @@ package.json
 package-lock.json
 .roo/
 .playwright-mcp/
+-p/
 *.bin
 
 # Build artifacts
@@ -40,6 +41,10 @@ $null
 # staging key). Rebuild via `go build`; regenerate keys per L5 runbook.
 dist/
 
+# D3b: reproducible Linux amd64 build artifacts (scripts/build-linux.sh output).
+# NEVER commit: only the SHA256SUMS sidecar may be copied to a release manifest.
+dist_onclick/
+
 # T3 Pinned-Xray gate: rendered fixed-vector config written at CI run time
 # (contains the documented non-production test vector; regenerate, never commit).
 internal/xray/testdata/e2e/
@@ -48,3 +53,55 @@ internal/xray/testdata/e2e/
 # time (contains the documented non-production test vectors; regenerate,
 # never commit).
 internal/origin/testdata/e2e/
+
+# Phase 2 subtask 4: one-time operational scratch files (plain-HTTP migration)
+# and preserved stray root files. NOT part of the module; recoverable only.
+ops-scratch/
+archive/
+
+# SSH key material (subtask 9 key hygiene). Private keys live under ssh/ and
+# must NEVER be committed; the directory is not tracked and is ignored here so
+# a future `git add .` can never stage private key material.
+ssh/
+
+# Defensive backstop: ignore common private-key filename patterns anywhere in
+# the tree, even if they appear outside ssh/.
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# ---- Commit hygiene (subtask 22): keep generated/scratch/secret dirs out of any
+# `git add .`. These are NOT part of the Go module.
+#
+# Generated build staging (cross-compiled release binaries, e2e scratch).
+staging-upread-build/
+out/
+
+# Manifests captured at deploy time (host manifests, probe scripts, capture
+# helpers). Operational scratch, not source of record.
+manifests/
+
+# Ad-hoc API/vendor reference dumps (CDN yml, notes). Not module source.
+arvan api documents/
+
+# One-off root scratch/log files and archives from the flow-control work.
+.git-baseline-phaseb.txt
+build_phaseb.txt
+offbuild.txt
+offresult.txt
+p6all.sh
+race678-src.tar.gz
+rollback-iran-splitter.sh
+.roomodes
+
+# FINAL-SUITE: test-run evidence + the LOCAL SOCKS5 credentials file
+# (secret). NEVER commit this directory.
+final-suite/
+
+# Local backup folder (pre-deploy snapshots, unit/binary copies). Never commit.
+backups/
+
+# Transient base64 transfer artifacts (cross-host binary transfer scratch).
+# NEVER commit: large binary blobs, not part of the Go module.
+.tmp-*.b64

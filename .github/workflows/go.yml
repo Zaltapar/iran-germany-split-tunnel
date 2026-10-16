@@ -2,10 +2,11 @@ name: Go
 
 on:
   push:
-    # main gets every push; the production-hardening branch is listed too
-    # so its changes (which cannot run `go test -race` on the Windows dev
-    # host) are race-tested by this same Linux workflow.
-    branches: [main, hardening/production-reliability]
+    # main gets every push; the production-hardening and multi-carrier
+    # branches are listed too so their changes (which cannot run
+    # `go test -race` on the Windows dev host) are race-tested by this
+    # same Linux workflow.
+    branches: [main, hardening/production-reliability, feat/multi-carrier-phase2]
   pull_request:
   # Issue #9: the L4 two-process local integration gate runs the REAL
   # production binaries as two OS processes (real sockets, real
@@ -44,10 +45,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          scripts=(install.sh deploy.sh)
+          scripts=(install.sh deploy.sh install-oneclick.sh)
           if [[ -f test-install.sh ]]; then
             scripts+=(test-install.sh)
+          fi
+          if [[ -f install-oneclick.test.sh ]]; then
+            scripts+=(install-oneclick.test.sh)
           fi
           bash -n "${scripts[@]}"
 
@@ -83,6 +86,18 @@ jobs:
             bash test-install.sh
           else
             echo "test-install.sh not present; conditional contract satisfied"
+          fi
+
+          # Issue #12: the one-click installer's local test harness is
+          # hermetic — it only syntax-checks install-oneclick.sh, unit-tests
+          # its pure helper functions, and runs the --dry-run paths, which
+          # never touch a host, clone, or download anything (--no-clone, no
+          # network). Running it here keeps the installer's env contract and
+          # arg-parsing gates green on Linux.
+          if [[ -f install-oneclick.test.sh ]]; then
+            bash install-oneclick.test.sh
+          else
+            echo "install-oneclick.test.sh not present; conditional contract satisfied"
           fi
 
       - name: go test -race

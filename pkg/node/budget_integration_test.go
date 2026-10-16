@@ -65,7 +65,11 @@ func newTopoBudget(t *testing.T, grace time.Duration, bufBytes, totalBytes int) 
 		SessionBufferTotalBytes: totalBytes,
 		KeepAliveInterval:       time.Hour,
 	}
-	tp.iran = node.NewNode(iranCfg, logger, secret)
+	var err error
+	tp.iran, err = node.NewNode(iranCfg, logger, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	deCfg := node.Config{
 		Role: node.RoleGermany, Grace: grace,
@@ -83,7 +87,10 @@ func newTopoBudget(t *testing.T, grace time.Duration, bufBytes, totalBytes int) 
 			return c, nil
 		},
 	}
-	tp.de = node.NewNode(deCfg, deLog, secret)
+	tp.de, err = node.NewNode(deCfg, deLog, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Cleanup(func() {
 		tp.iran.Close()

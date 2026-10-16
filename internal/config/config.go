@@ -35,7 +35,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Zaltapar/iran-germany-split-tunnel/internal/pairing"
 	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/mux"
+	"github.com/Zaltapar/iran-germany-split-tunnel/pkg/routing"
 )
 
 const (
@@ -43,28 +45,184 @@ const (
 	RoleGermany = "germany"
 )
 
+// Phase 3 carrier-intelligence policy modes (the values accepted by
+// SPLIT_POLICY_MODE). These mirror the pkg/node PolicyStatic / PolicyAdaptive
+// constants so the config layer can validate the operator's choice without
+// importing pkg/node (the config package stays transport-free).
+const (
+	PolicyStaticMode   = "static"
+	PolicyAdaptiveMode = "adaptive"
+)
+
 // Environment variable names (single source of truth).
 const (
-	EnvSocksListen     = "SPLIT_SOCKS_LISTEN"               // Iran
-	EnvSocksUser       = "SPLIT_SOCKS_USER"                 // Iran — SOCKS5 RFC 1929 username
-	EnvSocksPass       = "SPLIT_SOCKS_PASS"                 // Iran — SOCKS5 RFC 1929 password (never logged)
-	EnvWsListen        = "SPLIT_WS_LISTEN"                  // Iran
-	EnvDownCarrier     = "SPLIT_DOWN_CARRIER_ADDR"          // Iran
-	EnvUpWsUrl         = "SPLIT_UP_WS_URL"                  // Germany
-	EnvDownListen      = "SPLIT_DOWN_LISTEN"                // Germany
-	EnvSecret          = "SPLIT_SECRET"                     // both
-	EnvAllowWeak       = "SPLIT_ALLOW_WEAK_SECRET"          // both (bool)
-	EnvMetricsPort     = "SPLIT_METRICS_PORT"               // both
-	EnvRelayBuf        = "SPLIT_RELAY_BUF"                  // both
-	EnvQueueBytes      = "SPLIT_STREAM_QUEUE_BYTES"         // both
-	EnvQueueFrames     = "SPLIT_STREAM_QUEUE_FRAMES"        // both
-	EnvQueueTotal      = "SPLIT_STREAM_QUEUE_TOTAL_BYTES"   // both
-	EnvOverflowMs      = "SPLIT_STREAM_OVERFLOW_MS"         // both
-	EnvCarrierGrace    = "SPLIT_CARRIER_GRACE"              // both (ms) — Phase 5
+	EnvSocksListen         = "SPLIT_SOCKS_LISTEN"             // Iran
+	EnvSocksUser           = "SPLIT_SOCKS_USER"               // Iran — SOCKS5 RFC 1929 username
+	EnvSocksPass           = "SPLIT_SOCKS_PASS"               // Iran — SOCKS5 RFC 1929 password (never logged)
+	EnvSocksAllowedSources = "SPLIT_SOCKS_ALLOWED_SOURCES"    // Iran — SOCKS5 source-IP allowlist (unset/empty = allow all)
+	EnvWsListen            = "SPLIT_WS_LISTEN"                // Iran
+	EnvDownCarrier         = "SPLIT_DOWN_CARRIER_ADDR"        // Iran
+	EnvUpWsUrl             = "SPLIT_UP_WS_URL"                // Germany
+	EnvDownListen          = "SPLIT_DOWN_LISTEN"              // Germany
+	EnvSecret              = "SPLIT_SECRET"                   // both
+	EnvAllowWeak           = "SPLIT_ALLOW_WEAK_SECRET"        // both (bool)
+	EnvMetricsPort         = "SPLIT_METRICS_PORT"             // both
+	EnvRelayBuf            = "SPLIT_RELAY_BUF"                // both
+	EnvQueueBytes          = "SPLIT_STREAM_QUEUE_BYTES"       // both
+	EnvQueueFrames         = "SPLIT_STREAM_QUEUE_FRAMES"      // both
+	EnvQueueTotal          = "SPLIT_STREAM_QUEUE_TOTAL_BYTES" // both
+	EnvOverflowMs          = "SPLIT_STREAM_OVERFLOW_MS"       // both
+	EnvCarrierGrace        = "SPLIT_CARRIER_GRACE"            // both (ms) — Phase 5
+	EnvReconnectBaseMs     = "SPLIT_RECONNECT_BASE_MS"        // both (ms) — carrier reconnect backoff base
+	EnvReconnectMaxMs      = "SPLIT_RECONNECT_MAX_MS"         // both (ms) — carrier reconnect backoff cap
+	EnvReconnectWindowMs   = "SPLIT_RECONNECT_WINDOW_MS"      // both (ms) — cumulative reconnect-sleep bound; 0 disables
+	EnvReconnectClampMs    = "SPLIT_RECONNECT_CLAMP_MS"       // both (ms) — per-attempt delay once the window is exhausted; 0 disables
+	// Issue #19: kernel TCP keepalive probe period for the long-lived
+	// client / target / carrier TCP sockets (ms). A wedged or half-open
+	// socket is then torn down by the kernel within ~one probe period
+	// instead of the OS default (~2 h on Linux). 0 disables (use the OS
+	// default). Both roles.
+	EnvTCPKeepAlive    = "SPLIT_TCP_KEEPALIVE_MS"
 	EnvBootstrapWait   = "SPLIT_BOOTSTRAP_WAIT_MS"          // both (ms) — Issue #7
 	EnvSessionBuf      = "SPLIT_SESSION_BUFFER_BYTES"       // both — Phase 5
 	EnvSessionBufTotal = "SPLIT_SESSION_BUFFER_TOTAL_BYTES" // both — Issue #6
 	EnvLivenessRounds  = "SPLIT_LIVENESS_ROUNDS"            // both — blackhole detection
+	// Phase B credit flow-control (Slices 4-8):
+	//
+	// SPLIT_CREDITS_ENABLED is the master on/off for the whole credit plane.
+	// The three sub-knobs that were here (SPLIT_CREDIT_WINDOW_MAX,
+	// SPLIT_CREDIT_SAFE_TIMEOUT_MS, SPLIT_CREDIT_BATCH_BYTES) have been
+	// removed: their values are fixed by the design §5/§14 invariants
+	// (creditWindowMax = 512 KiB, CreditSafeTimeout = 2 s,
+	// creditBatchBytes = MaxPayload) and are NOT per-operator tunable —
+	// changing creditWindowMax would break the B2 memory-bound guarantee
+	// (creditPreLatchBound < MaxBytesPerStream) that the whole credit plane
+	// relies on. The pkg/node constants are the single source of truth.
+	EnvCreditsEnabled = "SPLIT_CREDITS_ENABLED" // both (bool, default false) — credit plane master on/off
+	// Opt-in only-IPv4 egress-target policy: when true, the node's
+	// default TargetDial resolves domain hosts to IPv4 (A records only)
+	// and refuses to silently fall back to IPv6; literal IP addresses
+	// bypass resolution entirely. Wired on BOTH roles even though only
+	// the Germany role currently dials egress targets, so the config
+	// stays symmetric.
+	EnvTargetOnlyIPv4 = "SPLIT_TARGET_ONLY_IPV4" // both (bool, default false)
+	// Opt-in egress-target address-family POLICY (SUBTASK 42): a single
+	// additive knob with three values that expresses every dial family
+	// behavior in one place — "default" (today's byte-identical dual-
+	// stack dial), "prefer-ipv4" (deterministic v4-first with v6
+	// fallback, the RECOMMENDED opt-in), and "ipv4-only" (the hard A-
+	// record filter, equivalent to SPLIT_TARGET_ONLY_IPV4=true). Wired
+	// on BOTH roles for symmetry.
+	EnvTargetAddrPolicy = "SPLIT_TARGET_ADDR_POLICY" // both (enum, default "default")
+	// up-carrier drop-storm fix (Parts 2 & 3): bounded target-dial ceiling +
+	// jittered per-target retry backoff + per-target dial-failure circuit
+	// breaker. Every one is OFF / byte-identical by default; only an operator
+	// who opts in changes the dial-path timing. Wired on BOTH roles for
+	// symmetry (only the Germany role actually dials egress targets, so these
+	// are inert on Iran). See docs/upcarrier-drop-fix.md.
+	//
+	// SPLIT_TARGET_DIAL_BOUND_MS: per-dial ceiling for the default TargetDial
+	// (Part 2). 0 = no extra ceiling (the raw dialer's own 10s bound stands —
+	// byte-identical default). A positive value makes a hung target fail fast.
+	EnvTargetDialBoundMs = "SPLIT_TARGET_DIAL_BOUND_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_ENABLED: master on/off for the per-target dial
+	// circuit breaker (Part 3, default false → byte-identical).
+	EnvTargetBreakerEnabled = "SPLIT_TARGET_BREAKER_ENABLED" // both (bool, default false)
+	// SPLIT_TARGET_BREAKER_WINDOW_MS: rolling window (ms) over which consecutive
+	// failures count toward opening the breaker (Part 3). 0 = library default
+	// (60 s).
+	EnvTargetBreakerWindowMs = "SPLIT_TARGET_BREAKER_WINDOW_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_THRESHOLD: number of failures within the window that
+	// opens the breaker (Part 3). 0 = library default (5).
+	EnvTargetBreakerThreshold = "SPLIT_TARGET_BREAKER_THRESHOLD" // both (int, default 0)
+	// SPLIT_TARGET_BREAKER_COOLDOWN_MS: how long an open breaker stays open
+	// before it admits a single half-open probe (Part 3). 0 = library default
+	// (30 s).
+	EnvTargetBreakerCooldownMs = "SPLIT_TARGET_BREAKER_COOLDOWN_MS" // both (ms, default 0)
+	// SPLIT_TARGET_BREAKER_MAX_TARGETS: LRU cap on the tracked-target map
+	// (Part 3). 0 = library default (1024). A full map evicts the LRU target,
+	// which thereafter fails closed to the direct dial.
+	EnvTargetBreakerMaxTargets = "SPLIT_TARGET_BREAKER_MAX_TARGETS" // both (int, default 0)
+	// SPLIT_TARGET_DIAL_BACKOFF_ENABLED: master on/off for the jittered per
+	// target retry backoff (Part 2, default false → byte-identical).
+	EnvTargetDialBackoffEnabled = "SPLIT_TARGET_DIAL_BACKOFF_ENABLED" // both (bool, default false)
+	// SPLIT_TARGET_DIAL_BACKOFF_BASE_MS: exponential backoff base (Part 2).
+	// 0 = library default (500 ms).
+	EnvTargetDialBackoffBaseMs = "SPLIT_TARGET_DIAL_BACKOFF_BASE_MS" // both (ms, default 0)
+	// SPLIT_TARGET_DIAL_BACKOFF_MAX_MS: exponential backoff cap (Part 2).
+	// 0 = library default (30 s).
+	EnvTargetDialBackoffMaxMs = "SPLIT_TARGET_DIAL_BACKOFF_MAX_MS" // both (ms, default 0)
+	// Multi-carrier down-plane (Phase 2, plans/multi-carrier-intelligence-design.md):
+	//
+	// SPLIT_MULTI_CARRIER_ENABLED is the master on/off for a SECOND down
+	// carrier. OFF by default; when off the single-value down form
+	// (SPLIT_DOWN_LISTEN / SPLIT_DOWN_CARRIER_ADDR) is used and behavior is
+	// byte-identical to the pre-Phase-2 build. When on, the second down
+	// instance (a second VLESS+Reality listener on Germany, a second
+	// consumer inbound on Iran) is added and the three SPLIT_DOWN_*_2 /
+	EnvMultiCarrierEnabled = "SPLIT_MULTI_CARRIER_ENABLED" // both (bool, default false)
+	// Second down instance (only consulted when MultiCarrierEnabled).
+	EnvDownListen2      = "SPLIT_DOWN_LISTEN_2"       // Germany: second down-carrier loopback listener (host:port, host required)
+	EnvDownCarrierAddr2 = "SPLIT_DOWN_CARRIER_ADDR_2" // Iran: second down-carrier dial target (host:port, host required)
+	EnvDownSNI2         = "SPLIT_DOWN_CARRIER2_SNI"   // Germany: second instance's TLS 1.3 SNI (operator-set, required when enabled; never a hardcoded third-party default)
+
+	// Phase 3 carrier-intelligence policy (plans/multi-carrier-intelligence-
+	// design.md §6-§7). These knobs are only consulted when
+	// MultiCarrierEnabled is true (the policy engine is constructed only for a
+	// multi-carrier down plane); in a single-carrier node they are ignored and
+	// the Phase 3 path is fully inert.
+	//
+	// SPLIT_POLICY_MODE selects the new-stream selection policy: "static"
+	// (the Phase 2 static-priority rollback, the default; adaptive switching
+	// is OFF) or "adaptive" (hard gates + weighted score + hysteresis +
+	// cooldown + smooth WRR). The static mode is the design rollback.
+	EnvPolicyMode = "SPLIT_POLICY_MODE" // both (enum static|adaptive, default "static")
+	// SPLIT_POLICY_TOPK is the number of top-scored Active carriers used for
+	// new-stream round-robin in adaptive mode (design §7.1, D13 default 2).
+	EnvPolicyTopK = "SPLIT_POLICY_TOPK" // both (int, default 2, 1..8)
+	// SPLIT_PROBING_ENABLED turns on the bounded in-tunnel active probes.
+	// OFF by default; when ON the probe URL (SPLIT_PROBE_URL) is required —
+	// there is deliberately no third-party default, so probing enabled without
+	// a URL is a config error (fail-closed, design §6.4).
+	EnvProbingEnabled = "SPLIT_PROBING_ENABLED" // both (bool, default false)
+	// SPLIT_PROBE_URL is the operator-configured probe target. No default.
+	EnvProbeURL = "SPLIT_PROBE_URL" // both (string, required when probing enabled)
+	// SPLIT_PROBE_DAILY_BUDGET is the hard daily byte budget per carrier for
+	// active probes (design §6.4, D7 default 96 MiB). 0 = no cap (test
+	// sentinel); NEGATIVE is a config error. Expressed in bytes.
+	EnvProbeDailyBudget = "SPLIT_PROBE_DAILY_BUDGET" // both (int bytes, default 96 MiB, >= 0)
+	// SPLIT_TTFB_BASELINE_MS is the Phase 0 baseline p50 TTFB used to
+	// normalize the T score term (design §6.3). 0 = library default (500 ms).
+	EnvTTFBBaselineMs = "SPLIT_TTFB_BASELINE_MS" // both (int ms, default 500, 0..30000)
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22, plans/dashboard-control-
+	// design.md). The rule file is the 3x-ui-style ordered rule set
+	// (domains, CIDRs, port ranges, first-match-wins) that decides the
+	// egress outbound for every NEW stream on the Germany node's
+	// target dial path. OFF by default: an empty (unset) SPLIT_ROUTING_
+	// RULES_FILE means the pre-routing policy dial is used, byte-
+	// identical to the no-routing build. The routing concept is
+	// Germany-only (only the Germany node dials egress targets).
+	EnvRoutingRulesFile = "SPLIT_ROUTING_RULES_FILE" // Germany: JSON rules file path (empty = routing OFF)
+	// SPLIT_ROUTING_DEFAULT is the outbound used when NO rule matches:
+	// "direct" (the default) or "warp". "block" is NOT a valid default
+	// (it would lock out the tunnel for every unmatched destination —
+	// the same reason the rule validator rejects a catch-all block
+	// rule). Overridden from the rules file's default_action when the
+	// env is set; when unset the rules file's default_action stands.
+	EnvRoutingDefault = "SPLIT_ROUTING_DEFAULT" // Germany: enum "direct"|"warp" (default "direct" when routing ON and the rules file has no default_action)
+	// SPLIT_WARP_SOCKS_ADDR is the WARP SOCKS5 endpoint the routing
+	// engine dials for the "warp" outbound (SOCKS5h: DNS resolution
+	// happens inside WARP, not on this host). Required when any rule
+	// or the default routes to warp; empty (unset) is only valid when
+	// no warp routing is configured. Default 127.0.0.1:40000 (the
+	// WARP local forwarder on a typical host) applies when routing is
+	// ON and the env is unset.
+	EnvWarpSocksAddr = "SPLIT_WARP_SOCKS_ADDR" // Germany: host:port of the WARP SOCKS5 endpoint
+	// SPLIT_ROUTING_DEBUG turns on the per-dial debug log line
+	// ("routing: <host>:<port> → <outbound> (rule <id>)"). OFF by
+	// default: at the default level the destination is NEVER logged.
+	EnvRoutingDebug = "SPLIT_ROUTING_DEBUG" // Germany (bool, default false)
 )
 
 // Defaults (mirror the pre-Phase-7 hardcoded values; every one is safe
@@ -76,8 +234,14 @@ const (
 	DefaultDownCarrier = "127.0.0.1:10802"
 	// Placeholder URL: rejected by Validate so a fresh install fails
 	// fast instead of dialing a dead domain forever.
-	DefaultUpWsUrl    = "wss://cdn.example.com/upload"
-	DefaultDownListen = ":9002"
+	DefaultUpWsUrl = "wss://cdn.example.com/upload"
+	// DefaultDownListen is loopback-only: the down-carrier TCP listener is
+	// reached through the local VLESS+Reality Xray inbound, never directly
+	// from the Internet, so the default binds 127.0.0.1. Operators who need
+	// a non-loopback bind (e.g. a Reality front-end on another host) set
+	// SPLIT_DOWN_LISTEN explicitly — checkHostPort still accepts any
+	// host:port, so non-loopback binds remain supported.
+	DefaultDownListen = "127.0.0.1:9002"
 	// Placeholder secret: rejected by the Phase 6 policy.
 	DefaultSecret = "CHANGE-ME-SECRET-USE-A-LONG-RANDOM-STRING"
 	// RFC 1929 SOCKS5 credentials (Iran): empty means auth disabled,
@@ -104,6 +268,32 @@ const (
 	MinCarrierGraceMs = 500    // 0.5 s
 	MaxCarrierGraceMs = 600000 // 10 min
 
+	// Carrier reconnect backoff bounds (internal/backoff.NewBounded). These
+	// keep a misconfiguration from sleeping for hours (or busy-looping at
+	// zero); the window/clamp bounds of 0 mean "disabled" (pure
+	// exponential backoff — the pre-fix behavior).
+	MinReconnectBaseMs   = 100
+	MaxReconnectBaseMs   = 60000
+	MinReconnectMaxMs    = 100
+	MaxReconnectMaxMs    = 300000
+	MinReconnectWindowMs = 0
+	MaxReconnectWindowMs = 600000 // 10 min
+	MinReconnectClampMs  = 0
+	MaxReconnectClampMs  = 300000 // 5 min
+	// Carrier reconnect backoff defaults: a bounded reconnect window so a
+	// brief underlay blip cannot amplify into a multi-minute outage.
+	// Defaults: base 1s, cap 10s, window 30s, clamp 2s.
+	DefaultReconnectBaseMs   = 1000
+	DefaultReconnectMaxMs    = 10000
+	DefaultReconnectWindowMs = 30000
+	DefaultReconnectClampMs  = 2000
+
+	// Issue #19 kernel TCP keepalive. Default (enabled) probe period 30s —
+	// a wedged / half-open socket is detected within one probe instead of
+	// the OS default (~2 h). Bounds: 0 disables, 1000..36000000 (30 min).
+	MinTCPKeepAliveMs   = 0
+	MaxTCPKeepAliveMs   = 36000000 // 30 min
+	DefaultTCPKeepAlive = 30000
 	// Issue #7 bootstrap wait bounds (ms). 0 = library default
 	// (node.defaultBootstrapWait, 30 s). The maximum keeps a
 	// misconfiguration from holding a new session hostage for hours;
@@ -136,8 +326,95 @@ const (
 	MinLivenessRounds     = 0
 	MaxLivenessRounds     = 20
 
+	// Phase B credit flow-control (Slices 6-7). Credits are OFF by default;
+	// the whole plane is inert until SPLIT_CREDITS_ENABLED is set true. The
+	// credit-plane sub-constants (window, timeout, batch) are fixed by the
+	// design §5/§14 invariants in pkg/node/credit.go and are NOT exposed as
+	// the operator env vars (setting one would break the B2 memory-bound
+	// guarantee creditPreLatchBound < MaxBytesPerStream).
+	DefaultCreditsEnabled = false
+	// Multi-carrier down-plane default (Phase 2): OFF. When false the
+	// single-value down form is used and behavior is byte-identical to the
+	// pre-Phase-2 build.
+	DefaultMultiCarrierEnabled = false
+
+	// Phase 3 carrier-intelligence defaults (plans/multi-carrier-intelligence-
+	// design.md §6-§7). The policy engine sanitizes zero values to the
+	// documented starting values; these defaults mirror the ON/OFF and the
+	// bounded ranges enforced at config validation.
+	// DefaultPolicyMode is the Phase 2 rollback: "static" (adaptive switching
+	// OFF by default).
+	DefaultPolicyMode = PolicyStaticMode
+	// DefaultProbingEnabled: OFF (probes are opt-in; the byte budget and the
+	// probe URL are only consulted when ON).
+	DefaultProbingEnabled = false
+	// DefaultProbeURL: no third-party default (empty). Required when
+	// ProbingEnabled is true.
+	DefaultProbeURL = ""
+	// DefaultProbeDailyBudget: the hard daily byte cap for active probes
+	// (design §6.4, D7): 96 MiB.
+	DefaultProbeDailyBudget = 96 << 20 // 96 MiB
+	// MinTTFBBaselineMs / MaxTTFBBaselineMs bound the TTFB baseline (ms).
+	// 0 means "library default" (500 ms).
+	MinTTFBBaselineMs = 0
+	MaxTTFBBaselineMs = 30000
+	// MinPolicyTopK / MaxPolicyTopK bound the top-K carrier count.
+	MinPolicyTopK = 1
+	MaxPolicyTopK = 8
+	// DefaultPolicyTopK (design §7.1, D13).
+	DefaultPolicyTopK = 2
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22):
+	// DefaultRoutingRulesFile: empty — routing is OFF unless the operator
+	// (or the C4 control plane) sets SPLIT_ROUTING_RULES_FILE.
+	DefaultRoutingRulesFile = ""
+	// DefaultRoutingDefault: empty — SPLIT_ROUTING_DEFAULT defers to the
+	// rules file's default_action (which the rules validator lifts to
+	// "direct" when the file omits it). An explicit env value OVERRIDES
+	// the rules file's default_action; the empty value never overrides.
+	DefaultRoutingDefault = ""
+	// RoutingDefaultAllowed is the valid value set for SPLIT_ROUTING_DEFAULT.
+	// "block" is deliberately NOT allowed: a block default would refuse
+	// every unmatched destination and lock out the tunnel (the same
+	// reason a catch-all block rule is rejected by the validator).
+	RoutingDefaultAllowed = "direct|warp"
+	// DefaultWarpSocksAddr: the WARP local SOCKS5 forwarder. The routing
+	// engine only reaches it when a rule or the default routes to warp.
+	DefaultWarpSocksAddr = "127.0.0.1:40000"
+	// DefaultRoutingDebug: OFF — at the default log level the engine
+	// logs no destination at all.
+	DefaultRoutingDebug = false
+	// Opt-in only-IPv4 target-dial policy: false by default preserves the
+	// current net.DialTimeout("tcp") behavior for every host (dual-stack
+	// resolution, OS address-family preference). When true, domain hosts
+	// are resolved to IPv4 A records only and a clear error is returned
+	// when no A record exists (no silent IPv6 fallback).
+	DefaultTargetOnlyIPv4 = false
+
+	// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+	// SUBTASK 42). The default "default" preserves today's byte-identical
+	// dual-stack net.DialTimeout. The three allowed values (and their
+	// semantics) are documented in docs/target-ipv4-policy.md:
+	//   - "default"     — OS dual-stack preference (today's behavior);
+	//   - "prefer-ipv4" — deterministic IPv4-first with IPv6 fallback
+	//     (RECOMMENDED for dual-homed Germany; never refuses AAAA-only);
+	//   - "ipv4-only"   — hard A-record filter (use with care — breaks
+	//     AAAA-only endpoints; 96-refusal evidence).
+	DefaultTargetAddrPolicy    = "default"
+	TargetAddrPolicyPreferIPv4 = "prefer-ipv4"
+	TargetAddrPolicyIPv4Only   = "ipv4-only"
+	// targetAddrPolicyAllowed is the valid value set, named in validation
+	// errors.
+	targetAddrPolicyAllowed = "default|prefer-ipv4|ipv4-only"
+
 	MinPort = 1
 	MaxPort = 65535
+
+	// ReservedPort is the dashboard TLS port (plans/oneclick-installer-design.md
+	// §305). It must never be used for a carrier listener: a carrier bound to
+	// it would fail at bind time once the dashboard is installed, so the
+	// config layer refuses it up front.
+	ReservedPort = 8443
 
 	// SOCKS5 RFC 1929 username bounds: RFC 1929 encodes the username
 	// length in one byte, so 1..255 is the representable range. The
@@ -159,7 +436,6 @@ type Config struct {
 	DownCarrierAddr string // Iran: down-carrier dial target (host:port)
 	UpWsUrl         string // Germany: up-carrier WS URL (ws:// or wss://host/upload)
 	DownListen      string // Germany: down-carrier TCP listener (host:port, host may be empty)
-
 	// Iran RFC 1929 SOCKS5 credentials (plans/socks5-auth-design.md §1.2):
 	// empty = auth not configured (pre-RFC-1929 behavior); both non-empty =
 	// auth enforced. Exactly one set is a config error (fail closed). The
@@ -167,6 +443,13 @@ type Config struct {
 	SocksUser string
 	SocksPass string
 
+	// Iran SOCKS5 source-IP allowlist (opt-in; comma-separated CIDRs and/or
+	// bare IPv4/IPv6 addresses). Empty = unset = allow all sources
+	// (backward-compatible default). When set, a non-empty entry list is
+	// validated at config load: every entry must be a well-formed CIDR or
+	// single address, or the config fails (a typo'd allowlist must NOT
+	// silently allow everyone). Independent of the RFC 1929 credential pair.
+	SocksAllowedSources string
 	// Shared
 	Secret               string        // never logged, never echoed in errors
 	AllowWeakSecret      bool          // SPLIT_ALLOW_WEAK_SECRET (Phase 6 bypass)
@@ -180,15 +463,107 @@ type Config struct {
 
 	// Phase 5 carrier-loss recovery (pkg/node engine).
 	CarrierGraceMs int // SPLIT_CARRIER_GRACE: grace window per direction (ms)
+	// Carrier reconnect backoff (internal/backoff.NewBounded). Both roles run
+	// a reconnect loop, so these are wired for both; window/clamp of 0
+	// disables the bound (pure exponential backoff — the pre-fix behavior).
+	ReconnectBaseMs   int // SPLIT_RECONNECT_BASE_MS: exponential backoff base (ms)
+	ReconnectMaxMs    int // SPLIT_RECONNECT_MAX_MS: exponential backoff cap (ms)
+	ReconnectWindowMs int // SPLIT_RECONNECT_WINDOW_MS: cumulative sleep bound per episode (ms; 0 disables)
+	ReconnectClampMs  int // SPLIT_RECONNECT_CLAMP_MS: per-attempt delay once the window is exhausted (ms; 0 disables)
+	// Issue #19: kernel TCP keepalive probe period for the long-lived
+	// client / target / carrier TCP sockets (ms; SPLIT_TCP_KEEPALIVE_MS).
+	// 0 = disabled (use the OS default). Applied at the node layer to the
+	// accepted client sockets, the egress target dials, and the carrier
+	// TCP transports so a wedged/half-open socket is reaped in ~one probe.
+	TCPKeepAliveMs int
 	// Issue #7 bootstrap wait (pkg/node engine).
 	BootstrapWaitMs int // SPLIT_BOOTSTRAP_WAIT_MS: bounded bootstrap wait for a down carrier (ms; 0 = library default)
 	SessionBufBytes int // SPLIT_SESSION_BUFFER_BYTES: bounded per-direction reconnect buffer
 	SessionBufTotal int // SPLIT_SESSION_BUFFER_TOTAL_BYTES: node-level aggregate (0 = library default)
-
 	// Carrier liveness (blackhole detection): consecutive unanswered
 	// keepalive pings before the carrier is torn down through the normal
 	// loss/rebind machinery. 0 = library default (mux.DefaultLivenessRounds).
 	LivenessRounds int // SPLIT_LIVENESS_ROUNDS
+
+	// Phase B credit flow-control (Slices 6-7). CreditsEnabled is the
+	// master on/off (default false → the whole credit plane is inert).
+	// The credit-plane sub-constants (window, timeout, batch) are fixed
+	// by design §5/§14 invariants in pkg/node/credit.go and are NOT
+	// per-operator env vars.
+	CreditsEnabled bool // SPLIT_CREDITS_ENABLED
+
+	// Opt-in only-IPv4 egress-target policy (SPLIT_TARGET_ONLY_IPV4).
+	// Default false preserves the existing dual-stack net.DialTimeout
+	// behavior. When true the node's default TargetDial resolves domain
+	// hosts to IPv4 only; literal IPs dial exactly as given.
+	TargetOnlyIPv4 bool // SPLIT_TARGET_ONLY_IPV4 (hard filter; SUBTASK-42 legacy)
+
+	// Opt-in egress-target address-family policy (SPLIT_TARGET_ADDR_POLICY,
+	// SUBTASK 42). One of "default" | "prefer-ipv4" | "ipv4-only".
+	// Default "default" preserves today's byte-identical dual-stack dial.
+	// "prefer-ipv4" is the recommended opt-in (v4-first, v6 fallback,
+	// AAAA-only still succeeds); "ipv4-only" is the hard A-record filter
+	// (equivalent to TargetOnlyIPv4=true). Unknown values are a validation
+	// error naming the allowed set. Precedence when both are set:
+	// TargetOnlyIPv4=true / "ipv4-only" is the stricter policy and wins;
+	// the explicit contradiction TargetOnlyIPv4=true + "prefer-ipv4" is a
+	// validation error.
+	TargetAddrPolicy string // SPLIT_TARGET_ADDR_POLICY
+
+	// Multi-carrier down-plane (Phase 2). MultiCarrierEnabled is the master
+	// on/off (default false → single-value down form, byte-identical behavior).
+	// When true, the SECOND down instance is described by the three _2 fields
+	// (all required and validated): Germany adds a second loopback Reality
+	// listener (DownListen2), Iran dials a second local consumer inbound
+	// (DownCarrierAddr2), and Germany renders the second instance's SNI
+	// (DownSNI2). Port 8443 is reserved for the dashboard and rejected for
+	// any carrier listener.
+	MultiCarrierEnabled bool   // SPLIT_MULTI_CARRIER_ENABLED
+	DownListen2         string // Germany: second down-carrier loopback listener (host:port)
+	DownCarrierAddr2    string // Iran: second down-carrier dial target (host:port)
+	DownSNI2            string // Germany: second instance SNI (TLS 1.3, operator-set)
+
+	// Phase 3 carrier-intelligence policy (only consulted when
+	// MultiCarrierEnabled; inert in single-carrier nodes).
+	PolicyMode       string // SPLIT_POLICY_MODE (static|adaptive, default static)
+	PolicyTopK       int    // SPLIT_POLICY_TOPK (1..8, default 2)
+	ProbingEnabled   bool   // SPLIT_PROBING_ENABLED (default false)
+	ProbeURL         string // SPLIT_PROBE_URL (required when ProbingEnabled; no default)
+	ProbeDailyBudget int64  // SPLIT_PROBE_DAILY_BUDGET (bytes, default 96 MiB, >= 0)
+	TTFBBaselineMs   int    // SPLIT_TTFB_BASELINE_MS (ms, default 0 = library 500 ms)
+
+	// GERMANY OUTBOUND ROUTING ENGINE (§22). Germany role only (the
+	// Germany node is the only side that dials egress targets). When
+	// RoutingRulesFile is empty the routing engine is NOT constructed:
+	// the node's default policy dial (post-Sanitize) is used, which is
+	// byte-identical to the no-routing build.
+	RoutingRulesFile string // SPLIT_ROUTING_RULES_FILE (empty = routing OFF)
+	// RoutingDefault is the outbound kind ("direct"|"warp") used when no
+	// rule matches; it OVERRIDES the rules file's default_action when
+	// non-empty. "block" is not a valid value.
+	RoutingDefault string // SPLIT_ROUTING_DEFAULT ("" = use the rules file's default_action; "direct"|"warp")
+	// WarpSocksAddr is the WARP SOCKS5 endpoint for the "warp" outbound.
+	// Required when any rule or the default routes to warp; default
+	// DefaultWarpSocksAddr when routing is ON and the env is unset.
+	WarpSocksAddr string // SPLIT_WARP_SOCKS_ADDR (default 127.0.0.1:40000 when routing ON)
+	// RoutingDebug turns on the per-dial debug log line (destination is
+	// logged ONLY when this is true).
+	RoutingDebug bool // SPLIT_ROUTING_DEBUG (default false)
+
+	// up-carrier drop-storm fix (Parts 2 & 3). All default to the OFF /
+	// zero-sentinel values so the dial path is byte-identical to the
+	// pre-fix build unless an operator opts in. The 0 sentinel on a numeric
+	// knob means "use the library default" (pkg/node/target_dial_governor.go
+	// lifts it); 0 on SPLIT_TARGET_DIAL_BOUND_MS means "no extra ceiling".
+	TargetDialBoundMs       int  // SPLIT_TARGET_DIAL_BOUND_MS (ms, default 0)
+	TargetBreakerEnabled    bool // SPLIT_TARGET_BREAKER_ENABLED (default false)
+	TargetBreakerWindowMs   int  // SPLIT_TARGET_BREAKER_WINDOW_MS (ms, default 0)
+	TargetBreakerThreshold  int  // SPLIT_TARGET_BREAKER_THRESHOLD (default 0)
+	TargetBreakerCooldownMs int  // SPLIT_TARGET_BREAKER_COOLDOWN_MS (ms, default 0)
+	TargetBreakerMaxTargets int  // SPLIT_TARGET_BREAKER_MAX_TARGETS (default 0)
+	TargetBackoffEnabled    bool // SPLIT_TARGET_DIAL_BACKOFF_ENABLED (default false)
+	TargetBackoffBaseMs     int  // SPLIT_TARGET_DIAL_BACKOFF_BASE_MS (ms, default 0)
+	TargetBackoffMaxMs      int  // SPLIT_TARGET_DIAL_BACKOFF_MAX_MS (ms, default 0)
 }
 
 // Defaults returns a Config with all built-in defaults (no env read).
@@ -208,7 +583,39 @@ func Defaults() *Config {
 		RelayBufSize:      DefaultRelayBuf,
 		KeepAliveInterval: DefaultKeepAlive,
 		CarrierGraceMs:    5000,
-		SessionBufBytes:   DefaultSessionBuf,
+		ReconnectBaseMs:   DefaultReconnectBaseMs,
+		ReconnectMaxMs:    DefaultReconnectMaxMs,
+		ReconnectWindowMs: DefaultReconnectWindowMs,
+		ReconnectClampMs:  DefaultReconnectClampMs,
+		// Issue #19: kernel TCP keepalive probe period (default 30s).
+		TCPKeepAliveMs:  DefaultTCPKeepAlive,
+		SessionBufBytes: DefaultSessionBuf,
+		// Phase B credit flow-control default (Slices 6-7): credits off.
+		CreditsEnabled: DefaultCreditsEnabled,
+		// Opt-in only-IPv4 target policy default (off: preserves the
+		// existing dual-stack dial behavior).
+		TargetOnlyIPv4: DefaultTargetOnlyIPv4,
+		// Opt-in egress-target address-family policy default ("default"
+		// preserves today's byte-identical dual-stack dial; SUBTASK 42).
+		TargetAddrPolicy: DefaultTargetAddrPolicy,
+		// Multi-carrier down-plane default (Phase 2): OFF.
+		MultiCarrierEnabled: DefaultMultiCarrierEnabled,
+		// Phase 3 carrier-intelligence defaults (inert unless
+		// MultiCarrierEnabled): static policy (the Phase 2 rollback),
+		// probing OFF, no third-party probe URL, the 96 MiB daily budget,
+		// and the 0-means-library-default TTFB baseline.
+		PolicyMode:       DefaultPolicyMode,
+		PolicyTopK:       DefaultPolicyTopK,
+		ProbingEnabled:   DefaultProbingEnabled,
+		ProbeURL:         DefaultProbeURL,
+		ProbeDailyBudget: DefaultProbeDailyBudget,
+		TTFBBaselineMs:   0,
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): routing OFF by default.
+		// Empty rules file = the pre-routing policy dial (byte-identical).
+		RoutingRulesFile: DefaultRoutingRulesFile,
+		RoutingDefault:   DefaultRoutingDefault,
+		WarpSocksAddr:    DefaultWarpSocksAddr,
+		RoutingDebug:     DefaultRoutingDebug,
 	}
 }
 
@@ -254,6 +661,10 @@ func Load(role string) (*Config, error) {
 	// half-set state is deterministic and fails closed in Validate.
 	c.SocksUser = envString(EnvSocksUser, c.SocksUser)
 	c.SocksPass = envString(EnvSocksPass, c.SocksPass)
+	// SOCKS5 source-IP allowlist (opt-in): unset or empty means "allow all"
+	// (the backward-compatible default; a restrictive default would break a
+	// user who runs the SOCKS5 proxy from an unknown IP).
+	c.SocksAllowedSources = envString(EnvSocksAllowedSources, "")
 	c.MetricsPort = envInt(&problems, EnvMetricsPort, 0, 0, MaxPort)
 	c.RelayBufSize = envInt(&problems, EnvRelayBuf, DefaultRelayBuf, MinRelayBuf, MaxRelayBuf)
 	c.QueueBytesPerStream = envInt(&problems, EnvQueueBytes, 0, 0, MaxQueueBytesPerStream)
@@ -261,10 +672,85 @@ func Load(role string) (*Config, error) {
 	c.QueueBytesTotal = envInt(&problems, EnvQueueTotal, 0, 0, MaxQueueBytesTotal)
 	c.OverflowWaitMs = envInt(&problems, EnvOverflowMs, 0, 0, MaxOverflowWaitMs)
 	c.CarrierGraceMs = envInt(&problems, EnvCarrierGrace, 5000, MinCarrierGraceMs, MaxCarrierGraceMs)
+	// Carrier reconnect backoff (internal/backoff.NewBounded). Both roles run
+	// a reconnect loop (Germany: up-carrier WS → CDN; Iran: down-carrier TCP →
+	// local Xray), so all four knobs are wired here, in the role-agnostic part
+	// of Load — not gated on RoleIran/RoleGermany. 0 on the window or clamp
+	// disables the bound (pure exponential backoff — the pre-fix behavior).
+	c.ReconnectBaseMs = envInt(&problems, EnvReconnectBaseMs, DefaultReconnectBaseMs, MinReconnectBaseMs, MaxReconnectBaseMs)
+	c.ReconnectMaxMs = envInt(&problems, EnvReconnectMaxMs, DefaultReconnectMaxMs, MinReconnectMaxMs, MaxReconnectMaxMs)
+	c.ReconnectWindowMs = envInt(&problems, EnvReconnectWindowMs, DefaultReconnectWindowMs, MinReconnectWindowMs, MaxReconnectWindowMs) // 0 = disabled
+	c.ReconnectClampMs = envInt(&problems, EnvReconnectClampMs, DefaultReconnectClampMs, MinReconnectClampMs, MaxReconnectClampMs)      // 0 = disabled
+	// Issue #19: kernel TCP keepalive probe period (ms). 0 = disabled
+	// (use the OS default keepalive); default 30s. Both roles.
+	c.TCPKeepAliveMs = envInt(&problems, EnvTCPKeepAlive, DefaultTCPKeepAlive, MinTCPKeepAliveMs, MaxTCPKeepAliveMs)
 	c.BootstrapWaitMs = envInt(&problems, EnvBootstrapWait, DefaultBootstrapWaitMs, 0, MaxBootstrapWaitMs) // 0 = library default
 	c.SessionBufBytes = envInt(&problems, EnvSessionBuf, DefaultSessionBuf, MinSessionBuf, MaxSessionBuf)
 	c.SessionBufTotal = envInt(&problems, EnvSessionBufTotal, DefaultSessionBufTotal, 0, MaxSessionBufTotal)             // 0 = library default
 	c.LivenessRounds = envInt(&problems, EnvLivenessRounds, DefaultLivenessRounds, MinLivenessRounds, MaxLivenessRounds) // 0 = library default
+	// Phase B credit flow-control (Slices 6-7): master flag. The three
+	// sub-knobs (window/timeout/batch) are fixed by pkg/node/credit.go
+	// constants and are NOT operator env vars (removing them prevents
+	// SPLIT_CREDIT_* from silently doing nothing).
+	c.CreditsEnabled = envBool(&problems, EnvCreditsEnabled, DefaultCreditsEnabled)
+	// Opt-in only-IPv4 target policy: an invalid value (anything other
+	// than 1/0/t/f/true/false) is a config error, matching the
+	// EnvAllowWeak boolean convention; unset/empty keeps the default
+	// (false — current dual-stack behavior preserved).
+	c.TargetOnlyIPv4 = envBool(&problems, EnvTargetOnlyIPv4, DefaultTargetOnlyIPv4)
+	// Opt-in egress-target address-family policy (SUBTASK 42): a string
+	// enum, default "default" (today's behavior). Unset/empty keeps the
+	// default. An unknown value is rejected in Validate (naming the
+	// allowed set) rather than silently falling back to the default —
+	// a typo'd policy must not silently change dial behavior.
+	c.TargetAddrPolicy = envString(EnvTargetAddrPolicy, DefaultTargetAddrPolicy)
+	// Multi-carrier down-plane (Phase 2): master on/off (default false →
+	// single-value form, byte-identical behavior). The three _2 values are
+	// read only when enabled; when disabled they stay at their defaults
+	// (empty) and are NOT validated, so an operator can set them early
+	// without flipping the master switch.
+	c.MultiCarrierEnabled = envBool(&problems, EnvMultiCarrierEnabled, DefaultMultiCarrierEnabled)
+	c.DownListen2 = envString(EnvDownListen2, c.DownListen2)
+	c.DownCarrierAddr2 = envString(EnvDownCarrierAddr2, c.DownCarrierAddr2)
+	c.DownSNI2 = envString(EnvDownSNI2, c.DownSNI2)
+	// Phase 3 carrier-intelligence policy (only validated when
+	// MultiCarrierEnabled; inert otherwise).
+	c.PolicyMode = envString(EnvPolicyMode, DefaultPolicyMode)
+	c.PolicyTopK = envInt(&problems, EnvPolicyTopK, DefaultPolicyTopK, MinPolicyTopK, MaxPolicyTopK)
+	c.ProbingEnabled = envBool(&problems, EnvProbingEnabled, DefaultProbingEnabled)
+	c.ProbeURL = envString(EnvProbeURL, c.ProbeURL)
+	c.ProbeDailyBudget = envInt64(&problems, EnvProbeDailyBudget, DefaultProbeDailyBudget)
+	c.TTFBBaselineMs = envInt(&problems, EnvTTFBBaselineMs, 0, MinTTFBBaselineMs, MaxTTFBBaselineMs) // 0 = library default
+	// GERMANY OUTBOUND ROUTING ENGINE (§22). OFF by default: an empty
+	// rules-file value leaves routing disabled and the node's pre-
+	// routing policy dial in place (byte-identical to no-routing).
+	// SPLIT_ROUTING_DEFAULT, when set, OVERRIDES the rules file's
+	// default_action; when empty the rules file's default_action (or
+	// "direct" if the file omits it) stands.
+	c.RoutingRulesFile = envString(EnvRoutingRulesFile, c.RoutingRulesFile) // "" = routing OFF
+	c.RoutingDefault = envString(EnvRoutingDefault, c.RoutingDefault)       // empty env → keep the default ("direct")
+	// SPLIT_WARP_SOCKS_ADDR: the DefaultWarpSocksAddr (127.0.0.1:40000)
+	// is applied only when routing is ON; when routing is OFF the value
+	// stays at the default (unused, so it is never dialed).
+	c.WarpSocksAddr = envString(EnvWarpSocksAddr, DefaultWarpSocksAddr)
+	// SPLIT_ROUTING_DEBUG: OFF by default — at the default level the
+	// engine logs no destination at all.
+	c.RoutingDebug = envBool(&problems, EnvRoutingDebug, DefaultRoutingDebug)
+	// up-carrier drop-storm fix (Parts 2 & 3): bounded dial, circuit breaker,
+	// jittered backoff. Every knob ships at its OFF / zero-sentinel default so
+	// an unconfigured deployment is byte-identical to the pre-fix build. The
+	// 0 sentinel means "use the library default" (lifted in
+	// pkg/node/target_dial_governor.go); 0 on the bound means "no extra
+	// ceiling" (the raw dialer's 10s stands).
+	c.TargetDialBoundMs = envInt(&problems, EnvTargetDialBoundMs, 0, 0, 120000) // 0 = no ceiling
+	c.TargetBreakerEnabled = envBool(&problems, EnvTargetBreakerEnabled, false)
+	c.TargetBreakerWindowMs = envInt(&problems, EnvTargetBreakerWindowMs, 0, 0, 3600000)     // 0 = library 60s
+	c.TargetBreakerThreshold = envInt(&problems, EnvTargetBreakerThreshold, 0, 0, 100000)    // 0 = library 5
+	c.TargetBreakerCooldownMs = envInt(&problems, EnvTargetBreakerCooldownMs, 0, 0, 3600000) // 0 = library 30s
+	c.TargetBreakerMaxTargets = envInt(&problems, EnvTargetBreakerMaxTargets, 0, 0, 100000)  // 0 = library 1024
+	c.TargetBackoffEnabled = envBool(&problems, EnvTargetDialBackoffEnabled, false)
+	c.TargetBackoffBaseMs = envInt(&problems, EnvTargetDialBackoffBaseMs, 0, 0, 60000) // 0 = library 500ms
+	c.TargetBackoffMaxMs = envInt(&problems, EnvTargetDialBackoffMaxMs, 0, 0, 300000)  // 0 = library 30s
 
 	if v, ok := os.LookupEnv(EnvAllowWeak); ok && v != "" {
 		b, err := strconv.ParseBool(v)
@@ -335,9 +821,68 @@ func (c *Config) Validate(role string) error {
 				}
 			}
 		}
+		// SOCKS5 source-IP allowlist (opt-in; independent of the credential pair):
+		// empty = allow all (backward-compatible default). When non-empty, every
+		// comma-separated entry must be a well-formed CIDR or single IPv4/IPv6
+		// address; an invalid entry fails config load so a typo'd allowlist
+		// cannot silently allow everyone.
+		checkSocksAllowedSources(&problems, c.SocksAllowedSources)
+		// Multi-carrier (Phase 2, Iran role): a SECOND down-carrier dial
+		// target (loopback port of the second Xray consumer inbound). Valid
+		// only when multi-carrier is enabled; it must be a well-formed host:port
+		// that differs from the primary down target, otherwise the two carriers
+		// would dial the same endpoint and the second carrier adds nothing.
+		if c.MultiCarrierEnabled {
+			checkHostPort(&problems, EnvDownCarrierAddr2, c.DownCarrierAddr2, true)
+			if c.DownCarrierAddr2 != "" && c.DownCarrierAddr2 == c.DownCarrierAddr {
+				problems = append(problems, fmt.Sprintf(
+					"%s=%q equals %s=%q; the second down carrier must dial a different local consumer inbound",
+					EnvDownCarrierAddr2, c.DownCarrierAddr2, EnvDownCarrier, c.DownCarrierAddr))
+			}
+		}
 	case RoleGermany:
 		checkWsUrl(&problems, c.UpWsUrl)
 		checkHostPort(&problems, EnvDownListen, c.DownListen, false)
+		// Port 8443 is reserved for the dashboard TLS listener
+		// (plans/oneclick-installer-design.md §305); a carrier bound to it
+		// would fail at bind time once the dashboard is installed, so reject
+		// it at config time. The primary down listener and, when enabled, the
+		// second down listener are both carrier listeners.
+		checkNotReservedCarrierPort(&problems, EnvDownListen, c.DownListen)
+		// Multi-carrier (Phase 2, Germany role): a SECOND down-carrier
+		// listener (loopback port of the second splitter down instance) plus
+		// the second instance's TLS 1.3 SNI for Reality config rendering.
+		// All are required and validated only when multi-carrier is enabled.
+		if c.MultiCarrierEnabled {
+			checkHostPort(&problems, EnvDownListen2, c.DownListen2, true)
+			checkNotReservedCarrierPort(&problems, EnvDownListen2, c.DownListen2)
+			// Conflicting listeners: the second down listener must not fight
+			// the first over the same bind address.
+			if c.DownListen2 != "" && conflict(c.DownListen, c.DownListen2) {
+				problems = append(problems, fmt.Sprintf(
+					"%s and %s use the same endpoint %q; the app owns both listeners",
+					EnvDownListen, EnvDownListen2, c.DownListen2))
+			}
+			// SNI: required when multi-carrier is enabled. The default is the
+			// operator-placeholder sentinel; a real TLS 1.3-compliant domain
+			// must be set (decision D3). It is validated with the same SNI
+			// rule the Reality renderer uses (internal/pairing.ValidSNI).
+			if c.DownSNI2 == "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s is required when %s=true (the second down carrier's TLS 1.3 SNI; set a real, TLS 1.3-compliant domain)",
+					EnvDownSNI2, EnvMultiCarrierEnabled))
+			} else if !pairing.ValidSNI(c.DownSNI2) {
+				problems = append(problems, fmt.Sprintf(
+					"%s=%q: must be a lowercase RFC 1123 hostname (no IP literal, no port, no scheme)",
+					EnvDownSNI2, c.DownSNI2))
+			}
+		}
+		// GERMANY OUTBOUND ROUTING ENGINE (§22): routing is OFF unless the
+		// operator (or the C4 control plane) sets SPLIT_ROUTING_RULES_FILE.
+		// When OFF, the node's pre-routing policy dial is used, byte-
+		// identical to the no-routing build, so no routing fields are
+		// validated here.
+		checkRouting(&problems, c)
 	case "":
 		return fmt.Errorf("config: no role given")
 	default:
@@ -416,12 +961,78 @@ func (c *Config) Validate(role string) error {
 			"%s=%d: expected 0 (library default) .. %d bytes (Issue #6 node-level aggregate session-buffer budget)",
 			EnvSessionBufTotal, c.SessionBufTotal, MaxSessionBufTotal))
 	}
+	// Opt-in egress-target address-family policy (SUBTASK 42): the value
+	// must be one of the allowed set (default|prefer-ipv4|ipv4-only); an
+	// unknown value is rejected naming the allowed set so a typo'd policy
+	// cannot silently change dial behavior.
+	// The empty string is the "unset" sentinel (a hand-constructed Config
+	// that never reads the env) and is valid — Load fills it with the
+	// default before Validate, so by the time Load's Validate runs the
+	// field is always one of the three allowed values; a directly
+	// constructed Config (tests, future non-env callers) may leave it
+	// empty and that means "default".
+	switch c.TargetAddrPolicy {
+	case "", "default", "prefer-ipv4", "ipv4-only":
+	default:
+		problems = append(problems, fmt.Sprintf(
+			"%s=%q: expected one of %s",
+			EnvTargetAddrPolicy, c.TargetAddrPolicy, targetAddrPolicyAllowed))
+	}
+	// Cross-field: the hard filter (SPLIT_TARGET_ONLY_IPV4=true) is the
+	// STRICTER policy; it is equivalent to "ipv4-only" and compatible with
+	// "default"/"ipv4-only". The explicit contradiction TargetOnlyIPv4=true
+	// + "prefer-ipv4" (hard refuse + soft fallback) is a config error, not
+	// a silent precedence, so an operator cannot unknowingly get one or
+	// the other.
+	if c.TargetOnlyIPv4 && c.TargetAddrPolicy == "prefer-ipv4" {
+		problems = append(problems, fmt.Sprintf(
+			"%s=true contradicts %s=%q: the hard IPv4-only filter refuses AAAA-only domains, while %q falls back to IPv6. Use either %s=false + %s=prefer-ipv4, or %s=true + %s=ipv4-only, not both",
+			EnvTargetOnlyIPv4, EnvTargetAddrPolicy, c.TargetAddrPolicy,
+			c.TargetAddrPolicy, EnvTargetOnlyIPv4, EnvTargetAddrPolicy,
+			EnvTargetOnlyIPv4, EnvTargetAddrPolicy))
+	}
+
 	// Cross-field: the carrier-wide budget must cover one stream's share.
 	if c.QueueBytesPerStream > 0 && c.QueueBytesTotal > 0 &&
 		c.QueueBytesTotal < c.QueueBytesPerStream {
 		problems = append(problems, fmt.Sprintf(
 			"%s=%d is smaller than %s=%d; the aggregate budget must cover at least one stream",
 			EnvQueueTotal, c.QueueBytesTotal, EnvQueueBytes, c.QueueBytesPerStream))
+	}
+
+	// Phase 3 policy config: all validations are gated on MultiCarrierEnabled
+	// so that single-carrier deployments (the default) are unaffected by the
+	// Phase 3 fields (they stay at their zero defaults and are never
+	// validated). This preserves the "hand-built config must validate without
+	// env" invariant.
+	if c.MultiCarrierEnabled {
+		if c.PolicyMode != PolicyStaticMode && c.PolicyMode != PolicyAdaptiveMode {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%q: expected %q or %q", EnvPolicyMode, c.PolicyMode, PolicyStaticMode, PolicyAdaptiveMode))
+		}
+		if c.PolicyTopK < MinPolicyTopK || c.PolicyTopK > MaxPolicyTopK {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected %d..%d", EnvPolicyTopK, c.PolicyTopK, MinPolicyTopK, MaxPolicyTopK))
+		}
+		if c.ProbeDailyBudget < 0 {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected a non-negative byte count", EnvProbeDailyBudget, c.ProbeDailyBudget))
+		}
+		if c.TTFBBaselineMs < MinTTFBBaselineMs || c.TTFBBaselineMs > MaxTTFBBaselineMs {
+			problems = append(problems, fmt.Sprintf(
+				"%s=%d: expected %d..%d milliseconds (0 = library default)", EnvTTFBBaselineMs, c.TTFBBaselineMs, MinTTFBBaselineMs, MaxTTFBBaselineMs))
+		}
+		if c.ProbingEnabled && strings.TrimSpace(c.ProbeURL) == "" {
+			problems = append(problems, fmt.Sprintf(
+				"%s is required when %s=true; configure an operator-owned probe target (no third-party default)", EnvProbeURL, EnvProbingEnabled))
+		}
+		if c.ProbingEnabled && c.ProbeURL != "" {
+			u, err := url.ParseRequestURI(c.ProbeURL)
+			if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+				problems = append(problems, fmt.Sprintf(
+					"%s: expected an operator-configured http(s) URL with a host", EnvProbeURL))
+			}
+		}
 	}
 
 	// Secret policy: Phase 6's validator, not duplicated here. The
@@ -450,6 +1061,135 @@ func roleOwnedEndpoints(role string, c *Config) [][2]string {
 	return [][2]string{{EnvDownListen, c.DownListen}}
 }
 
+// checkSocksAllowedSources validates the optional SOCKS5 source-IP allowlist
+// (SPLIT_SOCKS_ALLOWED_SOURCES). The empty string means "allow all sources"
+// (the backward-compatible default) and is accepted without further checks.
+// When non-empty, the value must be a comma-separated list where every entry
+// is either a single IPv4/IPv6 address or a CIDR block ("10.0.0.0/8",
+// "fe80::/64"); any entry that parses to neither is a config problem, so a
+// typo'd allowlist fails fast at config load instead of silently allowing
+// everyone.
+func checkSocksAllowedSources(problems *[]string, raw string) {
+	if _, err := ParseAllowedSources(raw); err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s: %v; each entry must be a single IPv4/IPv6 address or a CIDR block",
+			EnvSocksAllowedSources, err))
+	}
+}
+
+// ParseAllowedSources parses a comma-separated allowlist of single IPs or
+// CIDR blocks into a slice of *net.IPNet. A bare address is wrapped in its
+// host network (a /32 for IPv4, /128 for IPv6) so membership is a single
+// uniform Contains() check. The empty or all-whitespace string is the
+// "allow all sources" sentinel and returns a NIL slice (a nil result means
+// no restriction). Any empty entry inside a non-empty list (a stray comma)
+// or any entry that is neither an address nor a CIDR is a parse error, so a
+// typo'd allowlist cannot be silently dropped.
+func ParseAllowedSources(raw string) ([]*net.IPNet, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil // allow-all sentinel
+	}
+	parts := strings.Split(trimmed, ",")
+	out := make([]*net.IPNet, 0, len(parts))
+	for _, p := range parts {
+		entry := strings.TrimSpace(p)
+		if entry == "" {
+			// A stray comma ("10.0.0.0/8,,1.2.3.4") is not representable as
+			// "allow all"; dropping it would widen the allowlist, so fail.
+			return nil, fmt.Errorf("entry list contains an empty entry (stray comma)")
+		}
+		var n *net.IPNet
+		if ip := net.ParseIP(entry); ip != nil {
+			// A bare address: a single /32 (v4) or /128 (v6) host network.
+			var mask net.IPMask
+			if ip.To4() != nil {
+				mask = net.CIDRMask(32, 32)
+			} else {
+				mask = net.CIDRMask(128, 128)
+			}
+			n = &net.IPNet{IP: ip, Mask: mask}
+		} else if _, cidr, err := net.ParseCIDR(entry); err == nil {
+			n = cidr
+		} else {
+			return nil, fmt.Errorf("entry %q is not a valid IPv4/IPv6 address or CIDR block", entry)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// AllowedSourcesMatch reports whether the client source IP (the host part of
+// the client's RemoteAddr, which the caller must strip the port from) is
+// permitted by a raw allowlist string (the form stored on
+// Config.SocksAllowedSources). The empty string permits every source
+// (allow-all default). A clientIP that cannot be parsed as an IP address is
+// rejected when an allowlist is set; under the allow-all default the parse
+// is never consulted. The source IP is a non-secret value, safe to log
+// (matching the existing "from <RemoteAddr>" lines); the allowlist entries
+// are operator configuration, not secret material.
+func AllowedSourcesMatch(raw, clientIP string) bool {
+	nets, err := ParseAllowedSources(raw)
+	if err != nil {
+		// Unreachable in production (Load validates before storing).
+		// Fail closed rather than open if it ever happens.
+		return false
+	}
+	if len(nets) == 0 {
+		return true // allow-all sentinel
+	}
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRouting validates the GERMANY OUTBOUND ROUTING ENGINE fields (§22).
+// It is a no-op when routing is OFF (empty RoutingRulesFile). When ON, it
+// validates:
+//   - SPLIT_ROUTING_DEFAULT is "" (use the rules file's default_action) or
+//     one of "direct"|"warp" ("block" is rejected — a block default would
+//     lock out the tunnel for every unmatched destination);
+//   - SPLIT_WARP_SOCKS_ADDR is a well-formed host:port when any rule or the
+//     default could route to warp (the same condition the engine's New
+//     checks, surfaced earlier at config-load time);
+//   - the rules file exists and parses (routing.LoadRulesFile); the error
+//     message names the file path, not its contents (no destination or
+//     rule data is echoed — the file is a public artifact, not secret,
+//     but its contents may include operator-chosen domain strings and
+//     should not be echoed into a config error).
+func checkRouting(problems *[]string, c *Config) {
+	if c.RoutingRulesFile == "" {
+		return // routing OFF: byte-identical, nothing to validate.
+	}
+	// Default outbound enum: only "direct"|"warp" (empty = deferral to
+	// the rules file). "block" is deliberately rejected: a block default
+	// would refuse every unmatched destination and lock out the tunnel.
+	if c.RoutingDefault != "" && c.RoutingDefault != "direct" && c.RoutingDefault != "warp" {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected one of %s (a block default would lock out the tunnel)",
+			EnvRoutingDefault, c.RoutingDefault, RoutingDefaultAllowed))
+	}
+	// WARP endpoint must be a valid host:port when routing is ON (it will
+	// be dialed whenever any rule or the default routes to warp).
+	if c.WarpSocksAddr != "" {
+		checkHostPort(problems, EnvWarpSocksAddr, c.WarpSocksAddr, true)
+	}
+	// Rules file must exist and parse (public-field validation happens in
+	// routing.ParseRules; the error text names only the file path and the
+	// first parse problem, never rule contents).
+	if _, err := routing.LoadRulesFile(c.RoutingRulesFile); err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: %v", EnvRoutingRulesFile, c.RoutingRulesFile, err))
+	}
+}
+
 // checkHostPort validates a host:port endpoint. requireHost applies to
 // dial targets (a listen address may omit the host: ":9002"). IPv6
 // requires bracket syntax ("[::1]:9002") — that is standard
@@ -475,6 +1215,26 @@ func checkHostPort(problems *[]string, name, addr string, requireHost bool) {
 	if err != nil || p < MinPort || p > MaxPort {
 		*problems = append(*problems, fmt.Sprintf(
 			"%s=%q: expected a port between %d and %d", name, addr, MinPort, MaxPort))
+	}
+}
+
+// checkNotReservedCarrierPort reports a config problem when the
+// host:port endpoint's port is the dashboard-reserved port 8443
+// (plans/oneclick-installer-design.md §305). A carrier listener on that
+// port would fail to bind once the dashboard is installed, so the config
+// layer refuses it up front. The endpoint's port is parsed with the same
+// host:port rules as checkHostPort (IPv6 bracket syntax supported); when
+// the endpoint is unparseable checkHostPort has already reported the
+// problem, so this helper is a no-op in that case.
+func checkNotReservedCarrierPort(problems *[]string, name, addr string) {
+	_, p, ok := portOf(addr)
+	if !ok {
+		return // checkHostPort already reported the parse problem.
+	}
+	if p == ReservedPort {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: port %d is reserved for the dashboard TLS listener; use a different carrier port",
+			name, addr, ReservedPort))
 	}
 }
 
@@ -572,6 +1332,42 @@ func envInt(problems *[]string, name string, def, min, max int) int {
 	if n < min || n > max {
 		*problems = append(*problems, fmt.Sprintf(
 			"%s=%q: expected an integer between %d and %d", name, v, min, max))
+		return def
+	}
+	return n
+}
+
+// envBool parses a boolean env variable (1/0/t/f/true/false, case-insensitive
+// via strconv.ParseBool). Unset/empty returns def. An invalid value is
+// aggregated as a precise problem (mirroring the EnvAllowWeak convention in
+// Load) and def is returned.
+func envBool(problems *[]string, name string, def bool) bool {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected a boolean (true/false, 1/0)", name, v))
+		return def
+	}
+	return b
+}
+
+// envInt64 parses an integer64 env variable (the probe byte budget is the one
+// int64-typed knob). Unset/empty returns def. A non-integer value is a config
+// error (no silent zeroing). Negative values are validated by the caller
+// (Validate) since the minimum is knob-specific; this helper only parses.
+func envInt64(problems *[]string, name string, def int64) int64 {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s=%q: expected an integer (bytes)", name, v))
 		return def
 	}
 	return n

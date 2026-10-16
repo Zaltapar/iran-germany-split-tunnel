@@ -37,12 +37,20 @@ func buildWorkerlessStream(t *testing.T, c *CarrierConn, stats *QueueStats, id u
 	return s
 }
 
-// TestRefusedDataFrameTerminatesStreamNoHole is the integrity-seam test: when
-// the consumer stalls so the mailbox is full, delivering one more DATA frame
-// must cleanly fail the stream — what the consumer has received is a
-// contiguous, in-order PREFIX of what was sent, and the stream then errors
-// (clean termination), never a silent hole.
-func TestRefusedDataFrameTerminatesStreamNoHole(t *testing.T) {
+// TestCarryExhaustionParksThenDeliversInOrder is the integrity-seam test
+// for the SUBTASK-30 backpressure: when a consumer stalls so BOTH the
+// primary mailbox AND the bounded carry region are full, the dispatcher no
+// longer terminates the stream (the old "carry-then-abort" was the
+// ~1 MB download-truncation bug). It now PARKS the delivering goroutine in
+// PushPark until the consumer drains the mailbox (a Pop frees space and
+// wakes the parked pusher), then delivers the full sequence IN ORDER with
+// zero drops and zero terminations.
+//
+// Driven by a real dispatcher + a paced consumer over a mempipe, so the
+// "the sender outpaces the consumer, the mailbox overflows, the dispatcher
+// parks, the consumer catches up, the transfer completes" loop is exactly
+// the production slow-client shape — but bounded and deterministic.
+func TestCarryExhaustionParksThenDeliversInOrder(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -50,77 +58,93 @@ func TestRefusedDataFrameTerminatesStreamNoHole(t *testing.T) {
 	defer c.Close()
 	stats := &QueueStats{}
 	c.SetQueueStats(stats)
-	c.SetStreamLimits(bpLimits(2, 4096, 4096, 50*time.Millisecond))
-	s := buildWorkerlessStream(t, c, stats, 1, 2, 4096, 4096)
+	// Primary: 2 frames of 4 B (8 B byte cap) + carry 8 B (2 frames of 4 B)
+	// = 16 B of mailbox. 24 frames of 4 B = 96 B >> 16 B: the dispatcher
+	// MUST park repeatedly. MaxBytesTotal is large so only the PER-STREAM
+	// path (the slow-consumer path) ever engages. ConsumerStall is set to a
+	// generous 30 s so the SLOW (not dead) consumer below is never
+	// reclaimed mid-transfer.
+	limits := bpLimits(2, 8, 1<<20, 100*time.Millisecond)
+	limits.ConsumerStall = 30 * time.Second
+	_ = c.SetStreamLimits(limits)
 
-	// The node wiring fires exactly one distinct callback when the data is
-	// undeliverable (this is what classifies the close as data_undeliverable
-	// instead of overflow).
+	ch := c.Register(1)
+	go c.Dispatch()
+
+	const total = 24
 	var undel atomic.Int32
 	c.OnStreamDataUndeliverable = func(uint32) { undel.Add(1) }
 
-	// Fill the mailbox to capacity with frames 0 and 1, in order.
-	if !s.q.TryPush(queueItem{payload: []byte("f0")}) ||
-		!s.q.TryPush(queueItem{payload: []byte("f1")}) {
-		t.Fatal("seed pushes to a 2-frame mailbox refused")
-	}
-
-	// The consumer stalled, so frame 2 is refused by the full mailbox. Push
-	// it through the real dispatcher path: it must hit the deliver-or-fail
-	// policy, not a silent drop.
-	if s.q.TryPush(queueItem{payload: []byte("f2")}) {
-		t.Fatal("f2 unexpectedly fit the full mailbox")
-	}
-	c.deliver(s, queueItem{payload: []byte("f2")})
-
-	// INVARIANT part 1 — contiguity BEFORE the stream fails: everything that
-	// ever reached the consumer is exactly [f0 f1], a contiguous in-order
-	// prefix of the sent [f0 f1 f2] with NO hole. (Inspect the mailbox under
-	// its own lock; same-package test, the way queue_stats_test.go does.)
-	s.q.mu.Lock()
-	var queued []string
-	for _, it := range s.q.items {
-		queued = append(queued, string(it.payload))
-	}
-	qclosed := s.q.closed
-	s.q.mu.Unlock()
-	// f2 was refused, not queued; termination then closed the mailbox.
-	if qclosed {
-		// Mailbox was closed by terminateStream: the consumer got [f0 f1]
-		// (or is mid-drain of it) — the prefix holds by construction because
-		// the FIFO mailbox never reordered or skipped, and f2 never entered.
-		if !s.terminated.Load() {
-			t.Fatal("mailbox closed but stream not marked terminated")
+	// SENDER: stream all frames, then close.
+	go func() {
+		for i := 0; i < total; i++ {
+			buf := make([]byte, 4)
+			for j := range buf {
+				buf[j] = byte(i % 251)
+			}
+			if err := WriteFrame(b, 1, FrameData, buf); err != nil {
+				return
+			}
 		}
-	} else if len(queued) != 2 || queued[0] != "f0" || queued[1] != "f1" {
-		t.Fatalf("queued contents = %v, want [f0 f1] (contiguous, no hole)", queued)
+		_ = WriteFrame(b, 1, FrameClose, nil)
+	}()
+
+	// CONSUMER: deliberately slow (reads a little, then pauses), always well
+	// under ConsumerStall. The pause is long enough that the dispatcher's
+	// mailbox (primary + carry) overflows and it parks; the resume drains it.
+	received := 0
+	terminated := false
+	hardCap := time.After(30 * time.Second) // runaway backstop only
+	closeSeen := false
+	for !closeSeen {
+		select {
+		case f := <-ch:
+			if f == nil {
+				terminated = true
+				closeSeen = true
+				break
+			}
+			want := byte(received % 251)
+			if len(f) != 4 || f[0] != want {
+				t.Fatalf("frame %d: corrupt payload len=%d first=%d want=%d (reorder/loss)",
+					received, len(f), f[0], want)
+			}
+			received++
+			// Slow-but-alive: a bounded pause, always < ConsumerStall.
+			time.Sleep(2 * time.Millisecond)
+		case <-hardCap:
+			t.Fatalf("consumer hung: received %d/%d frames (terminated=%v)", received, total, terminated)
+		}
+		if terminated {
+			// A real stream-end only arrives AFTER every data frame; the
+			// pre-fix signature was an EARLY nil (mid-transfer termination).
+			if received != total {
+				t.Fatalf("stream terminated after only %d/%d frames — pre-fix truncation", received, total)
+			}
+		}
 	}
 
-	// INVARIANT part 2 — the stream was CLEANLY FAILED, not left alive with
-	// the missing frame.
-	if !s.terminated.Load() {
-		t.Fatal("refused DATA frame left the stream alive (silent byte hole)")
+	// (1) The FULL transfer completed in order.
+	if received != total {
+		t.Fatalf("delivered %d/%d frames: the transfer truncated (pre-fix ~1 MB signature)", received, total)
 	}
-	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 1 {
-		t.Fatalf("dropped_data_frames = %d, want 1", got)
+	// (2) NO DATA frame was dropped on the down carrier.
+	if dropped := atomic.LoadInt64(&stats.DroppedDataFrames); dropped != 0 {
+		t.Fatalf("dropped_data_frames = %d, want 0 (the park released every frame in order)", dropped)
 	}
-	if got := undel.Load(); got != 1 {
-		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 1", got)
+	// (3) The mailbox genuinely overflowed to its ceiling — this is what
+	// makes the test a real overflow reproducer, not a trivial pass.
+	if high := atomic.LoadInt64(&stats.StreamQueuedFramesHigh); high < 2 {
+		t.Fatalf("stream_queued_frames_high = %d, want >= 2 (the mailbox must have overflowed to park)", high)
 	}
-	// The consumer is notified of the clean stream end (nil), the same
-	// signal as a FrameClose — so the down relay closes, not corrupts.
-	select {
-	case f := <-s.ch:
-		if f != nil {
-			t.Fatalf("stream end signal = %q, want nil", f)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("consumer never received the clean stream-end signal")
+	// (4) No data-undeliverable escalation fired (the stream stayed alive).
+	if n := undel.Load(); n != 0 {
+		t.Fatalf("OnStreamDataUndeliverable fired %d times, want 0 (no termination under a live slow consumer)", n)
 	}
-	// The closed mailbox can resurface no bytes.
-	if it, ok := s.q.Pop(); ok {
-		t.Fatalf("Pop after termination returned %q, want closed", it.payload)
-	}
+	t.Logf("carry-exhaustion park: %d/%d frames delivered in order, frames_high=%d, dropped=%d, undel=%d",
+		received, total,
+		atomic.LoadInt64(&stats.StreamQueuedFramesHigh),
+		atomic.LoadInt64(&stats.DroppedDataFrames), undel.Load())
 }
 
 // TestHealthyStreamDeliversInOrderNoDrops is the other half of the invariant:
@@ -159,11 +183,12 @@ func TestHealthyStreamDeliversInOrderNoDrops(t *testing.T) {
 	}
 }
 
-// TestStreamCloseStillUsesPressureKeepsCloseOffTheDataPath guards the one
-// behavior that must NOT have migrated to the data path: a refused FrameClose
-// still goes through the pressure rule (applyPressure), so a half-close on a
-// stalled stream ends that stream on its later push — not on the data path.
-func TestStreamCloseStillUsesPressure(t *testing.T) {
+// TestStreamCloseCarriedPreservesFIFO guards the retry-grace close path:
+// a refused FrameClose (because the primary mailbox is full) is CARRIED
+// into the queue's bounded carry region so the consumer still sees it AFTER
+// every preceding DATA frame — never overtaken, never dropped. The stream
+// stays alive and no DATA frame is counted as dropped.
+func TestStreamCloseCarriedPreservesFIFO(t *testing.T) {
 	a, b := testutil.NewMemPipe()
 	defer a.Close()
 	defer b.Close()
@@ -177,17 +202,30 @@ func TestStreamCloseStillUsesPressure(t *testing.T) {
 	if !s.q.TryPush(queueItem{payload: []byte("x")}) {
 		t.Fatal("seed push to a 1-frame mailbox refused")
 	}
-	// A FrameClose cannot be queued (mailbox full). It must apply the
-	// pressure rule (set pressureStart), NOT terminate via the data path,
-	// and must NOT bump the dropped-DATA counter (it is not a data frame).
+	// A FrameClose cannot be queued (mailbox full). The retry-grace CARRIES
+	// it so the consumer still sees the ordered half-close after "x".
 	c.deliver(s, queueItem{isClose: true})
-	if s.pressureStart.IsZero() {
-		t.Fatal("refused FrameClose did not apply the pressure rule")
+
+	// The carry must have accepted the close (0 payload bytes, fits any cap).
+	if n := s.q.OverflowLen(); n != 1 {
+		t.Fatalf("overflow_len = %d, want 1 (the carried close)", n)
 	}
+	// The stream must NOT be terminated: the close was carried, not lost.
 	if s.terminated.Load() {
-		t.Fatal("a refused FrameClose terminated the stream immediately; it should use pressure")
+		t.Fatal("a carried FrameClose terminated the stream; it should preserve FIFO")
 	}
+	// No DATA frame was dropped (the close carries no bytes).
 	if got := atomic.LoadInt64(&stats.DroppedDataFrames); got != 0 {
-		t.Fatalf("dropped_data_frames = %d after a refused FrameClose, want 0", got)
+		t.Fatalf("dropped_data_frames = %d after a carried FrameClose, want 0", got)
+	}
+
+	// Drain in order: primary "x" first, then the carried close.
+	it, ok := s.q.Pop()
+	if !ok || it.isClose || string(it.payload) != "x" {
+		t.Fatalf("first Pop = %+v ok=%v, want primary \"x\"", it, ok)
+	}
+	it, ok = s.q.Pop()
+	if !ok || !it.isClose {
+		t.Fatalf("second Pop = %+v ok=%v, want the carried close", it, ok)
 	}
 }

@@ -105,7 +105,10 @@ func newRelayReadNode(t *testing.T) (*Node, *session.Session, *testutil.MemConn,
 		KeepAliveInterval:       time.Hour,
 		SessionBufferTotalBytes: 1 << 20,
 	}
-	n := NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	n, err := NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { n.Close() })
 
 	upA, upB := testutil.NewMemPipe()
@@ -318,7 +321,10 @@ func TestDownReadErrorStillFatalOnTargetSide(t *testing.T) {
 		KeepAliveInterval:       time.Hour,
 		SessionBufferTotalBytes: 1 << 20,
 	}
-	n := NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	n, err := NewNode(cfg, log.New(io.Discard, "", 0), []byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { n.Close() })
 
 	downA, _ := testutil.NewMemPipe()
