@@ -19,6 +19,22 @@ import (
 	"github.com/Zaltapar/iran-germany-split-tunnel/internal/dashboard"
 )
 
+// chownForTest returns the chownFn a test should use. On a root Linux host the
+// real chownByName is kept so the tests also verify ownership against the
+// systemd "0640 root:split-tunnel" contract. On any other host (non-root, or
+// non-Linux) a no-op is returned: a non-root process cannot perform a chown,
+// and the credential-file tests only assert the file plumbing (creation,
+// atomicity, idempotence, recovery) — never real ownership — so a no-op is
+// both sufficient and correct there. This is what makes the suite runnable on
+// a bare CI runner that has neither root nor the split-tunnel group.
+func chownForTest(t *testing.T) func(string, string, string) error {
+	t.Helper()
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		return chownByName
+	}
+	return func(string, string, string) error { return nil }
+}
+
 // withCredPaths points the credential-path vars at <root>/dashboard/... and
 // swaps the dir-convergence + chown gates for temp-root no-ops (restored via
 // t.Cleanup). This keeps the generate/recover flows exercisable off a Linux
@@ -35,7 +51,7 @@ func withCredPaths(t *testing.T, root string) {
 	convergeCredDir = func(dir string) error { return os.MkdirAll(dir, 0o750) }
 
 	oldChown := chownFn
-	chownFn = chownByName
+	chownFn = chownForTest(t)
 
 	t.Cleanup(func() {
 		dashCredsFile, dashRetrievalFile, dashCredsDir = oldCreds, oldRet, oldDir
@@ -74,6 +90,14 @@ func TestWriteSecretFileRefusesSymlinkTarget(t *testing.T) {
 	if err := os.Symlink(leak, creds); err != nil {
 		t.Skip("symlink not supported on this host")
 	}
+
+	// The chown step is unrunnable on a non-root host; the symlink-refusal
+	// property this test pins lives in the atomic rename, not the ownership.
+	// Inject the matching no-op so the write succeeds and the rename is what
+	// gets asserted.
+	oldChown := chownFn
+	chownFn = chownForTest(t)
+	t.Cleanup(func() { chownFn = oldChown })
 
 	if err := writeSecretFile(creds, "new-content", 0o640, "root", "root"); err != nil {
 		t.Fatalf("writeSecretFile through symlink target: %v", err)

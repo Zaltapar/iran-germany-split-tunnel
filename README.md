@@ -171,7 +171,7 @@ All variables are read by `internal/config` at startup. Unset / empty means
 
 ## Quick Start / Deployment
 
-The one-click installer provisions both roles on their respective hosts:
+`install-oneclick.sh` is the supported production installer for both roles:
 
 ```bash
 # On the Iran host:
@@ -181,7 +181,10 @@ The one-click installer provisions both roles on their respective hosts:
 ./install-oneclick.sh --role germany
 ```
 
-`install.sh` is the interactive variant. `splitterctl` is the transactional
+`install.sh` is the **legacy / non-production** interactive variant, kept for
+existing hosts; it is not the recommended deployment path (its firewall
+mutation is gated behind `--legacy-firewall`, off by default). `splitterctl`
+is the transactional
 deployment CLI (state root `/etc/split-tunnel`):
 
 ```
